@@ -960,8 +960,7 @@ export default function HomePage() {
     for (const m of DASHBOARD_MARKETS) result[m] = null;
 
     for (const r of signalRows) {
-      const market = (r.parsed as any)?.p?.market;
-      if (typeof market !== "string") continue;
+      const market = r.parsed.p.market;
       if (!DASHBOARD_MARKET_SET.has(market)) continue;
       const key = market as DashboardMarket;
       if (result[key] === null) {
