@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.next/
+out/
+*.log
+.env
+.env.local
+.env.*.local
+auth_cookie*.txt
+data/
+coverage/
+.turbo/

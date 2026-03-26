@@ -1,0 +1,27 @@
+{
+  "name": "orbitalpha-trading",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Upbit spot signal monitoring, logs, and admin dashboard (trading-only, isolated from other products).",
+  "workspaces": [
+    "shared",
+    "server",
+    "dashboard"
+  ],
+  "scripts": {
+    "postinstall": "npm run build -w @orbitalpha/shared",
+    "build": "npm run build -w @orbitalpha/shared && npm run build -w @orbitalpha/server && npm run build -w @orbitalpha/dashboard",
+    "start": "node scripts/start-railway.mjs",
+    "dev": "concurrently -n shared,server,dash -c blue,green,magenta \"npm run dev -w @orbitalpha/shared\" \"npm run dev -w @orbitalpha/server\" \"npm run dev -w @orbitalpha/dashboard\"",
+    "dev:server": "npm run dev -w @orbitalpha/server",
+    "dev:dashboard": "npm run dev -w @orbitalpha/dashboard",
+    "lint": "npm run lint -w @orbitalpha/shared && npm run lint -w @orbitalpha/server && npm run lint -w @orbitalpha/dashboard"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

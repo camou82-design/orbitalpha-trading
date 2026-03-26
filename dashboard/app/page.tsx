@@ -1,0 +1,1882 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { usePathname, useRouter } from "next/navigation";
+import Link from "next/link";
+import type { SignalLogEntry } from "@orbitalpha/shared";
+import {
+  DEFAULT_TRADING_COMPANY_ID,
+  DEFAULT_TRADING_SERVICE_ID,
+  mvpSignalPayloadV1Schema,
+  mvpSignalPayloadV2Schema,
+  THIS_REPO_SERVICE_LINE,
+} from "@orbitalpha/shared";
+import {
+  fetchTradeStatusDetailed,
+  fetchTradeStatusOnce,
+  fetchTradeStatusUntilSyncedWithLog,
+} from "@/lib/trade-status-fetch";
+
+const apiBase =
+  process.env.NEXT_PUBLIC_ORBITALPHA_TRADING_API_BASE?.replace(/\/$/, "") ??
+  process.env.NEXT_PUBLIC_ORBITALPHA_API_BASE?.replace(/\/$/, "") ??
+  "";
+
+function parseSignalPayload(row: SignalLogEntry) {
+  if (row.kind !== "signal" || !row.payload) return null;
+  const v2 = mvpSignalPayloadV2Schema.safeParse(row.payload);
+  if (v2.success) return { kind: "v2" as const, p: v2.data };
+  const v1 = mvpSignalPayloadV1Schema.safeParse(row.payload);
+  if (v1.success) return { kind: "v1" as const, p: v1.data };
+  return null;
+}
+
+function isPass(parsed: NonNullable<ReturnType<typeof parseSignalPayload>>): boolean {
+  return parsed.kind === "v2" ? parsed.p.filter_pass : parsed.p.passed;
+}
+
+const FILTER_LABELS: Record<string, string> = {
+  volume_increase: "거래량 증가",
+  box_breakout: "박스 상단 돌파",
+  pullback_reclaim: "짧은 눌림 후 재상승",
+  upper_wick: "윗꼬리 과다",
+  no_vertical_spike: "단기 수직 급등 제외",
+  volume_spike_close_fail: "거래량 급증 후 종가 유지",
+  data: "데이터 충분성",
+};
+
+/** 6개 필터 중 정확히 5개 통과 + 전체 미통과 → 마지막 1조건 탈락 후보 */
+function isNearMissFiveOfSix(parsed: NonNullable<ReturnType<typeof parseSignalPayload>>): boolean {
+  if (parsed.kind !== "v2") return false;
+  const { filter_pass, filters } = parsed.p;
+  if (filter_pass) return false;
+  if (filters.length !== 6) return false;
+  return filters.filter((f) => f.passed).length === 5;
+}
+
+function singleFailedFilterId(parsed: NonNullable<ReturnType<typeof parseSignalPayload>>): string | null {
+  if (parsed.kind !== "v2") return null;
+  const failed = parsed.p.filters.filter((f) => !f.passed);
+  return failed.length === 1 ? failed[0]!.id : null;
+}
+
+const DASHBOARD_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"] as const;
+type DashboardMarket = (typeof DASHBOARD_MARKETS)[number];
+const DASHBOARD_MARKET_SET = new Set<string>(DASHBOARD_MARKETS as unknown as string[]);
+const UPBIT_FEE_RATE = 0.0005;
+
+/** API 구버전 대비 — 서버 `volume-thresholds`와 동기 */
+const DEFAULT_VOLUME_THRESHOLDS_BY_MARKET: Record<string, number> = {
+  "KRW-BTC": 0.75,
+  "KRW-ETH": 1.15,
+  "KRW-XRP": 0.75,
+  "KRW-TRX": 1.15,
+};
+
+type Ctx = {
+  company_id: string;
+  service_id: string;
+  product?: string;
+  service_line?: string;
+  monitor_instance_id?: string | null;
+  monitor_started_at?: string | null;
+  last_strategy_tick_at?: string | null;
+  last_scanner_tick_at?: string | null;
+  last_market_state_tick_at?: string | null;
+  watch_markets?: string[];
+  excluded_markets?: string[];
+  volume_threshold_fallback?: number;
+  volume_thresholds_by_market?: Record<string, number>;
+  volume_threshold_alt?: { "095": number; "075": number };
+} | null;
+
+type TradeStatus = {
+  trading_mode: "paper" | "live";
+  live_order_confirm: boolean;
+  live_enabled: boolean;
+  env_access_key_present?: boolean;
+  env_access_key_masked?: string | null;
+  env_secret_key_present?: boolean;
+  api_connected: boolean;
+  api_reason: string | null;
+  account_sync_failure_code?: string | null;
+  account_sync_failure_message?: string | null;
+  krw_available: number;
+  balances: Array<{
+    currency: string;
+    balance: number;
+    locked: number;
+    avg_buy_price: number;
+    unit_currency: string;
+  }>;
+  test_order_krw: number;
+  cooldown_ms: number;
+  test_market: "KRW-BTC" | "KRW-XRP" | null;
+  last_order: {
+    ts: string;
+    market: string;
+    side: "buy" | "sell";
+    amount_krw: number;
+    status: "ok" | "error";
+    detail: string;
+    order_uuid?: string;
+  } | null;
+  last_error: string | null;
+  in_flight: boolean;
+  auto_trade_enabled?: boolean;
+  auto_trade_changed_at?: string | null;
+  legacy_position?: {
+    market: string;
+    qty: number;
+    avg: number;
+    excluded_from_strategy: boolean;
+  };
+  strategy_positions?: Record<
+    string,
+    {
+      qty: number;
+      avg: number;
+      entries: number;
+      realized_pnl: number;
+      strategy_type?: "stable" | "momentum";
+      stop_loss_pct?: number;
+      breakeven_arm_pct?: number;
+      partial_take_profit_pct?: number;
+      trailing_from_peak_pct?: number;
+    }
+  >;
+  pnl_summary?: {
+    legacy_position_pnl: number | null;
+    strategy_position_pnl: number;
+    total_pnl: number | null;
+  };
+};
+
+type UpbitTickerRow = {
+  market: string;
+  trade_price: number;
+};
+
+type AuthSession = {
+  authenticated: boolean;
+  user_id?: string;
+  auto_trade_enabled?: boolean;
+  live_enabled?: boolean;
+  api_connected?: boolean;
+  recovery_ready?: boolean;
+  safety_guard_state?: "정상" | "주의" | "자동정지";
+  can_enable_auto_trade?: boolean;
+  cannot_enable_reason?: string | null;
+  auto_trade_changed_at?: string | null;
+  message?: string;
+};
+
+type StrategyStatus = {
+  mode: string;
+  strategy_tag: string;
+  strategy_available_krw: number | null;
+  strategy_invested_krw: number;
+  strategy_pnl_krw: number;
+  strategy_win_rate: number;
+  strategy_total_fills: number;
+  strategy_take_profit_count: number;
+  strategy_stop_loss_count: number;
+  strategy_avg_holding_minutes: number;
+  safety_guard_state?: "정상" | "주의" | "자동정지";
+  safety_guard_reason?: string | null;
+  order_fail_count_today?: number;
+  consecutive_losses?: number;
+  max_positions?: number;
+  reentry_cooldowns?: Record<string, string>;
+  open_positions?: Record<
+    string,
+    {
+      strategy_type: "stable" | "momentum";
+      breakeven_armed: boolean;
+      partial_tp_done: boolean;
+      trailing_stop_price: number;
+      highest_price_after_entry: number;
+      current_net_pnl_pct: number;
+      remaining_qty: number;
+    }
+  >;
+};
+
+type PumpScannerStatus = {
+  updated_at: string | null;
+  items: Array<{
+    rank: number;
+    market: string;
+    score: number;
+    status: "진입후보" | "강관찰" | "예비후보" | "제외";
+    volume_multiple: number;
+    breakout: boolean;
+    close_upper_hold: boolean;
+    rise_3m_pct: number;
+    exclude_reasons?: string[];
+    captured_at?: string | null;
+    return_3m_pct?: number | null;
+    return_5m_pct?: number | null;
+    return_10m_pct?: number | null;
+    updated_at: string;
+  }>;
+};
+
+type MarketStateStatus = {
+  timestamp: string;
+  market_state: "risk_on" | "neutral" | "risk_off";
+  entry_policy: "적극 진입" | "선별 진입" | "신규 진입 차단";
+  market_bonus: number;
+  min_entry_score: number;
+  btc_5m_trend: "up" | "down" | "flat";
+  btc_15m_trend: "up" | "down" | "flat";
+  breadth_ratio: number;
+  recent_close_bias: "up" | "down" | "flat";
+};
+
+/** 로그(최신순)에서 가장 최근 signal_monitor_started의 인스턴스 id */
+function latestMonitorInstanceIdFromLogs(logs: SignalLogEntry[]): string | undefined {
+  for (const row of logs) {
+    if (row.kind !== "system" || row.message !== "signal_monitor_started") continue;
+    const id = (row.payload as { monitor_instance_id?: string } | undefined)?.monitor_instance_id;
+    if (typeof id === "string" && id.length > 0) return id;
+  }
+  return undefined;
+}
+
+/** 현재 API가 알려준 인스턴스만 집계에 포함 (구버전 로그는 id 없으면 제외) */
+function signalMatchesActiveMonitor(row: SignalLogEntry, activeId: string | undefined): boolean {
+  if (row.kind !== "signal") return true;
+  if (!activeId) return true;
+  const p = row.payload as { v?: number; monitor_instance_id?: string };
+  if (p?.v === 2) return p.monitor_instance_id === activeId;
+  return false;
+}
+
+function volumeFilterRow(parsed: NonNullable<ReturnType<typeof parseSignalPayload>>) {
+  if (parsed.kind !== "v2") return null;
+  return parsed.p.filters.find((f) => f.id === "volume_increase") ?? null;
+}
+
+function toEpochMs(ts: string): number {
+  const n = Date.parse(ts);
+  return Number.isNaN(n) ? 0 : n;
+}
+
+function formatTsLocal(ts: string): string {
+  const n = Date.parse(ts);
+  if (Number.isNaN(n)) return ts;
+  return new Date(n).toLocaleString("ko-KR", { hour12: false });
+}
+
+function failedFilterLabels(parsed: NonNullable<ReturnType<typeof parseSignalPayload>>): string {
+  if (parsed.kind !== "v2") return "";
+  return parsed.p.filters
+    .filter((f) => !f.passed)
+    .map((f) => FILTER_LABELS[f.id] ?? f.label)
+    .join(", ");
+}
+
+
+function SignalEvalCard({
+  entry,
+  parsed,
+  nearMiss,
+}: {
+  entry: SignalLogEntry;
+  parsed: NonNullable<ReturnType<typeof parseSignalPayload>>;
+  nearMiss?: boolean;
+}) {
+  const p = parsed.p;
+  const market = p.market;
+  const pass = parsed.kind === "v2" ? parsed.p.filter_pass : parsed.p.passed;
+  const reason = parsed.kind === "v2" ? parsed.p.signal_reason : parsed.p.summary;
+  const failReason = parsed.kind === "v2" ? parsed.p.filter_fail_reason : null;
+  const sigType =
+    parsed.kind === "v2"
+      ? parsed.p.signal_type
+      : parsed.p.passed
+        ? "spot_mvp_v1"
+        : "none";
+
+  const border = nearMiss ? "1px solid #d97706" : pass ? "1px solid #22c55e" : "1px solid #334155";
+  const bg = nearMiss ? "#1c1410" : "#0f1623";
+
+  return (
+    <article
+      style={{
+        background: bg,
+        border,
+        borderRadius: 8,
+        padding: "0.85rem 1rem",
+        fontSize: "0.88rem",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          gap: "0.5rem 1rem",
+          alignItems: "baseline",
+          marginBottom: "0.5rem",
+        }}
+      >
+        {nearMiss ? (
+          <span style={{ fontSize: "0.72rem", padding: "0.12rem 0.4rem", borderRadius: 4, background: "#92400e", color: "#ffedd5" }}>
+            5/6 준통과
+          </span>
+        ) : (
+          <span style={{ color: "#94a3b8", fontSize: "0.75rem" }}>signal</span>
+        )}
+        <span style={{ color: "var(--muted)", fontSize: "0.8rem" }}>{entry.ts}</span>
+        <strong style={{ fontSize: "1rem" }}>{market}</strong>
+        <span style={{ color: "var(--muted)", fontSize: "0.75rem" }}>{sigType}</span>
+        <span
+          style={{
+            fontSize: "0.75rem",
+            padding: "0.15rem 0.45rem",
+            borderRadius: 4,
+            background: pass ? "#14532d" : "#451a1a",
+            color: "#e5e7eb",
+          }}
+        >
+          {pass ? "통과" : "탈락"}
+        </span>
+        {nearMiss && parsed.kind === "v2" ? (
+          <span style={{ fontSize: "0.78rem", color: "#fdba74" }}>
+            마지막 탈락: <strong>{FILTER_LABELS[singleFailedFilterId(parsed) ?? ""] ?? "?"}</strong>
+          </span>
+        ) : null}
+      </div>
+      {!pass && parsed.kind === "v2" && failedFilterLabels(parsed) ? (
+        <div
+          style={{
+            marginBottom: "0.5rem",
+            padding: "0.4rem 0.55rem",
+            background: "#1e1b2e",
+            borderRadius: 6,
+            border: "1px solid #6366f1",
+            fontSize: "0.84rem",
+            color: "#e0e7ff",
+          }}
+        >
+          <strong>이번 평가 탈락 필터</strong> — {failedFilterLabels(parsed)}
+        </div>
+      ) : null}
+      <div style={{ marginBottom: "0.5rem", lineHeight: 1.45 }}>
+        <strong>이유</strong> — {reason}
+      </div>
+      {nearMiss && parsed.kind === "v2" && typeof parsed.p.volume_ratio === "number" ? (
+        <div
+          style={{
+            fontSize: "0.82rem",
+            marginBottom: "0.5rem",
+            padding: "0.45rem 0.6rem",
+            background: "#292018",
+            borderRadius: 6,
+            border: "1px solid #b45309",
+            color: "#fde68a",
+          }}
+        >
+          <strong>현재 종목 거래량 기준 ({parsed.p.volume_threshold_main ?? "?"})</strong>
+          {" → "}
+          거래량 증가 필터:{" "}
+          {volumeFilterRow(parsed)?.passed ? (
+            <span style={{ color: "#86efac" }}>통과</span>
+          ) : (
+            <span style={{ color: "#fca5a5" }}>탈락</span>
+          )}
+          {" · "}
+          volume_ratio={parsed.p.volume_ratio.toFixed(3)}
+        </div>
+      ) : null}
+      {parsed.kind === "v2" &&
+      typeof parsed.p.pullback_relaxed_pass === "boolean" &&
+      typeof parsed.p.would_pass_with_pullback_relaxed === "boolean" ? (
+        <div
+          style={{
+            fontSize: "0.82rem",
+            marginBottom: "0.5rem",
+            padding: "0.45rem 0.6rem",
+            background: "#0f172a",
+            borderRadius: 6,
+            border: "1px solid #334155",
+            color: "#cbd5e1",
+          }}
+        >
+          <div style={{ marginBottom: 4, color: "#94a3b8", fontSize: "0.78rem" }}>패턴 보조 판정 (메인 조건 불변)</div>
+          <div>
+            눌림 완화 기준:{" "}
+            {parsed.p.pullback_relaxed_pass ? (
+              <span style={{ color: "#86efac" }}>충족</span>
+            ) : (
+              <span style={{ color: "#fca5a5" }}>미충족</span>
+            )}
+            {" · 눌림만 완화 시 전체 "}
+            {parsed.p.would_pass_with_pullback_relaxed ? (
+              <span style={{ color: "#4ade80" }}>통과</span>
+            ) : (
+              <span style={{ color: "#f87171" }}>여전히 탈락</span>
+            )}
+          </div>
+        </div>
+      ) : null}
+      {parsed.kind === "v2" &&
+      typeof parsed.p.vol_close_relaxed_a_pass === "boolean" &&
+      typeof parsed.p.vol_close_relaxed_b_pass === "boolean" &&
+      typeof parsed.p.would_pass_with_vol_close_relaxed_a === "boolean" &&
+      typeof parsed.p.would_pass_with_vol_close_relaxed_b === "boolean" ? (
+        <div
+          style={{
+            fontSize: "0.82rem",
+            marginBottom: "0.5rem",
+            padding: "0.45rem 0.6rem",
+            background: "#1a1628",
+            borderRadius: 6,
+            border: "1px solid #7c3aed",
+            color: "#e9d5ff",
+          }}
+        >
+          <div style={{ marginBottom: 4, color: "#c4b5fd", fontSize: "0.78rem" }}>
+            종가 유지 보조 판정 (메인: 급증 시 양봉·캔들 내 ≥38% — 불변)
+          </div>
+          <div>
+            A (cl≥시가×0.998 · 캔들내≥28%):{" "}
+            {parsed.p.vol_close_relaxed_a_pass ? (
+              <span style={{ color: "#86efac" }}>충족</span>
+            ) : (
+              <span style={{ color: "#fca5a5" }}>미충족</span>
+            )}
+            {" · 종가만 A로 완화 시 전체 "}
+            {parsed.p.would_pass_with_vol_close_relaxed_a ? (
+              <span style={{ color: "#4ade80" }}>통과</span>
+            ) : (
+              <span style={{ color: "#f87171" }}>여전히 탈락</span>
+            )}
+          </div>
+          <div style={{ marginTop: 6 }}>
+            B (cl≥시가×0.996 · 캔들내≥20%):{" "}
+            {parsed.p.vol_close_relaxed_b_pass ? (
+              <span style={{ color: "#86efac" }}>충족</span>
+            ) : (
+              <span style={{ color: "#fca5a5" }}>미충족</span>
+            )}
+            {" · 종가만 B로 완화 시 전체 "}
+            {parsed.p.would_pass_with_vol_close_relaxed_b ? (
+              <span style={{ color: "#4ade80" }}>통과</span>
+            ) : (
+              <span style={{ color: "#f87171" }}>여전히 탈락</span>
+            )}
+          </div>
+        </div>
+      ) : null}
+      {parsed.kind === "v2" &&
+      typeof parsed.p.breakout_relaxed_a_pass === "boolean" &&
+      typeof parsed.p.breakout_relaxed_b_pass === "boolean" &&
+      typeof parsed.p.would_pass_with_breakout_relaxed_a === "boolean" &&
+      typeof parsed.p.would_pass_with_breakout_relaxed_b === "boolean" ? (
+        <div
+          style={{
+            fontSize: "0.82rem",
+            marginBottom: "0.5rem",
+            padding: "0.45rem 0.6rem",
+            background: "#0c1a14",
+            borderRadius: 6,
+            border: "1px solid #166534",
+            color: "#bbf7d0",
+          }}
+        >
+          <div style={{ marginBottom: 4, color: "#86efac", fontSize: "0.78rem" }}>돌파 보조 판정 (메인 99.8% 불변)</div>
+          <div>
+            A (고가 ≥ 저항 99.7%):{" "}
+            {parsed.p.breakout_relaxed_a_pass ? (
+              <span style={{ color: "#86efac" }}>충족</span>
+            ) : (
+              <span style={{ color: "#fca5a5" }}>미충족</span>
+            )}
+            {" · 돌파만 A로 완화 시 전체 "}
+            {parsed.p.would_pass_with_breakout_relaxed_a ? (
+              <span style={{ color: "#4ade80" }}>통과</span>
+            ) : (
+              <span style={{ color: "#f87171" }}>여전히 탈락</span>
+            )}
+          </div>
+          <div style={{ marginTop: 6 }}>
+            B (고가 ≥ 저항 99.4%):{" "}
+            {parsed.p.breakout_relaxed_b_pass ? (
+              <span style={{ color: "#86efac" }}>충족</span>
+            ) : (
+              <span style={{ color: "#fca5a5" }}>미충족</span>
+            )}
+            {" · 돌파만 B로 완화 시 전체 "}
+            {parsed.p.would_pass_with_breakout_relaxed_b ? (
+              <span style={{ color: "#4ade80" }}>통과</span>
+            ) : (
+              <span style={{ color: "#f87171" }}>여전히 탈락</span>
+            )}
+          </div>
+        </div>
+      ) : null}
+      {parsed.kind === "v2" &&
+      typeof parsed.p.pair_pass_breakout_b_and_pullback_relaxed === "boolean" &&
+      typeof parsed.p.pair_pass_breakout_b_and_vol_close_a === "boolean" ? (
+        <div
+          style={{
+            fontSize: "0.8rem",
+            marginBottom: "0.5rem",
+            padding: "0.4rem 0.55rem",
+            background: "#111827",
+            borderRadius: 6,
+            border: "1px solid #4b5563",
+            color: "#e5e7eb",
+          }}
+        >
+          <div style={{ color: "#9ca3af", fontSize: "0.75rem", marginBottom: 6 }}>복합 보조 (검증)</div>
+          <div>
+            돌파B+눌림완화 동시 → 전체 통과?{" "}
+            {parsed.p.pair_pass_breakout_b_and_pullback_relaxed ? (
+              <span style={{ color: "#4ade80" }}>예</span>
+            ) : (
+              <span style={{ color: "#f87171" }}>아니오</span>
+            )}
+          </div>
+          <div style={{ marginTop: 4 }}>
+            돌파B+종가유지A 동시 → 전체 통과?{" "}
+            {parsed.p.pair_pass_breakout_b_and_vol_close_a ? (
+              <span style={{ color: "#4ade80" }}>예</span>
+            ) : (
+              <span style={{ color: "#f87171" }}>아니오</span>
+            )}
+          </div>
+        </div>
+      ) : null}
+      {parsed.kind === "v2" &&
+      typeof parsed.p.volume_ratio === "number" &&
+      typeof parsed.p.would_pass_at_095 === "boolean" ? (
+        <div
+          style={{
+            fontSize: "0.82rem",
+            marginBottom: "0.5rem",
+            padding: "0.45rem 0.6rem",
+            background: "#0c1220",
+            borderRadius: 6,
+            border: "1px solid #1e3a5f",
+          }}
+        >
+          <div style={{ color: "#93c5fd" }}>
+            volume_ratio={parsed.p.volume_ratio.toFixed(3)} · 종목 기준≥{parsed.p.volume_threshold_main ?? "?"}
+          </div>
+          {!pass ? (
+            <div style={{ marginTop: 6, color: "var(--muted)" }}>
+              메인 탈락 시 보조: 임계 <strong>0.95</strong>면 전체 통과{" "}
+              <span style={{ color: parsed.p.would_pass_at_095 ? "#4ade80" : "#f87171" }}>
+                {parsed.p.would_pass_at_095 ? "예" : "아니오"}
+              </span>
+              {" · "}
+              <strong>0.75</strong>면{" "}
+              <span style={{ color: parsed.p.would_pass_at_075 ? "#4ade80" : "#f87171" }}>
+                {parsed.p.would_pass_at_075 ? "예" : "아니오"}
+              </span>
+            </div>
+          ) : (
+            <div style={{ marginTop: 6, color: "#86efac" }}>메인 임계로 이미 통과</div>
+          )}
+        </div>
+      ) : null}
+      {!pass && failReason ? (
+        <div style={{ color: "#fca5a5", fontSize: "0.82rem", marginBottom: "0.5rem" }}>
+          <strong>탈락 상세</strong> — {failReason}
+        </div>
+      ) : null}
+      {parsed.kind === "v1" ? (
+        <ul style={{ margin: "0.35rem 0 0", paddingLeft: "1.1rem", color: "var(--muted)", fontSize: "0.82rem" }}>
+          {parsed.p.reasons.map((r, i) => (
+            <li key={i}>{r}</li>
+          ))}
+        </ul>
+      ) : null}
+      <div style={{ marginTop: "0.65rem" }}>
+        <strong style={{ fontSize: "0.85rem" }}>필터</strong>
+        <table
+          style={{
+            width: "100%",
+            borderCollapse: "collapse",
+            marginTop: "0.35rem",
+            fontSize: "0.8rem",
+          }}
+        >
+          <thead>
+            <tr style={{ color: "var(--muted)", textAlign: "left" }}>
+              <th style={{ padding: "0.25rem 0.5rem 0.25rem 0" }}>조건</th>
+              <th style={{ padding: "0.25rem 0.5rem" }}>결과</th>
+              <th style={{ padding: "0.25rem 0" }}>비고</th>
+            </tr>
+          </thead>
+          <tbody>
+            {p.filters.map((f) => (
+              <tr key={f.id} style={{ borderTop: "1px solid var(--border)" }}>
+                <td style={{ padding: "0.35rem 0.5rem 0.35rem 0" }}>{f.label}</td>
+                <td style={{ padding: "0.35rem 0.5rem", color: f.passed ? "#4ade80" : "#f87171" }}>
+                  {f.passed ? "통과" : "탈락"}
+                </td>
+                <td style={{ padding: "0.35rem 0", color: "var(--muted)" }}>{f.detail ?? "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </article>
+  );
+}
+
+const FILTER_ORDER = [
+  "volume_increase",
+  "box_breakout",
+  "pullback_reclaim",
+  "upper_wick",
+  "no_vertical_spike",
+  "volume_spike_close_fail",
+  "data",
+] as const;
+const FAIL_SUMMARY_IDS = [
+  "volume_increase",
+  "box_breakout",
+  "pullback_reclaim",
+  "upper_wick",
+  "volume_spike_close_fail",
+] as const;
+
+const UI = {
+  pageOuterBg: "radial-gradient(1200px 700px at 20% -10%, #1d4ed833 0%, #070d1b 48%, #02050d 100%)",
+  pageBg: "linear-gradient(180deg, #0b1428 0%, #081125 100%)",
+  panelBg: "linear-gradient(180deg, #10203d 0%, #0b1a33 100%)",
+  cardBg: "linear-gradient(180deg, #152a4f 0%, #102241 100%)",
+  cardSoftBg: "#0f2240",
+  border: "#2b4d7a",
+  borderSoft: "#1f3c63",
+  title: "#f1f7ff",
+  body: "#d6e7ff",
+  muted: "#8ea9d1",
+  mutedSoft: "#6781a9",
+  pass: "#2dd4bf",
+  passBg: "#052e2b",
+  watch: "#f59e0b",
+  watchBg: "#3a2a07",
+  fail: "#ef4444",
+  failBg: "#3a1014",
+  idle: "#60a5fa",
+  idleBg: "#0a2244",
+  error: "#ef4444",
+  warningChipBg: "#3b2306",
+  warningChipBorder: "#d97706",
+  errorChipBg: "#3a1014",
+  errorChipBorder: "#b91c1c",
+  panelInnerLine: "#3c66a3",
+  panelGlow: "0 10px 30px rgba(2, 6, 23, 0.45)",
+} as const;
+
+export default function HomePage() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const [ctx, setCtx] = useState<Ctx>(null);
+  const [logs, setLogs] = useState<SignalLogEntry[]>([]);
+  const [err, setErr] = useState<string | null>(null);
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
+  const [trade, setTrade] = useState<TradeStatus | null>(null);
+  const [tickerByMarket, setTickerByMarket] = useState<Record<string, number>>({});
+  const [sessionUserId, setSessionUserId] = useState<string | null>(null);
+  const [autoTradeEnabled, setAutoTradeEnabled] = useState(false);
+  const [autoTradeChangedAt, setAutoTradeChangedAt] = useState<string | null>(null);
+  const [toggleBusy, setToggleBusy] = useState(false);
+  const [canEnableAutoTrade, setCanEnableAutoTrade] = useState(false);
+  const [cannotEnableReason, setCannotEnableReason] = useState<string | null>(null);
+  const [authState, setAuthState] = useState<"loading" | "ok" | "expired">("loading");
+  const [strategy, setStrategy] = useState<StrategyStatus | null>(null);
+  const [scanner, setScanner] = useState<PumpScannerStatus | null>(null);
+  const [marketState, setMarketState] = useState<MarketStateStatus | null>(null);
+  const [accountSyncState, setAccountSyncState] = useState<"idle" | "syncing" | "ok" | "error">("idle");
+  const [lastClientTradeFailure, setLastClientTradeFailure] = useState<{ code: string; message: string } | null>(null);
+  const tradeInitialSyncDoneRef = useRef(false);
+  const prevPathnameRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const prev = prevPathnameRef.current;
+    prevPathnameRef.current = pathname;
+    const onTrading =
+      pathname === "/" || pathname === "/trading" || pathname.startsWith("/trading/");
+    if (onTrading && prev !== pathname) {
+      tradeInitialSyncDoneRef.current = false;
+    }
+  }, [pathname]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      setErr(null);
+      try {
+        if (typeof window !== "undefined") {
+          const sp = new URLSearchParams(window.location.search);
+          if (sp.get("account_sync") === "1") {
+            tradeInitialSyncDoneRef.current = false;
+            window.history.replaceState(null, "", `${window.location.pathname}${window.location.hash}`);
+          }
+        }
+        const ts = Date.now();
+        const sessionRes = await fetch(`${apiBase}/api/v1/auth/session?_=${ts}`, {
+          cache: "no-store",
+          credentials: "include",
+        });
+        if (sessionRes.status === 401) {
+          if (!cancelled) {
+            setAuthState("expired");
+            setAccountSyncState("idle");
+            tradeInitialSyncDoneRef.current = false;
+            router.replace("/login?reason=session_expired");
+          }
+          return;
+        }
+        const session = (await sessionRes.json()) as AuthSession;
+        if (!session.authenticated) {
+          if (!cancelled) {
+            setAuthState("expired");
+            setAccountSyncState("idle");
+            tradeInitialSyncDoneRef.current = false;
+            router.replace("/login");
+          }
+          return;
+        }
+        if (!cancelled) {
+          setAuthState("ok");
+          setSessionUserId(session.user_id ?? null);
+          setAutoTradeEnabled(session.auto_trade_enabled === true);
+          setAutoTradeChangedAt(typeof session.auto_trade_changed_at === "string" ? session.auto_trade_changed_at : null);
+          setCanEnableAutoTrade(session.can_enable_auto_trade === true);
+          setCannotEnableReason(typeof session.cannot_enable_reason === "string" ? session.cannot_enable_reason : null);
+        }
+
+        if (!tradeInitialSyncDoneRef.current) {
+          if (!cancelled) setAccountSyncState("syncing");
+          const syncResult = await fetchTradeStatusUntilSyncedWithLog(apiBase, {
+            maxAttempts: 15,
+            logContext: "trading_page_initial",
+          });
+          if (cancelled) return;
+          tradeInitialSyncDoneRef.current = true;
+          const primed = syncResult.payload;
+          if (primed) {
+            if (!cancelled) {
+              const p = primed as TradeStatus;
+              setTrade(p);
+              setLastClientTradeFailure(null);
+              if (p.api_connected) setAccountSyncState("ok");
+              else if (p.env_access_key_present && p.env_secret_key_present) setAccountSyncState("error");
+              else setAccountSyncState("ok");
+              if (!p.api_connected) {
+                console.log("[orbitalpha-trading] /trading initial sync final snapshot", {
+                  attempts: syncResult.attempts,
+                  httpStatus: syncResult.lastFetch?.httpStatus,
+                  api_connected: p.api_connected,
+                  account_sync_failure_code: p.account_sync_failure_code,
+                  account_sync_failure_message: p.account_sync_failure_message,
+                  api_reason: p.api_reason,
+                });
+              }
+            }
+          } else if (!cancelled) {
+            setAccountSyncState("error");
+            const lf = syncResult.lastFetch;
+            if (lf?.failureCode) {
+              setLastClientTradeFailure({
+                code: lf.failureCode,
+                message: lf.failureMessage ?? "",
+              });
+              console.log("[orbitalpha-trading] /trading initial sync no valid payload", {
+                attempts: syncResult.attempts,
+                lastHttpStatus: lf.httpStatus,
+                failureCode: lf.failureCode,
+                failureMessage: lf.failureMessage,
+              });
+            } else {
+              setLastClientTradeFailure(null);
+            }
+          }
+        }
+
+        const [c, l, tradePollRes, s, scannerStatus, marketStateStatus, tickerRows] = await Promise.all([
+          fetch(`${apiBase}/api/v1/context?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()),
+          fetch(`${apiBase}/api/v1/logs?limit=200&_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()),
+          fetchTradeStatusDetailed(apiBase),
+          fetch(`${apiBase}/api/v1/strategy/status?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()).catch(() => null),
+          fetch(`${apiBase}/api/v1/scanner/status?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()).catch(() => null),
+          fetch(`${apiBase}/api/v1/market-state?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()).catch(() => null),
+          fetch("https://api.upbit.com/v1/ticker?markets=KRW-BTC,KRW-ETH,KRW-XRP,KRW-TRX", { cache: "no-store" })
+            .then((r) => r.json() as Promise<UpbitTickerRow[]>)
+            .catch(() => [] as UpbitTickerRow[]),
+        ]);
+        if (cancelled) return;
+        setCtx({
+          company_id: c.company_id ?? DEFAULT_TRADING_COMPANY_ID,
+          service_id: c.service_id ?? DEFAULT_TRADING_SERVICE_ID,
+          product: c.product,
+          service_line: c.service_line ?? THIS_REPO_SERVICE_LINE,
+          monitor_instance_id: typeof c.monitor_instance_id === "string" ? c.monitor_instance_id : null,
+          monitor_started_at: typeof c.monitor_started_at === "string" ? c.monitor_started_at : null,
+          watch_markets: Array.isArray(c.watch_markets)
+            ? (c.watch_markets as string[])
+            : ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"],
+          excluded_markets: Array.isArray(c.excluded_markets) ? (c.excluded_markets as string[]) : [],
+          volume_threshold_fallback:
+            typeof c.volume_threshold_fallback === "number"
+              ? c.volume_threshold_fallback
+              : typeof c.volume_threshold_main === "number"
+                ? c.volume_threshold_main
+                : 1.15,
+          volume_thresholds_by_market:
+            c.volume_thresholds_by_market && typeof c.volume_thresholds_by_market === "object"
+              ? (c.volume_thresholds_by_market as Record<string, number>)
+              : DEFAULT_VOLUME_THRESHOLDS_BY_MARKET,
+          volume_threshold_alt:
+            c.volume_threshold_alt && typeof c.volume_threshold_alt === "object"
+              ? c.volume_threshold_alt
+              : { "095": 0.95, "075": 0.75 },
+        });
+        setLogs(l.items ?? []);
+        const t = tradePollRes.payload;
+        if (t) {
+          setTrade(t as TradeStatus);
+          if (!cancelled) {
+            setLastClientTradeFailure(null);
+            const p = t as TradeStatus;
+            if (p.api_connected) setAccountSyncState("ok");
+            else if (p.env_access_key_present && p.env_secret_key_present) setAccountSyncState("error");
+            else setAccountSyncState("ok");
+          }
+        } else if (!cancelled && tradePollRes.failureCode) {
+          console.log("[orbitalpha-trading] trade/status poll (invalid or error body)", {
+            httpStatus: tradePollRes.httpStatus,
+            failureCode: tradePollRes.failureCode,
+            failureMessage: tradePollRes.failureMessage,
+          });
+        }
+        if (s) setStrategy(s as StrategyStatus);
+        if (scannerStatus) setScanner(scannerStatus as PumpScannerStatus);
+        if (marketStateStatus) setMarketState(marketStateStatus as MarketStateStatus);
+        const nextTicker: Record<string, number> = {};
+        for (const row of tickerRows) {
+          if (typeof row.market === "string" && typeof row.trade_price === "number") {
+            nextTicker[row.market] = row.trade_price;
+          }
+        }
+        setTickerByMarket(nextTicker);
+        setLastUpdatedAt(new Date().toLocaleTimeString("ko-KR", { hour12: false }));
+      } catch (e) {
+        if (!cancelled) setErr(e instanceof Error ? e.message : "load failed");
+      }
+    }
+    void load();
+    const t = setInterval(load, 2_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [router, pathname]);
+
+  const activeMonitorInstanceId = useMemo(() => {
+    const fromCtx = ctx?.monitor_instance_id;
+    if (typeof fromCtx === "string" && fromCtx.length > 0) return fromCtx;
+    return latestMonitorInstanceIdFromLogs(logs);
+  }, [ctx, logs]);
+
+  const signalEvents = useMemo(() => {
+    const rows: SignalLogEntry[] = [];
+    for (const row of logs) {
+      if (row.kind !== "signal") continue;
+      if (!signalMatchesActiveMonitor(row, activeMonitorInstanceId)) continue;
+      rows.push(row);
+    }
+    rows.sort((a, b) => toEpochMs(b.ts) - toEpochMs(a.ts));
+    return rows;
+  }, [logs, activeMonitorInstanceId]);
+
+  const { signalRows, systemRows, passCount } = useMemo(() => {
+    const signalRows: { entry: SignalLogEntry; parsed: NonNullable<ReturnType<typeof parseSignalPayload>> }[] = [];
+    const systemRows: SignalLogEntry[] = [];
+
+    for (const row of signalEvents) {
+      const parsed = parseSignalPayload(row);
+      if (parsed) signalRows.push({ entry: row, parsed });
+    }
+    for (const row of logs) {
+      if (row.kind === "system" || row.kind === "upbit") {
+        systemRows.push(row);
+      }
+    }
+    signalRows.sort((a, b) => toEpochMs(b.entry.ts) - toEpochMs(a.entry.ts));
+    systemRows.sort((a, b) => toEpochMs(b.ts) - toEpochMs(a.ts));
+    const passCount = signalRows.filter((r) => isPass(r.parsed)).length;
+    return { signalRows, systemRows, passCount };
+  }, [logs, signalEvents]);
+
+  const recentFillRows = useMemo(() => signalEvents.filter((e) => {
+    const parsed = parseSignalPayload(e);
+    return parsed ? isPass(parsed) : false;
+  }).slice(0, 8), [signalEvents]);
+  const runState = err ? "오류" : activeMonitorInstanceId ? "실행 중" : "대기";
+
+  const recentServerTickTs = useMemo(() => {
+    const candidates = [ctx?.last_strategy_tick_at, ctx?.last_market_state_tick_at].filter((v): v is string => typeof v === "string" && v.length > 0);
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => Date.parse(b) - Date.parse(a));
+    return candidates[0] ?? null;
+  }, [ctx]);
+
+  const recentScannerCalcTs = useMemo(() => {
+    const fromCtx = ctx?.last_scanner_tick_at;
+    if (typeof fromCtx === "string" && fromCtx.length > 0) return fromCtx;
+    const fromScanner = scanner?.updated_at;
+    return typeof fromScanner === "string" && fromScanner.length > 0 ? fromScanner : null;
+  }, [ctx, scanner]);
+
+  const entryBlockReason = useMemo(() => {
+    if (!trade?.api_connected) return "API 미연결";
+    if (!autoTradeEnabled) return "자동매매 OFF";
+    const policy = marketState?.entry_policy;
+    if (policy === "신규 진입 차단") return "시장 상태: 신규 진입 차단";
+    if (policy === "선별 진입") {
+      if (!scanner?.items?.length) return "급등 후보 없음";
+      return "선별 진입 모드 유지";
+    }
+    if (!scanner?.items?.length) return "급등 후보 없음";
+    return "조건 대기";
+  }, [trade, autoTradeEnabled, marketState, scanner]);
+
+  const latestByMarket = useMemo(() => {
+    const result: Partial<
+      Record<
+        DashboardMarket,
+        { entry: SignalLogEntry; parsed: NonNullable<ReturnType<typeof parseSignalPayload>> } | null
+      >
+    > = {};
+    for (const m of DASHBOARD_MARKETS) result[m] = null;
+
+    for (const r of signalRows) {
+      const market = (r.parsed as any)?.p?.market;
+      if (typeof market !== "string") continue;
+      if (!DASHBOARD_MARKET_SET.has(market)) continue;
+      const key = market as DashboardMarket;
+      if (result[key] === null) {
+        result[key] = r;
+      }
+    }
+    return result as Record<
+      DashboardMarket,
+      { entry: SignalLogEntry; parsed: NonNullable<ReturnType<typeof parseSignalPayload>> } | null
+    >;
+  }, [signalRows]);
+
+  type CardTone = "pass" | "near" | "fail" | "none";
+
+  function getCardTone(parsed: NonNullable<ReturnType<typeof parseSignalPayload>> | null | undefined): CardTone {
+    if (!parsed) return "none";
+    if (isPass(parsed)) return "pass";
+    if (isNearMissFiveOfSix(parsed)) return "near";
+    return "fail";
+  }
+
+  function getCardVolumeRatio(parsed: NonNullable<ReturnType<typeof parseSignalPayload>> | null | undefined): string {
+    if (!parsed) return "—";
+    if (parsed.kind === "v2" && typeof parsed.p.volume_ratio === "number") return parsed.p.volume_ratio.toFixed(3);
+    return "—";
+  }
+
+  function getSignalStrength(parsed: NonNullable<ReturnType<typeof parseSignalPayload>> | null | undefined): string {
+    if (!parsed) return "LOW";
+    if (isPass(parsed)) return "HIGH";
+    if (isNearMissFiveOfSix(parsed)) return "MID";
+    return "LOW";
+  }
+
+  function getCardFailReason(parsed: NonNullable<ReturnType<typeof parseSignalPayload>> | null | undefined): string {
+    if (!parsed) return "—";
+    if (parsed.kind !== "v2") return parsed.p.summary ?? "—";
+
+    // 준통과는 정의상 “마지막으로 탈락한 1개 필터”가 존재
+    if (isNearMissFiveOfSix(parsed)) {
+      const id = singleFailedFilterId(parsed);
+      return (id ? FILTER_LABELS[id] ?? id : parsed.p.signal_reason) ?? "—";
+    }
+
+    const failed = parsed.p.filters.filter((f) => !f.passed).map((f) => f.id);
+    if (failed.length === 0) return "—";
+
+    const best = failed.reduce((acc, id) => {
+      const ia = FILTER_ORDER.indexOf(acc as (typeof FILTER_ORDER)[number]);
+      const ib = FILTER_ORDER.indexOf(id as (typeof FILTER_ORDER)[number]);
+      if (ia === -1 && ib === -1) return id.localeCompare(acc) < 0 ? id : acc;
+      if (ia === -1) return id;
+      if (ib === -1) return acc;
+      return ib < ia ? id : acc;
+    }, failed[0]!);
+
+    return FILTER_LABELS[best] ?? best;
+  }
+
+  const latestCycleRows = useMemo(
+    () =>
+      Object.values(latestByMarket)
+        .filter((r): r is NonNullable<(typeof latestByMarket)[DashboardMarket]> => Boolean(r))
+        .sort((a, b) => toEpochMs(b.entry.ts) - toEpochMs(a.entry.ts))
+        .slice(0, 4),
+    [latestByMarket],
+  );
+
+  const latestSignalTs = latestCycleRows[0]?.entry?.ts ? formatTsLocal(latestCycleRows[0].entry.ts) : "-";
+
+  const marketStatusSummary = useMemo(() => {
+    let pass = 0;
+    let watch = 0;
+    let fail = 0;
+    for (const m of DASHBOARD_MARKETS) {
+      const parsed = latestByMarket[m]?.parsed;
+      const tone = getCardTone(parsed);
+      if (tone === "pass") pass += 1;
+      else if (tone === "near") watch += 1;
+      else fail += 1;
+    }
+    return { pass, watch, fail };
+  }, [latestByMarket]);
+
+  const holdingCards = useMemo(() => {
+    const byCurrency = new Map((trade?.balances ?? []).map((b) => [b.currency, b]));
+    const strategyByMarket = trade?.strategy_positions ?? {};
+    const legacyXrpQty = trade?.legacy_position?.market === "KRW-XRP" ? Number(trade.legacy_position.qty ?? 0) : 0;
+    return DASHBOARD_MARKETS.map((m) => {
+      const currency = m.replace("KRW-", "");
+      const bal = byCurrency.get(currency);
+      const qty = bal?.balance ?? 0;
+      const avg = bal?.avg_buy_price ?? 0;
+      const strategyQtyRaw = Number(strategyByMarket[m]?.qty ?? 0);
+      const strategyQty = Number.isFinite(strategyQtyRaw) ? Math.max(0, strategyQtyRaw) : 0;
+      const legacyQty = m === "KRW-XRP" ? Math.max(0, legacyXrpQty) : Math.max(0, qty - strategyQty);
+      const now = tickerByMarket[m] ?? 0;
+      const evalAmount = qty > 0 && now > 0 ? qty * now : 0;
+      const cost = qty > 0 && avg > 0 ? qty * avg : 0;
+      const estimatedFees = evalAmount > 0 && cost > 0 ? cost * UPBIT_FEE_RATE + evalAmount * UPBIT_FEE_RATE : 0;
+      const netPnl = evalAmount > 0 && cost > 0 ? evalAmount - cost - estimatedFees : 0;
+      const netRet = cost > 0 ? (netPnl / cost) * 100 : 0;
+      const strategyMeta = strategyByMarket[m];
+      const livePos = strategy?.open_positions?.[m];
+      return {
+        market: m,
+        currency,
+        qty,
+        avg,
+        now,
+        evalAmount,
+        cost,
+        estimatedFees,
+        netPnl,
+        netRet,
+        legacyQty,
+        strategyQty,
+        strategyType: livePos?.strategy_type ?? strategyMeta?.strategy_type ?? "stable",
+        stopLossPct: Number(strategyMeta?.stop_loss_pct ?? -2),
+        currentNetPnlPct: Number(livePos?.current_net_pnl_pct ?? 0),
+        breakevenArmed: Boolean(livePos?.breakeven_armed),
+        partialTpDone: Boolean(livePos?.partial_tp_done),
+        trailingStopPrice: Number(livePos?.trailing_stop_price ?? 0),
+      };
+    });
+  }, [trade, tickerByMarket, strategy]);
+
+  const holdingQtyByMarket = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const h of holdingCards) map[h.market] = h.qty;
+    return map;
+  }, [holdingCards]);
+
+  const assetSummary = useMemo(() => {
+    const krw = Number(trade?.krw_available ?? 0);
+    const totalBuy = holdingCards.reduce((acc, h) => acc + (h.qty > 0 ? h.cost : 0), 0);
+    const totalEval = holdingCards.reduce((acc, h) => acc + (h.qty > 0 ? h.evalAmount : 0), 0);
+    const totalFees = holdingCards.reduce((acc, h) => acc + (h.qty > 0 ? h.estimatedFees : 0), 0);
+    const netPnl = totalEval - totalBuy - totalFees;
+    const netRet = totalBuy > 0 ? (netPnl / totalBuy) * 100 : 0;
+    const totalAssets = krw + totalEval;
+    return { krw, totalAssets, totalBuy, totalEval, netPnl, netRet, totalFees };
+  }, [trade, holdingCards]);
+
+  const tradeReadyLabel = useMemo(() => {
+    if (accountSyncState === "syncing") return "계좌 동기화 중";
+    if (trade?.live_enabled && trade?.api_connected) return "실거래 가능";
+    if (trade?.api_connected) return "API 연결됨 · 승인 필요";
+    return "API 확인 필요";
+  }, [trade, accountSyncState]);
+
+  const accountSyncFailureDisplay = useMemo(() => {
+    if (trade?.api_connected) return null;
+    const code = trade?.account_sync_failure_code;
+    const msg = trade?.account_sync_failure_message ?? trade?.api_reason;
+    if (typeof code === "string" && code.length > 0) {
+      return `${code}${msg ? ` — ${msg}` : ""}`.slice(0, 220);
+    }
+    if (typeof msg === "string" && msg.length > 0) return msg.slice(0, 220);
+    if (lastClientTradeFailure) {
+      return `${lastClientTradeFailure.code} — ${lastClientTradeFailure.message}`.slice(0, 220);
+    }
+    return null;
+  }, [trade, lastClientTradeFailure]);
+
+  const onToggleAutoTrade = async (enabled: boolean) => {
+    if (enabled) {
+      const ok = window.confirm("자동매매를 활성화합니다. 실제 주문이 실행될 수 있습니다.");
+      if (!ok) return;
+    }
+    setToggleBusy(true);
+    try {
+      const res = await fetch(`${apiBase}/api/v1/trade/auto-toggle`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ enabled, risk_ack: enabled ? true : false }),
+      });
+      if (res.status === 401) {
+        router.replace("/login?reason=session_expired");
+        return;
+      }
+      const body = await res.json();
+      if (!res.ok) throw new Error(body?.error ?? "자동매매 상태 변경 실패");
+      setAutoTradeEnabled(Boolean(body.auto_trade_enabled));
+      setAutoTradeChangedAt(typeof body.auto_trade_changed_at === "string" ? body.auto_trade_changed_at : null);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "toggle failed");
+    } finally {
+      setToggleBusy(false);
+    }
+  };
+
+  const onLogout = async () => {
+    try {
+      await fetch(`${apiBase}/api/v1/auth/logout`, {
+        method: "POST",
+        credentials: "include",
+      });
+    } finally {
+      router.replace("/login?reason=logged_out");
+    }
+  };
+
+  if (authState !== "ok") {
+    return (
+      <div style={{ background: UI.pageOuterBg, minHeight: "100vh", display: "grid", placeItems: "center", color: UI.body }}>
+        인증 상태 확인 중...
+      </div>
+    );
+  }
+
+  if (accountSyncState === "syncing" && !trade) {
+    return (
+      <div style={{ background: UI.pageOuterBg, minHeight: "100vh", display: "grid", placeItems: "center", color: UI.body }}>
+        계좌 동기화 중...
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ background: UI.pageOuterBg, minHeight: "100vh", padding: "1rem 0.85rem" }}>
+    <main
+      style={{
+        padding: "1.1rem",
+        maxWidth: 1240,
+        margin: "0 auto",
+        color: UI.body,
+        background: UI.pageBg,
+        border: "1px solid #2a4671",
+        borderRadius: 14,
+        boxShadow: "0 0 0 1px #1d3558 inset, 0 24px 60px rgba(2, 6, 23, 0.55)",
+      }}
+    >
+      <header
+        style={{
+          marginBottom: "0.9rem",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: "0.8rem",
+          flexWrap: "wrap",
+        }}
+      >
+        <div>
+          <h1 style={{ fontSize: "1.35rem", fontWeight: 900, letterSpacing: "0.03em", margin: 0, color: UI.title, textShadow: "0 0 12px #38bdf833" }}>
+            Orbitalpha Trading
+          </h1>
+          <p style={{ margin: "0.22rem 0 0", fontSize: "0.8rem", color: UI.muted, fontWeight: 600 }}>Signals / Auto Trade</p>
+        </div>
+        <div style={{ display: "flex", gap: "0.95rem", flexWrap: "wrap", fontSize: "0.76rem", color: UI.muted, alignItems: "center" }}>
+          <span>
+            상태{" "}
+            <strong
+              style={{
+                color: err ? UI.error : UI.pass,
+                background: err ? UI.errorChipBg : UI.passBg,
+                border: `1px solid ${err ? UI.errorChipBorder : "#93c5fd"}`,
+                borderRadius: 999,
+                padding: "0.1rem 0.45rem",
+                boxShadow: err ? "0 0 0 1px #7f1d1d inset" : "0 0 0 1px #075985 inset",
+              }}
+            >
+              {runState}
+            </strong>
+          </span>
+          <span>갱신 <strong style={{ color: UI.body }}>{lastUpdatedAt ?? "-"}</strong></span>
+          <span>최근 서버 틱 <strong style={{ color: UI.body }}>{recentServerTickTs ? formatTsLocal(recentServerTickTs) : "-"}</strong></span>
+          <span>최근 스캐너 계산 <strong style={{ color: UI.body }}>{recentScannerCalcTs ? formatTsLocal(recentScannerCalcTs) : "-"}</strong></span>
+          <span style={{ maxWidth: 420, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            진입 차단 사유 <strong style={{ color: UI.body }}>{entryBlockReason}</strong>
+          </span>
+          <span style={{ maxWidth: 360, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            monitor <strong style={{ color: UI.body }}>{ctx?.monitor_instance_id ?? activeMonitorInstanceId ?? "-"}</strong>
+          </span>
+          <span>
+            scope <strong style={{ color: UI.body }}>{ctx?.company_id ?? DEFAULT_TRADING_COMPANY_ID}/{ctx?.service_id ?? DEFAULT_TRADING_SERVICE_ID}</strong>
+          </span>
+          <button
+            type="button"
+            onClick={onLogout}
+            style={{
+              borderRadius: 8,
+              border: `1px solid ${UI.errorChipBorder}`,
+              background: UI.errorChipBg,
+              color: "#fecaca",
+              fontWeight: 700,
+              padding: "0.28rem 0.68rem",
+              cursor: "pointer",
+            }}
+          >
+            로그아웃
+          </button>
+          <Link
+            href="/replay"
+            style={{
+              borderRadius: 8,
+              border: `1px solid ${UI.border}`,
+              background: UI.cardSoftBg,
+              color: UI.body,
+              fontWeight: 700,
+              padding: "0.28rem 0.68rem",
+              textDecoration: "none",
+            }}
+          >
+            리플레이
+          </Link>
+        </div>
+      </header>
+
+      <section
+        style={{
+          background: UI.panelBg,
+          border: `1px solid ${UI.border}`,
+          borderRadius: 12,
+          padding: "0.95rem 1rem",
+          marginBottom: "1rem",
+          boxShadow: `0 0 0 1px #1b3558 inset, ${UI.panelGlow}`,
+          position: "relative",
+          overflow: "hidden",
+        }}
+      >
+        <div style={{ position: "absolute", inset: 0, pointerEvents: "none", background: "linear-gradient(180deg, #60a5fa12 0%, #00000000 42%)" }} />
+        <div style={{ height: 2, marginBottom: "0.7rem", borderRadius: 999, background: "linear-gradient(90deg, #2dd4bf, #38bdf8, #2dd4bf)" }} />
+        <div style={{ height: 1, marginBottom: "0.65rem", background: `linear-gradient(90deg, ${UI.panelInnerLine}, transparent)` }} />
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(6, minmax(0, 1fr))",
+            gap: "0.8rem",
+            flexWrap: "wrap",
+          }}
+        >
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>보유 KRW</div>
+            <div style={{ fontSize: "1.45rem", fontWeight: 900, color: UI.title, lineHeight: 1.05, letterSpacing: "0.01em" }}>{Math.round(assetSummary.krw).toLocaleString()}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>총 보유자산</div>
+            <div style={{ fontSize: "1.45rem", fontWeight: 900, color: "#67e8f9", lineHeight: 1.05, textShadow: "0 0 12px #22d3ee44" }}>{Math.round(assetSummary.totalAssets).toLocaleString()}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>총매수</div>
+            <div style={{ fontSize: "1.1rem", fontWeight: 850, color: UI.body, lineHeight: 1.05 }}>{Math.round(assetSummary.totalBuy).toLocaleString()}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>총평가</div>
+            <div style={{ fontSize: "1.1rem", fontWeight: 850, color: UI.body, lineHeight: 1.05 }}>{Math.round(assetSummary.totalEval).toLocaleString()}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>순평가손익</div>
+            <div style={{ fontSize: "1.1rem", fontWeight: 850, color: assetSummary.netPnl > 0 ? "#22c55e" : assetSummary.netPnl < 0 ? "#ef4444" : UI.muted, lineHeight: 1.05 }}>{Math.round(assetSummary.netPnl).toLocaleString()}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>순수익률</div>
+            <div style={{ fontSize: "1.1rem", fontWeight: 850, color: assetSummary.netRet > 0 ? "#22c55e" : assetSummary.netRet < 0 ? "#ef4444" : UI.muted, lineHeight: 1.05 }}>{assetSummary.netRet.toFixed(2)}%</div>
+          </div>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(9, minmax(0, 1fr))", gap: "0.8rem", marginTop: "0.7rem", borderTop: `1px solid ${UI.borderSoft}`, paddingTop: "0.7rem" }}>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>API 연결 상태</div>
+            <div
+              style={{
+                fontSize: "0.9rem",
+                fontWeight: 800,
+                color: accountSyncState === "syncing" ? UI.watch : trade?.api_connected ? UI.pass : UI.error,
+              }}
+            >
+              {accountSyncState === "syncing" ? "계좌 동기화 중" : trade?.api_connected ? "연결됨" : "미연결"}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>자동매매 상태</div>
+            <div style={{ fontSize: "0.9rem", fontWeight: 800, color: autoTradeEnabled ? "#22c55e" : "#ef4444" }}>
+              {autoTradeEnabled ? "ON" : "OFF"}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>시장 상태</div>
+            <div
+              style={{
+                fontSize: "0.9rem",
+                fontWeight: 800,
+                color:
+                  marketState?.market_state === "risk_on"
+                    ? "#22c55e"
+                    : marketState?.market_state === "neutral"
+                      ? "#f59e0b"
+                      : "#ef4444",
+              }}
+            >
+              {marketState?.market_state === "risk_on"
+                ? "상방장"
+                : marketState?.market_state === "neutral"
+                  ? "횡보장"
+                  : marketState?.market_state === "risk_off"
+                    ? "하락장"
+                    : "-"}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted }}>진입 정책</div>
+            <div style={{ fontSize: "0.9rem", fontWeight: 800, color: UI.body }}>{marketState?.entry_policy ?? "-"}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted }}>신규 전략 사용 가능 KRW</div>
+            <div style={{ fontSize: "0.9rem", fontWeight: 800, color: "#67e8f9" }}>
+              {Math.round(strategy?.strategy_available_krw ?? 0).toLocaleString()}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted }}>신규 전략 이미 투입 KRW</div>
+            <div style={{ fontSize: "0.9rem", fontWeight: 800, color: "#fbbf24" }}>{Math.round(strategy?.strategy_invested_krw ?? 0).toLocaleString()}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted }}>신규 전략 누적 순손익</div>
+            <div style={{ fontSize: "0.9rem", fontWeight: 800, color: (strategy?.strategy_pnl_krw ?? 0) >= 0 ? UI.pass : UI.fail }}>{Math.round(strategy?.strategy_pnl_krw ?? 0).toLocaleString()}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted }}>신규 전략 승률</div>
+            <div style={{ fontSize: "0.9rem", fontWeight: 800, color: UI.body }}>{(strategy?.strategy_win_rate ?? 0).toFixed(1)}%</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted }}>신규 전략 체결 수</div>
+            <div style={{ fontSize: "0.9rem", fontWeight: 800, color: UI.body }}>{strategy?.strategy_total_fills ?? 0}</div>
+          </div>
+        </div>
+        <div style={{ marginTop: "0.35rem", fontSize: "0.74rem", color: UI.mutedSoft }}>
+          총 보유 KRW = 사용 가능 KRW + 이미 투입 KRW
+        </div>
+        <div style={{ marginTop: "0.2rem", fontSize: "0.74rem", color: UI.mutedSoft }}>
+          모든 손익은 수수료 반영 후 순금액 기준
+        </div>
+        <div style={{ marginTop: "0.2rem", fontSize: "0.74rem", color: UI.mutedSoft }}>
+          시장근거: 5m {marketState?.btc_5m_trend ?? "-"} / 15m {marketState?.btc_15m_trend ?? "-"} / breadth {(marketState?.breadth_ratio ?? 0).toFixed(3)} / close {marketState?.recent_close_bias ?? "-"}
+        </div>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(6, minmax(0, 1fr))",
+            gap: "0.7rem",
+            marginTop: "0.7rem",
+            borderTop: `1px solid ${UI.borderSoft}`,
+            paddingTop: "0.7rem",
+          }}
+        >
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>로그인 상태</div>
+            <div style={{ fontSize: "0.92rem", fontWeight: 700, color: UI.pass }}>인증됨</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>세션 사용자 ID</div>
+            <div style={{ fontSize: "0.92rem", fontWeight: 700, color: UI.body }}>{sessionUserId ?? "-"}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>최근 체결/신호 시각</div>
+            <div style={{ fontSize: "0.92rem", fontWeight: 700, color: UI.body }}>
+              {latestSignalTs}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>계좌보호 상태</div>
+            <div style={{ fontSize: "0.92rem", fontWeight: 700, color: strategy?.safety_guard_state === "자동정지" ? "#ef4444" : strategy?.safety_guard_state === "주의" ? "#f59e0b" : "#22c55e" }}>
+              {strategy?.safety_guard_state ?? "-"}
+            </div>
+            <div style={{ fontSize: "0.72rem", color: UI.mutedSoft }}>{strategy?.safety_guard_reason ?? "-"}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>연속 손실 / 주문실패</div>
+            <div style={{ fontSize: "0.92rem", fontWeight: 700, color: UI.body }}>
+              {strategy?.consecutive_losses ?? 0} / {strategy?.order_fail_count_today ?? 0}
+            </div>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
+            <div>
+              <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>실거래 가능 상태</div>
+              <div
+                style={{
+                  fontSize: "0.92rem",
+                  fontWeight: 700,
+                  color:
+                    accountSyncState === "syncing" ? UI.watch : trade?.api_connected ? UI.pass : UI.watch,
+                }}
+              >
+                {tradeReadyLabel}
+              </div>
+              {accountSyncFailureDisplay ? (
+                <div style={{ fontSize: "0.72rem", color: UI.mutedSoft, marginTop: 2, lineHeight: 1.35 }}>
+                  계좌 동기화 실패 사유: {accountSyncFailureDisplay}
+                </div>
+              ) : null}
+            </div>
+            <button
+              type="button"
+              onClick={() => void onToggleAutoTrade(!autoTradeEnabled)}
+              disabled={toggleBusy || (!autoTradeEnabled && !canEnableAutoTrade)}
+              style={{
+                marginTop: 6,
+                borderRadius: 999,
+                border: `1px solid ${autoTradeEnabled ? "#b91c1c" : "#0ea5e9"}`,
+                background: autoTradeEnabled ? "#3a1014" : "#0b2748",
+                color: autoTradeEnabled ? "#fecaca" : "#dbeafe",
+                fontSize: "0.72rem",
+                fontWeight: 700,
+                padding: "0.18rem 0.55rem",
+                cursor: toggleBusy ? "not-allowed" : "pointer",
+                opacity: toggleBusy ? 0.6 : 1,
+              }}
+            >
+              {autoTradeEnabled ? "OFF" : "ON"}
+            </button>
+            {!autoTradeEnabled && !canEnableAutoTrade ? (
+              <div style={{ marginTop: 4, fontSize: "0.7rem", color: "#fca5a5" }}>
+                ON 불가: {cannotEnableReason ?? "조건 미충족"}
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </section>
+
+      <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>
+        보유 자산 (BTC / ETH / XRP / TRX)
+      </section>
+      <section
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+          gap: "0.9rem",
+          marginBottom: "1.15rem",
+        }}
+      >
+        {holdingCards.map((h) => {
+          const pnlColor = h.netPnl > 0 ? "#22c55e" : h.netPnl < 0 ? "#ef4444" : UI.muted;
+          const retColor = h.netRet > 0 ? "#22c55e" : h.netRet < 0 ? "#ef4444" : UI.muted;
+          const hasHolding = h.qty > 0;
+          const latest = latestByMarket[h.market as DashboardMarket] ?? null;
+          const parsed = latest?.parsed ?? null;
+          const pass = parsed ? isPass(parsed) : false;
+          const entries = Number((trade?.strategy_positions?.[h.market]?.entries as number | undefined) ?? 0);
+          const additionalBuyBlockReason = (() => {
+            if (!hasHolding) return "보유 없음";
+            if (!trade?.api_connected) return "API 미연결";
+            if (!autoTradeEnabled) return "자동매매 OFF";
+            const policy = marketState?.entry_policy;
+            if (policy === "신규 진입 차단") return "횡보/하락장: 추가진입 금지";
+            if (entries >= 2) return "최대 진입 횟수 도달";
+            if (strategy?.safety_guard_state === "자동정지") return "계좌보호 자동정지";
+            if (parsed && !pass) return getCardFailReason(parsed);
+            if (!parsed) return "최근 신호 없음";
+            return "조건 대기";
+          })();
+          return (
+            <article
+              key={`asset-${h.market}`}
+              style={{
+                background: UI.cardBg,
+                border: hasHolding ? "1px solid #2dd4bf88" : `1px solid ${UI.borderSoft}`,
+                borderRadius: 12,
+                padding: "0.95rem 1rem",
+                boxShadow: hasHolding
+                  ? "0 0 0 1px #134e4a inset, 0 0 14px #2dd4bf22, 0 10px 24px rgba(2, 6, 23, 0.32)"
+                  : "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.24)",
+                opacity: hasHolding ? 1 : 0.88,
+                filter: hasHolding ? "none" : "saturate(0.88) brightness(0.9)",
+              }}
+            >
+              <div style={{ height: 1, marginBottom: 6, background: "linear-gradient(90deg, #2dd4bf, transparent)" }} />
+              <div style={{ fontSize: "1.12rem", color: UI.title, fontWeight: 900, letterSpacing: "0.02em", marginBottom: 10 }}>{h.currency}</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 7, fontSize: "0.82rem" }}>
+                <span style={{ color: UI.mutedSoft }}>보유수량</span>
+                <strong style={{ color: UI.body }}>{h.qty.toLocaleString(undefined, { maximumFractionDigits: 8 })}</strong>
+                <span style={{ color: UI.mutedSoft }}>평균매수가</span>
+                <strong style={{ color: UI.body }}>{h.avg > 0 ? h.avg.toLocaleString() : "-"}</strong>
+                <span style={{ color: UI.mutedSoft }}>평가금액</span>
+                <strong style={{ color: UI.title, fontSize: "0.94rem" }}>{h.evalAmount > 0 ? Math.round(h.evalAmount).toLocaleString() : "-"}</strong>
+                <span style={{ color: UI.mutedSoft }}>순평가손익</span>
+                <strong style={{ color: pnlColor, fontSize: "1.03rem", fontWeight: 900 }}>{h.evalAmount > 0 ? Math.round(h.netPnl).toLocaleString() : "-"}</strong>
+                <span style={{ color: UI.mutedSoft }}>순수익률</span>
+                <strong style={{ color: retColor, fontSize: "1.03rem", fontWeight: 900 }}>{h.evalAmount > 0 ? `${h.netRet.toFixed(2)}%` : "-"}</strong>
+                {h.market === "KRW-XRP" ? (
+                  <>
+                    <span style={{ color: UI.mutedSoft }}>기존 보유 XRP</span>
+                    <strong style={{ color: UI.body }}>{h.legacyQty.toLocaleString(undefined, { maximumFractionDigits: 8 })}</strong>
+                    <span style={{ color: UI.mutedSoft }}>신규 전략 XRP</span>
+                    <strong style={{ color: UI.body }}>{h.strategyQty.toLocaleString(undefined, { maximumFractionDigits: 8 })}</strong>
+                  </>
+                ) : null}
+                <span style={{ color: UI.mutedSoft }}>전략 유형</span>
+                <strong style={{ color: h.strategyType === "momentum" ? "#f59e0b" : "#60a5fa" }}>
+                  {h.strategyType === "momentum" ? "급등형" : "안정형"}
+                </strong>
+                <span style={{ color: UI.mutedSoft }}>현재 손절 기준</span>
+                <strong style={{ color: UI.body }}>{h.stopLossPct.toFixed(1)}%</strong>
+                <span style={{ color: UI.mutedSoft }}>현재 순이익률</span>
+                <strong style={{ color: h.currentNetPnlPct > 0 ? "#22c55e" : h.currentNetPnlPct < 0 ? "#ef4444" : UI.muted }}>
+                  {h.currentNetPnlPct.toFixed(2)}%
+                </strong>
+                <span style={{ color: UI.mutedSoft }}>브레이크이븐</span>
+                <strong style={{ color: h.breakevenArmed ? "#22c55e" : UI.muted }}>{h.breakevenArmed ? "활성" : "대기"}</strong>
+                <span style={{ color: UI.mutedSoft }}>1차 익절</span>
+                <strong style={{ color: h.partialTpDone ? "#22c55e" : UI.muted }}>{h.partialTpDone ? "완료" : "미완료"}</strong>
+                <span style={{ color: UI.mutedSoft }}>트레일링 기준가</span>
+                <strong style={{ color: UI.body }}>{h.trailingStopPrice > 0 ? Math.round(h.trailingStopPrice).toLocaleString() : "-"}</strong>
+              </div>
+              <div style={{ marginTop: 10, fontSize: "0.74rem", color: UI.mutedSoft, lineHeight: 1.35 }}>
+                추가매수 차단 사유: <strong style={{ color: UI.body }}>{additionalBuyBlockReason}</strong>
+              </div>
+            </article>
+          );
+        })}
+      </section>
+
+      <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>보유 종목 모니터</section>
+      <section
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+          gap: "0.8rem",
+          marginBottom: "1rem",
+        }}
+      >
+        {DASHBOARD_MARKETS.map((market) => {
+          const latest = latestByMarket[market];
+          const parsed = latest?.parsed;
+          const tone = getCardTone(parsed);
+          const holdingQty = holdingQtyByMarket[market] ?? 0;
+          const hasHolding = holdingQty > 0;
+
+          const statusLabel = hasHolding
+            ? tone === "pass"
+              ? "보유중"
+              : "보유 + 신호약함"
+            : tone === "fail"
+              ? "탈락"
+              : "미보유";
+
+          const statusColor =
+            tone === "pass" ? UI.pass : tone === "near" ? UI.watch : tone === "fail" ? UI.fail : UI.muted;
+
+          const failReason = tone === "fail" || tone === "near" ? getCardFailReason(parsed) : "—";
+          const volumeRatio = getCardVolumeRatio(parsed);
+          const short = market.replace("KRW-", "");
+          const latestTs = latest?.entry?.ts ? formatTsLocal(latest.entry.ts) : "-";
+
+          return (
+            <article
+              key={market}
+              style={{
+                background: UI.cardBg,
+                border: `1px solid ${
+                  tone === "pass" ? "#2dd4bf88" : tone === "near" ? "#f59e0b99" : tone === "fail" ? "#ef444499" : UI.border
+                }`,
+                borderRadius: 12,
+                padding: "0.72rem 0.8rem",
+                minHeight: 100,
+                boxShadow: tone === "pass"
+                  ? "0 0 0 1px #075985 inset, 0 0 13px #0284c722"
+                  : tone === "near"
+                    ? "0 0 0 1px #9a3412 inset, 0 0 10px #f59e0b1a"
+                    : tone === "fail"
+                      ? "0 0 0 1px #7f1d1d inset, 0 0 9px #ef44441a"
+                      : "0 0 0 1px #1b3558 inset",
+              }}
+            >
+              <div style={{ height: 1, marginBottom: 6, background: "linear-gradient(90deg, #3b82f6, transparent)" }} />
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 7 }}>
+                <strong style={{ fontSize: "1.08rem", color: UI.title, fontWeight: 900, letterSpacing: "0.02em" }}>{short}</strong>
+                <span
+                  style={{
+                    fontSize: "0.8rem",
+                    padding: "0.18rem 0.55rem",
+                    borderRadius: 999,
+                    background: tone === "pass" ? UI.passBg : tone === "near" ? UI.watchBg : tone === "fail" ? UI.failBg : "#e2e8f0",
+                    color: statusColor,
+                    fontWeight: 700,
+                    border: `1px solid ${tone === "pass" ? "#0369a1" : tone === "near" ? "#b45309" : tone === "fail" ? "#b91c1c" : "#64748b"}`,
+                  }}
+                >
+                  {statusLabel}
+                </span>
+              </div>
+              <div style={{ color: UI.mutedSoft, fontSize: "0.68rem", fontWeight: 700, letterSpacing: "0.03em", marginBottom: 2 }}>핵심 사유</div>
+              <div style={{ color: UI.body, fontSize: "0.8rem", lineHeight: 1.3, minHeight: 30, fontWeight: 700 }}>
+                {tone === "none" ? "핵심: 데이터 없음" : `핵심: ${failReason}`}
+              </div>
+              <div style={{ marginTop: 8, color: UI.mutedSoft, fontSize: "0.7rem", fontWeight: 700, letterSpacing: "0.03em" }}>VOLUME RATIO</div>
+              <div style={{ color: UI.title, fontSize: "0.94rem", fontWeight: 800 }}>volume_ratio {volumeRatio}</div>
+              <div style={{ marginTop: 6, color: UI.mutedSoft, fontSize: "0.7rem", fontWeight: 700, letterSpacing: "0.03em" }}>신호 강도</div>
+              <div style={{ color: tone === "pass" ? UI.pass : tone === "near" ? UI.watch : UI.fail, fontSize: "0.9rem", fontWeight: 800 }}>
+                {getSignalStrength(parsed)}
+              </div>
+              <div style={{ marginTop: 4, color: UI.mutedSoft, fontSize: "0.73rem", fontWeight: 600 }}>신호 {latestTs}</div>
+            </article>
+          );
+        })}
+      </section>
+
+      <section
+        style={{
+          background: UI.cardBg,
+          border: `1px solid ${UI.border}`,
+          borderRadius: 12,
+          padding: "0.8rem 1rem",
+          marginBottom: "0.9rem",
+          boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.32)",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.55rem" }}>
+          <div style={{ fontSize: "0.9rem", color: UI.title, fontWeight: 800, letterSpacing: "0.02em" }}>급등주 스캐너</div>
+          <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>
+            갱신 {scanner?.updated_at ? formatTsLocal(scanner.updated_at) : "-"}
+          </div>
+        </div>
+        {scanner?.items?.length ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "38px 88px 58px 70px 82px 62px 72px 78px 58px 58px 58px 1fr",
+                gap: 8,
+                alignItems: "center",
+                padding: "0 0.45rem",
+                fontSize: "0.66rem",
+                color: UI.mutedSoft,
+              }}
+            >
+              <span>#</span>
+              <span>코인</span>
+              <span>점수</span>
+              <span>상태</span>
+              <span>배수</span>
+              <span>돌파</span>
+              <span>상단</span>
+              <span>3분</span>
+              <span>3분후</span>
+              <span>5분후</span>
+              <span>10분후</span>
+              <span>갱신</span>
+            </div>
+            {scanner.items.map((it) => {
+              const reasonsText = it.exclude_reasons?.slice(0, 2).join(", ");
+              const statusLabel =
+                it.status === "제외" && reasonsText
+                  ? `${it.status} · ${reasonsText}`.slice(0, 26)
+                  : it.status;
+
+              const ret3 = it.return_3m_pct ?? null;
+              const ret5 = it.return_5m_pct ?? null;
+              const ret10 = it.return_10m_pct ?? null;
+
+              return (
+                <div
+                  key={`${it.rank}-${it.market}`}
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "38px 88px 58px 70px 82px 62px 72px 78px 58px 58px 58px 1fr",
+                    gap: 8,
+                    alignItems: "center",
+                    padding: "0.35rem 0.45rem",
+                    border: "1px solid #28456f",
+                    borderRadius: 6,
+                    fontSize: "0.76rem",
+                    background: UI.cardSoftBg,
+                  }}
+                >
+                  <strong style={{ color: UI.title }}>#{it.rank}</strong>
+                  <strong style={{ color: UI.title }}>{it.market.replace("KRW-", "")}</strong>
+                  <span style={{ color: it.score >= 80 ? "#22c55e" : it.score >= 65 ? "#f59e0b" : UI.body, fontWeight: 800 }}>{it.score.toFixed(1)}</span>
+                  <span style={{ color: it.status === "진입후보" ? "#22c55e" : it.status === "강관찰" ? "#f59e0b" : UI.body }}>{statusLabel}</span>
+                  <span style={{ color: UI.body }}>x{it.volume_multiple.toFixed(2)}</span>
+                  <span style={{ color: it.breakout ? "#22c55e" : UI.muted }}>{it.breakout ? "돌파" : "-"}</span>
+                  <span style={{ color: it.close_upper_hold ? "#22c55e" : UI.muted }}>{it.close_upper_hold ? "상단유지" : "-"}</span>
+                  <span style={{ color: it.rise_3m_pct >= 0 ? "#22c55e" : "#ef4444" }}>{it.rise_3m_pct.toFixed(2)}%</span>
+                  <span style={{ color: ret3 == null ? UI.mutedSoft : ret3 >= 0 ? "#22c55e" : "#ef4444" }}>{ret3 == null ? "-" : `${ret3.toFixed(2)}%`}</span>
+                  <span style={{ color: ret5 == null ? UI.mutedSoft : ret5 >= 0 ? "#22c55e" : "#ef4444" }}>{ret5 == null ? "-" : `${ret5.toFixed(2)}%`}</span>
+                  <span style={{ color: ret10 == null ? UI.mutedSoft : ret10 >= 0 ? "#22c55e" : "#ef4444" }}>{ret10 == null ? "-" : `${ret10.toFixed(2)}%`}</span>
+                  <span style={{ color: UI.mutedSoft }}>
+                    {formatTsLocal(it.updated_at)}
+                    {it.captured_at ? (
+                      <span style={{ marginLeft: 8, fontSize: "0.68rem" }}>
+                        cap {formatTsLocal(it.captured_at)}
+                      </span>
+                    ) : null}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>급등 후보 데이터 수집 중...</p>
+        )}
+      </section>
+
+      <section style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.8rem", marginBottom: "0.9rem" }}>
+        <article
+          style={{
+            background: UI.cardBg,
+            border: `1px solid ${UI.border}`,
+            borderRadius: 12,
+            padding: "0.8rem 1rem",
+            boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.32)",
+          }}
+        >
+          <div style={{ height: 1, marginBottom: "0.55rem", background: "linear-gradient(90deg, #38bdf8, transparent)" }} />
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.55rem" }}>
+            <div style={{ fontSize: "0.88rem", color: UI.title, fontWeight: 800, letterSpacing: "0.02em" }}>최근 통과 신호</div>
+            <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>통과 기준</div>
+          </div>
+          {recentFillRows.length === 0 ? (
+            <p style={{ color: "#94a3b8", margin: 0, fontSize: "0.84rem" }}>최근 통과 없음</p>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {recentFillRows.map((entry) => {
+                const parsed = parseSignalPayload(entry);
+                const pass = parsed ? isPass(parsed) : false;
+                const near = parsed ? !pass && isNearMissFiveOfSix(parsed) : false;
+                const status = pass ? "통과" : near ? "관찰" : "탈락";
+                const statusColor = pass ? "#4ade80" : near ? "#facc15" : "#f87171";
+                const market = parsed?.p?.market ? parsed.p.market.replace("KRW-", "") : "UNK";
+                const reason = parsed ? (!pass ? getCardFailReason(parsed) : "정상") : "payload 파싱 실패";
+                return (
+                  <div
+                    key={`${entry.ts}-${entry.message}-${market}`}
+                    style={{
+                      display: "flex",
+                      gap: 10,
+                      alignItems: "center",
+                      padding: "0.38rem 0.48rem",
+                      background: UI.cardSoftBg,
+                      borderRadius: 6,
+                      fontSize: "0.78rem",
+                      border: "1px solid #28456f",
+                    }}
+                  >
+                    <span style={{ color: UI.mutedSoft, minWidth: 142 }}>{formatTsLocal(entry.ts)}</span>
+                    <strong style={{ color: UI.title, fontWeight: 800, minWidth: 42 }}>{market}</strong>
+                    <span style={{ color: statusColor, fontWeight: 800, minWidth: 52 }}>{status}</span>
+                    <span style={{ color: UI.body, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{reason}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </article>
+
+        <article
+          style={{
+            background: UI.cardBg,
+            border: `1px solid ${UI.border}`,
+            borderRadius: 12,
+            padding: "0.8rem 1rem",
+            boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.32)",
+          }}
+        >
+          <div style={{ height: 1, marginBottom: "0.55rem", background: "linear-gradient(90deg, #60a5fa, transparent)" }} />
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.55rem" }}>
+            <div style={{ fontSize: "0.88rem", color: UI.title, fontWeight: 800, letterSpacing: "0.02em" }}>최근 전체 신호</div>
+            <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>최신순</div>
+          </div>
+          {latestCycleRows.length === 0 ? (
+            <p style={{ color: "#94a3b8", margin: 0, fontSize: "0.84rem" }}>신호 로그 없음</p>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {latestCycleRows.map(({ entry, parsed }) => {
+                const pass = isPass(parsed);
+                const near = !pass && isNearMissFiveOfSix(parsed);
+                const status = pass ? "통과" : near ? "관찰" : "탈락";
+                const statusColor = pass ? "#4ade80" : near ? "#facc15" : "#f87171";
+                const market = parsed.p.market.replace("KRW-", "");
+                const reason = !pass ? getCardFailReason(parsed) : "정상";
+                return (
+                  <div
+                    key={`${entry.ts}-sig-${market}`}
+                    style={{
+                      display: "flex",
+                      gap: 10,
+                      alignItems: "center",
+                      padding: "0.34rem 0.46rem",
+                      background: UI.cardSoftBg,
+                      borderRadius: 6,
+                      fontSize: "0.76rem",
+                      border: "1px solid #28456f",
+                    }}
+                  >
+                    <span style={{ color: UI.mutedSoft, minWidth: 142 }}>{formatTsLocal(entry.ts)}</span>
+                    <strong style={{ color: UI.title, fontWeight: 800, minWidth: 42 }}>{market}</strong>
+                    <span style={{ color: statusColor, fontWeight: 800, minWidth: 52 }}>{status}</span>
+                    <span style={{ color: UI.body, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{reason}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </article>
+      </section>
+
+      {err ? (
+        <p
+          role="alert"
+          style={{
+            color: UI.error,
+            marginTop: "0.75rem",
+            fontSize: "0.82rem",
+            background: UI.errorChipBg,
+            border: `1px solid ${UI.errorChipBorder}`,
+            borderRadius: 999,
+            display: "inline-block",
+            padding: "0.2rem 0.65rem",
+            fontWeight: 700,
+          }}
+        >
+          오류: {err}
+        </p>
+      ) : null}
+    </main>
+    </div>
+  );
+}
