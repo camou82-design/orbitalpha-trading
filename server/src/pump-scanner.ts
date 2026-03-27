@@ -332,6 +332,7 @@ export function createPumpScanner() {
         if (latestPerfByMarket.size >= state.rows.length) break;
       }
       return {
+        mode: "paper_validation",
         updated_at: state.updatedAt,
         items: state.rows.map((r) => {
           const p = latestPerfByMarket.get(r.market);

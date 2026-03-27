@@ -7,6 +7,19 @@ import { STRATEGY_RISK_CONFIG } from "./strategy-risk-config.js";
 import crypto from "node:crypto";
 
 type TradeOrderSide = "buy" | "sell";
+type PositionBucket = "strategy" | "legacy";
+type ManagedMarket = "KRW-BTC" | "KRW-ETH" | "KRW-XRP" | "KRW-TRX";
+
+type LegacyBucketState = {
+  qty: number;
+  avg: number;
+  dca_count: number;
+  dca_max: number;
+  dca_locked: boolean;
+  next_dca_at: string | null;
+  exit_stage: 0 | 1 | 2;
+  exit_status: "평단 복귀 대기" | "1차 탈출" | "분할 청산 중";
+};
 
 type TradeOrderSnapshot = {
   ts: string;
@@ -29,7 +42,7 @@ type TradeState = {
   autoTradeChangedAt: string | null;
   recoveryReady: boolean;
   strategyPositions: Record<
-    "KRW-BTC" | "KRW-ETH" | "KRW-XRP" | "KRW-TRX",
+    ManagedMarket,
     {
       qty: number;
       avg: number;
@@ -42,11 +55,13 @@ type TradeState = {
       trailing_from_peak_pct: number;
     }
   >;
+  legacyBuckets: Record<ManagedMarket, LegacyBucketState>;
 };
 
 const TEST_ORDER_KRW = 5000;
 const COOLDOWN_MS = 20_000;
 const ALLOWED_MARKETS = new Set(["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"]);
+const MANAGED_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"] as const;
 const MAX_CONCURRENT_STRATEGY_POSITIONS = 2;
 const MAX_ENTRIES_PER_MARKET = 2; // 최초 1 + 추가 1
 const STRATEGY_RULES = {
@@ -158,6 +173,35 @@ export function createTradeControl(
       "KRW-XRP": { qty: 0, avg: 0, entries: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
       "KRW-TRX": { qty: 0, avg: 0, entries: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
     },
+    legacyBuckets: {
+      "KRW-BTC": { qty: 0, avg: 0, dca_count: 0, dca_max: 3, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
+      "KRW-ETH": { qty: 0, avg: 0, dca_count: 0, dca_max: 3, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
+      "KRW-XRP": { qty: 0, avg: 0, dca_count: 0, dca_max: 3, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
+      "KRW-TRX": { qty: 0, avg: 0, dca_count: 0, dca_max: 3, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
+    },
+  };
+
+  const computeKrwFunds = (conn: ConnectionResult) => {
+    const krwAcc = conn.balances.find((b) => b.currency === "KRW");
+    const krwAvailable = Number(krwAcc?.balance ?? conn.krw_available ?? 0);
+    const krwLocked = Number(krwAcc?.locked ?? 0);
+    const totalKrw = Math.max(0, krwAvailable + krwLocked);
+    const strategyAllocatedKrw = Math.max(
+      0,
+      Object.values(state.strategyPositions).reduce((acc, p) => acc + Math.max(0, Number(p.qty ?? 0) * Math.max(0, Number(p.avg ?? 0))), 0),
+    );
+    const reservedKrw = Math.max(0, krwLocked + (state.inFlight ? TEST_ORDER_KRW : 0));
+    const protectiveReserveKrw = Math.max(0, Number(process.env.ORBITALPHA_TRADING_PROTECTIVE_RESERVE_KRW ?? 30_000));
+    const pumpPaperAllocatedKrw = Math.max(0, Number(process.env.ORBITALPHA_TRADING_PUMP_PAPER_ALLOCATED_KRW ?? 50_000));
+    const liveOrderAvailableKrw = Math.max(0, totalKrw - protectiveReserveKrw - strategyAllocatedKrw - reservedKrw);
+    return {
+      total_krw: totalKrw,
+      live_order_available_krw: liveOrderAvailableKrw,
+      reserved_krw: reservedKrw,
+      strategy_allocated_krw: strategyAllocatedKrw,
+      pump_paper_allocated_krw: pumpPaperAllocatedKrw,
+      protective_reserve_krw: protectiveReserveKrw,
+    };
   };
 
   const isLiveEnabled = () =>
@@ -225,7 +269,26 @@ export function createTradeControl(
     }
   };
 
-  const ensureOrderAllowed = async (side: TradeOrderSide, market: string, confirm: boolean) => {
+  const syncLegacyBuckets = (balances: ConnectionBalances) => {
+    for (const market of MANAGED_MARKETS) {
+      const currency = market.replace("KRW-", "");
+      const account = balances.find((b) => b.currency === currency);
+      const accountQty = Number(account?.balance ?? 0);
+      const strategyQty = Number(state.strategyPositions[market].qty ?? 0);
+      const legacyQty = Math.max(0, accountQty - strategyQty);
+      const bucket = state.legacyBuckets[market];
+      bucket.qty = legacyQty;
+      bucket.avg = legacyQty > 0 ? Number(account?.avg_buy_price ?? 0) : 0;
+      if (legacyQty <= 0) {
+        bucket.exit_stage = 0;
+        bucket.exit_status = "평단 복귀 대기";
+        bucket.dca_locked = false;
+        bucket.next_dca_at = null;
+      }
+    }
+  };
+
+  const ensureOrderAllowed = async (side: TradeOrderSide, market: string, confirm: boolean, bucket: PositionBucket = "strategy") => {
     if (!state.autoTradeEnabled) throw new Error("Auto trade is disabled");
     if (!ALLOWED_MARKETS.has(market)) throw new Error("Only KRW-BTC or KRW-XRP allowed for test");
     if (!confirm) throw new Error("confirm=true required");
@@ -235,7 +298,7 @@ export function createTradeControl(
     if (now - state.lastOrderAtMs < COOLDOWN_MS) throw new Error(`Cooldown active: wait ${COOLDOWN_MS}ms`);
     const key = `${side}:${market}:${Math.floor(now / 1000)}`;
     if (state.lastOrderKey === key) throw new Error("Duplicate order blocked");
-    if (side === "buy") {
+    if (side === "buy" && bucket === "strategy") {
       const openPositions = Object.values(state.strategyPositions).filter((p) => p.qty > 0).length;
       if (openPositions >= MAX_CONCURRENT_STRATEGY_POSITIONS) {
         throw new Error(`Max concurrent strategy positions is ${MAX_CONCURRENT_STRATEGY_POSITIONS}`);
@@ -247,6 +310,7 @@ export function createTradeControl(
     }
     const conn = await getConnectionStatus();
     if (!conn.connected) throw new Error(conn.reason ?? "Connection failed");
+    syncLegacyBuckets(conn.balances);
     return conn;
   };
 
@@ -284,9 +348,17 @@ export function createTradeControl(
     if (!state.testMarket) state.testMarket = snap.market as "KRW-BTC" | "KRW-XRP";
   };
 
-  const placeBuy = async (market: string, confirm: boolean, amountKrw = TEST_ORDER_KRW, strategyType: StrategyType = "stable") => {
-    const conn = await ensureOrderAllowed("buy", market, confirm);
-    if (conn.krw_available < amountKrw) throw new Error(`Not enough KRW. required=${amountKrw}`);
+  const placeBuy = async (
+    market: string,
+    confirm: boolean,
+    amountKrw = TEST_ORDER_KRW,
+    strategyType: StrategyType = "stable",
+    bucket: PositionBucket = "strategy",
+  ) => {
+    const conn = await ensureOrderAllowed("buy", market, confirm, bucket);
+    const funds = computeKrwFunds(conn);
+    if (funds.live_order_available_krw < 5000) throw new Error("Live order available KRW is below minimum order amount");
+    if (funds.live_order_available_krw < amountKrw) throw new Error(`Not enough live-order KRW. available=${funds.live_order_available_krw}`);
     state.inFlight = true;
     try {
       await log("manual_buy_request", { market, amount_krw: amountKrw, mode: env.tradingMode });
@@ -298,7 +370,7 @@ export function createTradeControl(
         market_state: null,
         side: "buy",
         reason: "manual_buy_request",
-        balance_krw: conn.krw_available,
+        balance_krw: funds.total_krw,
         position_qty: null,
         avg_buy_price: null,
         current_price: null,
@@ -324,7 +396,7 @@ export function createTradeControl(
       markOrderResult(snap);
       const executed = Number(rsp.executed_volume ?? "0");
       const pos = state.strategyPositions[market as keyof typeof state.strategyPositions];
-      if (pos && Number.isFinite(executed) && executed > 0) {
+      if (bucket === "strategy" && pos && Number.isFinite(executed) && executed > 0) {
         const nextQty = pos.qty + executed;
         const nextCost = pos.qty * pos.avg + amountKrw;
         pos.qty = nextQty;
@@ -337,16 +409,23 @@ export function createTradeControl(
         pos.partial_take_profit_pct = rule.partial_take_profit_pct;
         pos.trailing_from_peak_pct = rule.trailing_from_peak_pct;
       }
+      if (bucket === "legacy") {
+        const lb = state.legacyBuckets[market as ManagedMarket];
+        lb.dca_count = Math.min(lb.dca_count + 1, lb.dca_max);
+        lb.dca_locked = lb.dca_count >= lb.dca_max;
+        lb.next_dca_at = new Date(Date.now() + 20 * 60_000).toISOString();
+        lb.exit_status = lb.exit_stage === 0 ? "평단 복귀 대기" : lb.exit_stage === 1 ? "1차 탈출" : "분할 청산 중";
+      }
       await log("manual_buy_response", { market, amount_krw: amountKrw, order: rsp });
       await hooks?.onEvent?.({
         timestamp: snap.ts,
         event_type: "order_filled",
         market,
-        strategy_type: strategyType,
+        strategy_type: bucket === "legacy" ? "legacy" : strategyType,
         market_state: null,
         side: "buy",
         reason: "manual_buy_response",
-        balance_krw: conn.krw_available - amountKrw,
+        balance_krw: Math.max(0, funds.total_krw - amountKrw),
         position_qty: Number(rsp.executed_volume ?? "0"),
         avg_buy_price: amountKrw,
         current_price: null,
@@ -375,7 +454,7 @@ export function createTradeControl(
         market_state: null,
         side: "buy",
         reason: msg,
-        balance_krw: conn.krw_available,
+        balance_krw: funds.total_krw,
         position_qty: null,
         avg_buy_price: null,
         current_price: null,
@@ -389,13 +468,15 @@ export function createTradeControl(
     }
   };
 
-  const placeSell = async (market: string, confirm: boolean, ratio = 1) => {
-    await ensureOrderAllowed("sell", market, confirm);
+  const placeSell = async (market: string, confirm: boolean, ratio = 1, bucket: PositionBucket = "strategy") => {
+    const conn = await ensureOrderAllowed("sell", market, confirm, bucket);
     state.inFlight = true;
     try {
       const pos = state.strategyPositions[market as keyof typeof state.strategyPositions];
-      const volume = (pos?.qty ?? 0) * Math.min(1, Math.max(0.01, ratio));
-      if (!Number.isFinite(volume) || volume <= 0) throw new Error(`No strategy position to sell for ${market}`);
+      const legacyPos = state.legacyBuckets[market as ManagedMarket];
+      const baseQty = bucket === "legacy" ? legacyPos?.qty ?? 0 : pos?.qty ?? 0;
+      const volume = baseQty * Math.min(1, Math.max(0.01, ratio));
+      if (!Number.isFinite(volume) || volume <= 0) throw new Error(`No ${bucket} position to sell for ${market}`);
 
       await log("manual_sell_request", { market, volume, mode: env.tradingMode });
       const rsp = await placeMarketSell({
@@ -414,12 +495,24 @@ export function createTradeControl(
         order_uuid: rsp.uuid,
       };
       markOrderResult(snap);
-      if (pos) {
+      if (bucket === "strategy" && pos) {
         const remain = Math.max(0, pos.qty - volume);
         pos.qty = remain;
         if (remain <= 0) {
           pos.avg = 0;
           pos.entries = 0;
+        }
+      }
+      if (bucket === "legacy" && legacyPos) {
+        const remain = Math.max(0, legacyPos.qty - volume);
+        legacyPos.qty = remain;
+        if (remain <= 0) {
+          legacyPos.avg = 0;
+          legacyPos.exit_stage = 0;
+          legacyPos.exit_status = "평단 복귀 대기";
+        } else {
+          legacyPos.exit_stage = legacyPos.exit_stage >= 2 ? 2 : (legacyPos.exit_stage + 1) as 0 | 1 | 2;
+          legacyPos.exit_status = legacyPos.exit_stage === 0 ? "평단 복귀 대기" : legacyPos.exit_stage === 1 ? "1차 탈출" : "분할 청산 중";
         }
       }
       await log("manual_sell_response", { market, volume, order: rsp });
@@ -444,11 +537,25 @@ export function createTradeControl(
 
   const status = async () => {
     const conn = await getConnectionStatus();
-    const strategyPositions = state.strategyPositions;
-    const strategyXrpQty = strategyPositions["KRW-XRP"].qty;
-    const xrpAccount = conn.balances.find((b) => b.currency === "XRP");
-    const legacyXrpQty = Math.max(0, Number(xrpAccount?.balance ?? 0) - strategyXrpQty);
-    const legacyXrpAvg = Number(xrpAccount?.avg_buy_price ?? 0);
+      const strategyPositions = state.strategyPositions;
+      syncLegacyBuckets(conn.balances);
+      const funds = computeKrwFunds(conn);
+      const legacyPositions = Object.fromEntries(
+        MANAGED_MARKETS.map((market) => [
+          market,
+          {
+            market,
+            qty: state.legacyBuckets[market].qty,
+            avg: state.legacyBuckets[market].avg,
+            stop_loss_disabled: true,
+            dca_count: state.legacyBuckets[market].dca_count,
+            dca_max: state.legacyBuckets[market].dca_max,
+            dca_available: !state.legacyBuckets[market].dca_locked,
+            next_dca_at: state.legacyBuckets[market].next_dca_at,
+            exit_status: state.legacyBuckets[market].exit_status,
+          },
+        ]),
+      );
     return {
       trading_mode: env.tradingMode,
       live_order_confirm: env.liveOrderConfirm,
@@ -462,6 +569,12 @@ export function createTradeControl(
       account_sync_failure_code: conn.connected ? null : conn.failure_code,
       account_sync_failure_message: conn.connected ? null : conn.reason,
       krw_available: conn.krw_available,
+      total_krw: funds.total_krw,
+      live_order_available_krw: funds.live_order_available_krw,
+      reserved_krw: funds.reserved_krw,
+      strategy_allocated_krw: funds.strategy_allocated_krw,
+      pump_paper_allocated_krw: funds.pump_paper_allocated_krw,
+      protective_reserve_krw: funds.protective_reserve_krw,
       balances: conn.balances,
       test_order_krw: TEST_ORDER_KRW,
       cooldown_ms: COOLDOWN_MS,
@@ -476,10 +589,11 @@ export function createTradeControl(
       strategy_risk_rules: STRATEGY_RISK_CONFIG,
       legacy_position: {
         market: "KRW-XRP",
-        qty: legacyXrpQty,
-        avg: legacyXrpAvg,
+        qty: legacyPositions["KRW-XRP"].qty,
+        avg: legacyPositions["KRW-XRP"].avg,
         excluded_from_strategy: true,
       },
+      legacy_positions: legacyPositions,
       strategy_positions: strategyPositions,
       pnl_summary: {
         legacy_position_pnl: null,
@@ -494,6 +608,10 @@ export function createTradeControl(
     connectionCheck: getConnectionStatus,
     placeBuy,
     placeSell,
+    placeLegacyDcaBuy: (market: string, confirm: boolean, amountKrw = TEST_ORDER_KRW) =>
+      placeBuy(market, confirm, amountKrw, "stable", "legacy"),
+    placeLegacyExitSell: (market: string, confirm: boolean, ratio = 1) =>
+      placeSell(market, confirm, ratio, "legacy"),
     setAutoTradeEnabled,
     setRecoveryReady,
   };

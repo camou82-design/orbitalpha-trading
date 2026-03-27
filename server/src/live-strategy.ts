@@ -10,6 +10,8 @@ type TradeApi = {
   status: () => Promise<any>;
   placeBuy: (market: string, confirm: boolean, amountKrw?: number, strategyType?: StrategyType) => Promise<any>;
   placeSell: (market: string, confirm: boolean, ratio?: number) => Promise<any>;
+  placeLegacyDcaBuy?: (market: string, confirm: boolean, amountKrw?: number) => Promise<any>;
+  placeLegacyExitSell?: (market: string, confirm: boolean, ratio?: number) => Promise<any>;
   setAutoTradeEnabled?: (enabled: boolean) => Promise<void>;
 };
 
@@ -94,6 +96,12 @@ type PersistedState = {
     consecutive_losses: number;
     max_positions: number;
   };
+  legacy: {
+    dca_count: Record<string, number>;
+    dca_locked: Record<string, boolean>;
+    next_dca_at: Record<string, string>;
+    exit_stage: Record<string, 0 | 1 | 2>;
+  };
 };
 
 const MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"] as const;
@@ -154,6 +162,12 @@ export function createLiveDataStrategy(opts: {
       consecutive_losses: 0,
       max_positions: 2,
     },
+    legacy: {
+      dca_count: {},
+      dca_locked: {},
+      next_dca_at: {},
+      exit_stage: {},
+    },
   };
 
   const persist = async () => {
@@ -161,7 +175,7 @@ export function createLiveDataStrategy(opts: {
     await fs.writeFile(tradesFile, JSON.stringify(state.trades, null, 2), "utf8");
     await fs.writeFile(
       dailyFile,
-      JSON.stringify({ daily: state.daily, positions: state.positions, cooldown_until: state.cooldown_until, safety_guard: state.safety_guard }, null, 2),
+      JSON.stringify({ daily: state.daily, positions: state.positions, cooldown_until: state.cooldown_until, safety_guard: state.safety_guard, legacy: state.legacy }, null, 2),
       "utf8",
     );
   };
@@ -177,6 +191,7 @@ export function createLiveDataStrategy(opts: {
       state.positions = d.positions ?? state.positions;
       state.cooldown_until = d.cooldown_until ?? state.cooldown_until;
       state.safety_guard = d.safety_guard ?? state.safety_guard;
+      state.legacy = d.legacy ?? state.legacy;
     } catch {}
     state.safety_guard.state = "정상";
     state.safety_guard.reason = null;
@@ -212,7 +227,30 @@ export function createLiveDataStrategy(opts: {
       consecutive_losses: state.safety_guard.consecutive_losses,
       max_positions: state.safety_guard.max_positions,
       reentry_cooldowns: state.cooldown_until,
+      legacy_management: state.legacy,
     };
+  };
+
+  const legacySignalAllowsDca = (sig: any): boolean => {
+    if (!sig?.p) return false;
+    const p = sig.p;
+    const volumeOkay = Number(p.volume_ratio ?? 0) >= 0.85;
+    const filters = Array.isArray(p.filters) ? p.filters : [];
+    const passed = new Set(filters.filter((f: any) => f?.passed === true).map((f: any) => String(f.id)));
+    const reboundPattern =
+      passed.has("box_breakout") ||
+      passed.has("pullback_reclaim") ||
+      passed.has("volume_spike_close_fail");
+    return volumeOkay && reboundPattern;
+  };
+
+  const legacySignalWeakening = (sig: any): boolean => {
+    if (!sig?.p) return false;
+    const p = sig.p;
+    const filters = Array.isArray(p.filters) ? p.filters : [];
+    const closeHold = filters.find((f: any) => String(f?.id) === "volume_spike_close_fail");
+    const volume = Number(p.volume_ratio ?? 0);
+    return (closeHold && closeHold.passed === false) || volume < 0.75;
   };
 
   const runTick = async () => {
@@ -231,6 +269,69 @@ export function createLiveDataStrategy(opts: {
     if (state.safety_guard.state === "자동정지") return;
     const tickerRows = await fetchTickers([...MARKETS]);
     const priceBy = new Map(tickerRows.map((r) => [r.market, r.trade_price]));
+    const latestByMarket = new Map<string, any>();
+    const logs = await opts.readLogs(220);
+    const marketState = await opts.marketState.evaluate();
+    for (const row of logs) {
+      if (row.kind !== "signal" || !row.payload) continue;
+      const p = mvpSignalPayloadV2Schema.safeParse(row.payload);
+      if (!p.success) continue;
+      if (!MARKETS.includes(p.data.market as any)) continue;
+      if (!latestByMarket.has(p.data.market)) latestByMarket.set(p.data.market, { ts: row.ts, p: p.data });
+    }
+
+    // legacy buckets: no stop-loss, limited DCA, staged recovery exits.
+    const legacyByMarket = (tstatus.legacy_positions ?? {}) as Record<
+      string,
+      { qty?: number; avg?: number; dca_count?: number; dca_max?: number; dca_available?: boolean; exit_status?: string }
+    >;
+    for (const market of MARKETS) {
+      const legacy = legacyByMarket[market];
+      const legacyQty = Number(legacy?.qty ?? 0);
+      const legacyAvg = Number(legacy?.avg ?? 0);
+      if (legacyQty <= 0 || legacyAvg <= 0) continue;
+      const now = priceBy.get(market) ?? legacyAvg;
+      const pnlPct = netPnlPct(legacyAvg, now);
+      const sig = latestByMarket.get(market);
+      const stage = state.legacy.exit_stage[market] ?? 0;
+      const dcaCount = state.legacy.dca_count[market] ?? Number(legacy?.dca_count ?? 0);
+      const dcaMax = Number(legacy?.dca_max ?? 3);
+      const locked = state.legacy.dca_locked[market] ?? !(legacy?.dca_available ?? true);
+      const nextDcaAt = state.legacy.next_dca_at[market];
+      const dcaCooldownPassed = !nextDcaAt || Date.now() >= Date.parse(nextDcaAt);
+
+      // DCA only when market is not collapsing, signal supports rebound, and capped by count/size.
+      if (opts.trade.placeLegacyDcaBuy && !locked && dcaCount < dcaMax && dcaCooldownPassed) {
+        const krw = Number(tstatus.krw_available ?? 0);
+        const orderKrw = Math.floor(Math.max(5000, Math.min(12000, krw * 0.06)));
+        const marketOkay = marketState.market_state !== "risk_off";
+        if (orderKrw >= 5000 && krw > orderKrw * 1.2 && marketOkay && legacySignalAllowsDca(sig)) {
+          try {
+            await opts.trade.placeLegacyDcaBuy(market, true, orderKrw);
+            state.legacy.dca_count[market] = dcaCount + 1;
+            state.legacy.next_dca_at[market] = new Date(Date.now() + 20 * 60_000).toISOString();
+            state.legacy.dca_locked[market] = dcaCount + 1 >= dcaMax;
+          } catch {}
+        }
+      }
+
+      // Recovery exits: break-even partial -> small profit partial -> weaken signal trim.
+      if (!opts.trade.placeLegacyExitSell) continue;
+      const shouldStage1 = stage < 1 && pnlPct >= 0;
+      const shouldStage2 = stage < 2 && pnlPct >= 0.9;
+      const shouldTrimWeak = stage >= 1 && pnlPct >= 0.4 && legacySignalWeakening(sig);
+      try {
+        if (shouldStage1) {
+          await opts.trade.placeLegacyExitSell(market, true, 0.35);
+          state.legacy.exit_stage[market] = 1;
+        } else if (shouldStage2) {
+          await opts.trade.placeLegacyExitSell(market, true, 0.35);
+          state.legacy.exit_stage[market] = 2;
+        } else if (shouldTrimWeak) {
+          await opts.trade.placeLegacyExitSell(market, true, 0.5);
+        }
+      } catch {}
+    }
 
     // exits
     for (const market of Object.keys(state.positions)) {
@@ -577,17 +678,6 @@ export function createLiveDataStrategy(opts: {
       return;
     }
 
-    const logs = await opts.readLogs(200);
-    const marketState = await opts.marketState.evaluate();
-    const latestByMarket = new Map<string, any>();
-    for (const row of logs) {
-      if (row.kind !== "signal" || !row.payload) continue;
-      const p = mvpSignalPayloadV2Schema.safeParse(row.payload);
-      if (!p.success) continue;
-      if (!MARKETS.includes(p.data.market as any)) continue;
-      if (!latestByMarket.has(p.data.market)) latestByMarket.set(p.data.market, { ts: row.ts, p: p.data });
-    }
-
     for (const market of MARKETS) {
       if (Object.keys(state.positions).length >= 2) break;
       if (state.positions[market]) continue;
@@ -606,11 +696,11 @@ export function createLiveDataStrategy(opts: {
       const currency = market.replace("KRW-", "");
       const existingQty = Number(st.balances?.find((b: any) => b.currency === currency)?.balance ?? 0);
       if (existingQty > 0) continue; // no averaging / no existing hold
-      const krw = Number(st.krw_available ?? 0);
-      let orderKrw = Math.floor(krw * 0.1);
-      orderKrw = Math.max(5000, Math.min(10000, orderKrw));
+      const liveOrderAvailableKrw = Math.max(0, Number(st.live_order_available_krw ?? st.krw_available ?? 0));
+      let orderKrw = Math.floor(liveOrderAvailableKrw * 0.2);
+      orderKrw = Math.max(5000, Math.min(30000, orderKrw));
       if (orderKrw < 5000) continue;
-      if (krw - orderKrw < krw * 0.7) continue; // keep >=70% cash
+      if (liveOrderAvailableKrw < orderKrw) continue;
       const strategyType: StrategyType = marketState.market_state === "risk_on" ? "momentum" : "stable";
       try {
         await opts.trade.placeBuy(market, true, orderKrw, strategyType);

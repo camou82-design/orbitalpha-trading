@@ -102,6 +102,11 @@ type TradeStatus = {
   account_sync_failure_code?: string | null;
   account_sync_failure_message?: string | null;
   krw_available: number;
+  total_krw?: number;
+  live_order_available_krw?: number;
+  reserved_krw?: number;
+  strategy_allocated_krw?: number;
+  pump_paper_allocated_krw?: number;
   balances: Array<{
     currency: string;
     balance: number;
@@ -131,6 +136,20 @@ type TradeStatus = {
     avg: number;
     excluded_from_strategy: boolean;
   };
+  legacy_positions?: Record<
+    string,
+    {
+      market: string;
+      qty: number;
+      avg: number;
+      stop_loss_disabled: boolean;
+      dca_count: number;
+      dca_max: number;
+      dca_available: boolean;
+      next_dca_at: string | null;
+      exit_status: string;
+    }
+  >;
   strategy_positions?: Record<
     string,
     {
@@ -203,6 +222,7 @@ type StrategyStatus = {
 };
 
 type PumpScannerStatus = {
+  mode?: string;
   updated_at: string | null;
   items: Array<{
     rank: number;
@@ -1048,7 +1068,7 @@ export default function HomePage() {
   const holdingCards = useMemo(() => {
     const byCurrency = new Map((trade?.balances ?? []).map((b) => [b.currency, b]));
     const strategyByMarket = trade?.strategy_positions ?? {};
-    const legacyXrpQty = trade?.legacy_position?.market === "KRW-XRP" ? Number(trade.legacy_position.qty ?? 0) : 0;
+    const legacyByMarket = trade?.legacy_positions ?? {};
     return DASHBOARD_MARKETS.map((m) => {
       const currency = m.replace("KRW-", "");
       const bal = byCurrency.get(currency);
@@ -1056,7 +1076,11 @@ export default function HomePage() {
       const avg = bal?.avg_buy_price ?? 0;
       const strategyQtyRaw = Number(strategyByMarket[m]?.qty ?? 0);
       const strategyQty = Number.isFinite(strategyQtyRaw) ? Math.max(0, strategyQtyRaw) : 0;
-      const legacyQty = m === "KRW-XRP" ? Math.max(0, legacyXrpQty) : Math.max(0, qty - strategyQty);
+      const legacyMeta = legacyByMarket[m];
+      const legacyQty = Number.isFinite(Number(legacyMeta?.qty ?? NaN))
+        ? Math.max(0, Number(legacyMeta?.qty ?? 0))
+        : Math.max(0, qty - strategyQty);
+      const legacyAvg = Number(legacyMeta?.avg ?? avg);
       const now = tickerByMarket[m] ?? 0;
       const evalAmount = qty > 0 && now > 0 ? qty * now : 0;
       const cost = qty > 0 && avg > 0 ? qty * avg : 0;
@@ -1077,7 +1101,15 @@ export default function HomePage() {
         netPnl,
         netRet,
         legacyQty,
+        legacyAvg,
         strategyQty,
+        strategyAvg: Number(strategyMeta?.avg ?? 0),
+        legacyDcaCount: Number(legacyMeta?.dca_count ?? 0),
+        legacyDcaMax: Number(legacyMeta?.dca_max ?? 3),
+        legacyDcaAvailable: Boolean(legacyMeta?.dca_available ?? true),
+        legacyNextDcaAt: typeof legacyMeta?.next_dca_at === "string" ? legacyMeta.next_dca_at : null,
+        legacyExitStatus: typeof legacyMeta?.exit_status === "string" ? legacyMeta.exit_status : "평단 복귀 대기",
+        legacyStopLossDisabled: Boolean(legacyMeta?.stop_loss_disabled ?? true),
         strategyType: livePos?.strategy_type ?? strategyMeta?.strategy_type ?? "stable",
         stopLossPct: Number(strategyMeta?.stop_loss_pct ?? -2),
         currentNetPnlPct: Number(livePos?.current_net_pnl_pct ?? 0),
@@ -1206,70 +1238,70 @@ export default function HomePage() {
         }}
       >
         <div>
-          <h1 style={{ fontSize: "1.35rem", fontWeight: 900, letterSpacing: "0.03em", margin: 0, color: UI.title, textShadow: "0 0 12px #38bdf833" }}>
+          <h1 style={{ fontSize: "1.35rem", fontWeight: 900, letterSpacing: "0.03em", margin: 0, color: UI.title }}>
             Orbitalpha Trading
           </h1>
           <p style={{ margin: "0.22rem 0 0", fontSize: "0.8rem", color: UI.muted, fontWeight: 600 }}>Signals / Auto Trade</p>
         </div>
-        <div style={{ display: "flex", gap: "0.95rem", flexWrap: "wrap", fontSize: "0.76rem", color: UI.muted, alignItems: "center" }}>
-          <span>
-            상태{" "}
-            <strong
-              style={{
-                color: err ? UI.error : UI.pass,
-                background: err ? UI.errorChipBg : UI.passBg,
-                border: `1px solid ${err ? UI.errorChipBorder : "#93c5fd"}`,
-                borderRadius: 999,
-                padding: "0.1rem 0.45rem",
-                boxShadow: err ? "0 0 0 1px #7f1d1d inset" : "0 0 0 1px #075985 inset",
-              }}
-            >
-              {runState}
-            </strong>
-          </span>
-          <span>갱신 <strong style={{ color: UI.body }}>{lastUpdatedAt ?? "-"}</strong></span>
-          <span>최근 서버 틱 <strong style={{ color: UI.body }}>{recentServerTickTs ? formatTsLocal(recentServerTickTs) : "-"}</strong></span>
-          <span>최근 스캐너 계산 <strong style={{ color: UI.body }}>{recentScannerCalcTs ? formatTsLocal(recentScannerCalcTs) : "-"}</strong></span>
-          <span style={{ maxWidth: 420, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            진입 차단 사유 <strong style={{ color: UI.body }}>{entryBlockReason}</strong>
-          </span>
-          <span style={{ maxWidth: 360, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            monitor <strong style={{ color: UI.body }}>{ctx?.monitor_instance_id ?? activeMonitorInstanceId ?? "-"}</strong>
-          </span>
-          <span>
-            scope <strong style={{ color: UI.body }}>{ctx?.company_id ?? DEFAULT_TRADING_COMPANY_ID}/{ctx?.service_id ?? DEFAULT_TRADING_SERVICE_ID}</strong>
-          </span>
-          <button
-            type="button"
-            onClick={onLogout}
-            style={{
-              borderRadius: 8,
-              border: `1px solid ${UI.errorChipBorder}`,
-              background: UI.errorChipBg,
-              color: "#fecaca",
-              fontWeight: 700,
-              padding: "0.28rem 0.68rem",
-              cursor: "pointer",
-            }}
-          >
-            로그아웃
-          </button>
+        <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "center" }}>
           <Link
             href="/replay"
             style={{
               borderRadius: 8,
-              border: `1px solid ${UI.border}`,
+              border: `1px solid ${UI.borderSoft}`,
               background: UI.cardSoftBg,
               color: UI.body,
               fontWeight: 700,
               padding: "0.28rem 0.68rem",
               textDecoration: "none",
+              fontSize: "0.76rem",
             }}
           >
             리플레이
           </Link>
+          <button
+            type="button"
+            onClick={onLogout}
+            style={{
+              borderRadius: 8,
+              border: `1px solid ${UI.borderSoft}`,
+              background: UI.cardSoftBg,
+              color: UI.body,
+              fontWeight: 700,
+              padding: "0.28rem 0.68rem",
+              cursor: "pointer",
+              fontSize: "0.76rem",
+            }}
+          >
+            로그아웃
+          </button>
         </div>
       </header>
+
+      <section
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          gap: "0.5rem",
+          marginBottom: "0.8rem",
+          fontSize: "0.78rem",
+        }}
+      >
+        <span style={{ color: UI.muted }}>실행 상태 <strong style={{ color: err ? UI.watch : UI.pass }}>{runState}</strong></span>
+        <span style={{ color: UI.muted }}>
+          시장 상태{" "}
+          <strong style={{ color: marketState?.market_state === "risk_off" ? UI.watch : UI.pass }}>
+            {marketState?.market_state === "risk_on"
+              ? "상방장"
+              : marketState?.market_state === "neutral"
+                ? "횡보장"
+                : marketState?.market_state === "risk_off"
+                  ? "하락장"
+                  : "-"}
+          </strong>
+        </span>
+        <span style={{ color: UI.muted }}>신규 진입 <strong style={{ color: marketState?.entry_policy === "신규 진입 차단" ? UI.watch : UI.body }}>{marketState?.entry_policy ?? "-"}</strong></span>
+      </section>
 
       <section
         style={{
@@ -1283,202 +1315,102 @@ export default function HomePage() {
           overflow: "hidden",
         }}
       >
-        <div style={{ position: "absolute", inset: 0, pointerEvents: "none", background: "linear-gradient(180deg, #60a5fa12 0%, #00000000 42%)" }} />
-        <div style={{ height: 2, marginBottom: "0.7rem", borderRadius: 999, background: "linear-gradient(90deg, #2dd4bf, #38bdf8, #2dd4bf)" }} />
-        <div style={{ height: 1, marginBottom: "0.65rem", background: `linear-gradient(90deg, ${UI.panelInnerLine}, transparent)` }} />
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(6, minmax(0, 1fr))",
+            gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
             gap: "0.8rem",
+          }}
+        >
+          <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
+            <div style={{ fontSize: "0.73rem", color: UI.muted, marginBottom: 3, fontWeight: 600 }}>총 보유자산</div>
+            <div style={{ fontSize: "1.55rem", fontWeight: 900, color: UI.title, lineHeight: 1.05 }}>{Math.round(assetSummary.totalAssets).toLocaleString()}</div>
+          </div>
+          <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>보유 KRW</div>
+            <div style={{ fontSize: "1.55rem", fontWeight: 900, color: UI.title, lineHeight: 1.05 }}>{Math.round(assetSummary.krw).toLocaleString()}</div>
+          </div>
+          <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>순평가손익</div>
+            <div style={{ fontSize: "1.55rem", fontWeight: 900, color: assetSummary.netPnl >= 0 ? UI.pass : UI.watch, lineHeight: 1.05 }}>{Math.round(assetSummary.netPnl).toLocaleString()}</div>
+          </div>
+          <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
+            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>순수익률</div>
+            <div style={{ fontSize: "1.55rem", fontWeight: 900, color: assetSummary.netRet >= 0 ? UI.pass : UI.watch, lineHeight: 1.05 }}>{assetSummary.netRet.toFixed(2)}%</div>
+          </div>
+        </div>
+        <section
+          style={{
+            marginTop: "0.75rem",
+            borderTop: `1px solid ${UI.borderSoft}`,
+            paddingTop: "0.7rem",
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: "0.7rem",
             flexWrap: "wrap",
           }}
         >
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>보유 KRW</div>
-            <div style={{ fontSize: "1.45rem", fontWeight: 900, color: UI.title, lineHeight: 1.05, letterSpacing: "0.01em" }}>{Math.round(assetSummary.krw).toLocaleString()}</div>
+          <div style={{ display: "flex", gap: "0.8rem", flexWrap: "wrap", fontSize: "0.78rem", color: UI.muted }}>
+            <span>API <strong style={{ color: trade?.api_connected ? UI.pass : UI.watch }}>{accountSyncState === "syncing" ? "동기화중" : trade?.api_connected ? "연결됨" : "미연결"}</strong></span>
+            <span>자동매매 <strong style={{ color: autoTradeEnabled ? UI.pass : UI.watch }}>{autoTradeEnabled ? "ON" : "OFF"}</strong></span>
+            <span>계좌보호 <strong style={{ color: strategy?.safety_guard_state === "자동정지" ? UI.watch : UI.body }}>{strategy?.safety_guard_state ?? "-"}</strong></span>
+            <span>실거래 <strong style={{ color: trade?.api_connected ? UI.pass : UI.watch }}>{tradeReadyLabel}</strong></span>
           </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>총 보유자산</div>
-            <div style={{ fontSize: "1.45rem", fontWeight: 900, color: "#67e8f9", lineHeight: 1.05, textShadow: "0 0 12px #22d3ee44" }}>{Math.round(assetSummary.totalAssets).toLocaleString()}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>총매수</div>
-            <div style={{ fontSize: "1.1rem", fontWeight: 850, color: UI.body, lineHeight: 1.05 }}>{Math.round(assetSummary.totalBuy).toLocaleString()}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>총평가</div>
-            <div style={{ fontSize: "1.1rem", fontWeight: 850, color: UI.body, lineHeight: 1.05 }}>{Math.round(assetSummary.totalEval).toLocaleString()}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>순평가손익</div>
-            <div style={{ fontSize: "1.1rem", fontWeight: 850, color: assetSummary.netPnl > 0 ? "#22c55e" : assetSummary.netPnl < 0 ? "#ef4444" : UI.muted, lineHeight: 1.05 }}>{Math.round(assetSummary.netPnl).toLocaleString()}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>순수익률</div>
-            <div style={{ fontSize: "1.1rem", fontWeight: 850, color: assetSummary.netRet > 0 ? "#22c55e" : assetSummary.netRet < 0 ? "#ef4444" : UI.muted, lineHeight: 1.05 }}>{assetSummary.netRet.toFixed(2)}%</div>
-          </div>
-        </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(9, minmax(0, 1fr))", gap: "0.8rem", marginTop: "0.7rem", borderTop: `1px solid ${UI.borderSoft}`, paddingTop: "0.7rem" }}>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>API 연결 상태</div>
-            <div
-              style={{
-                fontSize: "0.9rem",
-                fontWeight: 800,
-                color: accountSyncState === "syncing" ? UI.watch : trade?.api_connected ? UI.pass : UI.error,
-              }}
-            >
-              {accountSyncState === "syncing" ? "계좌 동기화 중" : trade?.api_connected ? "연결됨" : "미연결"}
-            </div>
-          </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>자동매매 상태</div>
-            <div style={{ fontSize: "0.9rem", fontWeight: 800, color: autoTradeEnabled ? "#22c55e" : "#ef4444" }}>
-              {autoTradeEnabled ? "ON" : "OFF"}
-            </div>
-          </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>시장 상태</div>
-            <div
-              style={{
-                fontSize: "0.9rem",
-                fontWeight: 800,
-                color:
-                  marketState?.market_state === "risk_on"
-                    ? "#22c55e"
-                    : marketState?.market_state === "neutral"
-                      ? "#f59e0b"
-                      : "#ef4444",
-              }}
-            >
-              {marketState?.market_state === "risk_on"
-                ? "상방장"
-                : marketState?.market_state === "neutral"
-                  ? "횡보장"
-                  : marketState?.market_state === "risk_off"
-                    ? "하락장"
-                    : "-"}
-            </div>
-          </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted }}>진입 정책</div>
-            <div style={{ fontSize: "0.9rem", fontWeight: 800, color: UI.body }}>{marketState?.entry_policy ?? "-"}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted }}>신규 전략 사용 가능 KRW</div>
-            <div style={{ fontSize: "0.9rem", fontWeight: 800, color: "#67e8f9" }}>
-              {Math.round(strategy?.strategy_available_krw ?? 0).toLocaleString()}
-            </div>
-          </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted }}>신규 전략 이미 투입 KRW</div>
-            <div style={{ fontSize: "0.9rem", fontWeight: 800, color: "#fbbf24" }}>{Math.round(strategy?.strategy_invested_krw ?? 0).toLocaleString()}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted }}>신규 전략 누적 순손익</div>
-            <div style={{ fontSize: "0.9rem", fontWeight: 800, color: (strategy?.strategy_pnl_krw ?? 0) >= 0 ? UI.pass : UI.fail }}>{Math.round(strategy?.strategy_pnl_krw ?? 0).toLocaleString()}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted }}>신규 전략 승률</div>
-            <div style={{ fontSize: "0.9rem", fontWeight: 800, color: UI.body }}>{(strategy?.strategy_win_rate ?? 0).toFixed(1)}%</div>
-          </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted }}>신규 전략 체결 수</div>
-            <div style={{ fontSize: "0.9rem", fontWeight: 800, color: UI.body }}>{strategy?.strategy_total_fills ?? 0}</div>
-          </div>
-        </div>
-        <div style={{ marginTop: "0.35rem", fontSize: "0.74rem", color: UI.mutedSoft }}>
-          총 보유 KRW = 사용 가능 KRW + 이미 투입 KRW
-        </div>
-        <div style={{ marginTop: "0.2rem", fontSize: "0.74rem", color: UI.mutedSoft }}>
-          모든 손익은 수수료 반영 후 순금액 기준
-        </div>
-        <div style={{ marginTop: "0.2rem", fontSize: "0.74rem", color: UI.mutedSoft }}>
-          시장근거: 5m {marketState?.btc_5m_trend ?? "-"} / 15m {marketState?.btc_15m_trend ?? "-"} / breadth {(marketState?.breadth_ratio ?? 0).toFixed(3)} / close {marketState?.recent_close_bias ?? "-"}
-        </div>
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(6, minmax(0, 1fr))",
-            gap: "0.7rem",
-            marginTop: "0.7rem",
-            borderTop: `1px solid ${UI.borderSoft}`,
-            paddingTop: "0.7rem",
-          }}
-        >
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>로그인 상태</div>
-            <div style={{ fontSize: "0.92rem", fontWeight: 700, color: UI.pass }}>인증됨</div>
-          </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>세션 사용자 ID</div>
-            <div style={{ fontSize: "0.92rem", fontWeight: 700, color: UI.body }}>{sessionUserId ?? "-"}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>최근 체결/신호 시각</div>
-            <div style={{ fontSize: "0.92rem", fontWeight: 700, color: UI.body }}>
-              {latestSignalTs}
-            </div>
-          </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>계좌보호 상태</div>
-            <div style={{ fontSize: "0.92rem", fontWeight: 700, color: strategy?.safety_guard_state === "자동정지" ? "#ef4444" : strategy?.safety_guard_state === "주의" ? "#f59e0b" : "#22c55e" }}>
-              {strategy?.safety_guard_state ?? "-"}
-            </div>
-            <div style={{ fontSize: "0.72rem", color: UI.mutedSoft }}>{strategy?.safety_guard_reason ?? "-"}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>연속 손실 / 주문실패</div>
-            <div style={{ fontSize: "0.92rem", fontWeight: 700, color: UI.body }}>
-              {strategy?.consecutive_losses ?? 0} / {strategy?.order_fail_count_today ?? 0}
-            </div>
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
-            <div>
-              <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2 }}>실거래 가능 상태</div>
-              <div
-                style={{
-                  fontSize: "0.92rem",
-                  fontWeight: 700,
-                  color:
-                    accountSyncState === "syncing" ? UI.watch : trade?.api_connected ? UI.pass : UI.watch,
-                }}
-              >
-                {tradeReadyLabel}
-              </div>
-              {accountSyncFailureDisplay ? (
-                <div style={{ fontSize: "0.72rem", color: UI.mutedSoft, marginTop: 2, lineHeight: 1.35 }}>
-                  계좌 동기화 실패 사유: {accountSyncFailureDisplay}
-                </div>
-              ) : null}
-            </div>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
             <button
               type="button"
               onClick={() => void onToggleAutoTrade(!autoTradeEnabled)}
               disabled={toggleBusy || (!autoTradeEnabled && !canEnableAutoTrade)}
               style={{
-                marginTop: 6,
                 borderRadius: 999,
-                border: `1px solid ${autoTradeEnabled ? "#b91c1c" : "#0ea5e9"}`,
-                background: autoTradeEnabled ? "#3a1014" : "#0b2748",
-                color: autoTradeEnabled ? "#fecaca" : "#dbeafe",
+                border: `1px solid ${UI.borderSoft}`,
+                background: autoTradeEnabled ? UI.passBg : UI.cardSoftBg,
+                color: UI.body,
                 fontSize: "0.72rem",
                 fontWeight: 700,
-                padding: "0.18rem 0.55rem",
+                padding: "0.2rem 0.65rem",
                 cursor: toggleBusy ? "not-allowed" : "pointer",
                 opacity: toggleBusy ? 0.6 : 1,
               }}
             >
-              {autoTradeEnabled ? "OFF" : "ON"}
+              자동매매 {autoTradeEnabled ? "OFF" : "ON"}
             </button>
             {!autoTradeEnabled && !canEnableAutoTrade ? (
-              <div style={{ marginTop: 4, fontSize: "0.7rem", color: "#fca5a5" }}>
-                ON 불가: {cannotEnableReason ?? "조건 미충족"}
-              </div>
+              <div style={{ fontSize: "0.7rem", color: UI.watch }}>ON 불가: {cannotEnableReason ?? "조건 미충족"}</div>
             ) : null}
           </div>
-        </div>
+        </section>
+        {accountSyncFailureDisplay ? (
+          <div style={{ marginTop: "0.45rem", fontSize: "0.72rem", color: UI.watch }}>
+            계좌 동기화 실패 사유: {accountSyncFailureDisplay}
+          </div>
+        ) : null}
+        <details style={{ marginTop: "0.55rem" }}>
+          <summary style={{ cursor: "pointer", color: UI.muted, fontSize: "0.74rem" }}>운영 정보 보기</summary>
+          <div style={{ marginTop: "0.45rem", display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: "0.55rem", fontSize: "0.74rem", color: UI.mutedSoft }}>
+            <div>로그인 상태: <strong style={{ color: UI.body }}>인증됨</strong></div>
+            <div>세션 사용자 ID: <strong style={{ color: UI.body }}>{sessionUserId ?? "-"}</strong></div>
+            <div>최근 체결/신호: <strong style={{ color: UI.body }}>{latestSignalTs}</strong></div>
+            <div>최근 서버 틱: <strong style={{ color: UI.body }}>{recentServerTickTs ? formatTsLocal(recentServerTickTs) : "-"}</strong></div>
+            <div>최근 스캐너 계산: <strong style={{ color: UI.body }}>{recentScannerCalcTs ? formatTsLocal(recentScannerCalcTs) : "-"}</strong></div>
+            <div>monitor: <strong style={{ color: UI.body }}>{ctx?.monitor_instance_id ?? activeMonitorInstanceId ?? "-"}</strong></div>
+            <div>scope: <strong style={{ color: UI.body }}>{ctx?.company_id ?? DEFAULT_TRADING_COMPANY_ID}/{ctx?.service_id ?? DEFAULT_TRADING_SERVICE_ID}</strong></div>
+            <div>갱신: <strong style={{ color: UI.body }}>{lastUpdatedAt ?? "-"}</strong></div>
+            <div>시장근거: <strong style={{ color: UI.body }}>5m {marketState?.btc_5m_trend ?? "-"} / 15m {marketState?.btc_15m_trend ?? "-"} / close {marketState?.recent_close_bias ?? "-"}</strong></div>
+            <div>총 보유 KRW: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.total_krw ?? trade?.krw_available ?? 0)).toLocaleString()}</strong></div>
+            <div>실주문 가능 KRW: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.live_order_available_krw ?? 0)).toLocaleString()}</strong></div>
+            <div>예약/미체결 KRW: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.reserved_krw ?? 0)).toLocaleString()}</strong></div>
+            <div>기존 전략 투입 KRW: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.strategy_allocated_krw ?? 0)).toLocaleString()}</strong></div>
+            <div>급등주 가상검증 자금: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.pump_paper_allocated_krw ?? 0)).toLocaleString()}</strong></div>
+          </div>
+          <div style={{ marginTop: "0.35rem", fontSize: "0.72rem", color: UI.mutedSoft }}>
+            총 보유 KRW = 사용 가능 KRW + 이미 투입 KRW · 모든 손익은 수수료 반영 후 순금액 기준
+          </div>
+          <div style={{ marginTop: "0.35rem", fontSize: "0.72rem", color: UI.mutedSoft }}>
+            신규 전략 사용 가능 KRW {Math.round(strategy?.strategy_available_krw ?? 0).toLocaleString()} · 이미 투입 KRW {Math.round(strategy?.strategy_invested_krw ?? 0).toLocaleString()} · 누적 순손익 {Math.round(strategy?.strategy_pnl_krw ?? 0).toLocaleString()} · 승률 {(strategy?.strategy_win_rate ?? 0).toFixed(1)}% · 체결 수 {strategy?.strategy_total_fills ?? 0}
+          </div>
+        </details>
       </section>
 
       <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>
@@ -1517,57 +1449,65 @@ export default function HomePage() {
               key={`asset-${h.market}`}
               style={{
                 background: UI.cardBg,
-                border: hasHolding ? "1px solid #2dd4bf88" : `1px solid ${UI.borderSoft}`,
+                border: hasHolding ? `1px solid ${UI.border}` : `1px solid ${UI.borderSoft}`,
                 borderRadius: 12,
-                padding: "0.95rem 1rem",
-                boxShadow: hasHolding
-                  ? "0 0 0 1px #134e4a inset, 0 0 14px #2dd4bf22, 0 10px 24px rgba(2, 6, 23, 0.32)"
-                  : "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.24)",
-                opacity: hasHolding ? 1 : 0.88,
-                filter: hasHolding ? "none" : "saturate(0.88) brightness(0.9)",
+                padding: "0.75rem 0.85rem",
+                boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.24)",
+                opacity: hasHolding ? 1 : 0.9,
               }}
             >
-              <div style={{ height: 1, marginBottom: 6, background: "linear-gradient(90deg, #2dd4bf, transparent)" }} />
-              <div style={{ fontSize: "1.12rem", color: UI.title, fontWeight: 900, letterSpacing: "0.02em", marginBottom: 10 }}>{h.currency}</div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 7, fontSize: "0.82rem" }}>
+              <div style={{ fontSize: "1.02rem", color: UI.title, fontWeight: 900, letterSpacing: "0.02em", marginBottom: 8 }}>{h.currency}</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 6, fontSize: "0.8rem" }}>
                 <span style={{ color: UI.mutedSoft }}>보유수량</span>
                 <strong style={{ color: UI.body }}>{h.qty.toLocaleString(undefined, { maximumFractionDigits: 8 })}</strong>
                 <span style={{ color: UI.mutedSoft }}>평균매수가</span>
                 <strong style={{ color: UI.body }}>{h.avg > 0 ? h.avg.toLocaleString() : "-"}</strong>
-                <span style={{ color: UI.mutedSoft }}>평가금액</span>
-                <strong style={{ color: UI.title, fontSize: "0.94rem" }}>{h.evalAmount > 0 ? Math.round(h.evalAmount).toLocaleString() : "-"}</strong>
-                <span style={{ color: UI.mutedSoft }}>순평가손익</span>
-                <strong style={{ color: pnlColor, fontSize: "1.03rem", fontWeight: 900 }}>{h.evalAmount > 0 ? Math.round(h.netPnl).toLocaleString() : "-"}</strong>
                 <span style={{ color: UI.mutedSoft }}>순수익률</span>
-                <strong style={{ color: retColor, fontSize: "1.03rem", fontWeight: 900 }}>{h.evalAmount > 0 ? `${h.netRet.toFixed(2)}%` : "-"}</strong>
-                {h.market === "KRW-XRP" ? (
-                  <>
-                    <span style={{ color: UI.mutedSoft }}>기존 보유 XRP</span>
-                    <strong style={{ color: UI.body }}>{h.legacyQty.toLocaleString(undefined, { maximumFractionDigits: 8 })}</strong>
-                    <span style={{ color: UI.mutedSoft }}>신규 전략 XRP</span>
-                    <strong style={{ color: UI.body }}>{h.strategyQty.toLocaleString(undefined, { maximumFractionDigits: 8 })}</strong>
-                  </>
-                ) : null}
-                <span style={{ color: UI.mutedSoft }}>전략 유형</span>
-                <strong style={{ color: h.strategyType === "momentum" ? "#f59e0b" : "#60a5fa" }}>
-                  {h.strategyType === "momentum" ? "급등형" : "안정형"}
-                </strong>
+                <strong style={{ color: retColor, fontWeight: 800 }}>{h.evalAmount > 0 ? `${h.netRet.toFixed(2)}%` : "-"}</strong>
                 <span style={{ color: UI.mutedSoft }}>현재 손절 기준</span>
                 <strong style={{ color: UI.body }}>{h.stopLossPct.toFixed(1)}%</strong>
-                <span style={{ color: UI.mutedSoft }}>현재 순이익률</span>
-                <strong style={{ color: h.currentNetPnlPct > 0 ? "#22c55e" : h.currentNetPnlPct < 0 ? "#ef4444" : UI.muted }}>
-                  {h.currentNetPnlPct.toFixed(2)}%
-                </strong>
-                <span style={{ color: UI.mutedSoft }}>브레이크이븐</span>
-                <strong style={{ color: h.breakevenArmed ? "#22c55e" : UI.muted }}>{h.breakevenArmed ? "활성" : "대기"}</strong>
-                <span style={{ color: UI.mutedSoft }}>1차 익절</span>
-                <strong style={{ color: h.partialTpDone ? "#22c55e" : UI.muted }}>{h.partialTpDone ? "완료" : "미완료"}</strong>
-                <span style={{ color: UI.mutedSoft }}>트레일링 기준가</span>
-                <strong style={{ color: UI.body }}>{h.trailingStopPrice > 0 ? Math.round(h.trailingStopPrice).toLocaleString() : "-"}</strong>
               </div>
-              <div style={{ marginTop: 10, fontSize: "0.74rem", color: UI.mutedSoft, lineHeight: 1.35 }}>
+              <div style={{ marginTop: 8, fontSize: "0.72rem", color: UI.mutedSoft, lineHeight: 1.3 }}>
                 추가매수 차단 사유: <strong style={{ color: UI.body }}>{additionalBuyBlockReason}</strong>
               </div>
+              <details style={{ marginTop: 6 }}>
+                <summary style={{ cursor: "pointer", color: UI.muted, fontSize: "0.72rem" }}>상세</summary>
+                <div style={{ marginTop: 6, display: "grid", gridTemplateColumns: "1fr auto", gap: 6, fontSize: "0.76rem" }}>
+                  <span style={{ color: UI.mutedSoft }}>평가금액</span>
+                  <strong style={{ color: UI.body }}>{h.evalAmount > 0 ? Math.round(h.evalAmount).toLocaleString() : "-"}</strong>
+                  <span style={{ color: UI.mutedSoft }}>순평가손익</span>
+                  <strong style={{ color: pnlColor }}>{h.evalAmount > 0 ? Math.round(h.netPnl).toLocaleString() : "-"}</strong>
+                  <span style={{ color: UI.mutedSoft }}>기존 보유 수량</span>
+                  <strong style={{ color: UI.body }}>{h.legacyQty.toLocaleString(undefined, { maximumFractionDigits: 8 })}</strong>
+                  <span style={{ color: UI.mutedSoft }}>기존 보유 평균단가</span>
+                  <strong style={{ color: UI.body }}>{h.legacyAvg > 0 ? h.legacyAvg.toLocaleString() : "-"}</strong>
+                  <span style={{ color: UI.mutedSoft }}>신규 전략 수량</span>
+                  <strong style={{ color: UI.body }}>{h.strategyQty.toLocaleString(undefined, { maximumFractionDigits: 8 })}</strong>
+                  <span style={{ color: UI.mutedSoft }}>신규 전략 평균단가</span>
+                  <strong style={{ color: UI.body }}>{h.strategyAvg > 0 ? h.strategyAvg.toLocaleString() : "-"}</strong>
+                  <span style={{ color: UI.mutedSoft }}>물타기 횟수</span>
+                  <strong style={{ color: UI.body }}>{h.legacyDcaCount}/{h.legacyDcaMax}</strong>
+                  <span style={{ color: UI.mutedSoft }}>다음 물타기 가능</span>
+                  <strong style={{ color: h.legacyDcaAvailable ? UI.pass : UI.watch }}>
+                    {h.legacyDcaAvailable ? "가능" : "잠금"}
+                    {h.legacyNextDcaAt ? ` (${formatTsLocal(h.legacyNextDcaAt)})` : ""}
+                  </strong>
+                  <span style={{ color: UI.mutedSoft }}>탈출 목표 상태</span>
+                  <strong style={{ color: UI.body }}>{h.legacyExitStatus}</strong>
+                  <span style={{ color: UI.mutedSoft }}>기존 보유 손절</span>
+                  <strong style={{ color: UI.body }}>{h.legacyStopLossDisabled ? "비활성" : "활성"}</strong>
+                  <span style={{ color: UI.mutedSoft }}>전략 유형</span>
+                  <strong style={{ color: UI.body }}>{h.strategyType === "momentum" ? "급등형" : "안정형"}</strong>
+                  <span style={{ color: UI.mutedSoft }}>현재 순이익률</span>
+                  <strong style={{ color: h.currentNetPnlPct >= 0 ? UI.pass : UI.watch }}>{h.currentNetPnlPct.toFixed(2)}%</strong>
+                  <span style={{ color: UI.mutedSoft }}>브레이크이븐</span>
+                  <strong style={{ color: UI.body }}>{h.breakevenArmed ? "활성" : "대기"}</strong>
+                  <span style={{ color: UI.mutedSoft }}>1차 익절</span>
+                  <strong style={{ color: UI.body }}>{h.partialTpDone ? "완료" : "미완료"}</strong>
+                  <span style={{ color: UI.mutedSoft }}>트레일링 기준가</span>
+                  <strong style={{ color: UI.body }}>{h.trailingStopPrice > 0 ? Math.round(h.trailingStopPrice).toLocaleString() : "-"}</strong>
+                </div>
+              </details>
             </article>
           );
         })}
@@ -1670,7 +1610,10 @@ export default function HomePage() {
       >
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.55rem" }}>
           <div style={{ fontSize: "0.9rem", color: UI.title, fontWeight: 800, letterSpacing: "0.02em" }}>급등주 스캐너</div>
-          <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>
+          <div style={{ fontSize: "0.74rem", color: UI.mutedSoft, display: "flex", gap: 8, alignItems: "center" }}>
+            <span style={{ color: "#f59e0b" }}>
+              {scanner?.mode === "paper_validation" ? "가상검증중" : "가상검증중"}
+            </span>
             갱신 {scanner?.updated_at ? formatTsLocal(scanner.updated_at) : "-"}
           </div>
         </div>
