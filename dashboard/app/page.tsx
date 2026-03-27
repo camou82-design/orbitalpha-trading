@@ -704,6 +704,11 @@ export default function HomePage() {
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
   const [trade, setTrade] = useState<TradeStatus | null>(null);
   const [tickerByMarket, setTickerByMarket] = useState<Record<string, number>>({});
+  const [valuationSnapshot, setValuationSnapshot] = useState<{
+    trade: TradeStatus;
+    tickerByMarket: Record<string, number>;
+    atMs: number;
+  } | null>(null);
   const [sessionUserId, setSessionUserId] = useState<string | null>(null);
   const [autoTradeEnabled, setAutoTradeEnabled] = useState(false);
   const [autoTradeChangedAt, setAutoTradeChangedAt] = useState<string | null>(null);
@@ -888,6 +893,13 @@ export default function HomePage() {
           }
         }
         setTickerByMarket(nextTicker);
+        if (t) {
+          setValuationSnapshot({
+            trade: t as TradeStatus,
+            tickerByMarket: nextTicker,
+            atMs: Date.now(),
+          });
+        }
         setLastUpdatedAt(new Date().toLocaleTimeString("ko-KR", { hour12: false }));
       } catch (e) {
         if (!cancelled) setErr(e instanceof Error ? e.message : "load failed");
@@ -1066,22 +1078,27 @@ export default function HomePage() {
   }, [latestByMarket]);
 
   const holdingCards = useMemo(() => {
-    const byCurrency = new Map((trade?.balances ?? []).map((b) => [b.currency, b]));
-    const strategyByMarket = trade?.strategy_positions ?? {};
-    const legacyByMarket = trade?.legacy_positions ?? {};
+    const valuationTrade = valuationSnapshot?.trade ?? trade;
+    const valuationTickerByMarket = valuationSnapshot?.tickerByMarket ?? tickerByMarket;
+    const byCurrency = new Map((valuationTrade?.balances ?? []).map((b) => [b.currency, b]));
+    const strategyByMarket = valuationTrade?.strategy_positions ?? {};
+    const legacyByMarket = valuationTrade?.legacy_positions ?? {};
+    const DUST_NOTIONAL_KRW = 1000;
     return DASHBOARD_MARKETS.map((m) => {
       const currency = m.replace("KRW-", "");
       const bal = byCurrency.get(currency);
-      const qty = bal?.balance ?? 0;
-      const avg = bal?.avg_buy_price ?? 0;
+      const qtyRaw = Number(bal?.balance ?? 0) + Number(bal?.locked ?? 0);
+      const avg = Number(bal?.avg_buy_price ?? 0);
+      const notionalByCost = qtyRaw * avg;
+      const qty = Number.isFinite(qtyRaw) && notionalByCost >= DUST_NOTIONAL_KRW ? Math.max(0, qtyRaw) : 0;
       const strategyQtyRaw = Number(strategyByMarket[m]?.qty ?? 0);
-      const strategyQty = Number.isFinite(strategyQtyRaw) ? Math.max(0, strategyQtyRaw) : 0;
+      const strategyQty = Number.isFinite(strategyQtyRaw) ? Math.max(0, Math.min(strategyQtyRaw, qty)) : 0;
       const legacyMeta = legacyByMarket[m];
       const legacyQty = Number.isFinite(Number(legacyMeta?.qty ?? NaN))
         ? Math.max(0, Number(legacyMeta?.qty ?? 0))
         : Math.max(0, qty - strategyQty);
       const legacyAvg = Number(legacyMeta?.avg ?? avg);
-      const now = tickerByMarket[m] ?? 0;
+      const now = valuationTickerByMarket[m] ?? 0;
       const evalAmount = qty > 0 && now > 0 ? qty * now : 0;
       const cost = qty > 0 && avg > 0 ? qty * avg : 0;
       const estimatedFees = evalAmount > 0 && cost > 0 ? cost * UPBIT_FEE_RATE + evalAmount * UPBIT_FEE_RATE : 0;
@@ -1118,7 +1135,7 @@ export default function HomePage() {
         trailingStopPrice: Number(livePos?.trailing_stop_price ?? 0),
       };
     });
-  }, [trade, tickerByMarket, strategy]);
+  }, [trade, tickerByMarket, valuationSnapshot, strategy]);
 
   const holdingQtyByMarket = useMemo(() => {
     const map: Record<string, number> = {};
@@ -1127,7 +1144,8 @@ export default function HomePage() {
   }, [holdingCards]);
 
   const assetSummary = useMemo(() => {
-    const krw = Number(trade?.krw_available ?? 0);
+    const valuationTrade = valuationSnapshot?.trade ?? trade;
+    const krw = Number(valuationTrade?.krw_available ?? 0);
     const totalBuy = holdingCards.reduce((acc, h) => acc + (h.qty > 0 ? h.cost : 0), 0);
     const totalEval = holdingCards.reduce((acc, h) => acc + (h.qty > 0 ? h.evalAmount : 0), 0);
     const totalFees = holdingCards.reduce((acc, h) => acc + (h.qty > 0 ? h.estimatedFees : 0), 0);
@@ -1135,7 +1153,7 @@ export default function HomePage() {
     const netRet = totalBuy > 0 ? (netPnl / totalBuy) * 100 : 0;
     const totalAssets = krw + totalEval;
     return { krw, totalAssets, totalBuy, totalEval, netPnl, netRet, totalFees };
-  }, [trade, holdingCards]);
+  }, [trade, valuationSnapshot, holdingCards]);
 
   const tradeReadyLabel = useMemo(() => {
     if (accountSyncState === "syncing") return "계좌 동기화 중";
