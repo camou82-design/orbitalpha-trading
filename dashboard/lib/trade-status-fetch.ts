@@ -1,4 +1,4 @@
-/** Validates `/api/v1/trade/status` JSON (rejects 401 bodies missing api_connected). */
+/** Validates `/api/v1/trade/status` (and 동일 페이로드의 `/api/v1/account/status`) JSON. */
 export function isValidTradeStatusPayload(x: unknown): boolean {
   if (!x || typeof x !== "object") return false;
   const o = x as Record<string, unknown>;
@@ -35,6 +35,7 @@ export async function fetchTradeStatusDetailed(apiBase: string): Promise<TradeSt
   let httpStatus = 0;
   let body: unknown | null = null;
   try {
+    // 동일 본문(account_portfolio 포함): GET /api/v1/account/status
     const r = await fetch(`${base}/api/v1/trade/status?_=${ts}`, { cache: "no-store", credentials: "include" });
     httpStatus = r.status;
     const text = await r.text();

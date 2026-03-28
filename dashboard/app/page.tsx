@@ -184,10 +184,20 @@ type TradeStatus = {
   mark_prices?: Record<string, number> | null;
 };
 
-type UpbitTickerRow = {
-  market: string;
-  trade_price: number;
-};
+/** 상단 KPI — `ready`일 때만 숫자 표시(서버 account_portfolio 단일 출처). */
+type AssetSummaryKpi =
+  | {
+      kpi: "ready";
+      krw: number;
+      totalAssets: number;
+      totalBuy: number;
+      totalEval: number;
+      netPnl: number;
+      netRet: number;
+      totalFees: number;
+    }
+  | { kpi: "pending" }
+  | { kpi: "unavailable" };
 
 type AuthSession = {
   authenticated: boolean;
@@ -716,7 +726,6 @@ export default function HomePage() {
   const [err, setErr] = useState<string | null>(null);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
   const [trade, setTrade] = useState<TradeStatus | null>(null);
-  const [tickerByMarket, setTickerByMarket] = useState<Record<string, number>>({});
   const [sessionUserId, setSessionUserId] = useState<string | null>(null);
   const [autoTradeEnabled, setAutoTradeEnabled] = useState(false);
   const [autoTradeChangedAt, setAutoTradeChangedAt] = useState<string | null>(null);
@@ -891,33 +900,6 @@ export default function HomePage() {
         if (s) setStrategy(s as StrategyStatus);
         if (scannerStatus) setScanner(scannerStatus as PumpScannerStatus);
         if (marketStateStatus) setMarketState(marketStateStatus as MarketStateStatus);
-        const nextTicker: Record<string, number> = {};
-        const pollTrade = t as TradeStatus | null;
-        const sm = pollTrade?.mark_prices;
-        if (sm) {
-          for (const m of DASHBOARD_MARKETS) {
-            const p = sm[m];
-            if (typeof p === "number" && p > 0) nextTicker[m] = p;
-          }
-        }
-        const needPublic =
-          !pollTrade?.api_connected ||
-          !DASHBOARD_MARKETS.every((m) => typeof nextTicker[m] === "number" && nextTicker[m] > 0);
-        if (needPublic) {
-          const tickerRows = await fetch("https://api.upbit.com/v1/ticker?markets=KRW-BTC,KRW-ETH,KRW-XRP,KRW-TRX", {
-            cache: "no-store",
-          })
-            .then((r) => r.json() as Promise<UpbitTickerRow[]>)
-            .catch(() => [] as UpbitTickerRow[]);
-          for (const row of tickerRows) {
-            if (typeof row.market === "string" && typeof row.trade_price === "number") {
-              if (!(typeof nextTicker[row.market] === "number" && nextTicker[row.market] > 0)) {
-                nextTicker[row.market] = row.trade_price;
-              }
-            }
-          }
-        }
-        setTickerByMarket(nextTicker);
         setLastUpdatedAt(new Date().toLocaleTimeString("ko-KR", { hour12: false }));
       } catch (e) {
         if (!cancelled) setErr(e instanceof Error ? e.message : "load failed");
@@ -1116,8 +1098,7 @@ export default function HomePage() {
         : Math.max(0, qty - strategyQty);
       const legacyAvg = Number(legacyMeta?.avg ?? avg);
       const mp = valuationTrade?.mark_prices?.[m];
-      const now =
-        typeof mp === "number" && mp > 0 ? mp : (tickerByMarket[m] ?? 0);
+      const now = typeof mp === "number" && mp > 0 ? mp : 0;
       const evalAmount = qty > 0 && now > 0 ? qty * now : 0;
       const cost = qty > 0 && avg > 0 ? qty * avg : 0;
       const estimatedFees = evalAmount > 0 && cost > 0 ? cost * UPBIT_FEE_RATE + evalAmount * UPBIT_FEE_RATE : 0;
@@ -1154,7 +1135,7 @@ export default function HomePage() {
         trailingStopPrice: Number(livePos?.trailing_stop_price ?? 0),
       };
     });
-  }, [trade, tickerByMarket, strategy]);
+  }, [trade, strategy]);
 
   const holdingQtyByMarket = useMemo(() => {
     const map: Record<string, number> = {};
@@ -1162,10 +1143,12 @@ export default function HomePage() {
     return map;
   }, [holdingCards]);
 
-  const assetSummary = useMemo(() => {
-    const ap = trade?.account_portfolio;
-    if (ap && trade?.api_connected) {
+  const assetSummary = useMemo((): AssetSummaryKpi => {
+    if (!trade) return { kpi: "unavailable" };
+    if (trade.api_connected && trade.account_portfolio) {
+      const ap = trade.account_portfolio;
       return {
+        kpi: "ready",
         krw: ap.krw_total_krw,
         totalAssets: ap.total_evaluated_krw,
         totalBuy: ap.buy_cost_krw,
@@ -1175,16 +1158,9 @@ export default function HomePage() {
         totalFees: ap.estimated_fees_krw,
       };
     }
-    const valuationTrade = trade;
-    const krw = Number(valuationTrade?.krw_available ?? 0);
-    const totalBuy = holdingCards.reduce((acc, h) => acc + (h.qty > 0 ? h.cost : 0), 0);
-    const totalEval = holdingCards.reduce((acc, h) => acc + (h.qty > 0 ? h.evalAmount : 0), 0);
-    const totalFees = holdingCards.reduce((acc, h) => acc + (h.qty > 0 ? h.estimatedFees : 0), 0);
-    const netPnl = totalEval - totalBuy - totalFees;
-    const netRet = totalBuy > 0 ? (netPnl / totalBuy) * 100 : 0;
-    const totalAssets = krw + totalEval;
-    return { krw, totalAssets, totalBuy, totalEval, netPnl, netRet, totalFees };
-  }, [trade, holdingCards]);
+    if (trade.api_connected) return { kpi: "pending" };
+    return { kpi: "unavailable" };
+  }, [trade]);
 
   const tradeReadyLabel = useMemo(() => {
     if (accountSyncState === "syncing") return "계좌 동기화 중";
@@ -1373,19 +1349,43 @@ export default function HomePage() {
         >
           <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
             <div style={{ fontSize: "0.73rem", color: UI.muted, marginBottom: 3, fontWeight: 600 }}>총 보유자산</div>
-            <div style={{ fontSize: "1.55rem", fontWeight: 900, color: UI.title, lineHeight: 1.05 }}>{Math.round(assetSummary.totalAssets).toLocaleString()}</div>
+            <div style={{ fontSize: "1.55rem", fontWeight: 900, color: UI.title, lineHeight: 1.05 }}>
+              {assetSummary.kpi === "ready" ? Math.round(assetSummary.totalAssets).toLocaleString() : assetSummary.kpi === "pending" ? "…" : "—"}
+            </div>
           </div>
           <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
             <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>보유 KRW</div>
-            <div style={{ fontSize: "1.55rem", fontWeight: 900, color: UI.title, lineHeight: 1.05 }}>{Math.round(assetSummary.krw).toLocaleString()}</div>
+            <div style={{ fontSize: "1.55rem", fontWeight: 900, color: UI.title, lineHeight: 1.05 }}>
+              {assetSummary.kpi === "ready" ? Math.round(assetSummary.krw).toLocaleString() : assetSummary.kpi === "pending" ? "…" : "—"}
+            </div>
           </div>
           <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
             <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>순평가손익</div>
-            <div style={{ fontSize: "1.55rem", fontWeight: 900, color: assetSummary.netPnl >= 0 ? UI.pass : UI.watch, lineHeight: 1.05 }}>{Math.round(assetSummary.netPnl).toLocaleString()}</div>
+            <div
+              style={{
+                fontSize: "1.55rem",
+                fontWeight: 900,
+                color:
+                  assetSummary.kpi === "ready" ? (assetSummary.netPnl >= 0 ? UI.pass : UI.watch) : UI.muted,
+                lineHeight: 1.05,
+              }}
+            >
+              {assetSummary.kpi === "ready" ? Math.round(assetSummary.netPnl).toLocaleString() : assetSummary.kpi === "pending" ? "…" : "—"}
+            </div>
           </div>
           <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
             <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>순수익률</div>
-            <div style={{ fontSize: "1.55rem", fontWeight: 900, color: assetSummary.netRet >= 0 ? UI.pass : UI.watch, lineHeight: 1.05 }}>{assetSummary.netRet.toFixed(2)}%</div>
+            <div
+              style={{
+                fontSize: "1.55rem",
+                fontWeight: 900,
+                color:
+                  assetSummary.kpi === "ready" ? (assetSummary.netRet >= 0 ? UI.pass : UI.watch) : UI.muted,
+                lineHeight: 1.05,
+              }}
+            >
+              {assetSummary.kpi === "ready" ? `${assetSummary.netRet.toFixed(2)}%` : assetSummary.kpi === "pending" ? "…" : "—"}
+            </div>
           </div>
         </div>
         <section

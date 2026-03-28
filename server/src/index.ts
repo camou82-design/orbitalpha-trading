@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import dotenv from "dotenv";
-import Fastify from "fastify";
+import Fastify, { type FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import {
   THIS_REPO_SERVICE_LINE,
@@ -456,13 +456,14 @@ async function main() {
     live_order_confirm: env.liveOrderConfirm,
   }));
 
-  app.get("/api/v1/trade/status", async (req) => {
+  /** 동일 페이로드(account_portfolio 포함) — 레거시 클라이언트가 /account/status 를 호출하는 경우 대비. */
+  const buildTradeStatusResponse = async (req: FastifyRequest, route: string) => {
     const body = await trade.status();
     if (!body.api_connected) {
       const egressIp = await getEgressPublicIp();
       req.log.warn(
         {
-          route: "GET /api/v1/trade/status",
+          route,
           api_connected: false,
           account_sync_failure_code: body.account_sync_failure_code,
           account_sync_failure_message: body.account_sync_failure_message,
@@ -477,7 +478,10 @@ async function main() {
       );
     }
     return body;
-  });
+  };
+
+  app.get("/api/v1/trade/status", async (req) => buildTradeStatusResponse(req, "GET /api/v1/trade/status"));
+  app.get("/api/v1/account/status", async (req) => buildTradeStatusResponse(req, "GET /api/v1/account/status"));
   app.get("/api/v1/strategy/status", async () => {
     const s = strategy.status();
     const t = await trade.status();
