@@ -1,4 +1,5 @@
 import type { Env } from "./env.js";
+import { buildAccountValuation, type AccountPortfolioSnapshot } from "./account-portfolio.js";
 import { appendLog } from "./log-store.js";
 import { fetchAccounts, placeMarketBuy, placeMarketSell, type UpbitAccount } from "./upbit-private.js";
 import { companyIdSchema, serviceIdSchema } from "@orbitalpha/shared";
@@ -540,6 +541,19 @@ export function createTradeControl(
       const strategyPositions = state.strategyPositions;
       syncLegacyBuckets(conn.balances);
       const funds = computeKrwFunds(conn);
+
+      let account_portfolio: AccountPortfolioSnapshot | null = null;
+      let mark_prices: Record<string, number> | null = null;
+      if (conn.connected && conn.balances.length > 0) {
+        try {
+          const snap = await buildAccountValuation(conn.balances);
+          account_portfolio = snap.portfolio;
+          mark_prices = snap.mark_prices;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          await log("account_portfolio_fetch_failed", { error: msg.slice(0, 400) });
+        }
+      }
       const legacyPositions = Object.fromEntries(
         MANAGED_MARKETS.map((market) => [
           market,
@@ -600,6 +614,8 @@ export function createTradeControl(
         strategy_position_pnl: Object.values(strategyPositions).reduce((acc, p) => acc + p.realized_pnl, 0),
         total_pnl: null,
       },
+      account_portfolio,
+      mark_prices,
     };
   };
 

@@ -169,6 +169,19 @@ type TradeStatus = {
     strategy_position_pnl: number;
     total_pnl: number | null;
   };
+  /** API 연결 시에만 채움 — 총평가·순손익·수익률 단일 기준(서버 계좌+동일 티커 스냅샷). */
+  account_portfolio?: {
+    total_evaluated_krw: number;
+    krw_available_krw: number;
+    krw_total_krw: number;
+    buy_cost_krw: number;
+    estimated_fees_krw: number;
+    net_pnl_krw: number;
+    net_return_pct: number;
+    as_of: string;
+  } | null;
+  /** `account_portfolio` 산출에 사용한 현재가(대시보드 4종목). */
+  mark_prices?: Record<string, number> | null;
 };
 
 type UpbitTickerRow = {
@@ -704,11 +717,6 @@ export default function HomePage() {
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
   const [trade, setTrade] = useState<TradeStatus | null>(null);
   const [tickerByMarket, setTickerByMarket] = useState<Record<string, number>>({});
-  const [valuationSnapshot, setValuationSnapshot] = useState<{
-    trade: TradeStatus;
-    tickerByMarket: Record<string, number>;
-    atMs: number;
-  } | null>(null);
   const [sessionUserId, setSessionUserId] = useState<string | null>(null);
   const [autoTradeEnabled, setAutoTradeEnabled] = useState(false);
   const [autoTradeChangedAt, setAutoTradeChangedAt] = useState<string | null>(null);
@@ -827,16 +835,13 @@ export default function HomePage() {
           }
         }
 
-        const [c, l, tradePollRes, s, scannerStatus, marketStateStatus, tickerRows] = await Promise.all([
+        const [c, l, tradePollRes, s, scannerStatus, marketStateStatus] = await Promise.all([
           fetch(`${apiBase}/api/v1/context?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()),
           fetch(`${apiBase}/api/v1/logs?limit=200&_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()),
           fetchTradeStatusDetailed(apiBase),
           fetch(`${apiBase}/api/v1/strategy/status?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()).catch(() => null),
           fetch(`${apiBase}/api/v1/scanner/status?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()).catch(() => null),
           fetch(`${apiBase}/api/v1/market-state?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()).catch(() => null),
-          fetch("https://api.upbit.com/v1/ticker?markets=KRW-BTC,KRW-ETH,KRW-XRP,KRW-TRX", { cache: "no-store" })
-            .then((r) => r.json() as Promise<UpbitTickerRow[]>)
-            .catch(() => [] as UpbitTickerRow[]),
         ]);
         if (cancelled) return;
         setCtx({
@@ -887,19 +892,32 @@ export default function HomePage() {
         if (scannerStatus) setScanner(scannerStatus as PumpScannerStatus);
         if (marketStateStatus) setMarketState(marketStateStatus as MarketStateStatus);
         const nextTicker: Record<string, number> = {};
-        for (const row of tickerRows) {
-          if (typeof row.market === "string" && typeof row.trade_price === "number") {
-            nextTicker[row.market] = row.trade_price;
+        const pollTrade = t as TradeStatus | null;
+        const sm = pollTrade?.mark_prices;
+        if (sm) {
+          for (const m of DASHBOARD_MARKETS) {
+            const p = sm[m];
+            if (typeof p === "number" && p > 0) nextTicker[m] = p;
+          }
+        }
+        const needPublic =
+          !pollTrade?.api_connected ||
+          !DASHBOARD_MARKETS.every((m) => typeof nextTicker[m] === "number" && nextTicker[m] > 0);
+        if (needPublic) {
+          const tickerRows = await fetch("https://api.upbit.com/v1/ticker?markets=KRW-BTC,KRW-ETH,KRW-XRP,KRW-TRX", {
+            cache: "no-store",
+          })
+            .then((r) => r.json() as Promise<UpbitTickerRow[]>)
+            .catch(() => [] as UpbitTickerRow[]);
+          for (const row of tickerRows) {
+            if (typeof row.market === "string" && typeof row.trade_price === "number") {
+              if (!(typeof nextTicker[row.market] === "number" && nextTicker[row.market] > 0)) {
+                nextTicker[row.market] = row.trade_price;
+              }
+            }
           }
         }
         setTickerByMarket(nextTicker);
-        if (t) {
-          setValuationSnapshot({
-            trade: t as TradeStatus,
-            tickerByMarket: nextTicker,
-            atMs: Date.now(),
-          });
-        }
         setLastUpdatedAt(new Date().toLocaleTimeString("ko-KR", { hour12: false }));
       } catch (e) {
         if (!cancelled) setErr(e instanceof Error ? e.message : "load failed");
@@ -1078,8 +1096,7 @@ export default function HomePage() {
   }, [latestByMarket]);
 
   const holdingCards = useMemo(() => {
-    const valuationTrade = valuationSnapshot?.trade ?? trade;
-    const valuationTickerByMarket = valuationSnapshot?.tickerByMarket ?? tickerByMarket;
+    const valuationTrade = trade;
     const byCurrency = new Map((valuationTrade?.balances ?? []).map((b) => [b.currency, b]));
     const strategyByMarket = valuationTrade?.strategy_positions ?? {};
     const legacyByMarket = valuationTrade?.legacy_positions ?? {};
@@ -1098,7 +1115,9 @@ export default function HomePage() {
         ? Math.max(0, Number(legacyMeta?.qty ?? 0))
         : Math.max(0, qty - strategyQty);
       const legacyAvg = Number(legacyMeta?.avg ?? avg);
-      const now = valuationTickerByMarket[m] ?? 0;
+      const mp = valuationTrade?.mark_prices?.[m];
+      const now =
+        typeof mp === "number" && mp > 0 ? mp : (tickerByMarket[m] ?? 0);
       const evalAmount = qty > 0 && now > 0 ? qty * now : 0;
       const cost = qty > 0 && avg > 0 ? qty * avg : 0;
       const estimatedFees = evalAmount > 0 && cost > 0 ? cost * UPBIT_FEE_RATE + evalAmount * UPBIT_FEE_RATE : 0;
@@ -1135,7 +1154,7 @@ export default function HomePage() {
         trailingStopPrice: Number(livePos?.trailing_stop_price ?? 0),
       };
     });
-  }, [trade, tickerByMarket, valuationSnapshot, strategy]);
+  }, [trade, tickerByMarket, strategy]);
 
   const holdingQtyByMarket = useMemo(() => {
     const map: Record<string, number> = {};
@@ -1144,7 +1163,19 @@ export default function HomePage() {
   }, [holdingCards]);
 
   const assetSummary = useMemo(() => {
-    const valuationTrade = valuationSnapshot?.trade ?? trade;
+    const ap = trade?.account_portfolio;
+    if (ap && trade?.api_connected) {
+      return {
+        krw: ap.krw_total_krw,
+        totalAssets: ap.total_evaluated_krw,
+        totalBuy: ap.buy_cost_krw,
+        totalEval: ap.total_evaluated_krw - ap.krw_total_krw,
+        netPnl: ap.net_pnl_krw,
+        netRet: ap.net_return_pct,
+        totalFees: ap.estimated_fees_krw,
+      };
+    }
+    const valuationTrade = trade;
     const krw = Number(valuationTrade?.krw_available ?? 0);
     const totalBuy = holdingCards.reduce((acc, h) => acc + (h.qty > 0 ? h.cost : 0), 0);
     const totalEval = holdingCards.reduce((acc, h) => acc + (h.qty > 0 ? h.evalAmount : 0), 0);
@@ -1153,7 +1184,7 @@ export default function HomePage() {
     const netRet = totalBuy > 0 ? (netPnl / totalBuy) * 100 : 0;
     const totalAssets = krw + totalEval;
     return { krw, totalAssets, totalBuy, totalEval, netPnl, netRet, totalFees };
-  }, [trade, valuationSnapshot, holdingCards]);
+  }, [trade, holdingCards]);
 
   const tradeReadyLabel = useMemo(() => {
     if (accountSyncState === "syncing") return "계좌 동기화 중";
@@ -1416,7 +1447,7 @@ export default function HomePage() {
             <div>scope: <strong style={{ color: UI.body }}>{ctx?.company_id ?? DEFAULT_TRADING_COMPANY_ID}/{ctx?.service_id ?? DEFAULT_TRADING_SERVICE_ID}</strong></div>
             <div>갱신: <strong style={{ color: UI.body }}>{lastUpdatedAt ?? "-"}</strong></div>
             <div>시장근거: <strong style={{ color: UI.body }}>5m {marketState?.btc_5m_trend ?? "-"} / 15m {marketState?.btc_15m_trend ?? "-"} / close {marketState?.recent_close_bias ?? "-"}</strong></div>
-            <div>총 보유 KRW: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.total_krw ?? trade?.krw_available ?? 0)).toLocaleString()}</strong></div>
+            <div>총 보유 KRW: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.account_portfolio?.krw_total_krw ?? trade?.total_krw ?? trade?.krw_available ?? 0)).toLocaleString()}</strong></div>
             <div>실주문 가능 KRW: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.live_order_available_krw ?? 0)).toLocaleString()}</strong></div>
             <div>예약/미체결 KRW: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.reserved_krw ?? 0)).toLocaleString()}</strong></div>
             <div>기존 전략 투입 KRW: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.strategy_allocated_krw ?? 0)).toLocaleString()}</strong></div>
