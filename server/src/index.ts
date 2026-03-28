@@ -101,7 +101,7 @@ async function main() {
     process.exit(1);
   }
 
-  const app = Fastify({ logger: true });
+  const app = Fastify({ logger: true, trustProxy: env.trustProxy });
   const opLog = createOperationalLogger({ debugEnabled: env.debugLogEnabled });
   const SESSION_COOKIE = "orbitalpha_trading_session";
   const sessions = new Map<string, { user_id: string; created_at: string }>();
@@ -111,7 +111,9 @@ async function main() {
     const parts = cookieHeader.split(";").map((v) => v.trim());
     const hit = parts.find((v) => v.startsWith(`${SESSION_COOKIE}=`));
     if (!hit) return null;
-    return decodeURIComponent(hit.split("=")[1] ?? "");
+    const eq = hit.indexOf("=");
+    if (eq === -1) return null;
+    return decodeURIComponent(hit.slice(eq + 1));
   };
 
   const getSession = (cookieHeader?: string) => {
@@ -120,12 +122,39 @@ async function main() {
     return sessions.get(token) ?? null;
   };
 
-  const setSessionCookie = (reply: { header: (name: string, value: string) => void }, token: string) => {
-    reply.header("set-cookie", `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=43200`);
+  const sessionCookieAttrs = (req: FastifyRequest) => {
+    const proto = String(req.headers["x-forwarded-proto"] ?? "")
+      .split(",")[0]!
+      .trim()
+      .toLowerCase();
+    const secure = env.sessionCookieSecure || proto === "https";
+    return { secure, domain: env.sessionCookieDomain };
   };
 
-  const clearSessionCookie = (reply: { header: (name: string, value: string) => void }) => {
-    reply.header("set-cookie", `${SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`);
+  const setSessionCookie = (
+    reply: { header: (name: string, value: string) => void },
+    req: FastifyRequest,
+    token: string,
+  ) => {
+    const { secure, domain } = sessionCookieAttrs(req);
+    const parts = [
+      `${SESSION_COOKIE}=${encodeURIComponent(token)}`,
+      "Path=/",
+      "HttpOnly",
+      "SameSite=Lax",
+      "Max-Age=43200",
+    ];
+    if (secure) parts.push("Secure");
+    if (domain) parts.push(`Domain=${domain}`);
+    reply.header("set-cookie", parts.join("; "));
+  };
+
+  const clearSessionCookie = (reply: { header: (name: string, value: string) => void }, req: FastifyRequest) => {
+    const { secure, domain } = sessionCookieAttrs(req);
+    const parts = [`${SESSION_COOKIE}=`, "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0"];
+    if (secure) parts.push("Secure");
+    if (domain) parts.push(`Domain=${domain}`);
+    reply.header("set-cookie", parts.join("; "));
   };
 
   const protectedPrefixes = ["/api/v1/trade/", "/api/v1/account/", "/api/v1/orders/", "/api/v1/replay/", "/api/v1/debug/"];
@@ -171,9 +200,20 @@ async function main() {
   })();
 
   await app.register(cors, {
-    origin: env.dashboardOrigin,
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      cb(null, env.corsAllowlist.includes(origin));
+    },
     credentials: true,
   });
+  app.log.info(
+    {
+      trust_proxy: env.trustProxy,
+      session_cookie_secure: env.sessionCookieSecure,
+      cors_allowlist: env.corsAllowlist,
+    },
+    "session_cookie_and_cors",
+  );
 
   const monitor = startSignalMonitor(env);
   const trade = createTradeControl(env, { onEvent: (row) => opLog.event(row) });
@@ -355,7 +395,7 @@ async function main() {
     const token = crypto.randomUUID();
     const now = new Date().toISOString();
     sessions.set(token, { user_id: id, created_at: now });
-    setSessionCookie(reply, token);
+    setSessionCookie(reply, req, token);
     const st = await trade.status();
     return {
       authenticated: true,
@@ -369,7 +409,7 @@ async function main() {
     const token = readSessionToken(req.headers.cookie);
     if (token) sessions.delete(token);
     await trade.setAutoTradeEnabled(false);
-    clearSessionCookie(reply);
+    clearSessionCookie(reply, req);
     app.log.info({ route: "auth_logout" }, "Auth logout");
     await opLog.event({
       timestamp: new Date().toISOString(),
@@ -390,13 +430,12 @@ async function main() {
     return { authenticated: false, auto_trade_enabled: false };
   });
 
-  app.get("/api/v1/auth/session", async (req, reply) => {
+  app.get("/api/v1/auth/session", async (req) => {
     const s = getSession(req.headers.cookie);
     if (!s) {
-      reply.code(401);
       return {
         authenticated: false,
-        message: "세션 만료",
+        message: "세션 없음",
         auto_trade_enabled: false,
         recovery_ready: false,
         safety_guard_state: "주의",

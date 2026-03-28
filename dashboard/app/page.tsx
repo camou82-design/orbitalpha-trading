@@ -768,7 +768,8 @@ export default function HomePage() {
           cache: "no-store",
           credentials: "include",
         });
-        if (sessionRes.status === 401) {
+        const session = (await sessionRes.json().catch(() => ({}))) as AuthSession;
+        if (!sessionRes.ok) {
           if (!cancelled) {
             setAuthState("expired");
             setAccountSyncState("idle");
@@ -777,7 +778,6 @@ export default function HomePage() {
           }
           return;
         }
-        const session = (await sessionRes.json()) as AuthSession;
         if (!session.authenticated) {
           if (!cancelled) {
             setAuthState("expired");

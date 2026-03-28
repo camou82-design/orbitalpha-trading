@@ -23,7 +23,8 @@ function LoginPageInner() {
     async function checkSession() {
       try {
         const res = await fetch(`${apiBase}/api/v1/auth/session`, { cache: "no-store", credentials: "include" });
-        if (!cancelled && res.ok) router.replace("/trading?account_sync=1");
+        const body = (await res.json().catch(() => ({}))) as { authenticated?: boolean };
+        if (!cancelled && res.ok && body.authenticated === true) router.replace("/trading?account_sync=1");
       } catch {}
     }
     const reason = params.get("reason");
