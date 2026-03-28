@@ -1449,13 +1449,13 @@ export default function HomePage() {
           <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
             <div style={{ fontSize: "0.73rem", color: UI.muted, marginBottom: 3, fontWeight: 600 }}>총 보유자산</div>
             <div style={{ fontSize: "1.55rem", fontWeight: 900, color: UI.title, lineHeight: 1.05 }}>
-              {assetSummary.kpi === "ready" ? Math.round(assetSummary.totalAssets).toLocaleString() : assetSummary.kpi === "pending" ? "…" : "—"}
+              {assetSummary.kpi === "ready" ? Math.round(assetSummary.totalAssets).toLocaleString() : "—"}
             </div>
           </div>
           <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
             <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>보유 KRW</div>
             <div style={{ fontSize: "1.55rem", fontWeight: 900, color: UI.title, lineHeight: 1.05 }}>
-              {assetSummary.kpi === "ready" ? Math.round(assetSummary.krw).toLocaleString() : assetSummary.kpi === "pending" ? "…" : "—"}
+              {assetSummary.kpi === "ready" ? Math.round(assetSummary.krw).toLocaleString() : "—"}
             </div>
           </div>
           <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
@@ -1469,7 +1469,7 @@ export default function HomePage() {
                 lineHeight: 1.05,
               }}
             >
-              {assetSummary.kpi === "ready" ? Math.round(assetSummary.netPnl).toLocaleString() : assetSummary.kpi === "pending" ? "…" : "—"}
+              {assetSummary.kpi === "ready" ? Math.round(assetSummary.netPnl).toLocaleString() : "—"}
             </div>
           </div>
           <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
@@ -1483,7 +1483,7 @@ export default function HomePage() {
                 lineHeight: 1.05,
               }}
             >
-              {assetSummary.kpi === "ready" ? `${assetSummary.netRet.toFixed(2)}%` : assetSummary.kpi === "pending" ? "…" : "—"}
+              {assetSummary.kpi === "ready" ? `${assetSummary.netRet.toFixed(2)}%` : "—"}
             </div>
           </div>
         </div>

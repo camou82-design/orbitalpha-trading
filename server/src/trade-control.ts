@@ -1,7 +1,9 @@
 import type { Env } from "./env.js";
 import {
-  buildAccountValuation,
   computeAccountValuationFromPrices,
+  fetchTickerPriceMap,
+  holdingsFullyPriced,
+  marketsForAccountValuation,
   type AccountPortfolioSnapshot,
 } from "./account-portfolio.js";
 import { appendLog } from "./log-store.js";
@@ -49,6 +51,8 @@ type TradeState = {
   autoTradeEnabled: boolean;
   autoTradeChangedAt: string | null;
   recoveryReady: boolean;
+  /** 티커 실패 시에도 동일 스냅샷 기준 유지 — 빈 맵으로 재계산하지 않음 */
+  lastGoodMarkPrices: Record<string, number> | null;
   strategyPositions: Record<
     ManagedMarket,
     {
@@ -183,6 +187,7 @@ export function createTradeControl(
     autoTradeEnabled: false,
     autoTradeChangedAt: null,
     recoveryReady: false,
+    lastGoodMarkPrices: null,
     strategyPositions: {
       "KRW-BTC": { qty: 0, avg: 0, entries: 0, invested_krw_total: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
       "KRW-ETH": { qty: 0, avg: 0, entries: 0, invested_krw_total: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
@@ -610,16 +615,25 @@ export function createTradeControl(
       let account_portfolio: AccountPortfolioSnapshot | null = null;
       let mark_prices: Record<string, number> | null = null;
       if (conn.connected) {
+        const balanceRows = conn.balances.map((b) => ({
+          currency: b.currency,
+          balance: Number(b.balance),
+          locked: Number(b.locked),
+          avg_buy_price: Number(b.avg_buy_price),
+        }));
+        const markets = marketsForAccountValuation(balanceRows);
         try {
-          const snap = await buildAccountValuation(conn.balances);
-          account_portfolio = snap.portfolio;
-          mark_prices = snap.mark_prices;
+          const fresh = await fetchTickerPriceMap(markets);
+          state.lastGoodMarkPrices = { ...(state.lastGoodMarkPrices ?? {}), ...fresh };
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
-          await log("account_portfolio_fetch_failed", { error: msg.slice(0, 400) });
-          const fallback = computeAccountValuationFromPrices(conn.balances, {}, new Date().toISOString());
-          account_portfolio = fallback.portfolio;
-          mark_prices = fallback.mark_prices;
+          await log("upbit_ticker_fetch_failed", { error: msg.slice(0, 400) });
+        }
+        const priceMap: Record<string, number> = state.lastGoodMarkPrices ?? {};
+        if (holdingsFullyPriced(balanceRows, priceMap)) {
+          const snap = computeAccountValuationFromPrices(balanceRows, priceMap, new Date().toISOString());
+          account_portfolio = snap.portfolio;
+          mark_prices = snap.mark_prices;
         }
       }
       const legacyPositions = Object.fromEntries(

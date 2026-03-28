@@ -83,13 +83,8 @@ export function computeAccountValuationFromPrices(balances: BalanceRow[], tradeP
   return { portfolio, mark_prices };
 }
 
-/**
- * 업비트 계좌 잔고 + 공개 티커로 총평가·순손익·수익률을 산출한다.
- * 공개 티커 호출이 실패해도 잔고·평단 기준 스냅샷은 반환한다(상단 KPI null 방지).
- */
-export async function buildAccountValuation(balances: BalanceRow[]): Promise<AccountValuationResult> {
-  const as_of = new Date().toISOString();
-
+/** 티커 요청에 쓸 마켓 목록(보유 코인 + 대시보드 4종). */
+export function marketsForAccountValuation(balances: BalanceRow[]): string[] {
   const marketsFromHoldings = new Set<string>();
   for (const b of balances) {
     if (b.currency === "KRW") continue;
@@ -97,19 +92,34 @@ export async function buildAccountValuation(balances: BalanceRow[]): Promise<Acc
     if (qty > 0) marketsFromHoldings.add(`KRW-${b.currency}`);
   }
   for (const m of MANAGED_MARKETS) marketsFromHoldings.add(m);
+  return [...marketsFromHoldings];
+}
 
-  const markets = [...marketsFromHoldings];
-  const tradePriceByMarket: Record<string, number> = {};
-  try {
-    const tickerRows = markets.length > 0 ? await fetchTickers(markets) : [];
-    for (const t of tickerRows) {
-      if (typeof t.market === "string" && typeof t.trade_price === "number") {
-        tradePriceByMarket[t.market] = t.trade_price;
-      }
-    }
-  } catch {
-    /* KPI는 account_portfolio 단일 출처 — 티커만 실패 시 가격 0으로 동일 스키마 유지 */
+/**
+ * 보유 중인 모든 코인에 대해 양(>0)의 현재가가 맵에 있어야 한다. KRW만 보유면 true.
+ * 빈 맵으로 평가해 "현금=총자산" 오표시를 막는다.
+ */
+export function holdingsFullyPriced(balances: BalanceRow[], tradePriceByMarket: Record<string, number>): boolean {
+  for (const b of balances) {
+    if (b.currency === "KRW") continue;
+    const qty = b.balance + b.locked;
+    if (qty <= 0) continue;
+    const market = `KRW-${b.currency}`;
+    const p = tradePriceByMarket[market];
+    if (typeof p !== "number" || !Number.isFinite(p) || p <= 0) return false;
   }
+  return true;
+}
 
-  return computeAccountValuationFromPrices(balances, tradePriceByMarket, as_of);
+/** 공개 티커 조회 실패 시 throw — 호출부에서 마지막 정상 가격맵으로 폴백한다. */
+export async function fetchTickerPriceMap(markets: string[]): Promise<Record<string, number>> {
+  if (markets.length === 0) return {};
+  const tickerRows = await fetchTickers(markets);
+  const tradePriceByMarket: Record<string, number> = {};
+  for (const t of tickerRows) {
+    if (typeof t.market === "string" && typeof t.trade_price === "number") {
+      tradePriceByMarket[t.market] = t.trade_price;
+    }
+  }
+  return tradePriceByMarket;
 }
