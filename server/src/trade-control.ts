@@ -1,9 +1,8 @@
 import type { Env } from "./env.js";
 import {
   computeAccountValuationFromPrices,
-  fetchTickerPriceMap,
   holdingsFullyPriced,
-  marketsForAccountValuation,
+  resolveTickerPricesForBalances,
   type AccountPortfolioSnapshot,
 } from "./account-portfolio.js";
 import { appendLog } from "./log-store.js";
@@ -621,17 +620,10 @@ export function createTradeControl(
           locked: Number(b.locked),
           avg_buy_price: Number(b.avg_buy_price),
         }));
-        const markets = marketsForAccountValuation(balanceRows);
-        try {
-          const fresh = await fetchTickerPriceMap(markets);
-          state.lastGoodMarkPrices = { ...(state.lastGoodMarkPrices ?? {}), ...fresh };
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          await log("upbit_ticker_fetch_failed", { error: msg.slice(0, 400) });
-        }
-        const priceMap: Record<string, number> = state.lastGoodMarkPrices ?? {};
-        if (holdingsFullyPriced(balanceRows, priceMap)) {
-          const snap = computeAccountValuationFromPrices(balanceRows, priceMap, new Date().toISOString());
+        const merged = await resolveTickerPricesForBalances(balanceRows, state.lastGoodMarkPrices);
+        state.lastGoodMarkPrices = merged;
+        if (holdingsFullyPriced(balanceRows, merged)) {
+          const snap = computeAccountValuationFromPrices(balanceRows, merged, new Date().toISOString());
           account_portfolio = snap.portfolio;
           mark_prices = snap.mark_prices;
         }
