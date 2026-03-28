@@ -19,7 +19,7 @@ import { VOLUME_THRESHOLD_BY_MARKET } from "./volume-thresholds.js";
 import { createTradeControl } from "./trade-control.js";
 import { createLiveDataStrategy } from "./live-strategy.js";
 import { createPumpScanner } from "./pump-scanner.js";
-import { createMarketStateFilter } from "./market-state-filter.js";
+import { assertOrderBuyAllowed, createMarketStateFilter } from "./market-state-filter.js";
 import { createOperationalLogger } from "./operational-logs.js";
 import { readReplayRange } from "./replay-store.js";
 
@@ -216,12 +216,22 @@ async function main() {
   );
 
   const monitor = startSignalMonitor(env);
-  const trade = createTradeControl(env, { onEvent: (row) => opLog.event(row) });
   const marketFilter = createMarketStateFilter({
     companyId: env.companyId,
     serviceId: env.serviceId,
     readLogs: (limit: number) => readRecentLogs(env.companyId, env.serviceId, limit),
     onEvent: (row) => opLog.event(row),
+  });
+  const trade = createTradeControl(env, {
+    onEvent: (row) => opLog.event(row),
+    assertBuyGate: async (ctx) => {
+      const snap = await marketFilter.evaluate();
+      const r = assertOrderBuyAllowed(snap, {
+        kind: ctx.isAdditionalBuy ? "add_to_position" : "new_entry",
+        signalPayload: ctx.signalPayload,
+      });
+      if (!r.ok) throw new Error(`order_entry_gate: ${r.blocked_reason}`);
+    },
   });
   const strategy = createLiveDataStrategy({
     companyId: env.companyId,
@@ -696,29 +706,7 @@ async function main() {
         reply.code(400);
         return { ok: false, error: allowed.reason ?? "entry not allowed by signal gate" };
       }
-      const ms = await marketFilter.evaluate();
-      const mg = marketFilter.entryGate(latestSignal?.payload, ms);
-      if (!mg.ok) {
-        await opLog.event({
-          timestamp: new Date().toISOString(),
-          event_type: "entry_candidate_rejected",
-          market,
-          strategy_type: null,
-          market_state: ms.market_state,
-          side: "buy",
-          reason: mg.reason ?? "market_state_gate",
-          balance_krw: null,
-          position_qty: null,
-          avg_buy_price: null,
-          current_price: null,
-          pnl_net: null,
-          pnl_net_pct: null,
-          note: null,
-        });
-        reply.code(400);
-        return { ok: false, error: mg.reason ?? "entry blocked by market state filter", market_state: ms.market_state };
-      }
-      const order = await trade.placeBuy(market, confirm);
+      const order = await trade.placeBuy(market, confirm, undefined, "stable", "strategy", latestSignal?.payload);
       await opLog.event({
         timestamp: new Date().toISOString(),
         event_type: "manual_order_filled",

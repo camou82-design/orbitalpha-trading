@@ -8,9 +8,16 @@ import { STRATEGY_RISK_CONFIG, UPBIT_FEE_RATE, type StopTriggerKind, type Strate
 
 type TradeApi = {
   status: () => Promise<any>;
-  placeBuy: (market: string, confirm: boolean, amountKrw?: number, strategyType?: StrategyType) => Promise<any>;
+  placeBuy: (
+    market: string,
+    confirm: boolean,
+    amountKrw?: number,
+    strategyType?: StrategyType,
+    bucket?: "strategy" | "legacy",
+    signalPayload?: unknown,
+  ) => Promise<any>;
   placeSell: (market: string, confirm: boolean, ratio?: number) => Promise<any>;
-  placeLegacyDcaBuy?: (market: string, confirm: boolean, amountKrw?: number) => Promise<any>;
+  placeLegacyDcaBuy?: (market: string, confirm: boolean, amountKrw?: number, signalPayload?: unknown) => Promise<any>;
   placeLegacyExitSell?: (market: string, confirm: boolean, ratio?: number) => Promise<any>;
   setAutoTradeEnabled?: (enabled: boolean) => Promise<void>;
 };
@@ -304,10 +311,9 @@ export function createLiveDataStrategy(opts: {
       if (opts.trade.placeLegacyDcaBuy && !locked && dcaCount < dcaMax && dcaCooldownPassed) {
         const krw = Number(tstatus.krw_available ?? 0);
         const orderKrw = Math.floor(Math.max(5000, Math.min(12000, krw * 0.06)));
-        const marketOkay = marketState.market_state !== "risk_off";
-        if (orderKrw >= 5000 && krw > orderKrw * 1.2 && marketOkay && legacySignalAllowsDca(sig)) {
+        if (orderKrw >= 5000 && krw > orderKrw * 1.2 && legacySignalAllowsDca(sig)) {
           try {
-            await opts.trade.placeLegacyDcaBuy(market, true, orderKrw);
+            await opts.trade.placeLegacyDcaBuy(market, true, orderKrw, sig?.p);
             state.legacy.dca_count[market] = dcaCount + 1;
             state.legacy.next_dca_at[market] = new Date(Date.now() + 20 * 60_000).toISOString();
             state.legacy.dca_locked[market] = dcaCount + 1 >= dcaMax;
@@ -689,8 +695,6 @@ export function createLiveDataStrategy(opts: {
       if (!sig) continue;
       if (!sig.p.filter_pass) continue; // pass only
       if ((sig.p.signal_type ?? "").toUpperCase() === "LOW") continue;
-      const gate = opts.marketState.entryGate(sig.p, marketState);
-      if (!gate.ok) continue;
 
       const st = await opts.trade.status();
       const currency = market.replace("KRW-", "");
@@ -703,7 +707,7 @@ export function createLiveDataStrategy(opts: {
       if (liveOrderAvailableKrw < orderKrw) continue;
       const strategyType: StrategyType = marketState.market_state === "risk_on" ? "momentum" : "stable";
       try {
-        await opts.trade.placeBuy(market, true, orderKrw, strategyType);
+        await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", sig.p);
       } catch (e) {
         state.safety_guard.order_fail_count_today += 1;
         if (state.safety_guard.order_fail_count_today >= 3) {

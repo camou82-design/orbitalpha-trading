@@ -154,6 +154,13 @@ export function createTradeControl(
       pnl_net_pct: number | null;
       note: string | null;
     }) => Promise<void>;
+    /** 매수 직전 — 시장 스냅샷·entry 게이트 재검사 (신규/추가 공통). */
+    assertBuyGate?: (ctx: {
+      market: string;
+      bucket: PositionBucket;
+      isAdditionalBuy: boolean;
+      signalPayload: unknown | undefined;
+    }) => Promise<void>;
   },
 ) {
   const companyId = companyIdSchema.parse(env.companyId);
@@ -355,7 +362,17 @@ export function createTradeControl(
     amountKrw = TEST_ORDER_KRW,
     strategyType: StrategyType = "stable",
     bucket: PositionBucket = "strategy",
+    signalPayload?: unknown,
   ) => {
+    const posPre = state.strategyPositions[market as keyof typeof state.strategyPositions];
+    const strategyQtyPre = Number(posPre?.qty ?? 0);
+    const isAdditionalBuy = bucket === "legacy" || strategyQtyPre > 0;
+    await hooks?.assertBuyGate?.({
+      market,
+      bucket,
+      isAdditionalBuy,
+      signalPayload,
+    });
     const conn = await ensureOrderAllowed("buy", market, confirm, bucket);
     const funds = computeKrwFunds(conn);
     if (funds.live_order_available_krw < 5000) throw new Error("Live order available KRW is below minimum order amount");
@@ -624,8 +641,8 @@ export function createTradeControl(
     connectionCheck: getConnectionStatus,
     placeBuy,
     placeSell,
-    placeLegacyDcaBuy: (market: string, confirm: boolean, amountKrw = TEST_ORDER_KRW) =>
-      placeBuy(market, confirm, amountKrw, "stable", "legacy"),
+    placeLegacyDcaBuy: (market: string, confirm: boolean, amountKrw = TEST_ORDER_KRW, signalPayload?: unknown) =>
+      placeBuy(market, confirm, amountKrw, "stable", "legacy", signalPayload),
     placeLegacyExitSell: (market: string, confirm: boolean, ratio = 1) =>
       placeSell(market, confirm, ratio, "legacy"),
     setAutoTradeEnabled,

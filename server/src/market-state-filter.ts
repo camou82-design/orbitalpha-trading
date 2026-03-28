@@ -6,7 +6,7 @@ import { fetchMinuteCandles } from "./upbit-public.js";
 export type MarketState = "risk_on" | "neutral" | "risk_off";
 export type EntryPolicy = "적극 진입" | "선별 진입" | "신규 진입 차단";
 
-type StateSnapshot = {
+export type MarketStateSnapshot = {
   timestamp: string;
   market_state: MarketState;
   entry_policy: EntryPolicy;
@@ -17,6 +17,25 @@ type StateSnapshot = {
   breadth_ratio: number;
   recent_close_bias: "up" | "down" | "flat";
 };
+
+/** 주문 직전 게이트용 — UI `market-state` 와 동일 스냅샷 기준. */
+export type OrderBuyGateResult =
+  | {
+      ok: true;
+      market_state: MarketState;
+      entry_policy: EntryPolicy;
+      new_entry_blocked: false;
+      add_entry_blocked: false;
+      blocked_reason: null;
+    }
+  | {
+      ok: false;
+      market_state: MarketState;
+      entry_policy: EntryPolicy;
+      new_entry_blocked: boolean;
+      add_entry_blocked: boolean;
+      blocked_reason: string;
+    };
 
 function ema(values: number[], period: number): number {
   if (!values.length) return 0;
@@ -53,6 +72,19 @@ function signalStrengthScore(payload: unknown) {
   return Math.min(100, score);
 }
 
+/** entryGate / assertOrderBuyAllowed 공통 점수 판정 */
+function runEntryScoreGate(
+  market_state: MarketState,
+  min_entry_score: number,
+  market_bonus: number,
+  payload: unknown | undefined,
+) {
+  const score = signalStrengthScore(payload) + market_bonus;
+  if (market_state === "risk_off") return { ok: false as const, reason: "market_state risk_off: 신규 진입 차단", score };
+  if (score < min_entry_score) return { ok: false as const, reason: `entry score ${score} < ${min_entry_score}`, score };
+  return { ok: true as const, score };
+}
+
 export function createMarketStateFilter(args: {
   companyId: string;
   serviceId: string;
@@ -74,7 +106,7 @@ export function createMarketStateFilter(args: {
     note: string | null;
   }) => Promise<void>;
 }) {
-  const state: { latest: StateSnapshot | null } = { latest: null };
+  const state: { latest: MarketStateSnapshot | null } = { latest: null };
 
   const evaluate = async () => {
     const c5 = await fetchMinuteCandles("KRW-BTC", 5, 50);
@@ -115,7 +147,7 @@ export function createMarketStateFilter(args: {
     if (riskOffScore >= 2) marketState = "risk_off";
     else if (btc5 === "up" && btc15 === "up" && flowUp && r5 > -0.2 && r15 > -0.2 && !sharpDrop) marketState = "risk_on";
 
-    const snap: StateSnapshot = {
+    const snap: MarketStateSnapshot = {
       timestamp: new Date().toISOString(),
       market_state: marketState,
       entry_policy: marketState === "risk_on" ? "적극 진입" : marketState === "neutral" ? "선별 진입" : "신규 진입 차단",
@@ -162,17 +194,67 @@ export function createMarketStateFilter(args: {
   const entryGate = (
     payload: unknown,
     s: { market_state: "risk_on" | "neutral" | "risk_off"; min_entry_score: number; market_bonus: number },
-  ) => {
-    const score = signalStrengthScore(payload) + s.market_bonus;
-    if (s.market_state === "risk_off") return { ok: false, reason: "market_state risk_off: 신규 진입 차단", score };
-    if (score < s.min_entry_score) return { ok: false, reason: `entry score ${score} < ${s.min_entry_score}`, score };
-    return { ok: true, score };
-  };
+  ) => runEntryScoreGate(s.market_state, s.min_entry_score, s.market_bonus, payload);
 
   return {
     evaluate,
     status: () => state.latest,
     entryGate,
+  };
+}
+
+/**
+ * 신규 진입·추가매수(전략 물량 추가·레거시 DCA) 공통 게이트.
+ * - 하락장(risk_off): 신규·추가 모두 차단.
+ * - 그 외: 추가매수도 `entryGate`와 동일 점수 기준(표시되는 진입 정책과 주문 엔진 일치).
+ */
+export function assertOrderBuyAllowed(
+  snap: MarketStateSnapshot,
+  args: { kind: "new_entry" | "add_to_position"; signalPayload: unknown | undefined },
+): OrderBuyGateResult {
+  const { market_state, entry_policy } = snap;
+
+  if (market_state === "risk_off") {
+    return {
+      ok: false,
+      market_state,
+      entry_policy,
+      new_entry_blocked: true,
+      add_entry_blocked: true,
+      blocked_reason: "market_state risk_off: 신규·추가 진입 차단",
+    };
+  }
+
+  const g = runEntryScoreGate(snap.market_state, snap.min_entry_score, snap.market_bonus, args.signalPayload);
+  if (!g.ok) {
+    const blocked_reason = g.reason ?? "entry_gate_failed";
+    if (args.kind === "new_entry") {
+      return {
+        ok: false,
+        market_state,
+        entry_policy,
+        new_entry_blocked: true,
+        add_entry_blocked: false,
+        blocked_reason,
+      };
+    }
+    return {
+      ok: false,
+      market_state,
+      entry_policy,
+      new_entry_blocked: false,
+      add_entry_blocked: true,
+      blocked_reason,
+    };
+  }
+
+  return {
+    ok: true,
+    market_state,
+    entry_policy,
+    new_entry_blocked: false,
+    add_entry_blocked: false,
+    blocked_reason: null,
   };
 }
 
