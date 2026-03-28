@@ -1,9 +1,14 @@
 import type { Env } from "./env.js";
-import { buildAccountValuation, type AccountPortfolioSnapshot } from "./account-portfolio.js";
+import {
+  buildAccountValuation,
+  computeAccountValuationFromPrices,
+  type AccountPortfolioSnapshot,
+} from "./account-portfolio.js";
 import { appendLog } from "./log-store.js";
 import { fetchAccounts, placeMarketBuy, placeMarketSell, type UpbitAccount } from "./upbit-private.js";
 import { companyIdSchema, serviceIdSchema } from "@orbitalpha/shared";
 import type { StrategyType } from "./strategy-risk-config.js";
+import { ORDER_LIMITS } from "@orbitalpha/shared";
 import { STRATEGY_RISK_CONFIG } from "./strategy-risk-config.js";
 import crypto from "node:crypto";
 
@@ -16,6 +21,8 @@ type LegacyBucketState = {
   avg: number;
   dca_count: number;
   dca_max: number;
+  /** 누적 DCA 매수 KRW (한도 게이트용). */
+  dca_krw_total: number;
   dca_locked: boolean;
   next_dca_at: string | null;
   exit_stage: 0 | 1 | 2;
@@ -48,6 +55,8 @@ type TradeState = {
       qty: number;
       avg: number;
       entries: number;
+      /** 전략 매수 누적 KRW (추가매수 한도). */
+      invested_krw_total: number;
       realized_pnl: number;
       strategy_type: StrategyType;
       stop_loss_pct: number;
@@ -64,7 +73,6 @@ const COOLDOWN_MS = 20_000;
 const ALLOWED_MARKETS = new Set(["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"]);
 const MANAGED_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"] as const;
 const MAX_CONCURRENT_STRATEGY_POSITIONS = 2;
-const MAX_ENTRIES_PER_MARKET = 2; // 최초 1 + 추가 1
 const STRATEGY_RULES = {
   tp1_pct: 2.5,
   tp2_pct: 5.0,
@@ -176,16 +184,16 @@ export function createTradeControl(
     autoTradeChangedAt: null,
     recoveryReady: false,
     strategyPositions: {
-      "KRW-BTC": { qty: 0, avg: 0, entries: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
-      "KRW-ETH": { qty: 0, avg: 0, entries: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
-      "KRW-XRP": { qty: 0, avg: 0, entries: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
-      "KRW-TRX": { qty: 0, avg: 0, entries: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
+      "KRW-BTC": { qty: 0, avg: 0, entries: 0, invested_krw_total: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
+      "KRW-ETH": { qty: 0, avg: 0, entries: 0, invested_krw_total: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
+      "KRW-XRP": { qty: 0, avg: 0, entries: 0, invested_krw_total: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
+      "KRW-TRX": { qty: 0, avg: 0, entries: 0, invested_krw_total: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
     },
     legacyBuckets: {
-      "KRW-BTC": { qty: 0, avg: 0, dca_count: 0, dca_max: 3, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
-      "KRW-ETH": { qty: 0, avg: 0, dca_count: 0, dca_max: 3, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
-      "KRW-XRP": { qty: 0, avg: 0, dca_count: 0, dca_max: 3, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
-      "KRW-TRX": { qty: 0, avg: 0, dca_count: 0, dca_max: 3, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
+      "KRW-BTC": { qty: 0, avg: 0, dca_count: 0, dca_max: ORDER_LIMITS.MAX_LEGACY_DCA_COUNT_PER_MARKET, dca_krw_total: 0, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
+      "KRW-ETH": { qty: 0, avg: 0, dca_count: 0, dca_max: ORDER_LIMITS.MAX_LEGACY_DCA_COUNT_PER_MARKET, dca_krw_total: 0, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
+      "KRW-XRP": { qty: 0, avg: 0, dca_count: 0, dca_max: ORDER_LIMITS.MAX_LEGACY_DCA_COUNT_PER_MARKET, dca_krw_total: 0, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
+      "KRW-TRX": { qty: 0, avg: 0, dca_count: 0, dca_max: ORDER_LIMITS.MAX_LEGACY_DCA_COUNT_PER_MARKET, dca_krw_total: 0, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
     },
   };
 
@@ -292,6 +300,8 @@ export function createTradeControl(
         bucket.exit_status = "평단 복귀 대기";
         bucket.dca_locked = false;
         bucket.next_dca_at = null;
+        bucket.dca_count = 0;
+        bucket.dca_krw_total = 0;
       }
     }
   };
@@ -307,13 +317,22 @@ export function createTradeControl(
     const key = `${side}:${market}:${Math.floor(now / 1000)}`;
     if (state.lastOrderKey === key) throw new Error("Duplicate order blocked");
     if (side === "buy" && bucket === "strategy") {
-      const openPositions = Object.values(state.strategyPositions).filter((p) => p.qty > 0).length;
-      if (openPositions >= MAX_CONCURRENT_STRATEGY_POSITIONS) {
-        throw new Error(`Max concurrent strategy positions is ${MAX_CONCURRENT_STRATEGY_POSITIONS}`);
-      }
       const p = state.strategyPositions[market as keyof typeof state.strategyPositions];
-      if (p && p.entries >= MAX_ENTRIES_PER_MARKET) {
+      const openingNewMarket = (p?.qty ?? 0) <= 0;
+      if (openingNewMarket) {
+        const openPositions = Object.values(state.strategyPositions).filter((x) => x.qty > 0).length;
+        if (openPositions >= MAX_CONCURRENT_STRATEGY_POSITIONS) {
+          throw new Error(`Max concurrent strategy positions is ${MAX_CONCURRENT_STRATEGY_POSITIONS}`);
+        }
+      }
+      if (p && p.entries >= ORDER_LIMITS.MAX_STRATEGY_ENTRIES_PER_MARKET) {
         throw new Error(`Additional entry limit reached for ${market}`);
+      }
+    }
+    if (side === "buy" && bucket === "legacy") {
+      const lb = state.legacyBuckets[market as ManagedMarket];
+      if (lb.dca_locked || lb.dca_count >= lb.dca_max) {
+        throw new Error(`Legacy DCA limit reached for ${market}`);
       }
     }
     const conn = await getConnectionStatus();
@@ -373,6 +392,22 @@ export function createTradeControl(
       isAdditionalBuy,
       signalPayload,
     });
+    if (bucket === "legacy") {
+      const lb = state.legacyBuckets[market as ManagedMarket];
+      if (lb.dca_locked || lb.dca_count >= lb.dca_max) {
+        throw new Error(`Legacy DCA limit reached for ${market}`);
+      }
+      if (lb.dca_krw_total + amountKrw > ORDER_LIMITS.MAX_LEGACY_DCA_KRW_PER_MARKET) {
+        throw new Error(`Legacy DCA KRW limit exceeded for ${market}`);
+      }
+    }
+    if (bucket === "strategy") {
+      const posPre = state.strategyPositions[market as keyof typeof state.strategyPositions];
+      const curInv = Number(posPre?.invested_krw_total ?? 0);
+      if (curInv + amountKrw > ORDER_LIMITS.MAX_STRATEGY_INVESTED_KRW_PER_MARKET) {
+        throw new Error(`Strategy invested KRW limit exceeded for ${market}`);
+      }
+    }
     const conn = await ensureOrderAllowed("buy", market, confirm, bucket);
     const funds = computeKrwFunds(conn);
     if (funds.live_order_available_krw < 5000) throw new Error("Live order available KRW is below minimum order amount");
@@ -420,6 +455,7 @@ export function createTradeControl(
         pos.qty = nextQty;
         pos.avg = nextQty > 0 ? nextCost / nextQty : 0;
         pos.entries += 1;
+        pos.invested_krw_total = (pos.invested_krw_total ?? 0) + amountKrw;
         pos.strategy_type = strategyType;
         const rule = strategyType === "momentum" ? STRATEGY_RISK_CONFIG.momentum : STRATEGY_RISK_CONFIG.stable;
         pos.stop_loss_pct = rule.stop_loss_pct;
@@ -429,6 +465,7 @@ export function createTradeControl(
       }
       if (bucket === "legacy") {
         const lb = state.legacyBuckets[market as ManagedMarket];
+        lb.dca_krw_total += amountKrw;
         lb.dca_count = Math.min(lb.dca_count + 1, lb.dca_max);
         lb.dca_locked = lb.dca_count >= lb.dca_max;
         lb.next_dca_at = new Date(Date.now() + 20 * 60_000).toISOString();
@@ -514,21 +551,32 @@ export function createTradeControl(
       };
       markOrderResult(snap);
       if (bucket === "strategy" && pos) {
+        const prevQty = pos.qty;
         const remain = Math.max(0, pos.qty - volume);
         pos.qty = remain;
         if (remain <= 0) {
           pos.avg = 0;
           pos.entries = 0;
+          pos.invested_krw_total = 0;
+        } else if (prevQty > 0) {
+          pos.invested_krw_total = Math.max(0, (pos.invested_krw_total ?? 0) * (remain / prevQty));
         }
       }
       if (bucket === "legacy" && legacyPos) {
+        const prevLQty = legacyPos.qty;
         const remain = Math.max(0, legacyPos.qty - volume);
         legacyPos.qty = remain;
         if (remain <= 0) {
           legacyPos.avg = 0;
           legacyPos.exit_stage = 0;
           legacyPos.exit_status = "평단 복귀 대기";
+          legacyPos.dca_krw_total = 0;
+          legacyPos.dca_count = 0;
+          legacyPos.dca_locked = false;
         } else {
+          if (prevLQty > 0) {
+            legacyPos.dca_krw_total = Math.max(0, legacyPos.dca_krw_total * (remain / prevLQty));
+          }
           legacyPos.exit_stage = legacyPos.exit_stage >= 2 ? 2 : (legacyPos.exit_stage + 1) as 0 | 1 | 2;
           legacyPos.exit_status = legacyPos.exit_stage === 0 ? "평단 복귀 대기" : legacyPos.exit_stage === 1 ? "1차 탈출" : "분할 청산 중";
         }
@@ -561,7 +609,7 @@ export function createTradeControl(
 
       let account_portfolio: AccountPortfolioSnapshot | null = null;
       let mark_prices: Record<string, number> | null = null;
-      if (conn.connected && conn.balances.length > 0) {
+      if (conn.connected) {
         try {
           const snap = await buildAccountValuation(conn.balances);
           account_portfolio = snap.portfolio;
@@ -569,6 +617,9 @@ export function createTradeControl(
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           await log("account_portfolio_fetch_failed", { error: msg.slice(0, 400) });
+          const fallback = computeAccountValuationFromPrices(conn.balances, {}, new Date().toISOString());
+          account_portfolio = fallback.portfolio;
+          mark_prices = fallback.mark_prices;
         }
       }
       const legacyPositions = Object.fromEntries(
@@ -582,6 +633,8 @@ export function createTradeControl(
             dca_count: state.legacyBuckets[market].dca_count,
             dca_max: state.legacyBuckets[market].dca_max,
             dca_available: !state.legacyBuckets[market].dca_locked,
+            dca_krw_total: state.legacyBuckets[market].dca_krw_total,
+            dca_krw_cap: ORDER_LIMITS.MAX_LEGACY_DCA_KRW_PER_MARKET,
             next_dca_at: state.legacyBuckets[market].next_dca_at,
             exit_status: state.legacyBuckets[market].exit_status,
           },
@@ -608,6 +661,7 @@ export function createTradeControl(
       protective_reserve_krw: funds.protective_reserve_krw,
       balances: conn.balances,
       test_order_krw: TEST_ORDER_KRW,
+      order_limits: ORDER_LIMITS,
       cooldown_ms: COOLDOWN_MS,
       test_market: state.testMarket,
       last_order: state.lastOrder,

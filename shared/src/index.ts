@@ -22,3 +22,5 @@ export {
   type MvpSignalPayloadV1,
   type MvpSignalPayloadV2,
 } from "./schemas.js";
+export { ORDER_LIMITS } from "./order-limits.js";
+export { signalStrengthScore, runEntryScoreGate, type MarketState } from "./entry-gate.js";

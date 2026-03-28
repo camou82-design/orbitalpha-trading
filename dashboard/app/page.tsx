@@ -9,6 +9,8 @@ import {
   DEFAULT_TRADING_SERVICE_ID,
   mvpSignalPayloadV1Schema,
   mvpSignalPayloadV2Schema,
+  ORDER_LIMITS,
+  runEntryScoreGate,
   THIS_REPO_SERVICE_LINE,
 } from "@orbitalpha/shared";
 import {
@@ -33,6 +35,81 @@ function parseSignalPayload(row: SignalLogEntry) {
 
 function isPass(parsed: NonNullable<ReturnType<typeof parseSignalPayload>>): boolean {
   return parsed.kind === "v2" ? parsed.p.filter_pass : parsed.p.passed;
+}
+
+/** 서버 `assertOrderBuyAllowed`·한도와 동일 기준으로 추가매수 가능 여부 문구 생성. */
+function formatAdditionalBuyStatus(params: {
+  hasHolding: boolean;
+  apiConnected: boolean;
+  autoTradeEnabled: boolean;
+  safetyStop: boolean;
+  marketState: MarketStateStatus | null;
+  orderLimits: typeof ORDER_LIMITS;
+  stepKrw: number;
+  signalPayload: unknown | undefined;
+  strategyQty: number;
+  legacyQty: number;
+  entries: number;
+  investedKrw: number;
+  legacyDcaCount: number;
+  legacyDcaMax: number;
+  legacyDcaAvailable: boolean;
+  legacyDcaKrw: number;
+}): string {
+  const {
+    hasHolding,
+    apiConnected,
+    autoTradeEnabled,
+    safetyStop,
+    marketState,
+    orderLimits,
+    stepKrw,
+    signalPayload,
+    strategyQty,
+    legacyQty,
+    entries,
+    investedKrw,
+    legacyDcaCount,
+    legacyDcaMax,
+    legacyDcaAvailable,
+    legacyDcaKrw,
+  } = params;
+
+  if (!hasHolding) return "보유 없음";
+  if (!apiConnected) return "API 미연결";
+  if (!autoTradeEnabled) return "자동매매 OFF";
+  if (safetyStop) return "계좌보호 자동정지";
+  if (!marketState) return "시장 스냅샷 로딩 중";
+
+  const ms = marketState.market_state;
+  if (ms === "risk_off" || marketState.regime_allows_new_and_additional_buys === false) {
+    return "risk_off: 신규·추가 진입 차단";
+  }
+
+  const parts: string[] = [];
+  if (strategyQty > 0) {
+    if (entries >= orderLimits.MAX_STRATEGY_ENTRIES_PER_MARKET) {
+      parts.push(`전략: 분할진입 ${orderLimits.MAX_STRATEGY_ENTRIES_PER_MARKET}회 상한`);
+    } else if (investedKrw + stepKrw > orderLimits.MAX_STRATEGY_INVESTED_KRW_PER_MARKET) {
+      parts.push("전략: 누적 투입 KRW 상한");
+    } else {
+      const g = runEntryScoreGate(ms, marketState.min_entry_score, marketState.market_bonus, signalPayload);
+      parts.push(g.ok ? "전략 추가: 가능" : `전략 추가: ${g.reason}`);
+    }
+  }
+  if (legacyQty > 0) {
+    if (!legacyDcaAvailable || legacyDcaCount >= legacyDcaMax) {
+      parts.push(`레거시 DCA: 횟수 상한 (${legacyDcaMax}회)`);
+    } else if (legacyDcaKrw + stepKrw > orderLimits.MAX_LEGACY_DCA_KRW_PER_MARKET) {
+      parts.push("레거시 DCA: 누적 KRW 상한");
+    } else {
+      const g = runEntryScoreGate(ms, marketState.min_entry_score, marketState.market_bonus, signalPayload);
+      parts.push(g.ok ? "레거시 DCA: 가능" : `레거시 DCA: ${g.reason}`);
+    }
+  }
+
+  if (parts.length === 0) return "해당 없음";
+  return parts.join(" · ");
 }
 
 const FILTER_LABELS: Record<string, string> = {
@@ -115,6 +192,7 @@ type TradeStatus = {
     unit_currency: string;
   }>;
   test_order_krw: number;
+  order_limits?: typeof ORDER_LIMITS;
   cooldown_ms: number;
   test_market: "KRW-BTC" | "KRW-XRP" | null;
   last_order: {
@@ -146,6 +224,8 @@ type TradeStatus = {
       dca_count: number;
       dca_max: number;
       dca_available: boolean;
+      dca_krw_total?: number;
+      dca_krw_cap?: number;
       next_dca_at: string | null;
       exit_status: string;
     }
@@ -156,6 +236,7 @@ type TradeStatus = {
       qty: number;
       avg: number;
       entries: number;
+      invested_krw_total?: number;
       realized_pnl: number;
       strategy_type?: "stable" | "momentum";
       stop_loss_pct?: number;
@@ -183,6 +264,17 @@ type TradeStatus = {
   /** `account_portfolio` 산출에 사용한 현재가(대시보드 4종목). */
   mark_prices?: Record<string, number> | null;
 };
+
+/** 서버 `account_portfolio`가 KPI에 쓰이기에 충분한지(타입·JSON 변형 대비). */
+function accountPortfolioForKpi(ap: TradeStatus["account_portfolio"]): NonNullable<TradeStatus["account_portfolio"]> | null {
+  if (ap == null || typeof ap !== "object") return null;
+  const total = Number(ap.total_evaluated_krw);
+  const krwT = Number(ap.krw_total_krw);
+  const netPnl = Number(ap.net_pnl_krw);
+  const netRet = Number(ap.net_return_pct);
+  if (![total, krwT, netPnl, netRet].every((n) => Number.isFinite(n))) return null;
+  return ap as NonNullable<TradeStatus["account_portfolio"]>;
+}
 
 /** 상단 KPI — `ready`일 때만 숫자 표시(서버 account_portfolio 단일 출처). */
 type AssetSummaryKpi =
@@ -271,6 +363,8 @@ type MarketStateStatus = {
   entry_policy: "적극 진입" | "선별 진입" | "신규 진입 차단";
   market_bonus: number;
   min_entry_score: number;
+  regime_allows_new_and_additional_buys?: boolean;
+  order_limits?: typeof ORDER_LIMITS;
   btc_5m_trend: "up" | "down" | "flat";
   btc_15m_trend: "up" | "down" | "flat";
   breadth_ratio: number;
@@ -1121,8 +1215,10 @@ export default function HomePage() {
         legacyAvg,
         strategyQty,
         strategyAvg: Number(strategyMeta?.avg ?? 0),
+        strategyInvestedKrw: Number(strategyMeta?.invested_krw_total ?? 0),
         legacyDcaCount: Number(legacyMeta?.dca_count ?? 0),
-        legacyDcaMax: Number(legacyMeta?.dca_max ?? 3),
+        legacyDcaMax: Number(legacyMeta?.dca_max ?? ORDER_LIMITS.MAX_LEGACY_DCA_COUNT_PER_MARKET),
+        legacyDcaKrwTotal: Number(legacyMeta?.dca_krw_total ?? 0),
         legacyDcaAvailable: Boolean(legacyMeta?.dca_available ?? true),
         legacyNextDcaAt: typeof legacyMeta?.next_dca_at === "string" ? legacyMeta.next_dca_at : null,
         legacyExitStatus: typeof legacyMeta?.exit_status === "string" ? legacyMeta.exit_status : "평단 복귀 대기",
@@ -1145,17 +1241,20 @@ export default function HomePage() {
 
   const assetSummary = useMemo((): AssetSummaryKpi => {
     if (!trade) return { kpi: "unavailable" };
-    if (trade.api_connected && trade.account_portfolio) {
-      const ap = trade.account_portfolio;
+    const ap0 = accountPortfolioForKpi(trade.account_portfolio);
+    if (trade.api_connected && ap0) {
+      const ap = ap0;
+      const buyCost = Number(ap.buy_cost_krw);
+      const fees = Number(ap.estimated_fees_krw);
       return {
         kpi: "ready",
-        krw: ap.krw_total_krw,
-        totalAssets: ap.total_evaluated_krw,
-        totalBuy: ap.buy_cost_krw,
-        totalEval: ap.total_evaluated_krw - ap.krw_total_krw,
-        netPnl: ap.net_pnl_krw,
-        netRet: ap.net_return_pct,
-        totalFees: ap.estimated_fees_krw,
+        krw: Number(ap.krw_total_krw),
+        totalAssets: Number(ap.total_evaluated_krw),
+        totalBuy: Number.isFinite(buyCost) ? buyCost : 0,
+        totalEval: Number(ap.total_evaluated_krw) - Number(ap.krw_total_krw),
+        netPnl: Number(ap.net_pnl_krw),
+        netRet: Number(ap.net_return_pct),
+        totalFees: Number.isFinite(fees) ? fees : 0,
       };
     }
     if (trade.api_connected) return { kpi: "pending" };
@@ -1478,21 +1577,26 @@ export default function HomePage() {
           const retColor = h.netRet > 0 ? "#22c55e" : h.netRet < 0 ? "#ef4444" : UI.muted;
           const hasHolding = h.qty > 0;
           const latest = latestByMarket[h.market as DashboardMarket] ?? null;
-          const parsed = latest?.parsed ?? null;
-          const pass = parsed ? isPass(parsed) : false;
           const entries = Number((trade?.strategy_positions?.[h.market]?.entries as number | undefined) ?? 0);
-          const additionalBuyBlockReason = (() => {
-            if (!hasHolding) return "보유 없음";
-            if (!trade?.api_connected) return "API 미연결";
-            if (!autoTradeEnabled) return "자동매매 OFF";
-            const policy = marketState?.entry_policy;
-            if (policy === "신규 진입 차단") return "횡보/하락장: 추가진입 금지";
-            if (entries >= 2) return "최대 진입 횟수 도달";
-            if (strategy?.safety_guard_state === "자동정지") return "계좌보호 자동정지";
-            if (parsed && !pass) return getCardFailReason(parsed);
-            if (!parsed) return "최근 신호 없음";
-            return "조건 대기";
-          })();
+          const orderLimits = trade?.order_limits ?? marketState?.order_limits ?? ORDER_LIMITS;
+          const additionalBuyStatus = formatAdditionalBuyStatus({
+            hasHolding,
+            apiConnected: Boolean(trade?.api_connected),
+            autoTradeEnabled,
+            safetyStop: strategy?.safety_guard_state === "자동정지",
+            marketState,
+            orderLimits,
+            stepKrw: Number(trade?.test_order_krw ?? 5000),
+            signalPayload: latest?.entry?.payload,
+            strategyQty: h.strategyQty,
+            legacyQty: h.legacyQty,
+            entries,
+            investedKrw: h.strategyInvestedKrw,
+            legacyDcaCount: h.legacyDcaCount,
+            legacyDcaMax: h.legacyDcaMax,
+            legacyDcaAvailable: h.legacyDcaAvailable,
+            legacyDcaKrw: h.legacyDcaKrwTotal,
+          });
           return (
             <article
               key={`asset-${h.market}`}
@@ -1513,11 +1617,11 @@ export default function HomePage() {
                 <strong style={{ color: UI.body }}>{h.avg > 0 ? h.avg.toLocaleString() : "-"}</strong>
                 <span style={{ color: UI.mutedSoft }}>순수익률</span>
                 <strong style={{ color: retColor, fontWeight: 800 }}>{h.evalAmount > 0 ? `${h.netRet.toFixed(2)}%` : "-"}</strong>
-                <span style={{ color: UI.mutedSoft }}>현재 손절 기준</span>
-                <strong style={{ color: UI.body }}>{h.stopLossPct.toFixed(1)}%</strong>
+                <span style={{ color: UI.mutedSoft }}>탈출 정책</span>
+                <strong style={{ color: UI.body }}>회복·익절 우선</strong>
               </div>
               <div style={{ marginTop: 8, fontSize: "0.72rem", color: UI.mutedSoft, lineHeight: 1.3 }}>
-                추가매수 차단 사유: <strong style={{ color: UI.body }}>{additionalBuyBlockReason}</strong>
+                추가매수(전략·레거시): <strong style={{ color: UI.body }}>{additionalBuyStatus}</strong>
               </div>
               <details style={{ marginTop: 6 }}>
                 <summary style={{ cursor: "pointer", color: UI.muted, fontSize: "0.72rem" }}>상세</summary>
@@ -1555,6 +1659,16 @@ export default function HomePage() {
                   <strong style={{ color: UI.body }}>{h.partialTpDone ? "완료" : "미완료"}</strong>
                   <span style={{ color: UI.mutedSoft }}>트레일링 기준가</span>
                   <strong style={{ color: UI.body }}>{h.trailingStopPrice > 0 ? Math.round(h.trailingStopPrice).toLocaleString() : "-"}</strong>
+                  <span style={{ color: UI.mutedSoft }}>전략 누적 매수 KRW</span>
+                  <strong style={{ color: UI.body }}>
+                    {Math.round(h.strategyInvestedKrw).toLocaleString()} / {ORDER_LIMITS.MAX_STRATEGY_INVESTED_KRW_PER_MARKET.toLocaleString()}
+                  </strong>
+                  <span style={{ color: UI.mutedSoft }}>레거시 DCA 누적 KRW</span>
+                  <strong style={{ color: UI.body }}>
+                    {Math.round(h.legacyDcaKrwTotal).toLocaleString()} / {ORDER_LIMITS.MAX_LEGACY_DCA_KRW_PER_MARKET.toLocaleString()}
+                  </strong>
+                  <span style={{ color: UI.mutedSoft }}>참고 손실률 필드(즉시청산 미사용)</span>
+                  <strong style={{ color: UI.body }}>{h.stopLossPct.toFixed(1)}%</strong>
                 </div>
               </details>
             </article>

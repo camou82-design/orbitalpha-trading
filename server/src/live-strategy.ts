@@ -4,7 +4,13 @@ import type { SignalLogEntry } from "@orbitalpha/shared";
 import { mvpSignalPayloadV2Schema } from "@orbitalpha/shared";
 import { tradingDataRoot } from "./paths.js";
 import { fetchMinuteCandles, fetchTickers } from "./upbit-public.js";
-import { STRATEGY_RISK_CONFIG, UPBIT_FEE_RATE, type StopTriggerKind, type StrategyType } from "./strategy-risk-config.js";
+import {
+  RECOVERY_EXIT_CONFIG,
+  STRATEGY_RISK_CONFIG,
+  UPBIT_FEE_RATE,
+  type StopTriggerKind,
+  type StrategyType,
+} from "./strategy-risk-config.js";
 
 type TradeApi = {
   status: () => Promise<any>;
@@ -440,8 +446,12 @@ export function createLiveDataStrategy(opts: {
         } else if (p.breakeven_armed && pnlPct <= s.breakeven_floor_pct) {
           reasonExit = "breakeven_exit";
           stopTriggerKind = "breakeven_protect";
-        } else if (pnlPct <= STRATEGY_RISK_CONFIG.stable.stop_loss_pct) {
-          reasonExit = `stable_price_stop_${STRATEGY_RISK_CONFIG.stable.stop_loss_pct}`;
+        } else if (
+          holdMin >= RECOVERY_EXIT_CONFIG.stable.giveup_minutes &&
+          p.max_pnl_pct < RECOVERY_EXIT_CONFIG.stable.min_peak_pct_to_skip_catastrophic &&
+          pnlPct <= RECOVERY_EXIT_CONFIG.stable.catastrophic_exit_pct
+        ) {
+          reasonExit = `stable_catastrophic_exit_${RECOVERY_EXIT_CONFIG.stable.catastrophic_exit_pct}`;
           stopTriggerKind = "price_stop";
         } else if (holdMin >= STRATEGY_RISK_CONFIG.stable.weak_hold_stop_minutes && p.max_pnl_pct < 0.35 && pnlPct < 0) {
           reasonExit = "stable_time_stop_weak_rebound";
@@ -506,8 +516,12 @@ export function createLiveDataStrategy(opts: {
         } else if (p.breakeven_armed && pnlPct <= m.breakeven_floor_pct) {
           reasonExit = "momentum_breakeven_protect";
           stopTriggerKind = "breakeven_protect";
-        } else if (pnlPct <= m.stop_loss_pct) {
-          reasonExit = `momentum_price_stop_${m.stop_loss_pct}`;
+        } else if (
+          holdMin >= RECOVERY_EXIT_CONFIG.momentum.giveup_minutes &&
+          p.max_pnl_pct < RECOVERY_EXIT_CONFIG.momentum.min_peak_pct_to_skip_catastrophic &&
+          pnlPct <= RECOVERY_EXIT_CONFIG.momentum.catastrophic_exit_pct
+        ) {
+          reasonExit = `momentum_catastrophic_exit_${RECOVERY_EXIT_CONFIG.momentum.catastrophic_exit_pct}`;
           stopTriggerKind = "price_stop";
         } else {
           try {

@@ -1,9 +1,9 @@
 import type { SignalLogEntry } from "@orbitalpha/shared";
-import { mvpSignalPayloadV2Schema } from "@orbitalpha/shared";
+import { mvpSignalPayloadV2Schema, ORDER_LIMITS, runEntryScoreGate, signalStrengthScore, type MarketState } from "@orbitalpha/shared";
 import { appendLog } from "./log-store.js";
 import { fetchMinuteCandles } from "./upbit-public.js";
 
-export type MarketState = "risk_on" | "neutral" | "risk_off";
+export type { MarketState };
 export type EntryPolicy = "적극 진입" | "선별 진입" | "신규 진입 차단";
 
 export type MarketStateSnapshot = {
@@ -12,6 +12,9 @@ export type MarketStateSnapshot = {
   entry_policy: EntryPolicy;
   market_bonus: number;
   min_entry_score: number;
+  /** risk_off가 아닐 때만 신규·추가 매수 게이트(점수) 평가 진행. */
+  regime_allows_new_and_additional_buys: boolean;
+  order_limits: typeof ORDER_LIMITS;
   btc_5m_trend: "up" | "down" | "flat";
   btc_15m_trend: "up" | "down" | "flat";
   breadth_ratio: number;
@@ -51,38 +54,6 @@ function trendByEma(closes: number[], shortP: number, longP: number): "up" | "do
   if (s > l * 1.001) return "up";
   if (s < l * 0.999) return "down";
   return "flat";
-}
-
-function signalStrengthScore(payload: unknown) {
-  const p = mvpSignalPayloadV2Schema.safeParse(payload);
-  if (!p.success) return 0;
-  let score = 0;
-  if (p.data.filter_pass) score += 45;
-  const vol = p.data.filters.find((f) => f.id === "volume_increase");
-  const box = p.data.filters.find((f) => f.id === "box_breakout");
-  const close = p.data.filters.find((f) => f.id === "volume_spike_close_fail");
-  if (vol?.passed) score += 20;
-  if (box?.passed) score += 15;
-  if (close?.passed) score += 10;
-  const sigType = (p.data.signal_type ?? "").toUpperCase();
-  if (sigType === "HIGH") score += 10;
-  if (sigType === "MID") score += 6;
-  const vr = Number(p.data.volume_ratio ?? 0);
-  if (vr >= 1.2) score += 10;
-  return Math.min(100, score);
-}
-
-/** entryGate / assertOrderBuyAllowed 공통 점수 판정 */
-function runEntryScoreGate(
-  market_state: MarketState,
-  min_entry_score: number,
-  market_bonus: number,
-  payload: unknown | undefined,
-) {
-  const score = signalStrengthScore(payload) + market_bonus;
-  if (market_state === "risk_off") return { ok: false as const, reason: "market_state risk_off: 신규 진입 차단", score };
-  if (score < min_entry_score) return { ok: false as const, reason: `entry score ${score} < ${min_entry_score}`, score };
-  return { ok: true as const, score };
 }
 
 export function createMarketStateFilter(args: {
@@ -153,6 +124,8 @@ export function createMarketStateFilter(args: {
       entry_policy: marketState === "risk_on" ? "적극 진입" : marketState === "neutral" ? "선별 진입" : "신규 진입 차단",
       market_bonus: marketState === "risk_on" ? 18 : marketState === "neutral" ? 0 : -100,
       min_entry_score: marketState === "risk_on" ? 70 : marketState === "neutral" ? 82 : 999,
+      regime_allows_new_and_additional_buys: marketState !== "risk_off",
+      order_limits: { ...ORDER_LIMITS },
       btc_5m_trend: btc5,
       btc_15m_trend: btc15,
       breadth_ratio: Number(breadth.toFixed(3)),

@@ -3,8 +3,27 @@ export type StopTriggerKind = "price_stop" | "pattern_break" | "time_stop" | "br
 
 export const UPBIT_FEE_RATE = 0.0005;
 
+/**
+ * 즉시 % 손절 대신 회복 탈출 우선. 아래 조건을 모두 만족할 때만 긴급 청산.
+ */
+export const RECOVERY_EXIT_CONFIG = {
+  stable: {
+    /** 이 시간 이상 보유 후에도 의미 있는 반등이 없으면 긴급 청산 검토 */
+    giveup_minutes: 480,
+    /** 반등 시도로 볼 최소 최고 수익률(미달 시 장기 미회복으로 간주) */
+    min_peak_pct_to_skip_catastrophic: 0.4,
+    catastrophic_exit_pct: -11,
+  },
+  momentum: {
+    giveup_minutes: 240,
+    min_peak_pct_to_skip_catastrophic: 0.5,
+    catastrophic_exit_pct: -12,
+  },
+} as const;
+
 export const STRATEGY_RISK_CONFIG = {
   stable: {
+    /** 레거시 필드 — 즉시 손절에는 사용하지 않음(회복·긴급 청산만). */
     stop_loss_pct: -2.0,
     breakeven_arm_pct: 1.8,
     breakeven_floor_pct: 0.05,
