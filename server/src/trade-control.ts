@@ -1,8 +1,10 @@
 import type { Env } from "./env.js";
 import {
+  buildEffectiveValuationPriceMap,
   computeAccountValuationFromPrices,
-  holdingsFullyPriced,
+  normalizeBalanceCurrency,
   resolveTickerPricesForBalances,
+  sanitizeAccountPortfolioSnapshot,
   type AccountPortfolioSnapshot,
 } from "./account-portfolio.js";
 import { appendLog } from "./log-store.js";
@@ -614,17 +616,38 @@ export function createTradeControl(
       let account_portfolio: AccountPortfolioSnapshot | null = null;
       let mark_prices: Record<string, number> | null = null;
       if (conn.connected) {
-        const balanceRows = conn.balances.map((b) => ({
-          currency: b.currency,
+        const rawBalances = Array.isArray(conn.balances) ? conn.balances : [];
+        const balanceRows = rawBalances.map((b) => ({
+          currency: normalizeBalanceCurrency(b.currency),
           balance: Number(b.balance),
           locked: Number(b.locked),
           avg_buy_price: Number(b.avg_buy_price),
         }));
-        const merged = await resolveTickerPricesForBalances(balanceRows, state.lastGoodMarkPrices);
-        state.lastGoodMarkPrices = merged;
-        if (holdingsFullyPriced(balanceRows, merged)) {
-          const snap = computeAccountValuationFromPrices(balanceRows, merged, new Date().toISOString());
-          account_portfolio = snap.portfolio;
+        try {
+          const merged = await resolveTickerPricesForBalances(balanceRows, state.lastGoodMarkPrices);
+          state.lastGoodMarkPrices = merged;
+          const effective = buildEffectiveValuationPriceMap(balanceRows, merged);
+          const snap = computeAccountValuationFromPrices(balanceRows, effective, new Date().toISOString());
+          account_portfolio = sanitizeAccountPortfolioSnapshot(snap.portfolio);
+          mark_prices = snap.mark_prices;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          await log("account_valuation_error", { error: msg.slice(0, 400) });
+          const effective = buildEffectiveValuationPriceMap(balanceRows, state.lastGoodMarkPrices ?? {});
+          const snap = computeAccountValuationFromPrices(balanceRows, effective, new Date().toISOString());
+          account_portfolio = sanitizeAccountPortfolioSnapshot(snap.portfolio);
+          mark_prices = snap.mark_prices;
+        }
+        if (account_portfolio === null) {
+          const br = (Array.isArray(conn.balances) ? conn.balances : []).map((b) => ({
+            currency: normalizeBalanceCurrency(b.currency),
+            balance: Number(b.balance),
+            locked: Number(b.locked),
+            avg_buy_price: Number(b.avg_buy_price),
+          }));
+          const eff = buildEffectiveValuationPriceMap(br, state.lastGoodMarkPrices ?? {});
+          const snap = computeAccountValuationFromPrices(br, eff, new Date().toISOString());
+          account_portfolio = sanitizeAccountPortfolioSnapshot(snap.portfolio);
           mark_prices = snap.mark_prices;
         }
       }

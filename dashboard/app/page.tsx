@@ -265,15 +265,23 @@ type TradeStatus = {
   mark_prices?: Record<string, number> | null;
 };
 
-/** 서버 `account_portfolio`가 KPI에 쓰이기에 충분한지(타입·JSON 변형 대비). */
+/** 서버 `account_portfolio` — 필드 누락·NaN 이 있어도 KPI는 유한 숫자로만 표시. */
 function accountPortfolioForKpi(ap: TradeStatus["account_portfolio"]): NonNullable<TradeStatus["account_portfolio"]> | null {
   if (ap == null || typeof ap !== "object") return null;
-  const total = Number(ap.total_evaluated_krw);
-  const krwT = Number(ap.krw_total_krw);
-  const netPnl = Number(ap.net_pnl_krw);
-  const netRet = Number(ap.net_return_pct);
-  if (![total, krwT, netPnl, netRet].every((n) => Number.isFinite(n))) return null;
-  return ap as NonNullable<TradeStatus["account_portfolio"]>;
+  const n = (v: unknown) => {
+    const x = Number(v);
+    return Number.isFinite(x) ? x : 0;
+  };
+  return {
+    total_evaluated_krw: n(ap.total_evaluated_krw),
+    krw_available_krw: n(ap.krw_available_krw),
+    krw_total_krw: n(ap.krw_total_krw),
+    buy_cost_krw: n(ap.buy_cost_krw),
+    estimated_fees_krw: n(ap.estimated_fees_krw),
+    net_pnl_krw: n(ap.net_pnl_krw),
+    net_return_pct: n(ap.net_return_pct),
+    as_of: typeof ap.as_of === "string" ? ap.as_of : "",
+  } as NonNullable<TradeStatus["account_portfolio"]>;
 }
 
 /** 상단 KPI — `ready`일 때만 숫자 표시(서버 account_portfolio 단일 출처). */
@@ -1241,8 +1249,12 @@ export default function HomePage() {
 
   const assetSummary = useMemo((): AssetSummaryKpi => {
     if (!trade) return { kpi: "unavailable" };
+    const apiOk =
+      trade.api_connected === true ||
+      (trade as { api_connected?: unknown }).api_connected === "true" ||
+      (trade as { api_connected?: unknown }).api_connected === 1;
     const ap0 = accountPortfolioForKpi(trade.account_portfolio);
-    if (trade.api_connected && ap0) {
+    if (apiOk && ap0) {
       const ap = ap0;
       const buyCost = Number(ap.buy_cost_krw);
       const fees = Number(ap.estimated_fees_krw);
@@ -1257,7 +1269,7 @@ export default function HomePage() {
         totalFees: Number.isFinite(fees) ? fees : 0,
       };
     }
-    if (trade.api_connected) return { kpi: "pending" };
+    if (apiOk) return { kpi: "pending" };
     return { kpi: "unavailable" };
   }, [trade]);
 

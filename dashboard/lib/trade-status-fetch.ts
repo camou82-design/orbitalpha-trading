@@ -1,7 +1,17 @@
+/** 프록시/직렬화 이슈로 api_connected 가 문자열로 올 수 있음 — 검증 전에 boolean 으로 맞춘다. */
+export function normalizeTradeStatusJson(body: unknown): void {
+  if (!body || typeof body !== "object") return;
+  const o = body as Record<string, unknown>;
+  const ac = o.api_connected;
+  if (ac === true || ac === "true" || ac === 1) o.api_connected = true;
+  else if (ac === false || ac === "false" || ac === 0) o.api_connected = false;
+}
+
 /** Validates `/api/v1/trade/status` (and 동일 페이로드의 `/api/v1/account/status`) JSON. */
 export function isValidTradeStatusPayload(x: unknown): boolean {
   if (!x || typeof x !== "object") return false;
   const o = x as Record<string, unknown>;
+  normalizeTradeStatusJson(o);
   if (typeof o.api_connected !== "boolean") return false;
   const mode = o.trading_mode;
   if (mode === undefined) return true;
@@ -44,6 +54,7 @@ export async function fetchTradeStatusDetailed(apiBase: string): Promise<TradeSt
     } catch {
       body = null;
     }
+    if (body && typeof body === "object") normalizeTradeStatusJson(body);
     if (!r.ok) {
       const { code, message } = readFailureFromBody(body, r.status);
       return { httpStatus, body, payload: null, failureCode: code, failureMessage: message };

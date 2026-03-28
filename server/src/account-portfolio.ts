@@ -11,6 +11,17 @@ export type BalanceRow = {
   avg_buy_price: number;
 };
 
+/** 업비트 잔고 currency → 티커 마켓 코드(KRW-BTC). KRW는 그대로. */
+export function normalizeBalanceCurrency(raw: string): string {
+  const s = String(raw ?? "").trim();
+  if (s.toUpperCase() === "KRW") return "KRW";
+  return s.toUpperCase();
+}
+
+function marketCodeForCurrency(currency: string): string {
+  return `KRW-${normalizeBalanceCurrency(currency)}`;
+}
+
 export type AccountPortfolioSnapshot = {
   /** KRW + 보유 암호화폐를 현재가로 환산한 총평가(업비트 앱의 총 보유자산과 동일 기준). */
   total_evaluated_krw: number;
@@ -41,9 +52,15 @@ export function computeAccountValuationFromPrices(balances: BalanceRow[], tradeP
   const krwTotal = krwAvail + krwLocked;
 
   const mark_prices: Record<string, number> = {};
-  for (const m of MANAGED_MARKETS) {
+  const addMark = (m: string) => {
     const p = tradePriceByMarket[m];
-    if (typeof p === "number" && Number.isFinite(p)) mark_prices[m] = p;
+    if (typeof p === "number" && Number.isFinite(p) && p > 0) mark_prices[m] = p;
+  };
+  for (const m of MANAGED_MARKETS) addMark(m);
+  for (const b of balances) {
+    if (b.currency === "KRW") continue;
+    if (b.balance + b.locked <= 0) continue;
+    addMark(marketCodeForCurrency(b.currency));
   }
 
   let total_evaluated = krwTotal;
@@ -54,7 +71,7 @@ export function computeAccountValuationFromPrices(balances: BalanceRow[], tradeP
     if (b.currency === "KRW") continue;
     const qty = b.balance + b.locked;
     if (qty <= 0) continue;
-    const market = `KRW-${b.currency}`;
+    const market = marketCodeForCurrency(b.currency);
     const price = tradePriceByMarket[market] ?? 0;
     const evalAmt = qty * price;
     const avg = Number(b.avg_buy_price ?? 0);
@@ -83,16 +100,54 @@ export function computeAccountValuationFromPrices(balances: BalanceRow[], tradeP
   return { portfolio, mark_prices };
 }
 
+const num = (v: unknown, d = 0): number => {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : d;
+};
+
+/** JSON 직렬화/부동소수 이후에도 KPI가 항상 유한 숫자를 갖도록 정규화. */
+export function sanitizeAccountPortfolioSnapshot(p: AccountPortfolioSnapshot): AccountPortfolioSnapshot {
+  return {
+    total_evaluated_krw: num(p.total_evaluated_krw),
+    krw_available_krw: num(p.krw_available_krw),
+    krw_total_krw: num(p.krw_total_krw),
+    buy_cost_krw: num(p.buy_cost_krw),
+    estimated_fees_krw: num(p.estimated_fees_krw),
+    net_pnl_krw: num(p.net_pnl_krw),
+    net_return_pct: num(p.net_return_pct),
+    as_of: typeof p.as_of === "string" && p.as_of.length > 0 ? p.as_of : new Date().toISOString(),
+  };
+}
+
 /** 티커 요청에 쓸 마켓 목록(보유 코인 + 대시보드 4종). */
 export function marketsForAccountValuation(balances: BalanceRow[]): string[] {
   const marketsFromHoldings = new Set<string>();
   for (const b of balances) {
     if (b.currency === "KRW") continue;
     const qty = b.balance + b.locked;
-    if (qty > 0) marketsFromHoldings.add(`KRW-${b.currency}`);
+    if (qty > 0) marketsFromHoldings.add(marketCodeForCurrency(b.currency));
   }
   for (const m of MANAGED_MARKETS) marketsFromHoldings.add(m);
   return [...marketsFromHoldings];
+}
+
+/**
+ * 티커 맵에 없거나 0인 보유 코인은 평단을 평가가로 사용(시세 부재 시에도 KPI·카드가 동일 맵 기준으로 숫자 표시).
+ * 티커가 있으면 항상 티커 우선.
+ */
+export function buildEffectiveValuationPriceMap(balances: BalanceRow[], tickerMap: Record<string, number>): Record<string, number> {
+  const out: Record<string, number> = { ...tickerMap };
+  for (const b of balances) {
+    if (b.currency === "KRW") continue;
+    const qty = b.balance + b.locked;
+    if (qty <= 0) continue;
+    const m = marketCodeForCurrency(b.currency);
+    const tp = out[m];
+    if (typeof tp === "number" && Number.isFinite(tp) && tp > 0) continue;
+    const avg = Number(b.avg_buy_price ?? 0);
+    if (Number.isFinite(avg) && avg > 0) out[m] = avg;
+  }
+  return out;
 }
 
 /**
@@ -100,12 +155,13 @@ export function marketsForAccountValuation(balances: BalanceRow[]): string[] {
  * 빈 맵으로 평가해 "현금=총자산" 오표시를 막는다.
  */
 export function holdingsFullyPriced(balances: BalanceRow[], tradePriceByMarket: Record<string, number>): boolean {
+  const eff = buildEffectiveValuationPriceMap(balances, tradePriceByMarket);
   for (const b of balances) {
     if (b.currency === "KRW") continue;
     const qty = b.balance + b.locked;
     if (qty <= 0) continue;
-    const market = `KRW-${b.currency}`;
-    const p = tradePriceByMarket[market];
+    const market = marketCodeForCurrency(b.currency);
+    const p = eff[market];
     if (typeof p !== "number" || !Number.isFinite(p) || p <= 0) return false;
   }
   return true;
@@ -137,11 +193,27 @@ function heldMarketsNeedingPrice(balances: BalanceRow[], priceMap: Record<string
     if (b.currency === "KRW") continue;
     const qty = b.balance + b.locked;
     if (qty <= 0) continue;
-    const market = `KRW-${b.currency}`;
+    const market = marketCodeForCurrency(b.currency);
     const p = priceMap[market];
     if (typeof p !== "number" || !Number.isFinite(p) || p <= 0) miss.push(market);
   }
   return miss;
+}
+
+const TICKER_CHUNK = 18;
+
+async function fetchTickerPriceMapChunked(markets: string[]): Promise<Record<string, number>> {
+  const out: Record<string, number> = {};
+  for (let i = 0; i < markets.length; i += TICKER_CHUNK) {
+    const chunk = markets.slice(i, i + TICKER_CHUNK);
+    try {
+      const part = await fetchTickerPriceMap(chunk);
+      Object.assign(out, part);
+    } catch {
+      /* 청크 단위 실패는 무시 — 단건 보충에서 이어짐 */
+    }
+  }
+  return out;
 }
 
 /**
@@ -157,7 +229,7 @@ export async function resolveTickerPricesForBalances(
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const fresh = await fetchTickerPriceMap(markets);
+      const fresh = markets.length <= TICKER_CHUNK ? await fetchTickerPriceMap(markets) : await fetchTickerPriceMapChunked(markets);
       merged = { ...merged, ...fresh };
       break;
     } catch {
