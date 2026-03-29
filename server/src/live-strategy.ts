@@ -1,13 +1,17 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { SignalLogEntry } from "@orbitalpha/shared";
-import { mvpSignalPayloadV2Schema } from "@orbitalpha/shared";
+import { companyIdSchema, mvpSignalPayloadV2Schema, serviceIdSchema } from "@orbitalpha/shared";
 import { tradingDataRoot } from "./paths.js";
+import { appendLog } from "./log-store.js";
 import { fetchMinuteCandles, fetchTickers } from "./upbit-public.js";
 import {
   RECOVERY_EXIT_CONFIG,
   STRATEGY_RISK_CONFIG,
   UPBIT_FEE_RATE,
+  UPBIT_MIN_ORDER_KRW,
+  grossPnlPct,
+  netPnlPctPerUnit,
   type StopTriggerKind,
   type StrategyType,
 } from "./strategy-risk-config.js";
@@ -125,16 +129,6 @@ function todayKst() {
 
 function minutesSince(ts: string) {
   return Math.max(0, (Date.now() - Date.parse(ts)) / 60_000);
-}
-
-function netPnlPct(entryPrice: number, nowPrice: number): number {
-  if (entryPrice <= 0 || nowPrice <= 0) return 0;
-  const grossSell = nowPrice;
-  const principal = entryPrice;
-  const buyFee = principal * UPBIT_FEE_RATE;
-  const sellFee = grossSell * UPBIT_FEE_RATE;
-  const net = grossSell - principal - buyFee - sellFee;
-  return (net / principal) * 100;
 }
 
 export function createLiveDataStrategy(opts: {
@@ -303,8 +297,10 @@ export function createLiveDataStrategy(opts: {
       const legacyQty = Number(legacy?.qty ?? 0);
       const legacyAvg = Number(legacy?.avg ?? 0);
       if (legacyQty <= 0 || legacyAvg <= 0) continue;
-      const now = priceBy.get(market) ?? legacyAvg;
-      const pnlPct = netPnlPct(legacyAvg, now);
+      const rawPxL = priceBy.get(market);
+      const hasTickerL = typeof rawPxL === "number" && Number.isFinite(rawPxL) && rawPxL > 0;
+      const now = hasTickerL ? rawPxL : legacyAvg;
+      const pnlGross = grossPnlPct(legacyAvg, now);
       const sig = latestByMarket.get(market);
       const stage = state.legacy.exit_stage[market] ?? 0;
       const dcaCount = state.legacy.dca_count[market] ?? Number(legacy?.dca_count ?? 0);
@@ -329,29 +325,69 @@ export function createLiveDataStrategy(opts: {
 
       // Recovery exits: break-even partial -> small profit partial -> weaken signal trim.
       if (!opts.trade.placeLegacyExitSell) continue;
-      const shouldStage1 = stage < 1 && pnlPct >= 0;
-      const shouldStage2 = stage < 2 && pnlPct >= 0.9;
-      const shouldTrimWeak = stage >= 1 && pnlPct >= 0.4 && legacySignalWeakening(sig);
+      const shouldStage1 = stage < 1 && pnlGross >= 0;
+      const shouldStage2 = stage < 2 && pnlGross >= 0.9;
+      const shouldTrimWeak = stage >= 1 && pnlGross >= 0.4 && legacySignalWeakening(sig);
+      const tryLegacySell = async (ratio: number): Promise<boolean> => {
+        if (!hasTickerL) {
+          await appendLog({
+            company_id: companyIdSchema.parse(opts.companyId),
+            service_id: serviceIdSchema.parse(opts.serviceId),
+            ts: new Date().toISOString(),
+            kind: "system",
+            message: "take_profit_blocked: stale mark price",
+            payload: { market, bucket: "legacy", blockedReason: "missing ticker trade_price" },
+          });
+          return false;
+        }
+        const vol = legacyQty * Math.min(1, Math.max(0.01, ratio));
+        if (vol * now < UPBIT_MIN_ORDER_KRW) {
+          await appendLog({
+            company_id: companyIdSchema.parse(opts.companyId),
+            service_id: serviceIdSchema.parse(opts.serviceId),
+            ts: new Date().toISOString(),
+            kind: "system",
+            message: "take_profit_blocked: order value below 5000 KRW",
+            payload: {
+              market,
+              bucket: "legacy",
+              intendedSellQty: vol,
+              intendedSellValueKRW: vol * now,
+              blockedReason: "order value below 5000 KRW",
+            },
+          });
+          return false;
+        }
+        try {
+          await opts.trade.placeLegacyExitSell!(market, true, ratio);
+          return true;
+        } catch {
+          return false;
+        }
+      };
       try {
         if (shouldStage1) {
-          await opts.trade.placeLegacyExitSell(market, true, 0.35);
-          state.legacy.exit_stage[market] = 1;
+          if (await tryLegacySell(0.35)) state.legacy.exit_stage[market] = 1;
         } else if (shouldStage2) {
-          await opts.trade.placeLegacyExitSell(market, true, 0.35);
-          state.legacy.exit_stage[market] = 2;
+          if (await tryLegacySell(0.35)) state.legacy.exit_stage[market] = 2;
         } else if (shouldTrimWeak) {
-          await opts.trade.placeLegacyExitSell(market, true, 0.5);
+          await tryLegacySell(0.5);
         }
       } catch {}
     }
 
-    // exits
+    // exits — 익절/손절 판단은 업비트 보유 화면과 동일한 평단 대비 가격 변동률(gross) 기준
     for (const market of Object.keys(state.positions)) {
       const p = state.positions[market]!;
-      const now = priceBy.get(market) ?? p.entry_price;
-      const pnlPct = netPnlPct(p.entry_price, now);
-      p.max_pnl_pct = Math.max(p.max_pnl_pct, pnlPct);
-      p.current_net_pnl_pct = pnlPct;
+      const rawPx = priceBy.get(market);
+      const hasTicker = typeof rawPx === "number" && Number.isFinite(rawPx) && rawPx > 0;
+      if (!hasTicker) {
+        continue;
+      }
+      const now = rawPx;
+      const pnlGross = grossPnlPct(p.entry_price, now);
+      p.max_pnl_pct = Math.max(p.max_pnl_pct, pnlGross);
+      p.current_net_pnl_pct = pnlGross;
       if (now > p.highest_price_after_entry) {
         p.highest_price_after_entry = now;
         state.trades.push({
@@ -364,7 +400,7 @@ export function createLiveDataStrategy(opts: {
           avg_buy_price: p.entry_price,
           exit_price: now,
           pnl_krw: 0,
-          pnl_pct: pnlPct,
+          pnl_pct: pnlGross,
           reason_enter: p.reason_enter,
           reason_exit: "highest_price_update",
           holding_minutes: minutesSince(p.entry_ts),
@@ -373,7 +409,7 @@ export function createLiveDataStrategy(opts: {
           strategy_tag: "live_data_mode_v1",
           strategy_type: p.strategy_type,
           stop_trigger_kind: null,
-          current_net_pnl_pct: pnlPct,
+          current_net_pnl_pct: pnlGross,
           liquidation_reason: "highest_price_update",
           remaining_qty: p.qty,
           highest_price_after_entry: p.highest_price_after_entry,
@@ -388,7 +424,7 @@ export function createLiveDataStrategy(opts: {
       let ratio = 1;
       if (p.strategy_type === "stable") {
         const s = STRATEGY_RISK_CONFIG.stable;
-        if (!p.breakeven_armed && pnlPct >= s.breakeven_arm_pct) {
+        if (!p.breakeven_armed && pnlGross >= s.breakeven_arm_pct) {
           p.breakeven_armed = true;
           p.breakeven_armed_at = new Date().toISOString();
           state.trades.push({
@@ -401,7 +437,7 @@ export function createLiveDataStrategy(opts: {
             avg_buy_price: p.entry_price,
             exit_price: now,
             pnl_krw: 0,
-            pnl_pct: pnlPct,
+            pnl_pct: pnlGross,
             reason_enter: p.reason_enter,
             reason_exit: "breakeven_armed",
             holding_minutes: holdMin,
@@ -410,7 +446,7 @@ export function createLiveDataStrategy(opts: {
             strategy_tag: "live_data_mode_v1",
             strategy_type: p.strategy_type,
             stop_trigger_kind: "breakeven_protect",
-            current_net_pnl_pct: pnlPct,
+            current_net_pnl_pct: pnlGross,
             liquidation_reason: "breakeven_armed",
             remaining_qty: p.qty,
             highest_price_after_entry: p.highest_price_after_entry,
@@ -431,35 +467,35 @@ export function createLiveDataStrategy(opts: {
             avg_buy_price: p.entry_price,
             current_price: now,
             pnl_net: null,
-            pnl_net_pct: pnlPct,
+            pnl_net_pct: pnlGross,
             note: "stable breakeven armed",
           });
         }
         p.trailing_stop_price = p.highest_price_after_entry * (1 - s.trailing_from_peak_pct / 100);
-        if (!p.partial_tp_done && pnlPct >= s.partial_take_profit_pct) {
+        if (!p.partial_tp_done && pnlGross >= s.partial_take_profit_pct) {
           reasonExit = "partial_take_profit";
           ratio = s.partial_take_profit_ratio;
           stopTriggerKind = null;
         } else if (p.partial_tp_done && now <= p.trailing_stop_price) {
           reasonExit = "trailing_take_profit";
           stopTriggerKind = "time_stop";
-        } else if (p.breakeven_armed && pnlPct <= s.breakeven_floor_pct) {
+        } else if (p.breakeven_armed && pnlGross <= s.breakeven_floor_pct) {
           reasonExit = "breakeven_exit";
           stopTriggerKind = "breakeven_protect";
         } else if (
           holdMin >= RECOVERY_EXIT_CONFIG.stable.giveup_minutes &&
           p.max_pnl_pct < RECOVERY_EXIT_CONFIG.stable.min_peak_pct_to_skip_catastrophic &&
-          pnlPct <= RECOVERY_EXIT_CONFIG.stable.catastrophic_exit_pct
+          pnlGross <= RECOVERY_EXIT_CONFIG.stable.catastrophic_exit_pct
         ) {
           reasonExit = `stable_catastrophic_exit_${RECOVERY_EXIT_CONFIG.stable.catastrophic_exit_pct}`;
           stopTriggerKind = "price_stop";
-        } else if (holdMin >= STRATEGY_RISK_CONFIG.stable.weak_hold_stop_minutes && p.max_pnl_pct < 0.35 && pnlPct < 0) {
+        } else if (holdMin >= STRATEGY_RISK_CONFIG.stable.weak_hold_stop_minutes && p.max_pnl_pct < 0.35 && pnlGross < 0) {
           reasonExit = "stable_time_stop_weak_rebound";
           stopTriggerKind = "time_stop";
         }
       } else {
         const m = STRATEGY_RISK_CONFIG.momentum;
-        if (!p.breakeven_armed && pnlPct >= m.breakeven_arm_pct) {
+        if (!p.breakeven_armed && pnlGross >= m.breakeven_arm_pct) {
           p.breakeven_armed = true;
           p.breakeven_armed_at = new Date().toISOString();
           state.trades.push({
@@ -472,7 +508,7 @@ export function createLiveDataStrategy(opts: {
             avg_buy_price: p.entry_price,
             exit_price: now,
             pnl_krw: 0,
-            pnl_pct: pnlPct,
+            pnl_pct: pnlGross,
             reason_enter: p.reason_enter,
             reason_exit: "breakeven_armed",
             holding_minutes: holdMin,
@@ -481,7 +517,7 @@ export function createLiveDataStrategy(opts: {
             strategy_tag: "live_data_mode_v1",
             strategy_type: p.strategy_type,
             stop_trigger_kind: "breakeven_protect",
-            current_net_pnl_pct: pnlPct,
+            current_net_pnl_pct: pnlGross,
             liquidation_reason: "breakeven_armed",
             remaining_qty: p.qty,
             highest_price_after_entry: p.highest_price_after_entry,
@@ -502,24 +538,24 @@ export function createLiveDataStrategy(opts: {
             avg_buy_price: p.entry_price,
             current_price: now,
             pnl_net: null,
-            pnl_net_pct: pnlPct,
+            pnl_net_pct: pnlGross,
             note: "momentum breakeven armed",
           });
         }
         p.trailing_stop_price = p.highest_price_after_entry * (1 - m.trailing_from_peak_pct / 100);
-        if (!p.partial_tp_done && pnlPct >= m.partial_take_profit_pct) {
+        if (!p.partial_tp_done && pnlGross >= m.partial_take_profit_pct) {
           reasonExit = "partial_take_profit";
           ratio = m.partial_take_profit_ratio;
         } else if (p.partial_tp_done && now <= p.trailing_stop_price) {
           reasonExit = "trailing_take_profit";
           stopTriggerKind = "time_stop";
-        } else if (p.breakeven_armed && pnlPct <= m.breakeven_floor_pct) {
+        } else if (p.breakeven_armed && pnlGross <= m.breakeven_floor_pct) {
           reasonExit = "momentum_breakeven_protect";
           stopTriggerKind = "breakeven_protect";
         } else if (
           holdMin >= RECOVERY_EXIT_CONFIG.momentum.giveup_minutes &&
           p.max_pnl_pct < RECOVERY_EXIT_CONFIG.momentum.min_peak_pct_to_skip_catastrophic &&
-          pnlPct <= RECOVERY_EXIT_CONFIG.momentum.catastrophic_exit_pct
+          pnlGross <= RECOVERY_EXIT_CONFIG.momentum.catastrophic_exit_pct
         ) {
           reasonExit = `momentum_catastrophic_exit_${RECOVERY_EXIT_CONFIG.momentum.catastrophic_exit_pct}`;
           stopTriggerKind = "price_stop";
@@ -542,7 +578,7 @@ export function createLiveDataStrategy(opts: {
               }
             }
           } catch {}
-          if (!reasonExit && holdMin >= m.time_stop_min_minutes && holdMin <= m.time_stop_max_minutes && p.max_pnl_pct < 0.8 && pnlPct <= -0.1) {
+          if (!reasonExit && holdMin >= m.time_stop_min_minutes && holdMin <= m.time_stop_max_minutes && p.max_pnl_pct < 0.8 && pnlGross <= -0.1) {
             reasonExit = "momentum_time_stop";
             stopTriggerKind = "time_stop";
           }
@@ -551,7 +587,69 @@ export function createLiveDataStrategy(opts: {
       if (!reasonExit) continue;
 
       const beforeQty = p.qty;
-      await opts.trade.placeSell(market, true, ratio);
+      const ratioClamped = Math.min(1, Math.max(0.01, ratio));
+      const intendedSellQty = beforeQty * ratioClamped;
+      const intendedSellValueKrw = intendedSellQty * now;
+      const pnlNetUnit = netPnlPctPerUnit(p.entry_price, now);
+
+      if (intendedSellQty <= 0) {
+        await appendLog({
+          company_id: companyIdSchema.parse(opts.companyId),
+          service_id: serviceIdSchema.parse(opts.serviceId),
+          ts: new Date().toISOString(),
+          kind: "system",
+          message: "take_profit_blocked: quantity zero",
+          payload: { market, reason_exit: reasonExit, quantity: beforeQty },
+        });
+        continue;
+      }
+      if (intendedSellValueKrw < UPBIT_MIN_ORDER_KRW) {
+        await appendLog({
+          company_id: companyIdSchema.parse(opts.companyId),
+          service_id: serviceIdSchema.parse(opts.serviceId),
+          ts: new Date().toISOString(),
+          kind: "system",
+          message: "take_profit_blocked: order value below 5000 KRW",
+          payload: {
+            market,
+            reason_exit: reasonExit,
+            avg_buy_price: p.entry_price,
+            current_price_used_for_display: now,
+            current_price_used_for_sell_decision: now,
+            quantity: beforeQty,
+            pnl_percent_display: pnlGross,
+            pnl_percent_sell_decision: pnlGross,
+            net_pnl_percent_after_fees: pnlNetUnit,
+            intended_sell_ratio: ratioClamped,
+            intended_sell_qty: intendedSellQty,
+            intended_sell_value_krw: intendedSellValueKrw,
+            blockedReason: "order value below 5000 KRW",
+          },
+        });
+        continue;
+      }
+
+      try {
+        await opts.trade.placeSell(market, true, ratio);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        await appendLog({
+          company_id: companyIdSchema.parse(opts.companyId),
+          service_id: serviceIdSchema.parse(opts.serviceId),
+          ts: new Date().toISOString(),
+          kind: "system",
+          message: "take_profit_blocked: sell_failed",
+          payload: {
+            market,
+            reason_exit: reasonExit,
+            error: msg.slice(0, 400),
+            intended_sell_qty: intendedSellQty,
+            intended_sell_value_krw: intendedSellValueKrw,
+            blockedReason: "sell_failed",
+          },
+        });
+        continue;
+      }
       const after = await opts.trade.status();
       const qtyAfter = Number(after.strategy_positions?.[market]?.qty ?? 0);
       const soldQty = Math.max(0, beforeQty - qtyAfter);

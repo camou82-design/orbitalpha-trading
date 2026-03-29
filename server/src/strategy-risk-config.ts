@@ -3,6 +3,28 @@ export type StopTriggerKind = "price_stop" | "pattern_break" | "time_stop" | "br
 
 export const UPBIT_FEE_RATE = 0.0005;
 
+/** 업비트 KRW 마켓 최소 주문 금액(시장가 매도 시 체결 예상 KRW 기준). */
+export const UPBIT_MIN_ORDER_KRW = 5000;
+
+/**
+ * 업비트 보유 화면과 동일하게 평단 대비 가격 변동률(%) — 익절/표시 기준 통일용.
+ */
+export function grossPnlPct(entryPrice: number, nowPrice: number): number {
+  if (entryPrice <= 0 || nowPrice <= 0) return 0;
+  return ((nowPrice / entryPrice) - 1) * 100;
+}
+
+/** 단위 가격 기준 매수·매도 수수료 반영 순수익률(%) — 체결 후 손익 추정·로그용. */
+export function netPnlPctPerUnit(entryPrice: number, nowPrice: number): number {
+  if (entryPrice <= 0 || nowPrice <= 0) return 0;
+  const grossSell = nowPrice;
+  const principal = entryPrice;
+  const buyFee = principal * UPBIT_FEE_RATE;
+  const sellFee = grossSell * UPBIT_FEE_RATE;
+  const net = grossSell - principal - buyFee - sellFee;
+  return (net / principal) * 100;
+}
+
 /**
  * 즉시 % 손절 대신 회복 탈출 우선. 아래 조건을 모두 만족할 때만 긴급 청산.
  */

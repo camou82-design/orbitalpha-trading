@@ -54,8 +54,17 @@ export function resolveWatchMarkets(excluded: readonly string[] = []): Promise<s
   return Promise.resolve(getMvpWatchMarkets(excluded));
 }
 
+function numTradePrice(v: unknown): number {
+  const p = Number(v);
+  return Number.isFinite(p) && p > 0 ? p : 0;
+}
+
 export async function fetchTickers(markets: string[]): Promise<UpbitTicker[]> {
   if (markets.length === 0) return [];
   const q = encodeURIComponent(markets.join(","));
-  return fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${q}`);
+  const rows = await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${q}`);
+  return rows.map((r) => ({
+    ...r,
+    trade_price: numTradePrice((r as { trade_price?: unknown }).trade_price),
+  }));
 }

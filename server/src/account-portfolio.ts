@@ -219,18 +219,29 @@ async function fetchTickerPriceMapChunked(markets: string[]): Promise<Record<str
 /**
  * seed(직전 성공 맵) + 배치 티커(재시도) + 보유 종목 단건 조회로 가격맵을 최대한 채운다.
  * account_portfolio·하단 카드가 같은 맵을 쓰도록 한 번에 반환한다.
+ * `rest_fresh_markets`: 이번 호출에서 REST 응답으로 유효 가격을 받은 마켓(캐시만으로 채운 경우 제외).
  */
 export async function resolveTickerPricesForBalances(
   balances: BalanceRow[],
   seed: Record<string, number> | null,
-): Promise<Record<string, number>> {
+): Promise<{ merged: Record<string, number>; rest_fresh_markets: Set<string> }> {
+  const restFresh = new Set<string>();
   let merged: Record<string, number> = { ...(seed ?? {}) };
   const markets = marketsForAccountValuation(balances);
+
+  const absorb = (part: Record<string, number>) => {
+    for (const [k, v] of Object.entries(part)) {
+      if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+        merged[k] = v;
+        restFresh.add(k);
+      }
+    }
+  };
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const fresh = markets.length <= TICKER_CHUNK ? await fetchTickerPriceMap(markets) : await fetchTickerPriceMapChunked(markets);
-      merged = { ...merged, ...fresh };
+      absorb(fresh);
       break;
     } catch {
       if (attempt < 1) await new Promise((r) => setTimeout(r, 350));
@@ -240,11 +251,11 @@ export async function resolveTickerPricesForBalances(
   for (const m of heldMarketsNeedingPrice(balances, merged)) {
     try {
       const one = await fetchTickerPriceMap([m]);
-      merged = { ...merged, ...one };
+      absorb(one);
     } catch {
       /* 다음 종목 */
     }
   }
 
-  return merged;
+  return { merged, rest_fresh_markets: restFresh };
 }

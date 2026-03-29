@@ -1205,7 +1205,8 @@ export default function HomePage() {
       const cost = qty > 0 && avg > 0 ? qty * avg : 0;
       const estimatedFees = evalAmount > 0 && cost > 0 ? cost * UPBIT_FEE_RATE + evalAmount * UPBIT_FEE_RATE : 0;
       const netPnl = evalAmount > 0 && cost > 0 ? evalAmount - cost - estimatedFees : 0;
-      const netRet = cost > 0 ? (netPnl / cost) * 100 : 0;
+      /** 업비트 보유 화면 수익률과 동일: 평단 대비 현재가 변동률(수수료 이중 차감 % 아님) */
+      const netRet = cost > 0 && avg > 0 && now > 0 ? ((now / avg) - 1) * 100 : 0;
       const strategyMeta = strategyByMarket[m];
       const livePos = strategy?.open_positions?.[m];
       return {

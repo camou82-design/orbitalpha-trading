@@ -12,7 +12,7 @@ import { fetchAccounts, placeMarketBuy, placeMarketSell, type UpbitAccount } fro
 import { companyIdSchema, serviceIdSchema } from "@orbitalpha/shared";
 import type { StrategyType } from "./strategy-risk-config.js";
 import { ORDER_LIMITS } from "@orbitalpha/shared";
-import { STRATEGY_RISK_CONFIG } from "./strategy-risk-config.js";
+import { STRATEGY_RISK_CONFIG, grossPnlPct, netPnlPctPerUnit } from "./strategy-risk-config.js";
 import crypto from "node:crypto";
 
 type TradeOrderSide = "buy" | "sell";
@@ -615,6 +615,22 @@ export function createTradeControl(
 
       let account_portfolio: AccountPortfolioSnapshot | null = null;
       let mark_prices: Record<string, number> | null = null;
+      type PricingDebugRow = {
+        avg_buy_price: number;
+        quantity: number;
+        current_price_used_for_display: number;
+        current_price_used_for_sell_decision: number;
+        pnl_percent_display: number;
+        pnl_percent_sell_decision: number;
+        net_pnl_percent_after_fees: number;
+        intended_sell_ratio: null;
+        intended_sell_qty: null;
+        intended_sell_value_krw: null;
+        blocked_reason: null;
+        ticker_from_rest_this_request: boolean;
+      };
+      let pricing_debug: Record<string, PricingDebugRow> | null = null;
+      let mark_prices_stale = false;
       if (conn.connected) {
         const rawBalances = Array.isArray(conn.balances) ? conn.balances : [];
         const balanceRows = rawBalances.map((b) => ({
@@ -624,12 +640,39 @@ export function createTradeControl(
           avg_buy_price: Number(b.avg_buy_price),
         }));
         try {
-          const merged = await resolveTickerPricesForBalances(balanceRows, state.lastGoodMarkPrices);
+          const { merged, rest_fresh_markets } = await resolveTickerPricesForBalances(balanceRows, state.lastGoodMarkPrices);
           state.lastGoodMarkPrices = merged;
           const effective = buildEffectiveValuationPriceMap(balanceRows, merged);
           const snap = computeAccountValuationFromPrices(balanceRows, effective, new Date().toISOString());
           account_portfolio = sanitizeAccountPortfolioSnapshot(snap.portfolio);
           mark_prices = snap.mark_prices;
+          const dbg: Record<string, PricingDebugRow> = {};
+          for (const m of MANAGED_MARKETS) {
+            const cur = m.replace("KRW-", "");
+            const row = balanceRows.find((r) => r.currency === cur);
+            const qty = row ? row.balance + row.locked : 0;
+            const avg = row ? row.avg_buy_price : 0;
+            const mark = effective[m] ?? 0;
+            const fromRest = rest_fresh_markets.has(m);
+            if (qty > 0 && mark > 0 && !fromRest) mark_prices_stale = true;
+            const gd = qty > 0 && avg > 0 && mark > 0 ? grossPnlPct(avg, mark) : 0;
+            const nd = qty > 0 && avg > 0 && mark > 0 ? netPnlPctPerUnit(avg, mark) : 0;
+            dbg[m] = {
+              avg_buy_price: avg,
+              quantity: qty,
+              current_price_used_for_display: mark,
+              current_price_used_for_sell_decision: mark,
+              pnl_percent_display: gd,
+              pnl_percent_sell_decision: gd,
+              net_pnl_percent_after_fees: nd,
+              intended_sell_ratio: null,
+              intended_sell_qty: null,
+              intended_sell_value_krw: null,
+              blocked_reason: null,
+              ticker_from_rest_this_request: fromRest,
+            };
+          }
+          pricing_debug = dbg;
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           await log("account_valuation_error", { error: msg.slice(0, 400) });
@@ -637,6 +680,7 @@ export function createTradeControl(
           const snap = computeAccountValuationFromPrices(balanceRows, effective, new Date().toISOString());
           account_portfolio = sanitizeAccountPortfolioSnapshot(snap.portfolio);
           mark_prices = snap.mark_prices;
+          mark_prices_stale = true;
         }
         if (account_portfolio === null) {
           const br = (Array.isArray(conn.balances) ? conn.balances : []).map((b) => ({
@@ -649,6 +693,7 @@ export function createTradeControl(
           const snap = computeAccountValuationFromPrices(br, eff, new Date().toISOString());
           account_portfolio = sanitizeAccountPortfolioSnapshot(snap.portfolio);
           mark_prices = snap.mark_prices;
+          mark_prices_stale = true;
         }
       }
       const legacyPositions = Object.fromEntries(
@@ -716,6 +761,8 @@ export function createTradeControl(
       },
       account_portfolio,
       mark_prices,
+      mark_prices_stale,
+      pricing_debug,
     };
   };
 
