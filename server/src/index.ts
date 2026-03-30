@@ -243,14 +243,14 @@ async function main() {
   });
   await strategy.init();
   trade.setRecoveryReady(true);
-  const pumpScanner = createPumpScanner();
+  const pumpScanner = createPumpScanner(() => Object.keys((strategy.status() as any).open_positions ?? {}));
   let lastStrategyTickAt: string | null = null;
   let lastScannerTickAt: string | null = null;
   let lastMarketStateTickAt: string | null = null;
   const strategyTimer = setInterval(() => {
     lastStrategyTickAt = new Date().toISOString();
     void strategy.tick().catch((e) => app.log.error({ err: String(e) }, "strategy_tick_failed"));
-  }, 15_000);
+  }, 30_000);
   const scannerTimer = setInterval(() => {
     lastScannerTickAt = new Date().toISOString();
     void pumpScanner.tick().catch((e) => app.log.error({ err: String(e) }, "pump_scanner_tick_failed"));
@@ -291,7 +291,6 @@ async function main() {
     })().catch((e) => app.log.error({ err: String(e) }, "snapshot_tick_failed"));
   }, 60_000);
   lastScannerTickAt = new Date().toISOString();
-  void pumpScanner.tick().catch((e) => app.log.error({ err: String(e) }, "pump_scanner_tick_failed"));
   lastMarketStateTickAt = new Date().toISOString();
   void marketFilter.evaluate().catch((e) => app.log.error({ err: String(e) }, "market_state_tick_failed"));
   await opLog.event({

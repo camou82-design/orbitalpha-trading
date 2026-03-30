@@ -55,12 +55,12 @@ type PerfRow = {
   return_10m_pct: number | null;
 };
 
-const SCANNER_INTERVAL_MS = 15_000;
+const SCANNER_INTERVAL_MS = 45_000;
 const LIQUIDITY_SCAN_MIN_24H_KRW = 300_000_000; // 3억 이상만 스캔(단, 후보 제외 사유로도 표시)
 const LIQUIDITY_EXCLUDE_MIN_24H_KRW = 1_000_000_000; // 10억 이상만 후보 (그 미만은 "유동성 부족")
 const BASE_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"] as const;
 const BASE_MARKET_SET = new Set<string>(BASE_MARKETS as unknown as string[]);
-const MAX_SCAN_MARKETS = 24;
+const MAX_NEW_CANDIDATE_MARKETS = 8;
 
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
@@ -166,13 +166,20 @@ function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btc
   };
 }
 
-export function createPumpScanner() {
+export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
   const state = {
     rows: [] as ScannerRow[],
     updatedAt: null as string | null,
     pending: [] as PendingEval[],
     perf: [] as PerfRow[],
   };
+
+  const MARKET_429_EXCLUDE_MS = Number(process.env.PUMP_SCANNER_429_EXCLUDE_MS ?? 10 * 60_000);
+  const market429CooldownUntilMs = new Map<string, number>();
+
+  const MARKET_LIST_CACHE_TTL_MS = Number(process.env.PUMP_SCANNER_MARKET_LIST_CACHE_TTL_MS ?? 10 * 60_000);
+  let cachedKrwMarkets: string[] | null = null;
+  let cachedKrwMarketsAtMs = 0;
 
   const debugEnabled =
     process.env.ORBITALPHA_TRADING_SCANNER_DEBUG === "1" ||
@@ -225,21 +232,52 @@ export function createPumpScanner() {
   };
 
   const tick = async () => {
+    const heldMarkets = Array.from(new Set(getHeldMarkets().filter((m) => typeof m === "string" && m.length > 0)));
+
+    const is429Excluded = (market: string) => {
+      const until = market429CooldownUntilMs.get(market) ?? 0;
+      return until > 0 && Date.now() < until;
+    };
+
     const baseTickers = await fetchTickers([...BASE_MARKETS]);
     const btc = baseTickers.find((t) => t.market === "KRW-BTC");
     const btcDropPenalty = btc && (btc.signed_change_rate ?? 0) < -0.01 ? 8 : 0;
 
-    const marketRows = await fetch("https://api.upbit.com/v1/market/all?isDetails=false").then((r) => r.json() as Promise<Array<{ market: string }>>);
-    const krwMarkets = marketRows.map((m) => m.market).filter((m) => m.startsWith("KRW-"));
+    let krwMarkets: string[];
+    if (cachedKrwMarkets && Date.now() - cachedKrwMarketsAtMs < MARKET_LIST_CACHE_TTL_MS) {
+      krwMarkets = cachedKrwMarkets;
+    } else {
+      const marketRows = await fetch("https://api.upbit.com/v1/market/all?isDetails=false").then((r) => r.json() as Promise<Array<{ market: string }>>);
+      krwMarkets = marketRows.map((m) => m.market).filter((m) => m.startsWith("KRW-"));
+      cachedKrwMarkets = krwMarkets;
+      cachedKrwMarketsAtMs = Date.now();
+    }
     const altMarkets = krwMarkets.filter((m) => !BASE_MARKET_SET.has(m));
     const tickers = await fetchTickers(altMarkets);
-    const liquid = tickers
+    const liquidNew = tickers
       .filter((t) => (t.acc_trade_price_24h ?? 0) >= LIQUIDITY_SCAN_MIN_24H_KRW)
       .sort((a, b) => (b.acc_trade_price_24h ?? 0) - (a.acc_trade_price_24h ?? 0))
-      .slice(0, MAX_SCAN_MARKETS);
+      .slice(0, MAX_NEW_CANDIDATE_MARKETS)
+      .filter((t) => !is429Excluded(t.market));
+
+    const allTickers = [...baseTickers, ...tickers];
+    const tByMarket = new Map(allTickers.map((t) => [t.market, t]));
+
+    // 기본: 보유 종목은 항상 스캔 대상에 포함(단, 429 쿨다운이면 제외).
+    const heldTickers = heldMarkets
+      .map((m) => tByMarket.get(m))
+      .filter((t): t is UpbitTicker => Boolean(t))
+      .filter((t) => !is429Excluded(t.market));
+
+    const seen = new Set<string>();
+    const marketsToScore = [...heldTickers, ...liquidNew].filter((t) => {
+      if (seen.has(t.market)) return false;
+      seen.add(t.market);
+      return true;
+    });
 
     const rows: ScannerRow[] = [];
-    for (const t of liquid) {
+    for (const t of marketsToScore) {
       try {
         const c1 = await fetchMinuteCandles(t.market, 1, 30);
         const c5 = await fetchMinuteCandles(t.market, 5, 20);
@@ -257,7 +295,12 @@ export function createPumpScanner() {
           exclude_reasons: s.exclude_reasons,
           updated_at: new Date().toISOString(),
         });
-      } catch {
+      } catch (e) {
+        const status = (e as any)?.status;
+        const msg = e instanceof Error ? e.message : String(e);
+        if (status === 429 || msg.includes("429")) {
+          market429CooldownUntilMs.set(t.market, Date.now() + MARKET_429_EXCLUDE_MS);
+        }
         continue;
       }
     }
@@ -269,7 +312,7 @@ export function createPumpScanner() {
     state.rows = rows.slice(0, 15);
     state.updatedAt = new Date().toISOString();
 
-    const priceBy = new Map(tickers.map((t) => [t.market, t.trade_price]));
+    const priceBy = new Map(allTickers.map((t) => [t.market, t.trade_price]));
     for (const r of state.rows.slice(0, 8)) {
       const ts = new Date().toISOString();
       const exists = state.perf.find((x) => x.timestamp === ts && x.market === r.market);
