@@ -366,6 +366,17 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
   return {
     intervalMs: SCANNER_INTERVAL_MS,
     tick,
+    signalFeed: () =>
+      state.rows
+        .filter((r) => r.status !== "제외")
+        .slice(0, 8)
+        .map((r) => ({
+          market: r.market,
+          score: r.score,
+          status: r.status,
+          signal_key: `${r.market}|${r.updated_at}|${r.score.toFixed(1)}|${r.status}`,
+          reason: `surge_scanner:${r.status}:score_${r.score.toFixed(1)}`,
+        })),
     status: () => {
       // Latest perf per market for post verification columns.
       const latestPerfByMarket = new Map<string, PerfRow>();

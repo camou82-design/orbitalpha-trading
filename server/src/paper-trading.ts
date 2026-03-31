@@ -1,6 +1,5 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { mvpSignalPayloadV2Schema, type SignalLogEntry } from "@orbitalpha/shared";
 import { tradingDataRoot } from "./paths.js";
 import { UPBIT_FEE_RATE } from "./strategy-risk-config.js";
 import { fetchTickers } from "./upbit-public.js";
@@ -54,7 +53,13 @@ function toNum(v: unknown, d = 0): number {
 export function createPaperTradingEngine(opts: {
   companyId: string;
   serviceId: string;
-  readLogs: (limit: number) => Promise<SignalLogEntry[]>;
+  getScannerSignals: () => Array<{
+    market: string;
+    score: number;
+    status: string;
+    signal_key: string;
+    reason: string;
+  }>;
 }) {
   const baseDir = path.join(tradingDataRoot(), "paper", opts.companyId, opts.serviceId);
   const stateFile = path.join(baseDir, "paper_state.json");
@@ -132,7 +137,7 @@ export function createPaperTradingEngine(opts: {
       ts: new Date().toISOString(),
       market,
       state: "OPEN",
-      note: "paper_buy_opened",
+      note: "paper_buy_opened:surge_scanner",
       signal_strength: signalStrength,
       entry_price: entryPrice,
       exit_price: null,
@@ -221,24 +226,20 @@ export function createPaperTradingEngine(opts: {
   };
 
   const tick = async () => {
-    const logs = await opts.readLogs(300);
-    const latestSignalByMarket = new Map<string, { key: string; ts: string; signal_strength: string }>();
+    const scannerSignals = opts.getScannerSignals();
+    const latestSignalByMarket = new Map<string, { key: string; signal_strength: string; reason: string }>();
     const watchMarkets = new Set<string>(Object.keys(state.positions));
 
-    for (const row of logs) {
-      if (row.kind !== "signal" || !row.payload) continue;
-      const parsed = mvpSignalPayloadV2Schema.safeParse(row.payload);
-      if (!parsed.success) continue;
-      const p = parsed.data;
-      const market = p.market;
-      const signalType = String(p.signal_type ?? "").toUpperCase();
-      if (!p.filter_pass || signalType === "LOW") continue;
-      const key = `${row.ts}|${market}|${signalType}`;
+    for (const sig of scannerSignals) {
+      const market = String(sig.market ?? "").trim();
+      if (!market) continue;
+      const signalType = "SURGE_SCANNER";
+      const key = String(sig.signal_key ?? `${market}|${sig.reason}`);
       if (!latestSignalByMarket.has(market)) {
         latestSignalByMarket.set(market, {
           key,
-          ts: row.ts,
-          signal_strength: signalType || "MID",
+          signal_strength: signalType,
+          reason: String(sig.reason ?? "surge_scanner"),
         });
       }
       watchMarkets.add(market);
@@ -264,7 +265,7 @@ export function createPaperTradingEngine(opts: {
         ts: new Date().toISOString(),
         market,
         state: "SIGNAL",
-        note: `signal_detected:${sig.signal_strength}`,
+        note: `signal_detected:surge_scanner:${sig.reason}`,
         signal_strength: sig.signal_strength,
         entry_price: null,
         exit_price: null,
@@ -298,11 +299,11 @@ export function createPaperTradingEngine(opts: {
       const heldMs = Date.now() - Date.parse(p.entry_ts);
 
       if (grossPct >= PAPER_TAKE_PROFIT_PCT) {
-        paperSell(p.market, px, "CLOSED_WIN", "take_profit_2pct");
+        paperSell(p.market, px, "CLOSED_WIN", "take_profit_2pct:surge_scanner");
       } else if (grossPct <= PAPER_STOP_LOSS_PCT) {
-        paperSell(p.market, px, "CLOSED_LOSS", "stop_loss_-1.5pct");
+        paperSell(p.market, px, "CLOSED_LOSS", "stop_loss_-1.5pct:surge_scanner");
       } else if (heldMs >= PAPER_TIMEOUT_MS) {
-        paperSell(p.market, px, "CLOSED_TIMEOUT", "time_exit_10m");
+        paperSell(p.market, px, "CLOSED_TIMEOUT", "time_exit_10m:surge_scanner");
       }
     }
 

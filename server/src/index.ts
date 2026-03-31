@@ -243,14 +243,14 @@ async function main() {
     onEvent: (row) => opLog.event(row),
   });
   await strategy.init();
+  const pumpScanner = createPumpScanner(() => Object.keys((strategy.status() as any).open_positions ?? {}));
   const paper = createPaperTradingEngine({
     companyId: env.companyId,
     serviceId: env.serviceId,
-    readLogs: (limit: number) => readRecentLogs(env.companyId, env.serviceId, limit),
+    getScannerSignals: () => pumpScanner.signalFeed(),
   });
   await paper.init();
   trade.setRecoveryReady(true);
-  const pumpScanner = createPumpScanner(() => Object.keys((strategy.status() as any).open_positions ?? {}));
   let lastStrategyTickAt: string | null = null;
   let lastScannerTickAt: string | null = null;
   let lastMarketStateTickAt: string | null = null;
