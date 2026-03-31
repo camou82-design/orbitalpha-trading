@@ -365,6 +365,57 @@ type PumpScannerStatus = {
   }>;
 };
 
+type PaperStatus = {
+  mode: string;
+  updated_at: string;
+  config: {
+    start_krw: number;
+    entry_krw_per_trade: number;
+    max_open_positions: number;
+    take_profit_pct: number;
+    stop_loss_pct: number;
+    timeout_minutes: number;
+    fee_rate: number;
+  };
+  account: {
+    total_asset_krw: number;
+    cash_krw: number;
+    holdings_eval_krw: number;
+    total_pnl_krw: number;
+    total_return_pct: number;
+    open_unrealized_pnl_krw: number;
+  };
+  counters: {
+    open_positions: number;
+    closed_wins: number;
+    closed_losses: number;
+    closed_timeouts: number;
+  };
+  holdings: Array<{
+    market: string;
+    entry_ts: string;
+    entry_price: number;
+    current_price: number;
+    qty: number;
+    invested_krw: number;
+    unrealized_pnl_krw: number;
+    unrealized_pnl_pct: number;
+    signal_strength: string;
+  }>;
+  recent_history: Array<{
+    ts: string;
+    market: string;
+    state: "SIGNAL" | "OPEN" | "CLOSED_WIN" | "CLOSED_LOSS" | "CLOSED_TIMEOUT" | "SKIPPED";
+    note: string;
+    signal_strength: string | null;
+    entry_price: number | null;
+    exit_price: number | null;
+    qty: number | null;
+    pnl_krw: number | null;
+    pnl_pct: number | null;
+  }>;
+};
+
 type MarketStateStatus = {
   timestamp: string;
   market_state: "risk_on" | "neutral" | "risk_off";
@@ -837,6 +888,7 @@ export default function HomePage() {
   const [authState, setAuthState] = useState<"loading" | "ok" | "expired">("loading");
   const [strategy, setStrategy] = useState<StrategyStatus | null>(null);
   const [scanner, setScanner] = useState<PumpScannerStatus | null>(null);
+  const [paper, setPaper] = useState<PaperStatus | null>(null);
   const [marketState, setMarketState] = useState<MarketStateStatus | null>(null);
   const [accountSyncState, setAccountSyncState] = useState<"idle" | "syncing" | "ok" | "error">("idle");
   const [lastClientTradeFailure, setLastClientTradeFailure] = useState<{ code: string; message: string } | null>(null);
@@ -946,12 +998,13 @@ export default function HomePage() {
           }
         }
 
-        const [c, l, tradePollRes, s, scannerStatus, marketStateStatus] = await Promise.all([
+        const [c, l, tradePollRes, s, scannerStatus, paperStatus, marketStateStatus] = await Promise.all([
           fetch(`${apiBase}/api/v1/context?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()),
           fetch(`${apiBase}/api/v1/logs?limit=200&_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()),
           fetchTradeStatusDetailed(apiBase),
           fetch(`${apiBase}/api/v1/strategy/status?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()).catch(() => null),
           fetch(`${apiBase}/api/v1/scanner/status?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()).catch(() => null),
+          fetch(`${apiBase}/api/v1/paper/status?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()).catch(() => null),
           fetch(`${apiBase}/api/v1/market-state?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()).catch(() => null),
         ]);
         if (cancelled) return;
@@ -1001,6 +1054,7 @@ export default function HomePage() {
         }
         if (s) setStrategy(s as StrategyStatus);
         if (scannerStatus) setScanner(scannerStatus as PumpScannerStatus);
+        if (paperStatus) setPaper(paperStatus as PaperStatus);
         if (marketStateStatus) setMarketState(marketStateStatus as MarketStateStatus);
         setLastUpdatedAt(new Date().toLocaleTimeString("ko-KR", { hour12: false }));
       } catch (e) {
@@ -1870,6 +1924,74 @@ export default function HomePage() {
           </div>
         ) : (
           <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>급등 후보 데이터 수집 중...</p>
+        )}
+      </section>
+
+      <section
+        style={{
+          background: UI.cardBg,
+          border: `1px solid ${UI.border}`,
+          borderRadius: 12,
+          padding: "0.8rem 1rem",
+          marginBottom: "0.9rem",
+          boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.32)",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.55rem" }}>
+          <div style={{ fontSize: "0.9rem", color: UI.title, fontWeight: 800, letterSpacing: "0.02em" }}>모의매매 (Paper)</div>
+          <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>
+            갱신 {paper?.updated_at ? formatTsLocal(paper.updated_at) : "-"}
+          </div>
+        </div>
+        {paper ? (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.85rem" }}>
+            <div style={{ border: "1px solid #28456f", borderRadius: 8, padding: "0.6rem", background: UI.cardSoftBg }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, fontSize: "0.78rem", color: UI.body }}>
+                <div>총자산: <strong>{Math.round(paper.account.total_asset_krw).toLocaleString()}</strong></div>
+                <div>보유 KRW: <strong>{Math.round(paper.account.cash_krw).toLocaleString()}</strong></div>
+                <div>평가손익: <strong style={{ color: paper.account.total_pnl_krw >= 0 ? UI.pass : UI.fail }}>{Math.round(paper.account.total_pnl_krw).toLocaleString()}</strong></div>
+                <div>수익률: <strong style={{ color: paper.account.total_return_pct >= 0 ? UI.pass : UI.fail }}>{paper.account.total_return_pct.toFixed(2)}%</strong></div>
+                <div>미실현 손익: <strong style={{ color: paper.account.open_unrealized_pnl_krw >= 0 ? UI.pass : UI.fail }}>{Math.round(paper.account.open_unrealized_pnl_krw).toLocaleString()}</strong></div>
+                <div>오픈/최대: <strong>{paper.counters.open_positions}/{paper.config.max_open_positions}</strong></div>
+              </div>
+              <div style={{ marginTop: 8, fontSize: "0.72rem", color: UI.mutedSoft }}>
+                시작 {paper.config.start_krw.toLocaleString()} / 종목당 {paper.config.entry_krw_per_trade.toLocaleString()} / TP {paper.config.take_profit_pct}% / SL {paper.config.stop_loss_pct}% / T/O {paper.config.timeout_minutes}분
+              </div>
+            </div>
+            <div style={{ border: "1px solid #28456f", borderRadius: 8, padding: "0.6rem", background: UI.cardSoftBg }}>
+              <div style={{ fontSize: "0.78rem", color: UI.title, fontWeight: 800, marginBottom: 6 }}>모의 보유 종목</div>
+              {paper.holdings.length === 0 ? (
+                <div style={{ fontSize: "0.76rem", color: UI.mutedSoft }}>보유 없음</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  {paper.holdings.slice(0, 6).map((h) => (
+                    <div key={`${h.market}-${h.entry_ts}`} style={{ display: "flex", justifyContent: "space-between", fontSize: "0.74rem", color: UI.body }}>
+                      <span>{h.market.replace("KRW-", "")} · {h.signal_strength}</span>
+                      <span style={{ color: h.unrealized_pnl_pct >= 0 ? UI.pass : UI.fail }}>{h.unrealized_pnl_pct.toFixed(2)}%</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div style={{ gridColumn: "1 / -1", border: "1px solid #28456f", borderRadius: 8, padding: "0.6rem", background: UI.cardSoftBg }}>
+              <div style={{ fontSize: "0.78rem", color: UI.title, fontWeight: 800, marginBottom: 6 }}>최근 모의매매 내역</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {paper.recent_history.slice(0, 10).map((h) => (
+                  <div key={`${h.ts}-${h.market}-${h.state}`} style={{ display: "grid", gridTemplateColumns: "130px 70px 110px 1fr 90px", gap: 8, fontSize: "0.73rem", color: UI.body }}>
+                    <span style={{ color: UI.mutedSoft }}>{formatTsLocal(h.ts)}</span>
+                    <strong>{h.market.replace("KRW-", "")}</strong>
+                    <span>{h.state}</span>
+                    <span style={{ color: UI.mutedSoft }}>{h.note}</span>
+                    <span style={{ color: (h.pnl_pct ?? 0) >= 0 ? UI.pass : UI.fail }}>
+                      {h.pnl_pct == null ? "-" : `${h.pnl_pct.toFixed(2)}%`}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>모의매매 데이터 수집 중...</p>
         )}
       </section>
 

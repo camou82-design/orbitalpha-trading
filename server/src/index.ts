@@ -22,6 +22,7 @@ import { createPumpScanner } from "./pump-scanner.js";
 import { assertOrderBuyAllowed, createMarketStateFilter } from "./market-state-filter.js";
 import { createOperationalLogger } from "./operational-logs.js";
 import { readReplayRange } from "./replay-store.js";
+import { createPaperTradingEngine } from "./paper-trading.js";
 
 const cwd = process.cwd();
 const envRoots = [cwd, path.dirname(cwd)];
@@ -157,7 +158,7 @@ async function main() {
     reply.header("set-cookie", parts.join("; "));
   };
 
-  const protectedPrefixes = ["/api/v1/trade/", "/api/v1/account/", "/api/v1/orders/", "/api/v1/replay/", "/api/v1/debug/"];
+  const protectedPrefixes = ["/api/v1/trade/", "/api/v1/account/", "/api/v1/orders/", "/api/v1/replay/", "/api/v1/debug/", "/api/v1/paper/"];
   const authAllowList = new Set(["/api/v1/auth/login", "/api/v1/auth/logout", "/api/v1/auth/session", "/api/v1/auth/me"]);
 
   app.addHook("onRequest", async (req, reply) => {
@@ -242,6 +243,12 @@ async function main() {
     onEvent: (row) => opLog.event(row),
   });
   await strategy.init();
+  const paper = createPaperTradingEngine({
+    companyId: env.companyId,
+    serviceId: env.serviceId,
+    readLogs: (limit: number) => readRecentLogs(env.companyId, env.serviceId, limit),
+  });
+  await paper.init();
   trade.setRecoveryReady(true);
   const pumpScanner = createPumpScanner(() => Object.keys((strategy.status() as any).open_positions ?? {}));
   let lastStrategyTickAt: string | null = null;
@@ -290,6 +297,9 @@ async function main() {
       await opLog.maintainRetention();
     })().catch((e) => app.log.error({ err: String(e) }, "snapshot_tick_failed"));
   }, 60_000);
+  const paperTimer = setInterval(() => {
+    void paper.tick().catch((e) => app.log.error({ err: String(e) }, "paper_tick_failed"));
+  }, 15_000);
   lastScannerTickAt = new Date().toISOString();
   lastMarketStateTickAt = new Date().toISOString();
   void marketFilter.evaluate().catch((e) => app.log.error({ err: String(e) }, "market_state_tick_failed"));
@@ -542,6 +552,7 @@ async function main() {
     };
   });
   app.get("/api/v1/scanner/status", async () => pumpScanner.status());
+  app.get("/api/v1/paper/status", async () => paper.status());
   app.get("/api/v1/market-state", async () => {
     const latest = marketFilter.status();
     if (latest) return latest;
@@ -834,6 +845,7 @@ async function main() {
     clearInterval(scannerTimer);
     clearInterval(marketStateTimer);
     clearInterval(snapshotTimer);
+    clearInterval(paperTimer);
     monitor.stop();
     trade.setRecoveryReady(false);
     await opLog.event({
