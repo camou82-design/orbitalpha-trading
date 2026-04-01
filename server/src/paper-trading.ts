@@ -42,6 +42,9 @@ const PAPER_MAX_OPEN = 3;
 const PAPER_TAKE_PROFIT_PCT = 2.0;
 const PAPER_STOP_LOSS_PCT = -1.5;
 const PAPER_TIMEOUT_MS = 10 * 60_000;
+const PAPER_EARLY_EXIT_MIN_MS = 2 * 60_000;
+const PAPER_EARLY_EXIT_MAX_MS = 3 * 60_000;
+const PAPER_EARLY_EXIT_MIN_FOLLOWTHROUGH_PCT = 0.2;
 const PAPER_HISTORY_MAX = 200;
 const PAPER_SEEN_SIGNAL_MAX = 500;
 
@@ -114,7 +117,7 @@ export function createPaperTradingEngine(opts: {
     }
   };
 
-  const paperBuy = (market: string, signalStrength: string, entryPrice: number): { ok: boolean; reason?: string } => {
+  const paperBuy = (market: string, signalStrength: string, entryPrice: number, note: string): { ok: boolean; reason?: string } => {
     if (state.positions[market]) return { ok: false, reason: "already_open" };
     if (Object.keys(state.positions).length >= PAPER_MAX_OPEN) return { ok: false, reason: "max_open_positions" };
     const buyFee = PAPER_ENTRY_KRW_PER_TRADE * UPBIT_FEE_RATE;
@@ -137,7 +140,7 @@ export function createPaperTradingEngine(opts: {
       ts: new Date().toISOString(),
       market,
       state: "OPEN",
-      note: "paper_buy_opened:surge_scanner",
+      note,
       signal_strength: signalStrength,
       entry_price: entryPrice,
       exit_price: null,
@@ -227,7 +230,16 @@ export function createPaperTradingEngine(opts: {
 
   const tick = async () => {
     const scannerSignals = opts.getScannerSignals();
-    const latestSignalByMarket = new Map<string, { key: string; signal_strength: string; reason: string }>();
+    const latestSignalByMarket = new Map<
+      string,
+      {
+        key: string;
+        signal_strength: string;
+        reason: string;
+        score: number;
+        status: string;
+      }
+    >();
     const watchMarkets = new Set<string>(Object.keys(state.positions));
 
     for (const sig of scannerSignals) {
@@ -235,11 +247,17 @@ export function createPaperTradingEngine(opts: {
       if (!market) continue;
       const signalType = "SURGE_SCANNER";
       const key = String(sig.signal_key ?? `${market}|${sig.reason}`);
-      if (!latestSignalByMarket.has(market)) {
+      const score = toNum(sig.score, 0);
+      const status = String(sig.status ?? "");
+      const reason = String(sig.reason ?? "surge_scanner");
+      const prev = latestSignalByMarket.get(market);
+      if (!prev || score >= prev.score) {
         latestSignalByMarket.set(market, {
           key,
           signal_strength: signalType,
-          reason: String(sig.reason ?? "surge_scanner"),
+          reason,
+          score,
+          status,
         });
       }
       watchMarkets.add(market);
@@ -257,7 +275,8 @@ export function createPaperTradingEngine(opts: {
       if (p > 0) priceByMarket[t.market] = p;
     }
 
-    for (const [market, sig] of latestSignalByMarket.entries()) {
+    const orderedSignals = Array.from(latestSignalByMarket.entries()).sort((a, b) => b[1].score - a[1].score);
+    for (const [market, sig] of orderedSignals) {
       if (state.seenSignalKeys.has(sig.key)) continue;
       state.seenSignalKeys.add(sig.key);
 
@@ -275,13 +294,69 @@ export function createPaperTradingEngine(opts: {
       });
 
       const px = priceByMarket[market] ?? 0;
-      const b = paperBuy(market, sig.signal_strength, px);
+      const isPreCandidate = sig.status === "예비후보";
+      const scoreOk = sig.score >= 65;
+      const reasonLower = sig.reason.toLowerCase();
+      const signalState = reasonLower.includes("breakout_confirmed")
+        ? "돌파"
+        : reasonLower.includes("upper_hold_confirmed")
+          ? "상단유지"
+          : "기타";
+
+      if (isPreCandidate) {
+        appendHistory({
+          ts: new Date().toISOString(),
+          market,
+          state: "SKIPPED",
+          note: "entry_blocked:pre_candidate",
+          signal_strength: sig.signal_strength,
+          entry_price: px > 0 ? px : null,
+          exit_price: null,
+          qty: null,
+          pnl_krw: null,
+          pnl_pct: null,
+        });
+        continue;
+      }
+      if (!scoreOk) {
+        appendHistory({
+          ts: new Date().toISOString(),
+          market,
+          state: "SKIPPED",
+          note: "entry_blocked:score_below_65",
+          signal_strength: sig.signal_strength,
+          entry_price: px > 0 ? px : null,
+          exit_price: null,
+          qty: null,
+          pnl_krw: null,
+          pnl_pct: null,
+        });
+        continue;
+      }
+      if (signalState !== "돌파" && signalState !== "상단유지") {
+        appendHistory({
+          ts: new Date().toISOString(),
+          market,
+          state: "SKIPPED",
+          note: "entry_blocked:state_not_confirmed",
+          signal_strength: sig.signal_strength,
+          entry_price: px > 0 ? px : null,
+          exit_price: null,
+          qty: null,
+          pnl_krw: null,
+          pnl_pct: null,
+        });
+        continue;
+      }
+
+      const entryNote = `paper_buy_opened:surge_scanner:${signalState === "돌파" ? "breakout_confirmed" : "upper_hold_confirmed"}`;
+      const b = paperBuy(market, sig.signal_strength, px, entryNote);
       if (!b.ok) {
         appendHistory({
           ts: new Date().toISOString(),
           market,
           state: "SKIPPED",
-          note: `entry_skipped:${b.reason ?? "unknown"}`,
+          note: `entry_blocked:${b.reason ?? "unknown"}`,
           signal_strength: sig.signal_strength,
           entry_price: px > 0 ? px : null,
           exit_price: null,
@@ -302,6 +377,12 @@ export function createPaperTradingEngine(opts: {
         paperSell(p.market, px, "CLOSED_WIN", "take_profit_2pct:surge_scanner");
       } else if (grossPct <= PAPER_STOP_LOSS_PCT) {
         paperSell(p.market, px, "CLOSED_LOSS", "stop_loss_-1.5pct:surge_scanner");
+      } else if (
+        heldMs >= PAPER_EARLY_EXIT_MIN_MS &&
+        heldMs <= PAPER_EARLY_EXIT_MAX_MS &&
+        grossPct < PAPER_EARLY_EXIT_MIN_FOLLOWTHROUGH_PCT
+      ) {
+        paperSell(p.market, px, grossPct < 0 ? "CLOSED_LOSS" : "CLOSED_TIMEOUT", "early_exit:weak_followthrough");
       } else if (heldMs >= PAPER_TIMEOUT_MS) {
         paperSell(p.market, px, "CLOSED_TIMEOUT", "time_exit_10m:surge_scanner");
       }

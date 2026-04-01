@@ -55,7 +55,7 @@ type PerfRow = {
   return_10m_pct: number | null;
 };
 
-const SCANNER_INTERVAL_MS = Math.max(5_000, Number(process.env.PUMP_SCANNER_INTERVAL_MS ?? 45_000));
+const SCANNER_INTERVAL_MS = Math.max(5_000, Number(process.env.PUMP_SCANNER_INTERVAL_MS ?? 60_000));
 const LIQUIDITY_SCAN_MIN_24H_KRW = 300_000_000; // 3억 이상만 스캔(단, 후보 제외 사유로도 표시)
 const LIQUIDITY_EXCLUDE_MIN_24H_KRW = 1_000_000_000; // 10억 이상만 후보 (그 미만은 "유동성 부족")
 const BASE_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"] as const;
@@ -63,13 +63,13 @@ const BASE_MARKET_SET = new Set<string>(BASE_MARKETS as unknown as string[]);
 const MAX_NEW_CANDIDATE_MARKETS = 8;
 const CANDLE_MAX_MARKETS_PER_TICK = Math.max(
   1,
-  Number(process.env.PUMP_SCANNER_CANDLE_MAX_MARKETS_PER_TICK ?? process.env.UPBIT_TICKER_MAX_MARKETS_PER_TICK ?? 25),
+  Number(process.env.PUMP_SCANNER_CANDLE_MAX_MARKETS_PER_TICK ?? process.env.UPBIT_TICKER_MAX_MARKETS_PER_TICK ?? 12),
 );
-const CANDLE_BATCH_SIZE = Math.max(1, Number(process.env.PUMP_SCANNER_CANDLE_BATCH_SIZE ?? 6));
-const CANDLE_BATCH_DELAY_MS = Math.max(0, Number(process.env.PUMP_SCANNER_CANDLE_BATCH_DELAY_MS ?? 1_200));
-const CANDLE_429_MAX_ATTEMPTS = Math.max(1, Number(process.env.PUMP_SCANNER_CANDLE_429_MAX_ATTEMPTS ?? 3));
-const CANDLE_429_BASE_DELAY_MS = Math.max(500, Number(process.env.PUMP_SCANNER_CANDLE_429_BASE_DELAY_MS ?? 1_000));
-const CANDLE_SNAPSHOT_CACHE_TTL_MS = Math.max(1_000, Number(process.env.PUMP_SCANNER_CANDLE_CACHE_TTL_MS ?? 60_000));
+const CANDLE_BATCH_SIZE = Math.max(1, Number(process.env.PUMP_SCANNER_CANDLE_BATCH_SIZE ?? 3));
+const CANDLE_BATCH_DELAY_MS = Math.max(0, Number(process.env.PUMP_SCANNER_CANDLE_BATCH_DELAY_MS ?? 2_000));
+const CANDLE_429_MAX_ATTEMPTS = Math.max(1, Number(process.env.PUMP_SCANNER_CANDLE_429_MAX_ATTEMPTS ?? 2));
+const CANDLE_429_BASE_DELAY_MS = Math.max(500, Number(process.env.PUMP_SCANNER_CANDLE_429_BASE_DELAY_MS ?? 1_500));
+const CANDLE_SNAPSHOT_CACHE_TTL_MS = Math.max(1_000, Number(process.env.PUMP_SCANNER_CANDLE_CACHE_TTL_MS ?? 120_000));
 
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
@@ -445,7 +445,11 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
           score: r.score,
           status: r.status,
           signal_key: `${r.market}|${r.updated_at}|${r.score.toFixed(1)}|${r.status}`,
-          reason: `surge_scanner:${r.status}:score_${r.score.toFixed(1)}`,
+          reason: r.breakout
+            ? `surge_scanner:breakout_confirmed:score_${r.score.toFixed(1)}`
+            : r.close_upper_hold
+              ? `surge_scanner:upper_hold_confirmed:score_${r.score.toFixed(1)}`
+              : `surge_scanner:candidate_watch:score_${r.score.toFixed(1)}`,
         })),
     status: () => {
       // Latest perf per market for post verification columns.

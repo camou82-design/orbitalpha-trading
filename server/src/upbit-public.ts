@@ -268,11 +268,11 @@ function numTradePrice(v: unknown): number {
   return Number.isFinite(p) && p > 0 ? p : 0;
 }
 
-const TICKER_MAX_MARKETS_PER_TICK = Number(process.env.UPBIT_TICKER_MAX_MARKETS_PER_TICK ?? 25); // 20~30 권장
-const TICKER_BATCH_SIZE = Number(process.env.UPBIT_TICKER_BATCH_SIZE ?? 10);
-const TICKER_BATCH_DELAY_MS = Number(process.env.UPBIT_TICKER_BATCH_DELAY_MS ?? 1_200); // 배치 간 간격
+const TICKER_MAX_MARKETS_PER_TICK = Number(process.env.UPBIT_TICKER_MAX_MARKETS_PER_TICK ?? 15);
+const TICKER_BATCH_SIZE = Number(process.env.UPBIT_TICKER_BATCH_SIZE ?? 5);
+const TICKER_BATCH_DELAY_MS = Number(process.env.UPBIT_TICKER_BATCH_DELAY_MS ?? 1_800); // 배치 간 간격
 const TICKER_429_MAX_ATTEMPTS = Number(process.env.UPBIT_TICKER_429_MAX_ATTEMPTS ?? 2); // 최초 + 1회 재시도
-const TICKER_429_RETRY_DELAY_MS = Number(process.env.UPBIT_TICKER_429_RETRY_DELAY_MS ?? 1_500); // 최소 1~2초
+const TICKER_429_RETRY_DELAY_MS = Number(process.env.UPBIT_TICKER_429_RETRY_DELAY_MS ?? 2_000); // 최소 1~2초
 
 const ticker24hVolumeHintByMarket = new Map<string, number>();
 
