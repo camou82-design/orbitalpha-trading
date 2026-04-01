@@ -214,12 +214,63 @@ function numTradePrice(v: unknown): number {
   return Number.isFinite(p) && p > 0 ? p : 0;
 }
 
+const TICKER_MAX_MARKETS_PER_TICK = Number(process.env.UPBIT_TICKER_MAX_MARKETS_PER_TICK ?? 25); // 20~30 권장
+const TICKER_BATCH_SIZE = Number(process.env.UPBIT_TICKER_BATCH_SIZE ?? 10);
+const TICKER_BATCH_DELAY_MS = Number(process.env.UPBIT_TICKER_BATCH_DELAY_MS ?? 1_200); // 배치 간 간격
+const TICKER_429_MAX_ATTEMPTS = Number(process.env.UPBIT_TICKER_429_MAX_ATTEMPTS ?? 2); // 최초 + 1회 재시도
+const TICKER_429_RETRY_DELAY_MS = Number(process.env.UPBIT_TICKER_429_RETRY_DELAY_MS ?? 1_500); // 최소 1~2초
+
+const ticker24hVolumeHintByMarket = new Map<string, number>();
+
+function chunk<T>(arr: T[], size: number): T[][] {
+  if (size <= 0) return [arr];
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
 export async function fetchTickers(markets: string[]): Promise<UpbitTicker[]> {
   if (markets.length === 0) return [];
-  const q = encodeURIComponent(markets.join(","));
-  const rows = await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${q}`);
-  return rows.map((r) => ({
-    ...r,
-    trade_price: numTradePrice((r as { trade_price?: unknown }).trade_price),
-  }));
+  const uniq = Array.from(new Set(markets));
+  const ranked = [...uniq].sort((a, b) => (ticker24hVolumeHintByMarket.get(b) ?? 0) - (ticker24hVolumeHintByMarket.get(a) ?? 0));
+  const limited = ranked.slice(0, Math.max(1, TICKER_MAX_MARKETS_PER_TICK));
+  const batches = chunk(limited, Math.max(1, TICKER_BATCH_SIZE));
+
+  const out: UpbitTicker[] = [];
+  for (let i = 0; i < batches.length; i++) {
+    const group = batches[i]!;
+    let done = false;
+    for (let attempt = 1; attempt <= Math.max(1, TICKER_429_MAX_ATTEMPTS); attempt++) {
+      try {
+        const q = encodeURIComponent(group.join(","));
+        const rows = await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${q}`);
+        const mapped = rows.map((r) => ({
+          ...r,
+          trade_price: numTradePrice((r as { trade_price?: unknown }).trade_price),
+        }));
+        for (const t of mapped) {
+          ticker24hVolumeHintByMarket.set(t.market, Number(t.acc_trade_price_24h ?? 0));
+        }
+        out.push(...mapped);
+        done = true;
+        break;
+      } catch (e) {
+        const status = e instanceof UpbitHttpError ? e.status : undefined;
+        const is429 = status === 429 || (e instanceof Error && e.message.includes("429"));
+        if (!is429 || attempt >= Math.max(1, TICKER_429_MAX_ATTEMPTS)) {
+          console.warn(
+            `[upbit-ticker] batch_failed markets=${group.length} attempt=${attempt} status=${status ?? "unknown"} error=${e instanceof Error ? e.message : String(e)}`,
+          );
+          break; // 부분 실패 허용
+        }
+        const retryDelay = TICKER_429_RETRY_DELAY_MS * attempt;
+        await sleep(retryDelay);
+      }
+    }
+    if (i < batches.length - 1) {
+      await sleep(Math.max(0, TICKER_BATCH_DELAY_MS));
+    }
+    if (!done) continue;
+  }
+  return out;
 }

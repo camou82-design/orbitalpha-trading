@@ -55,7 +55,7 @@ type PerfRow = {
   return_10m_pct: number | null;
 };
 
-const SCANNER_INTERVAL_MS = 45_000;
+const SCANNER_INTERVAL_MS = Math.max(5_000, Number(process.env.PUMP_SCANNER_INTERVAL_MS ?? 45_000));
 const LIQUIDITY_SCAN_MIN_24H_KRW = 300_000_000; // 3억 이상만 스캔(단, 후보 제외 사유로도 표시)
 const LIQUIDITY_EXCLUDE_MIN_24H_KRW = 1_000_000_000; // 10억 이상만 후보 (그 미만은 "유동성 부족")
 const BASE_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"] as const;
@@ -254,13 +254,16 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
     }
     const altMarkets = krwMarkets.filter((m) => !BASE_MARKET_SET.has(m));
     const tickers = await fetchTickers(altMarkets);
+    const fetchedAltSet = new Set(tickers.map((t) => t.market));
+    const heldMissingFromTicker = heldMarkets.filter((m) => !BASE_MARKET_SET.has(m) && !fetchedAltSet.has(m) && !is429Excluded(m));
+    const heldExtraTickers = await fetchTickers(heldMissingFromTicker);
     const liquidNew = tickers
       .filter((t) => (t.acc_trade_price_24h ?? 0) >= LIQUIDITY_SCAN_MIN_24H_KRW)
       .sort((a, b) => (b.acc_trade_price_24h ?? 0) - (a.acc_trade_price_24h ?? 0))
       .slice(0, MAX_NEW_CANDIDATE_MARKETS)
       .filter((t) => !is429Excluded(t.market));
 
-    const allTickers = [...baseTickers, ...tickers];
+    const allTickers = [...baseTickers, ...tickers, ...heldExtraTickers];
     const tByMarket = new Map(allTickers.map((t) => [t.market, t]));
 
     // 기본: 보유 종목은 항상 스캔 대상에 포함(단, 429 쿨다운이면 제외).
