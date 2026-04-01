@@ -61,6 +61,15 @@ const LIQUIDITY_EXCLUDE_MIN_24H_KRW = 1_000_000_000; // 10억 이상만 후보 (
 const BASE_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"] as const;
 const BASE_MARKET_SET = new Set<string>(BASE_MARKETS as unknown as string[]);
 const MAX_NEW_CANDIDATE_MARKETS = 8;
+const CANDLE_MAX_MARKETS_PER_TICK = Math.max(
+  1,
+  Number(process.env.PUMP_SCANNER_CANDLE_MAX_MARKETS_PER_TICK ?? process.env.UPBIT_TICKER_MAX_MARKETS_PER_TICK ?? 25),
+);
+const CANDLE_BATCH_SIZE = Math.max(1, Number(process.env.PUMP_SCANNER_CANDLE_BATCH_SIZE ?? 6));
+const CANDLE_BATCH_DELAY_MS = Math.max(0, Number(process.env.PUMP_SCANNER_CANDLE_BATCH_DELAY_MS ?? 1_200));
+const CANDLE_429_MAX_ATTEMPTS = Math.max(1, Number(process.env.PUMP_SCANNER_CANDLE_429_MAX_ATTEMPTS ?? 3));
+const CANDLE_429_BASE_DELAY_MS = Math.max(500, Number(process.env.PUMP_SCANNER_CANDLE_429_BASE_DELAY_MS ?? 1_000));
+const CANDLE_SNAPSHOT_CACHE_TTL_MS = Math.max(1_000, Number(process.env.PUMP_SCANNER_CANDLE_CACHE_TTL_MS ?? 60_000));
 
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
@@ -76,6 +85,17 @@ function toStatus(score: number): ScannerRow["status"] {
 function avg(nums: number[]) {
   if (nums.length === 0) return 0;
   return nums.reduce((a, b) => a + b, 0) / nums.length;
+}
+
+function chunk<T>(arr: T[], size: number): T[][] {
+  if (size <= 0) return [arr];
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btcDropPenalty: number) {
@@ -180,6 +200,7 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
   const MARKET_LIST_CACHE_TTL_MS = Number(process.env.PUMP_SCANNER_MARKET_LIST_CACHE_TTL_MS ?? 10 * 60_000);
   let cachedKrwMarkets: string[] | null = null;
   let cachedKrwMarketsAtMs = 0;
+  const candleSnapshotCache = new Map<string, { c1: UpbitCandle[]; c5: UpbitCandle[]; fetchedAtMs: number }>();
 
   const debugEnabled =
     process.env.ORBITALPHA_TRADING_SCANNER_DEBUG === "1" ||
@@ -231,7 +252,32 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
     state.pending = state.pending.filter((p) => !(p.done3 && p.done5 && p.done10));
   };
 
+  const getCandlesSafe = async (market: string): Promise<{ c1: UpbitCandle[]; c5: UpbitCandle[] } | null> => {
+    const cached = candleSnapshotCache.get(market);
+    const now = Date.now();
+    if (cached && now - cached.fetchedAtMs < CANDLE_SNAPSHOT_CACHE_TTL_MS) {
+      return { c1: cached.c1, c5: cached.c5 };
+    }
+    for (let attempt = 1; attempt <= CANDLE_429_MAX_ATTEMPTS; attempt++) {
+      try {
+        const c1 = await fetchMinuteCandles(market, 1, 30);
+        const c5 = await fetchMinuteCandles(market, 5, 20);
+        candleSnapshotCache.set(market, { c1, c5, fetchedAtMs: Date.now() });
+        return { c1, c5 };
+      } catch (e) {
+        const status = (e as any)?.status;
+        const msg = e instanceof Error ? e.message : String(e);
+        const is429 = status === 429 || msg.includes("429");
+        if (!is429 || attempt >= CANDLE_429_MAX_ATTEMPTS) return null;
+        const backoffMs = CANDLE_429_BASE_DELAY_MS * 2 ** (attempt - 1);
+        await sleep(backoffMs);
+      }
+    }
+    return null;
+  };
+
   const tick = async () => {
+    try {
     const heldMarkets = Array.from(new Set(getHeldMarkets().filter((m) => typeof m === "string" && m.length > 0)));
 
     const is429Excluded = (market: string) => {
@@ -247,10 +293,14 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
     if (cachedKrwMarkets && Date.now() - cachedKrwMarketsAtMs < MARKET_LIST_CACHE_TTL_MS) {
       krwMarkets = cachedKrwMarkets;
     } else {
-      const marketRows = await fetch("https://api.upbit.com/v1/market/all?isDetails=false").then((r) => r.json() as Promise<Array<{ market: string }>>);
-      krwMarkets = marketRows.map((m) => m.market).filter((m) => m.startsWith("KRW-"));
-      cachedKrwMarkets = krwMarkets;
-      cachedKrwMarketsAtMs = Date.now();
+      try {
+        const marketRows = await fetch("https://api.upbit.com/v1/market/all?isDetails=false").then((r) => r.json() as Promise<Array<{ market: string }>>);
+        krwMarkets = marketRows.map((m) => m.market).filter((m) => m.startsWith("KRW-"));
+        cachedKrwMarkets = krwMarkets;
+        cachedKrwMarketsAtMs = Date.now();
+      } catch {
+        krwMarkets = cachedKrwMarkets ?? [...BASE_MARKETS];
+      }
     }
     const altMarkets = krwMarkets.filter((m) => !BASE_MARKET_SET.has(m));
     const tickers = await fetchTickers(altMarkets);
@@ -280,11 +330,24 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
     });
 
     const rows: ScannerRow[] = [];
-    for (const t of marketsToScore) {
-      try {
-        const c1 = await fetchMinuteCandles(t.market, 1, 30);
-        const c5 = await fetchMinuteCandles(t.market, 5, 20);
-        const s = scoreOne(c1, c5, t as UpbitTicker, btcDropPenalty);
+    const heldSet = new Set(heldMarkets);
+    const marketsRanked = [...marketsToScore].sort((a, b) => {
+      const heldBiasA = heldSet.has(a.market) ? 1 : 0;
+      const heldBiasB = heldSet.has(b.market) ? 1 : 0;
+      if (heldBiasA !== heldBiasB) return heldBiasB - heldBiasA;
+      return (b.acc_trade_price_24h ?? 0) - (a.acc_trade_price_24h ?? 0);
+    });
+    const candleTargets = marketsRanked.slice(0, CANDLE_MAX_MARKETS_PER_TICK);
+    const batches = chunk(candleTargets, CANDLE_BATCH_SIZE);
+    for (let bi = 0; bi < batches.length; bi++) {
+      const batch = batches[bi]!;
+      for (const t of batch) {
+        const candles = await getCandlesSafe(t.market);
+        if (!candles) {
+          market429CooldownUntilMs.set(t.market, Date.now() + MARKET_429_EXCLUDE_MS);
+          continue;
+        }
+        const s = scoreOne(candles.c1, candles.c5, t as UpbitTicker, btcDropPenalty);
         if (!s) continue;
         rows.push({
           rank: 0,
@@ -298,13 +361,9 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
           exclude_reasons: s.exclude_reasons,
           updated_at: new Date().toISOString(),
         });
-      } catch (e) {
-        const status = (e as any)?.status;
-        const msg = e instanceof Error ? e.message : String(e);
-        if (status === 429 || msg.includes("429")) {
-          market429CooldownUntilMs.set(t.market, Date.now() + MARKET_429_EXCLUDE_MS);
-        }
-        continue;
+      }
+      if (bi < batches.length - 1) {
+        await sleep(CANDLE_BATCH_DELAY_MS);
       }
     }
 
@@ -363,7 +422,15 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
     }
 
     updatePending(priceBy);
-    await persist();
+    try {
+      await persist();
+    } catch {
+      // persistence failure should not fail scanner tick
+    }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn("[pump-scanner] tick_partial_failure", { error: msg });
+    }
   };
 
   return {
