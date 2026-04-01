@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 
 const root = process.cwd();
-const port = process.env.PORT || "3000";
+const port = process.env.PORT || "3010";
 const apiPort = process.env.ORBITALPHA_TRADING_PORT || "8787";
 
 const children = [];
@@ -36,6 +36,6 @@ process.on("SIGTERM", () => shutdown(0));
 run("server", "npm", ["run", "start", "-w", "@orbitalpha/server"], {
   ORBITALPHA_TRADING_PORT: apiPort,
 });
-run("dashboard", "npm", ["run", "start", "-w", "@orbitalpha/dashboard"], {
+run("dashboard", "npm", ["exec", "--workspace", "@orbitalpha/dashboard", "--", "next", "start", "-p", port], {
   PORT: port,
 });
