@@ -47,6 +47,8 @@ const CANDLE_429_MAX_ATTEMPTS = Number(process.env.UPBIT_CANDLE_429_MAX_ATTEMPTS
 
 const CANDLE_429_LOG_INTERVAL_MS = Number(process.env.UPBIT_CANDLE_429_LOG_INTERVAL_MS ?? 60_000);
 const CANDLE_CACHE_STATS_LOG_INTERVAL_MS = Number(process.env.UPBIT_CANDLE_CACHE_STATS_LOG_INTERVAL_MS ?? 60_000);
+const UPBIT_MARKET_CACHE_TTL_MS = Number(process.env.UPBIT_MARKET_CACHE_TTL_MS ?? 10 * 60_000);
+const UPBIT_INVALID_MARKET_TTL_MS = Number(process.env.UPBIT_INVALID_MARKET_TTL_MS ?? 20 * 60_000);
 
 const candleCache = new Map<string, CandleCacheEntry>();
 const candleInFlight = new Map<string, Promise<UpbitCandle[]>>();
@@ -58,6 +60,9 @@ let candleHttpFetchesSinceLastLog = 0;
 let candleCacheHitsSinceLastLog = 0;
 let candleStaleServedSinceLastLog = 0;
 let candleLastStatsLogAtMs = 0;
+let validKrwMarketsCache: Set<string> | null = null;
+let validKrwMarketsFetchedAtMs = 0;
+const invalidMarketUntilMs = new Map<string, number>();
 
 function candleKey(market: string, unit: 1 | 5 | 15, count: number) {
   return `${market}|u${unit}|c${count}`;
@@ -99,12 +104,57 @@ async function fetchJson<T>(path: string): Promise<T> {
   return r.json() as Promise<T>;
 }
 
+function is404CodeNotFound(err: unknown): boolean {
+  return err instanceof UpbitHttpError && err.status === 404 && err.message.includes("Code not found");
+}
+
+function markInvalidMarket(market: string) {
+  const until = Date.now() + UPBIT_INVALID_MARKET_TTL_MS;
+  invalidMarketUntilMs.set(market, until);
+  validKrwMarketsCache?.delete(market);
+}
+
+function isInvalidMarketBlocked(market: string): boolean {
+  const until = invalidMarketUntilMs.get(market) ?? 0;
+  if (until <= 0) return false;
+  if (Date.now() >= until) {
+    invalidMarketUntilMs.delete(market);
+    return false;
+  }
+  return true;
+}
+
+async function getValidKrwMarkets(): Promise<Set<string>> {
+  const now = Date.now();
+  if (validKrwMarketsCache && now - validKrwMarketsFetchedAtMs < UPBIT_MARKET_CACHE_TTL_MS) {
+    return validKrwMarketsCache;
+  }
+  try {
+    const rows = await fetchJson<Array<{ market: string }>>("/v1/market/all?isDetails=false");
+    const set = new Set(rows.map((r) => r.market).filter((m) => m.startsWith("KRW-")));
+    validKrwMarketsCache = set;
+    validKrwMarketsFetchedAtMs = now;
+    return set;
+  } catch {
+    return validKrwMarketsCache ?? new Set<string>();
+  }
+}
+
+async function sanitizeKrwMarkets(markets: string[]): Promise<string[]> {
+  const uniq = Array.from(new Set(markets)).filter((m) => m.startsWith("KRW-"));
+  if (uniq.length === 0) return [];
+  const valid = await getValidKrwMarkets();
+  return uniq.filter((m) => !isInvalidMarketBlocked(m) && (valid.size === 0 || valid.has(m)));
+}
+
 /** Newest candle first — reverse to oldest-first for indicators. */
 export async function fetchMinuteCandles(
   market: string,
   unit: 1 | 5 | 15,
   count: number,
 ): Promise<UpbitCandle[]> {
+  const validMarkets = await sanitizeKrwMarkets([market]);
+  if (validMarkets.length === 0) return [];
   const key = candleKey(market, unit, count);
   const nowMs = Date.now();
   maybeLogCandleCacheStats(nowMs);
@@ -159,6 +209,10 @@ export async function fetchMinuteCandles(
         });
         return value;
       } catch (e) {
+        if (is404CodeNotFound(e)) {
+          markInvalidMarket(market);
+          return [];
+        }
         if (e instanceof UpbitHttpError && e.status === 429) {
           const now = Date.now();
           const cooldownUntilMs2 = now + CANDLE_429_COOLDOWN_MS;
@@ -231,8 +285,9 @@ function chunk<T>(arr: T[], size: number): T[][] {
 
 export async function fetchTickers(markets: string[]): Promise<UpbitTicker[]> {
   if (markets.length === 0) return [];
-  const uniq = Array.from(new Set(markets));
-  const ranked = [...uniq].sort((a, b) => (ticker24hVolumeHintByMarket.get(b) ?? 0) - (ticker24hVolumeHintByMarket.get(a) ?? 0));
+  const sanitized = await sanitizeKrwMarkets(markets);
+  if (sanitized.length === 0) return [];
+  const ranked = [...sanitized].sort((a, b) => (ticker24hVolumeHintByMarket.get(b) ?? 0) - (ticker24hVolumeHintByMarket.get(a) ?? 0));
   const limited = ranked.slice(0, Math.max(1, TICKER_MAX_MARKETS_PER_TICK));
   const batches = chunk(limited, Math.max(1, TICKER_BATCH_SIZE));
 
@@ -242,8 +297,27 @@ export async function fetchTickers(markets: string[]): Promise<UpbitTicker[]> {
     let done = false;
     for (let attempt = 1; attempt <= Math.max(1, TICKER_429_MAX_ATTEMPTS); attempt++) {
       try {
+        const rows: UpbitTicker[] = [];
         const q = encodeURIComponent(group.join(","));
-        const rows = await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${q}`);
+        try {
+          rows.push(...(await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${q}`)));
+        } catch (batchErr) {
+          if (!is404CodeNotFound(batchErr)) throw batchErr;
+          // 404(Code not found) 배치 실패 시 단건으로 격리하여 invalid 마켓을 blacklist 처리.
+          for (const market of group) {
+            try {
+              const sq = encodeURIComponent(market);
+              const one = await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${sq}`);
+              rows.push(...one);
+            } catch (singleErr) {
+              if (is404CodeNotFound(singleErr)) {
+                markInvalidMarket(market);
+                continue;
+              }
+              throw singleErr;
+            }
+          }
+        }
         const mapped = rows.map((r) => ({
           ...r,
           trade_price: numTradePrice((r as { trade_price?: unknown }).trade_price),
