@@ -63,6 +63,8 @@ let candleLastStatsLogAtMs = 0;
 let validKrwMarketsCache: Set<string> | null = null;
 let validKrwMarketsFetchedAtMs = 0;
 const invalidMarketUntilMs = new Map<string, number>();
+const invalidMarketLoggedOnce = new Set<string>();
+const excludedByValidSetLoggedOnce = new Set<string>();
 
 function candleKey(market: string, unit: 1 | 5 | 15, count: number) {
   return `${market}|u${unit}|c${count}`;
@@ -104,14 +106,21 @@ async function fetchJson<T>(path: string): Promise<T> {
   return r.json() as Promise<T>;
 }
 
-function is404CodeNotFound(err: unknown): boolean {
-  return err instanceof UpbitHttpError && err.status === 404 && err.message.includes("Code not found");
+function is404MarketError(err: unknown): boolean {
+  return err instanceof UpbitHttpError && err.status === 404;
+}
+
+function logInvalidOnce(market: string, reason: string) {
+  if (invalidMarketLoggedOnce.has(market)) return;
+  invalidMarketLoggedOnce.add(market);
+  console.warn(`[upbit-market] excluded_invalid market=${market} reason=${reason}`);
 }
 
 function markInvalidMarket(market: string) {
   const until = Date.now() + UPBIT_INVALID_MARKET_TTL_MS;
   invalidMarketUntilMs.set(market, until);
   validKrwMarketsCache?.delete(market);
+  logInvalidOnce(market, "upbit_404");
 }
 
 function isInvalidMarketBlocked(market: string): boolean {
@@ -144,7 +153,24 @@ async function sanitizeKrwMarkets(markets: string[]): Promise<string[]> {
   const uniq = Array.from(new Set(markets)).filter((m) => m.startsWith("KRW-"));
   if (uniq.length === 0) return [];
   const valid = await getValidKrwMarkets();
-  return uniq.filter((m) => !isInvalidMarketBlocked(m) && (valid.size === 0 || valid.has(m)));
+  const out: string[] = [];
+  for (const m of uniq) {
+    if (isInvalidMarketBlocked(m)) {
+      logInvalidOnce(m, "blacklist_ttl");
+      continue;
+    }
+    // valid set 확보 실패 시 fail-close로 API 호출 차단 (404/429 악화 방지)
+    if (valid.size === 0) continue;
+    if (!valid.has(m)) {
+      if (!excludedByValidSetLoggedOnce.has(m)) {
+        excludedByValidSetLoggedOnce.add(m);
+        console.warn(`[upbit-market] excluded_not_in_valid_set market=${m}`);
+      }
+      continue;
+    }
+    out.push(m);
+  }
+  return out;
 }
 
 /** Newest candle first — reverse to oldest-first for indicators. */
@@ -209,7 +235,7 @@ export async function fetchMinuteCandles(
         });
         return value;
       } catch (e) {
-        if (is404CodeNotFound(e)) {
+        if (is404MarketError(e)) {
           markInvalidMarket(market);
           return [];
         }
@@ -302,7 +328,7 @@ export async function fetchTickers(markets: string[]): Promise<UpbitTicker[]> {
         try {
           rows.push(...(await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${q}`)));
         } catch (batchErr) {
-          if (!is404CodeNotFound(batchErr)) throw batchErr;
+          if (!is404MarketError(batchErr)) throw batchErr;
           // 404(Code not found) 배치 실패 시 단건으로 격리하여 invalid 마켓을 blacklist 처리.
           for (const market of group) {
             try {
@@ -310,7 +336,7 @@ export async function fetchTickers(markets: string[]): Promise<UpbitTicker[]> {
               const one = await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${sq}`);
               rows.push(...one);
             } catch (singleErr) {
-              if (is404CodeNotFound(singleErr)) {
+              if (is404MarketError(singleErr)) {
                 markInvalidMarket(market);
                 continue;
               }
