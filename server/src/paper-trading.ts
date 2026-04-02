@@ -78,6 +78,8 @@ const XRP_RECOVERY_FULL_MINUTES = 40;
 const XRP_RECOVERY_FULL_PCT = -0.2;
 const PAPER_HISTORY_MAX = 200;
 const PAPER_SEEN_SIGNAL_MAX = 500;
+const PAPER_BTC_NEUTRAL_ENTRY_SCALE = 0.75;
+const PAPER_BTC_WEAK_ENTRY_SCALE = 0.5;
 
 function toNum(v: unknown, d = 0): number {
   const n = Number(v);
@@ -391,6 +393,7 @@ export function createPaperTradingEngine(opts: {
       }
     >();
     const watchMarkets = new Set<string>(Object.keys(state.positions));
+    watchMarkets.add("KRW-BTC");
 
     for (const sig of scannerSignals) {
       const market = String(sig.market ?? "").trim();
@@ -433,10 +436,15 @@ export function createPaperTradingEngine(opts: {
 
     const tickers = await fetchTickers([...watchMarkets]);
     const priceByMarket: Record<string, number> = {};
+    let btcChange = 0;
     for (const t of tickers) {
       const p = toNum(t.trade_price, 0);
       if (p > 0) priceByMarket[t.market] = p;
+      if (t.market === "KRW-BTC") btcChange = Number(t.signed_change_rate ?? 0);
     }
+    const btcTier: "strong" | "neutral" | "weak" =
+      btcChange <= -0.004 ? "weak" : btcChange >= 0.002 ? "strong" : "neutral";
+    const entryScale = btcTier === "weak" ? PAPER_BTC_WEAK_ENTRY_SCALE : btcTier === "neutral" ? PAPER_BTC_NEUTRAL_ENTRY_SCALE : 1;
 
     const orderedSignals = Array.from(latestSignalByMarket.entries()).sort((a, b) => b[1].score - a[1].score);
     for (const [market, sig] of orderedSignals) {
@@ -516,11 +524,12 @@ export function createPaperTradingEngine(opts: {
       }
 
       if (Object.keys(state.positions).length >= PAPER_MAX_OPEN) continue;
-      const entryAmount = isBreakout ? PAPER_ENTRY_KRW_PER_TRADE : PAPER_PROBE_ENTRY_KRW;
+      const entryAmountBase = isBreakout ? PAPER_ENTRY_KRW_PER_TRADE : PAPER_PROBE_ENTRY_KRW;
+      const entryAmount = Math.max(5_000, Math.floor(entryAmountBase * entryScale));
 
       const entryNote = isBreakout
-        ? "paper_buy_opened:surge_scanner:breakout_confirmed"
-        : "paper_buy_opened:surge_scanner:candidate_probe";
+        ? `paper_buy_opened:surge_scanner:breakout_confirmed:btc_risk_scaled_${entryScale}`
+        : `paper_buy_opened:surge_scanner:candidate_probe:btc_risk_scaled_${entryScale}`;
       const b = paperBuy(market, sig.signal_strength, px, entryNote, entryAmount);
       if (!b.ok) {
         appendHistory({

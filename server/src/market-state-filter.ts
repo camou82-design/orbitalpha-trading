@@ -4,7 +4,7 @@ import { appendLog } from "./log-store.js";
 import { fetchMinuteCandles } from "./upbit-public.js";
 
 export type { MarketState };
-export type EntryPolicy = "적극 진입" | "선별 진입" | "신규 진입 차단";
+export type EntryPolicy = "적극 진입" | "선별 진입" | "축소 진입";
 
 export type MarketStateSnapshot = {
   timestamp: string;
@@ -126,10 +126,10 @@ export function createMarketStateFilter(args: {
     const snap: MarketStateSnapshot = {
       timestamp: new Date().toISOString(),
       market_state: marketState,
-      // risk_off도 "전면 차단" 대신 "보수적 선별 모드"로 운영
-      entry_policy: marketState === "risk_on" ? "적극 진입" : "선별 진입",
-      market_bonus: marketState === "risk_on" ? 18 : marketState === "neutral" ? 0 : -100,
-      min_entry_score: marketState === "risk_on" ? 70 : marketState === "neutral" ? 82 : 999,
+      // 분화 장세: risk_off도 차단이 아닌 축소 진입 모드로 운영.
+      entry_policy: marketState === "risk_on" ? "적극 진입" : marketState === "neutral" ? "선별 진입" : "축소 진입",
+      market_bonus: marketState === "risk_on" ? 18 : marketState === "neutral" ? 0 : -10,
+      min_entry_score: marketState === "risk_on" ? 70 : marketState === "neutral" ? 78 : 82,
       regime_allows_new_and_additional_buys: true,
       order_limits: { ...ORDER_LIMITS },
       btc_5m_trend: btc5,
@@ -194,9 +194,10 @@ export function assertOrderBuyAllowed(
   args: { kind: "new_entry" | "add_to_position"; signalPayload: unknown | undefined },
 ): OrderBuyGateResult {
   const { market_state, entry_policy } = snap;
+  const payload = args.signalPayload as { __strong_symbol_override?: boolean; __allow_risk_scaled_entry?: boolean } | undefined;
 
   const g = runEntryScoreGate(snap.market_state, snap.min_entry_score, snap.market_bonus, args.signalPayload);
-  if (!g.ok) {
+  if (!g.ok && payload?.__strong_symbol_override !== true && payload?.__allow_risk_scaled_entry !== true) {
     const blocked_reason = g.reason ?? "entry_gate_failed";
     if (args.kind === "new_entry") {
       return {

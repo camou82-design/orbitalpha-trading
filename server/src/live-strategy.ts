@@ -120,7 +120,7 @@ type PersistedState = {
     exit_stage: Record<string, 0 | 1 | 2>;
   };
   regime?: {
-    btc_filter_state: "normal" | "weak";
+    btc_filter_state: "strong" | "neutral" | "weak";
     conservative_mode: boolean;
     exception_entry_allowed: boolean;
     exception_candidates: Array<{ market: string; reason: string; relative_strength: number; signal_score: number }>;
@@ -187,7 +187,7 @@ export function createLiveDataStrategy(opts: {
       exit_stage: {},
     },
     regime: {
-      btc_filter_state: "normal",
+      btc_filter_state: "neutral",
       conservative_mode: false,
       exception_entry_allowed: false,
       exception_candidates: [],
@@ -339,7 +339,9 @@ export function createLiveDataStrategy(opts: {
     const priceBy = new Map(tickerRows.map((r) => [r.market, r.trade_price]));
     const changeRateBy = new Map(tickerRows.map((r) => [r.market, Number(r.signed_change_rate ?? 0)]));
     const btcChange = Number(changeRateBy.get("KRW-BTC") ?? 0);
-    const btcWeak = conservativeMode || btcChange <= -0.004;
+    const btcTier: "strong" | "neutral" | "weak" =
+      conservativeMode || btcChange <= -0.004 ? "weak" : btcChange >= 0.002 ? "strong" : "neutral";
+    const entrySizePct = btcTier === "strong" ? 1 : btcTier === "neutral" ? 0.75 : RISK_OFF_ENTRY_SCALE;
     const exceptionCandidates: Array<{ market: string; reason: string; relative_strength: number; signal_score: number }> = [];
     if (exceptionSlotMarket) {
       const x = exceptionPool[0]!;
@@ -353,12 +355,12 @@ export function createLiveDataStrategy(opts: {
     }
     exceptionCandidates.sort((a, b) => b.signal_score - a.signal_score || b.relative_strength - a.relative_strength);
     state.regime = {
-      btc_filter_state: btcWeak ? "weak" : "normal",
+      btc_filter_state: btcTier,
       conservative_mode: conservativeMode,
-      exception_entry_allowed: btcWeak,
+      exception_entry_allowed: true,
       exception_candidates: exceptionCandidates.slice(0, 1),
       exception_slot_market: exceptionSlotMarket,
-      entry_size_pct: btcWeak ? RISK_OFF_ENTRY_SCALE : 1,
+      entry_size_pct: entrySizePct,
       last_updated_at: new Date().toISOString(),
     };
 
@@ -497,7 +499,7 @@ export function createLiveDataStrategy(opts: {
       let reasonExit = "";
       let stopTriggerKind: StopTriggerKind | null = null;
       let ratio = 1;
-      const weakModeTighterStop = (state.regime?.btc_filter_state ?? "normal") === "weak" ? -0.9 : null;
+      const weakModeTighterStop = (state.regime?.btc_filter_state ?? "neutral") === "weak" ? -0.9 : null;
       if (weakModeTighterStop !== null && pnlGross <= weakModeTighterStop) {
         reasonExit = "btc_weak_tight_stop";
         stopTriggerKind = "price_stop";
@@ -896,6 +898,14 @@ export function createLiveDataStrategy(opts: {
       if ((sig.p.signal_type ?? "").toUpperCase() === "LOW") continue;
       const exception = state.regime?.exception_candidates.find((x) => x.market === market) ?? null;
       if (isExceptionMarket && !exception) continue;
+      const gate = opts.marketState.entryGate(sig.p, marketState);
+      const signalScore = Number(gate.score ?? 0);
+      const rel = (Number(changeRateBy.get(market) ?? 0) - btcChange) * 100;
+      const vol = Number(sig.p.volume_ratio ?? 0);
+      const reasonText = String(sig.p.signal_reason ?? "").toLowerCase();
+      const trendOk = reasonText.includes("breakout") || reasonText.includes("trend") || reasonText.includes("reclaim");
+      const strongSymbolOverride = signalScore >= 80 && rel >= 0.5 && vol >= 1.05 && trendOk;
+      if (!gate.ok && !strongSymbolOverride) continue;
 
       const st = await opts.trade.status();
       const currency = market.replace("KRW-", "");
@@ -904,18 +914,19 @@ export function createLiveDataStrategy(opts: {
       const liveOrderAvailableKrw = Math.max(0, Number(st.live_order_available_krw ?? st.krw_available ?? 0));
       let orderKrw = Math.floor(liveOrderAvailableKrw * 0.2);
       orderKrw = Math.max(5000, Math.min(30000, orderKrw));
-      if (btcWeak) {
-        orderKrw = Math.floor(orderKrw * RISK_OFF_ENTRY_SCALE);
-      }
+      orderKrw = Math.floor(orderKrw * entrySizePct);
       if (isExceptionMarket) {
         orderKrw = Math.floor(orderKrw * 0.9);
       }
       if (orderKrw < 5000) continue;
       if (liveOrderAvailableKrw < orderKrw) continue;
       const strategyType: StrategyType = marketState.market_state === "risk_on" ? "momentum" : "stable";
-      const signalPayloadForBuy = exception
-        ? { ...sig.p, __allow_risk_off_entry: true, __risk_off_exception_reason: exception.reason }
-        : sig.p;
+      const signalPayloadForBuy = {
+        ...sig.p,
+        __allow_risk_scaled_entry: true,
+        __strong_symbol_override: strongSymbolOverride,
+        __risk_off_exception_reason: exception?.reason,
+      };
       try {
         await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", signalPayloadForBuy);
       } catch (e) {
@@ -956,8 +967,8 @@ export function createLiveDataStrategy(opts: {
         order_krw: orderKrw,
         reason_enter: exception
           ? `exception_slot_entry:${exception.reason}`
-          : btcWeak
-            ? `${sig.p.signal_reason ?? "signal_pass"}:btc_weak_size_reduced`
+          : entrySizePct < 1
+            ? `${sig.p.signal_reason ?? "signal_pass"}:btc_risk_scaled_${entrySizePct}`
             : sig.p.signal_reason ?? "signal_pass",
         signal_strength: sig.p.signal_type ?? "MID",
         volume_ratio: Number(sig.p.volume_ratio ?? 0),
@@ -1015,7 +1026,14 @@ export function createLiveDataStrategy(opts: {
         current_price: price,
         pnl_net: 0,
         pnl_net_pct: 0,
-        note: exception ? "exception_entry_in_btc_weak_mode" : "strategy entry",
+        note: [
+          "strategy entry",
+          `btc_risk_scaled:${entrySizePct}`,
+          strongSymbolOverride ? "strong_symbol_override" : null,
+          exception ? "selective_entry_allowed" : null,
+        ]
+          .filter(Boolean)
+          .join("|"),
       });
     }
     await persist();
