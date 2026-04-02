@@ -4,7 +4,7 @@ import type { SignalLogEntry } from "@orbitalpha/shared";
 import { companyIdSchema, mvpSignalPayloadV2Schema, serviceIdSchema } from "@orbitalpha/shared";
 import { tradingDataRoot } from "./paths.js";
 import { appendLog } from "./log-store.js";
-import { fetchMinuteCandles, fetchTickers } from "./upbit-public.js";
+import { fetchMinuteCandles, fetchTickers, partitionKrwMarketsByUpbitValidity } from "./upbit-public.js";
 import {
   RECOVERY_EXIT_CONFIG,
   STRATEGY_RISK_CONFIG,
@@ -140,6 +140,107 @@ const DEBUG_INCLUDE_UNIVERSE_MARKETS = String(process.env.DEBUG_INCLUDE_UNIVERSE
   .split(",")
   .map((s) => s.trim().toUpperCase())
   .filter((s) => s.startsWith("KRW-"));
+
+function classifySignalMonitorErrorSnippet(err: string): { primary_reason: string; classification_tags: string[] } {
+  const e = err.toLowerCase();
+  const classification_tags: string[] = [];
+  if (/429|too many requests/.test(e)) classification_tags.push("volume_filter_failed");
+  if (/404|code not found|invalid_market|unknown market|not found/.test(e)) classification_tags.push("invalid_market_data");
+  if (/candle|캔들|\[\]|empty|length|too short/.test(e)) classification_tags.push("insufficient_candles");
+  if (/ema|indicator|nan|undefined/.test(e)) classification_tags.push("indicator_not_ready");
+  let primary_reason = "signal_monitor_scan_failed";
+  if (classification_tags.includes("invalid_market_data")) primary_reason = "invalid_market_data";
+  else if (classification_tags.includes("insufficient_candles")) primary_reason = "insufficient_candles";
+  else if (classification_tags.includes("volume_filter_failed")) primary_reason = "volume_filter_failed";
+  else if (classification_tags.includes("indicator_not_ready")) primary_reason = "indicator_not_ready";
+  return { primary_reason, classification_tags };
+}
+
+/** signal-monitor JSONL에 왜 해당 심볼 신호가 없는지 단계별로 분해 (pump-scanner 피드와는 별도 채널). */
+function buildLiveSignalMissingDetail(market: string, logs: SignalLogEntry[]): Record<string, unknown> {
+  let rawSignalRows = 0;
+  let parsedOkRows = 0;
+  let parsedFailRows = 0;
+  let newestRawSignalTs: string | null = null;
+  let lastZodIssue: string | null = null;
+
+  let scanFailNewestTs: string | null = null;
+  let scanFailNewestErr: string | null = null;
+  let scanFailCount = 0;
+  let cooldownRows = 0;
+
+  for (const row of logs) {
+    const msg = String(row.message ?? "");
+    if (msg === `market_scan_failed:${market}`) {
+      scanFailCount += 1;
+      if (!scanFailNewestTs) {
+        scanFailNewestTs = row.ts;
+        scanFailNewestErr = String((row.payload as { error?: unknown })?.error ?? "").slice(0, 500);
+      }
+    }
+    if (msg === `market_scan_skipped_cooldown:${market}`) {
+      cooldownRows += 1;
+    }
+  }
+
+  for (const row of logs) {
+    if (row.kind !== "signal" || !row.payload || typeof row.payload !== "object") continue;
+    const pay = row.payload as Record<string, unknown>;
+    if (pay.market !== market) continue;
+    rawSignalRows += 1;
+    if (!newestRawSignalTs) newestRawSignalTs = row.ts;
+    const p = mvpSignalPayloadV2Schema.safeParse(row.payload);
+    if (p.success) {
+      parsedOkRows += 1;
+    } else {
+      parsedFailRows += 1;
+      if (!lastZodIssue && p.error?.issues?.[0]) {
+        const iss = p.error.issues[0]!;
+        lastZodIssue = `${iss.path.join(".")}: ${iss.message}`;
+      }
+    }
+  }
+
+  const scanClass = scanFailNewestErr
+    ? classifySignalMonitorErrorSnippet(scanFailNewestErr)
+    : { primary_reason: "signal_monitor_scan_failed", classification_tags: [] as string[] };
+
+  const classification_tags = [...scanClass.classification_tags];
+  const hints: string[] = [
+    "live_strategy_uses_readLogs_kind_signal_only",
+    "pump_scanner_signalFeed_is_not_written_to_this_log_stream",
+  ];
+
+  let primary_reason = "not_in_signal_monitor_logs";
+
+  if (parsedOkRows > 0) {
+    primary_reason = "unexpected_parsed_ok_but_signal_map_miss";
+    hints.push("check_latestAllSignals_fill_order_and_log_window");
+  } else if (rawSignalRows > 0) {
+    primary_reason = "signal_payload_schema_mismatch";
+    if (lastZodIssue) hints.push(`zod_first_issue:${lastZodIssue}`);
+  } else if (scanFailNewestErr) {
+    primary_reason = scanClass.primary_reason;
+  } else if (cooldownRows > 0) {
+    primary_reason = "signal_monitor_cooldown_skips";
+    hints.push("only_system_cooldown_rows_no_signal_append_in_window");
+  }
+
+  return {
+    primary_reason,
+    signal_source: "signal_monitor_jsonl",
+    raw_signal_rows: rawSignalRows,
+    parsed_ok_rows: parsedOkRows,
+    parsed_fail_rows: parsedFailRows,
+    newest_raw_signal_ts: newestRawSignalTs,
+    scan_fail_count: scanFailCount,
+    last_scan_fail_ts: scanFailNewestTs,
+    last_scan_fail_error: scanFailNewestErr,
+    cooldown_rows_seen: cooldownRows,
+    classification_tags,
+    hints,
+  };
+}
 
 function todayKst() {
   return new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" });
@@ -355,6 +456,39 @@ export function createLiveDataStrategy(opts: {
       if (!MARKETS.includes(p.data.market as any)) continue;
       if (!latestByMarket.has(p.data.market)) latestByMarket.set(p.data.market, { ts: row.ts, p: p.data });
     }
+
+    const includeValidity = await partitionKrwMarketsByUpbitValidity(DEBUG_INCLUDE_UNIVERSE_MARKETS);
+    const debugUniverseExtra = includeValidity.skippedBecauseUnknown
+      ? [...DEBUG_INCLUDE_UNIVERSE_MARKETS]
+      : includeValidity.accepted;
+    if (!includeValidity.skippedBecauseUnknown && includeValidity.rejected.length > 0) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_INCLUDE_MARKET_REJECTED_BY_UPBIT_VALIDITY",
+          rejected: includeValidity.rejected,
+          env_raw: DEBUG_INCLUDE_UNIVERSE_MARKETS,
+        }),
+      );
+    }
+
+    const logMapValidity = await partitionKrwMarketsByUpbitValidity([...latestAllSignals.keys()]);
+    if (!logMapValidity.skippedBecauseUnknown) {
+      const keepLogMarkets = new Set(logMapValidity.accepted);
+      for (const k of [...latestAllSignals.keys()]) {
+        if (!keepLogMarkets.has(k)) {
+          latestAllSignals.delete(k);
+          console.info(
+            JSON.stringify({
+              tag: "DEBUG_STALE_INVALID_MARKET_PRUNED_FROM_SIGNAL_MAP",
+              symbol: k,
+              reason: "not_in_upbit_valid_set_or_blacklisted",
+              ingress_path: "historical_signal_jsonl_or_delisted_ticker",
+            }),
+          );
+        }
+      }
+    }
+
     const exceptionPool = Array.from(latestAllSignals.entries())
       .filter(([m]) => !LEADER_MARKETS.has(m) && m.startsWith("KRW-"))
       .map(([market, sig]) => {
@@ -370,11 +504,7 @@ export function createLiveDataStrategy(opts: {
       .sort((a, b) => b.signalScore - a.signalScore || b.vol - a.vol);
     const exceptionSlotMarket = exceptionPool[0]?.market ?? null;
     const watchMarkets = Array.from(
-      new Set([
-        ...MARKETS,
-        ...(exceptionSlotMarket ? [exceptionSlotMarket] : []),
-        ...DEBUG_INCLUDE_UNIVERSE_MARKETS,
-      ]),
+      new Set([...MARKETS, ...(exceptionSlotMarket ? [exceptionSlotMarket] : []), ...debugUniverseExtra]),
     );
     const tickerRows = await fetchTickers(watchMarkets);
     const priceBy = new Map(tickerRows.map((r) => [r.market, r.trade_price]));
@@ -921,11 +1051,7 @@ export function createLiveDataStrategy(opts: {
 
     const exceptionSlot = state.regime?.exception_slot_market ?? null;
     const baseEntryUniverse = Array.from(
-      new Set([
-        ...MARKETS,
-        ...(exceptionSlot ? [exceptionSlot] : []),
-        ...DEBUG_INCLUDE_UNIVERSE_MARKETS,
-      ]),
+      new Set([...MARKETS, ...(exceptionSlot ? [exceptionSlot] : []), ...debugUniverseExtra]),
     );
     const heldMeaningfulMarkets = new Set<string>();
     if (DEBUG_EXCLUDE_HELD_SYMBOLS) {
@@ -944,7 +1070,8 @@ export function createLiveDataStrategy(opts: {
       JSON.stringify({
         tag: "DEBUG_LIVE_CANDIDATE_UNIVERSE",
         debug_exclude_held_symbols: DEBUG_EXCLUDE_HELD_SYMBOLS,
-        debug_include_universe_markets: DEBUG_INCLUDE_UNIVERSE_MARKETS,
+        debug_include_universe_markets_env: DEBUG_INCLUDE_UNIVERSE_MARKETS,
+        debug_include_universe_markets_resolved: debugUniverseExtra,
         held_filtered_markets: [...heldMeaningfulMarkets],
         entry_universe: entryUniverse,
       }),
@@ -999,7 +1126,18 @@ export function createLiveDataStrategy(opts: {
 
       const sig = latestAllSignals.get(market);
       if (!sig) {
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "signal_missing" });
+        const missingDetail = buildLiveSignalMissingDetail(market, logs);
+        console.info(
+          JSON.stringify({
+            tag: "DEBUG_LIVE_SIGNAL_MISSING_DETAIL",
+            symbol: market,
+            ...missingDetail,
+          }),
+        );
+        emitEval("DEBUG_LIVE_PRECHECK", {
+          return_reason: String(missingDetail.primary_reason ?? "signal_missing"),
+          signal_missing_detail: true,
+        });
         continue;
       }
       const filterPass = Boolean(sig.p.filter_pass);

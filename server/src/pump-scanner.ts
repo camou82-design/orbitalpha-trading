@@ -1,7 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { tradingDataRoot } from "./paths.js";
-import { fetchMinuteCandles, fetchTickers, type UpbitCandle, type UpbitTicker } from "./upbit-public.js";
+import {
+  fetchMinuteCandles,
+  fetchTickers,
+  partitionKrwMarketsByUpbitValidity,
+  type UpbitCandle,
+  type UpbitTicker,
+} from "./upbit-public.js";
 
 type ScannerRow = {
   rank: number;
@@ -302,7 +308,20 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
         krwMarkets = cachedKrwMarkets ?? [...BASE_MARKETS];
       }
     }
-    const altMarkets = krwMarkets.filter((m) => !BASE_MARKET_SET.has(m));
+    let altMarkets = krwMarkets.filter((m) => !BASE_MARKET_SET.has(m));
+    const altValidity = await partitionKrwMarketsByUpbitValidity(altMarkets);
+    if (!altValidity.skippedBecauseUnknown) {
+      if (altValidity.rejected.length > 0) {
+        console.info(
+          JSON.stringify({
+            tag: "DEBUG_PUMP_SCANNER_ALT_MARKETS_PRUNED",
+            rejected_sample: altValidity.rejected.slice(0, 12),
+            rejected_count: altValidity.rejected.length,
+          }),
+        );
+      }
+      altMarkets = altValidity.accepted;
+    }
     const tickers = await fetchTickers(altMarkets);
     const fetchedAltSet = new Set(tickers.map((t) => t.market));
     const heldMissingFromTicker = heldMarkets.filter((m) => !BASE_MARKET_SET.has(m) && !fetchedAltSet.has(m) && !is429Excluded(m));

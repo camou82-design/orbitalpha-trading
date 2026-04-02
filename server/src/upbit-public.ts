@@ -173,6 +173,35 @@ async function sanitizeKrwMarkets(markets: string[]): Promise<string[]> {
   return out;
 }
 
+/**
+ * Upbit `/v1/market/all` 기준 유효 KRW 마켓만 통과.
+ * 유효 셋을 아직 못 가져온 경우(skippedBecauseUnknown)에는 호출부에서 맵을 비우지 말고 그대로 둔다.
+ */
+export async function partitionKrwMarketsByUpbitValidity(
+  markets: string[],
+): Promise<{ accepted: string[]; rejected: string[]; skippedBecauseUnknown: boolean }> {
+  const uniq = Array.from(new Set(markets)).filter((m) => m.startsWith("KRW-"));
+  if (uniq.length === 0) return { accepted: [], rejected: [], skippedBecauseUnknown: false };
+  const valid = await getValidKrwMarkets();
+  if (valid.size === 0) {
+    return { accepted: uniq, rejected: [], skippedBecauseUnknown: true };
+  }
+  const accepted: string[] = [];
+  const rejected: string[] = [];
+  for (const m of uniq) {
+    if (isInvalidMarketBlocked(m)) {
+      rejected.push(m);
+      continue;
+    }
+    if (!valid.has(m)) {
+      rejected.push(m);
+      continue;
+    }
+    accepted.push(m);
+  }
+  return { accepted, rejected, skippedBecauseUnknown: false };
+}
+
 /** Newest candle first — reverse to oldest-first for indicators. */
 export async function fetchMinuteCandles(
   market: string,
