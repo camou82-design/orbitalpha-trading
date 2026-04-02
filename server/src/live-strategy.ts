@@ -962,19 +962,8 @@ export function createLiveDataStrategy(opts: {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "signal_missing" });
         continue;
       }
-      if (!sig.p.filter_pass) {
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "base_gate_failed" });
-        continue; // pass only
-      }
-      if ((sig.p.signal_type ?? "").toUpperCase() === "LOW") {
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "score_below_threshold", signal_type: sig.p.signal_type ?? "LOW" });
-        continue;
-      }
-      const exception = state.regime?.exception_candidates.find((x) => x.market === market) ?? null;
-      if (isExceptionMarket && !exception) {
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "exception_not_selected" });
-        continue;
-      }
+      const filterPass = Boolean(sig.p.filter_pass);
+      const signalTypeLow = (sig.p.signal_type ?? "").toUpperCase() === "LOW";
       const gate = opts.marketState.entryGate(sig.p, marketState);
       const baseGateOriginalResult = Boolean(gate.ok);
       const gateOk = DEBUG_FORCE_BASE_GATE ? true : baseGateOriginalResult;
@@ -995,22 +984,27 @@ export function createLiveDataStrategy(opts: {
       });
       const strongSymbolOverride = signalScore >= 80 && rel >= 0.5 && vol >= 1.05 && trendOk;
       let detailedReason: string | null = null;
-      if (signalScore < minBaseScore) detailedReason = "score_below_threshold";
+      if (!filterPass) detailedReason = "base_gate_failed";
+      else if (signalTypeLow) detailedReason = "score_below_threshold";
+      else if (signalScore < minBaseScore) detailedReason = "score_below_threshold";
       else if (vol < minBaseVol) detailedReason = "volume_ratio_low";
       else if (!trendOk) detailedReason = "trend_not_ok";
       else if (!breakout) detailedReason = "no_breakout";
-      else if (!gate.ok) detailedReason = "base_gate_failed";
+      else if (!baseGateOriginalResult) detailedReason = "base_gate_failed";
+      const exception = state.regime?.exception_candidates.find((x) => x.market === market) ?? null;
       emitEval("DEBUG_LIVE_BASE_GATE_RESULT", {
         score: Number(signalScore.toFixed(2)),
         volume_ratio: Number(vol.toFixed(3)),
         relative_strength: Number(rel.toFixed(3)),
         trend_ok: trendOk,
         breakout,
+        filter_pass: filterPass,
+        signal_type: sig.p.signal_type ?? "MID",
         base_gate_ok: gateOk,
         base_gate_original_result: baseGateOriginalResult,
         base_gate_forced: DEBUG_FORCE_BASE_GATE,
         strong_symbol_override: strongSymbolOverride,
-        return_reason: !gateOk && !strongSymbolOverride ? detailedReason ?? "base_gate_failed" : null,
+        return_reason: !filterPass || signalTypeLow || (!gateOk && !strongSymbolOverride) ? detailedReason ?? "base_gate_failed" : null,
       });
       await appendLog({
         company_id: companyIdSchema.parse(opts.companyId),
@@ -1031,6 +1025,18 @@ export function createLiveDataStrategy(opts: {
           strong_symbol_override: strongSymbolOverride,
         },
       });
+      if (isExceptionMarket && !exception) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "exception_not_selected" });
+        continue;
+      }
+      if (!filterPass) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "base_gate_failed" });
+        continue;
+      }
+      if (signalTypeLow) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "score_below_threshold", signal_type: sig.p.signal_type ?? "LOW" });
+        continue;
+      }
       if (!gateOk && !strongSymbolOverride) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: detailedReason ?? "base_gate_failed" });
         continue;
