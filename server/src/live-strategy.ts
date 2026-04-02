@@ -133,6 +133,7 @@ type PersistedState = {
 const MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX"] as const;
 const LEADER_MARKETS = new Set<string>(MARKETS as unknown as string[]);
 const RISK_OFF_ENTRY_SCALE = 0.5;
+const DEBUG_FORCE_BASE_GATE = String(process.env.DEBUG_FORCE_BASE_GATE ?? "").toLowerCase() === "true";
 
 function todayKst() {
   return new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" });
@@ -975,6 +976,8 @@ export function createLiveDataStrategy(opts: {
         continue;
       }
       const gate = opts.marketState.entryGate(sig.p, marketState);
+      const baseGateOriginalResult = Boolean(gate.ok);
+      const gateOk = DEBUG_FORCE_BASE_GATE ? true : baseGateOriginalResult;
       const signalScore = Number(gate.score ?? 0);
       const rel = (Number(changeRateBy.get(market) ?? 0) - btcChange) * 100;
       const vol = Number(sig.p.volume_ratio ?? 0);
@@ -1003,9 +1006,11 @@ export function createLiveDataStrategy(opts: {
         relative_strength: Number(rel.toFixed(3)),
         trend_ok: trendOk,
         breakout,
-        base_gate_ok: gate.ok,
+        base_gate_ok: gateOk,
+        base_gate_original_result: baseGateOriginalResult,
+        base_gate_forced: DEBUG_FORCE_BASE_GATE,
         strong_symbol_override: strongSymbolOverride,
-        return_reason: !gate.ok && !strongSymbolOverride ? detailedReason ?? "base_gate_failed" : null,
+        return_reason: !gateOk && !strongSymbolOverride ? detailedReason ?? "base_gate_failed" : null,
       });
       await appendLog({
         company_id: companyIdSchema.parse(opts.companyId),
@@ -1020,11 +1025,13 @@ export function createLiveDataStrategy(opts: {
           btc_state: btcTier,
           relative_strength: Number(rel.toFixed(3)),
           trend_ok: trendOk,
-          gate_ok: gate.ok,
+          gate_ok: gateOk,
+          base_gate_original_result: baseGateOriginalResult,
+          base_gate_forced: DEBUG_FORCE_BASE_GATE,
           strong_symbol_override: strongSymbolOverride,
         },
       });
-      if (!gate.ok && !strongSymbolOverride) {
+      if (!gateOk && !strongSymbolOverride) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: detailedReason ?? "base_gate_failed" });
         continue;
       }
