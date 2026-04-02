@@ -905,6 +905,23 @@ export function createLiveDataStrategy(opts: {
       const reasonText = String(sig.p.signal_reason ?? "").toLowerCase();
       const trendOk = reasonText.includes("breakout") || reasonText.includes("trend") || reasonText.includes("reclaim");
       const strongSymbolOverride = signalScore >= 80 && rel >= 0.5 && vol >= 1.05 && trendOk;
+      await appendLog({
+        company_id: companyIdSchema.parse(opts.companyId),
+        service_id: serviceIdSchema.parse(opts.serviceId),
+        ts: new Date().toISOString(),
+        kind: "system",
+        message: "DEBUG_STRONG_CHECK",
+        payload: {
+          symbol: market,
+          volume_ratio: Number(vol.toFixed(3)),
+          score: Number(signalScore.toFixed(2)),
+          btc_state: btcTier,
+          relative_strength: Number(rel.toFixed(3)),
+          trend_ok: trendOk,
+          gate_ok: gate.ok,
+          strong_symbol_override: strongSymbolOverride,
+        },
+      });
       if (!gate.ok && !strongSymbolOverride) continue;
 
       const st = await opts.trade.status();
