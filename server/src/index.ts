@@ -14,7 +14,7 @@ import { getMonitorInstanceSnapshot } from "./monitor-instance-meta.js";
 import { acquireSignalServerProcessLock } from "./monitor-process-lock.js";
 import { startSignalMonitor } from "./signal-monitor.js";
 import { readRecentLogs } from "./log-store.js";
-import { getMvpWatchMarkets } from "./upbit-public.js";
+import { resolveWatchMarkets } from "./upbit-public.js";
 import { VOLUME_THRESHOLD_BY_MARKET } from "./volume-thresholds.js";
 import { createTradeControl } from "./trade-control.js";
 import { createLiveDataStrategy } from "./live-strategy.js";
@@ -372,7 +372,7 @@ async function main() {
     company_id: env.companyId,
     service_id: env.serviceId,
     ...monitorSnap(),
-    watch_markets: getMvpWatchMarkets(env.excludedMarkets),
+    watch_markets: await resolveWatchMarkets(env.excludedMarkets),
     excluded_markets: env.excludedMarkets,
     volume_threshold_fallback: env.volumeThresholdMain,
     volume_thresholds_by_market: VOLUME_THRESHOLD_BY_MARKET,
@@ -387,7 +387,7 @@ async function main() {
     company_id: env.companyId,
     service_id: env.serviceId,
     ...monitorSnap(),
-    watch_markets: getMvpWatchMarkets(env.excludedMarkets),
+    watch_markets: await resolveWatchMarkets(env.excludedMarkets),
     excluded_markets: env.excludedMarkets,
     volume_threshold_fallback: env.volumeThresholdMain,
     volume_thresholds_by_market: VOLUME_THRESHOLD_BY_MARKET,

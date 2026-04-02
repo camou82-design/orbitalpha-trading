@@ -314,8 +314,45 @@ export function getMvpWatchMarkets(excluded: readonly string[]): string[] {
   return MVP_WATCH_MARKETS.filter((m) => !ex.has(m));
 }
 
-export function resolveWatchMarkets(excluded: readonly string[] = []): Promise<string[]> {
-  return Promise.resolve(getMvpWatchMarkets(excluded));
+/** 콤마 구분. signal-monitor 전용 — live `DEBUG_INCLUDE_UNIVERSE_MARKETS`와 별도. */
+function parseSignalMonitorExtraMarketsFromEnv(): string[] {
+  const raw = String(process.env.ORBITALPHA_SIGNAL_MONITOR_EXTRA_MARKETS ?? "").trim();
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((s) => s.trim().toUpperCase())
+    .filter((s) => s.startsWith("KRW-"));
+}
+
+/**
+ * signal-monitor 감시 목록. 기본은 MVP 4종 + env로 추가(유효 마켓만 통과 시 prune).
+ * Upbit market/all를 아직 못 받은 경우에는 prune 생략(fail-open).
+ */
+export async function resolveWatchMarkets(excluded: readonly string[] = []): Promise<string[]> {
+  const ex = new Set(excluded);
+  const base = getMvpWatchMarkets(excluded);
+  const extra = parseSignalMonitorExtraMarketsFromEnv().filter((m) => !ex.has(m));
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  for (const m of [...base, ...extra]) {
+    if (seen.has(m)) continue;
+    seen.add(m);
+    merged.push(m);
+  }
+  const part = await partitionKrwMarketsByUpbitValidity(merged);
+  if (part.skippedBecauseUnknown) {
+    return merged;
+  }
+  if (part.rejected.length > 0) {
+    console.warn(
+      JSON.stringify({
+        tag: "DEBUG_SIGNAL_MONITOR_WATCHLIST_PRUNED_INVALID",
+        rejected: part.rejected,
+        accepted: part.accepted,
+      }),
+    );
+  }
+  return part.accepted;
 }
 
 function numTradePrice(v: unknown): number {
