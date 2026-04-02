@@ -231,6 +231,18 @@ async function main() {
         kind: ctx.isAdditionalBuy ? "add_to_position" : "new_entry",
         signalPayload: ctx.signalPayload,
       });
+      const btcState = snap.market_state === "risk_on" ? "strong" : snap.market_state === "neutral" ? "neutral" : "weak";
+      app.log.info(
+        {
+          tag: "DEBUG_MARKET_FILTER_RESULT",
+          symbol: ctx.market,
+          btc_state: btcState,
+          allow: r.ok,
+          size_scale: r.size_scale,
+          blocked_reason: r.blocked_reason,
+        },
+        "DEBUG_MARKET_FILTER_RESULT",
+      );
       if (!r.ok) throw new Error(`order_entry_gate: ${r.blocked_reason}`);
     },
   });

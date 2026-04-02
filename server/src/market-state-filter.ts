@@ -34,6 +34,7 @@ export type OrderBuyGateResult =
       new_entry_blocked: false;
       add_entry_blocked: false;
       blocked_reason: null;
+      size_scale: number;
     }
   | {
       ok: false;
@@ -42,6 +43,7 @@ export type OrderBuyGateResult =
       new_entry_blocked: boolean;
       add_entry_blocked: boolean;
       blocked_reason: string;
+      size_scale: number;
     };
 
 function ema(values: number[], period: number): number {
@@ -186,38 +188,15 @@ export function createMarketStateFilter(args: {
 
 /**
  * 신규 진입·추가매수(전략 물량 추가·레거시 DCA) 공통 게이트.
- * - 하락장(risk_off): 신규·추가 모두 차단.
- * - 그 외: 추가매수도 `entryGate`와 동일 점수 기준(표시되는 진입 정책과 주문 엔진 일치).
+ * - 분화 장세 대응: 어떤 상태에서도 전면 차단하지 않고 진입은 허용.
+ * - market-state는 차단기가 아니라 리스크 사이즈 조절 힌트만 제공.
  */
 export function assertOrderBuyAllowed(
   snap: MarketStateSnapshot,
-  args: { kind: "new_entry" | "add_to_position"; signalPayload: unknown | undefined },
+  _args: { kind: "new_entry" | "add_to_position"; signalPayload: unknown | undefined },
 ): OrderBuyGateResult {
   const { market_state, entry_policy } = snap;
-  const payload = args.signalPayload as { __strong_symbol_override?: boolean; __allow_risk_scaled_entry?: boolean } | undefined;
-
-  const g = runEntryScoreGate(snap.market_state, snap.min_entry_score, snap.market_bonus, args.signalPayload);
-  if (!g.ok && payload?.__strong_symbol_override !== true && payload?.__allow_risk_scaled_entry !== true) {
-    const blocked_reason = g.reason ?? "entry_gate_failed";
-    if (args.kind === "new_entry") {
-      return {
-        ok: false,
-        market_state,
-        entry_policy,
-        new_entry_blocked: true,
-        add_entry_blocked: false,
-        blocked_reason,
-      };
-    }
-    return {
-      ok: false,
-      market_state,
-      entry_policy,
-      new_entry_blocked: false,
-      add_entry_blocked: true,
-      blocked_reason,
-    };
-  }
+  const size_scale = market_state === "risk_on" ? 1 : market_state === "neutral" ? 0.75 : 0.5;
 
   return {
     ok: true,
@@ -226,6 +205,7 @@ export function assertOrderBuyAllowed(
     new_entry_blocked: false,
     add_entry_blocked: false,
     blocked_reason: null,
+    size_scale,
   };
 }
 
