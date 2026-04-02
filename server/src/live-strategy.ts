@@ -135,6 +135,11 @@ const LEADER_MARKETS = new Set<string>(MARKETS as unknown as string[]);
 const RISK_OFF_ENTRY_SCALE = 0.5;
 const EXISTING_POSITION_MIN_KRW = Math.max(1000, Number(process.env.LIVE_EXISTING_POSITION_MIN_KRW ?? 5000));
 const DEBUG_FORCE_BASE_GATE = String(process.env.DEBUG_FORCE_BASE_GATE ?? "").toLowerCase() === "true";
+const DEBUG_EXCLUDE_HELD_SYMBOLS = String(process.env.DEBUG_EXCLUDE_HELD_SYMBOLS ?? "").toLowerCase() === "true";
+const DEBUG_INCLUDE_UNIVERSE_MARKETS = String(process.env.DEBUG_INCLUDE_UNIVERSE_MARKETS ?? "")
+  .split(",")
+  .map((s) => s.trim().toUpperCase())
+  .filter((s) => s.startsWith("KRW-"));
 
 function todayKst() {
   return new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" });
@@ -364,7 +369,13 @@ export function createLiveDataStrategy(opts: {
       .filter((x) => x.signalScore >= 86 && x.vol >= 1.2 && x.rise3m >= 0.8 && x.trendOk)
       .sort((a, b) => b.signalScore - a.signalScore || b.vol - a.vol);
     const exceptionSlotMarket = exceptionPool[0]?.market ?? null;
-    const watchMarkets = exceptionSlotMarket ? [...MARKETS, exceptionSlotMarket] : [...MARKETS];
+    const watchMarkets = Array.from(
+      new Set([
+        ...MARKETS,
+        ...(exceptionSlotMarket ? [exceptionSlotMarket] : []),
+        ...DEBUG_INCLUDE_UNIVERSE_MARKETS,
+      ]),
+    );
     const tickerRows = await fetchTickers(watchMarkets);
     const priceBy = new Map(tickerRows.map((r) => [r.market, r.trade_price]));
     const changeRateBy = new Map(tickerRows.map((r) => [r.market, Number(r.signed_change_rate ?? 0)]));
@@ -909,7 +920,35 @@ export function createLiveDataStrategy(opts: {
     }
 
     const exceptionSlot = state.regime?.exception_slot_market ?? null;
-    const entryUniverse = exceptionSlot ? [...MARKETS, exceptionSlot] : [...MARKETS];
+    const baseEntryUniverse = Array.from(
+      new Set([
+        ...MARKETS,
+        ...(exceptionSlot ? [exceptionSlot] : []),
+        ...DEBUG_INCLUDE_UNIVERSE_MARKETS,
+      ]),
+    );
+    const heldMeaningfulMarkets = new Set<string>();
+    if (DEBUG_EXCLUDE_HELD_SYMBOLS) {
+      for (const b of Array.isArray(tstatus.balances) ? tstatus.balances : []) {
+        const currency = String((b as any).currency ?? "").toUpperCase();
+        if (!currency || currency === "KRW") continue;
+        const mk = `KRW-${currency}`;
+        const qty = Number((b as any).balance ?? 0);
+        const px = Number(priceBy.get(mk) ?? (b as any).avg_buy_price ?? 0);
+        const valueKrw = qty > 0 && px > 0 ? qty * px : 0;
+        if (valueKrw >= EXISTING_POSITION_MIN_KRW) heldMeaningfulMarkets.add(mk);
+      }
+    }
+    const entryUniverse = baseEntryUniverse.filter((m) => !heldMeaningfulMarkets.has(m));
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_LIVE_CANDIDATE_UNIVERSE",
+        debug_exclude_held_symbols: DEBUG_EXCLUDE_HELD_SYMBOLS,
+        debug_include_universe_markets: DEBUG_INCLUDE_UNIVERSE_MARKETS,
+        held_filtered_markets: [...heldMeaningfulMarkets],
+        entry_universe: entryUniverse,
+      }),
+    );
     for (const market of entryUniverse) {
       const emitEval = (tag: string, payload: Record<string, unknown>) => {
         console.info(
