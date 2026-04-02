@@ -133,6 +133,7 @@ type PersistedState = {
 const MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX"] as const;
 const LEADER_MARKETS = new Set<string>(MARKETS as unknown as string[]);
 const RISK_OFF_ENTRY_SCALE = 0.5;
+const EXISTING_POSITION_MIN_KRW = Math.max(1000, Number(process.env.LIVE_EXISTING_POSITION_MIN_KRW ?? 5000));
 const DEBUG_FORCE_BASE_GATE = String(process.env.DEBUG_FORCE_BASE_GATE ?? "").toLowerCase() === "true";
 
 function todayKst() {
@@ -1037,8 +1038,19 @@ export function createLiveDataStrategy(opts: {
       const st = await opts.trade.status();
       const currency = market.replace("KRW-", "");
       const existingQty = Number(st.balances?.find((b: any) => b.currency === currency)?.balance ?? 0);
+      const markPrice = Number(priceBy.get(market) ?? 0);
+      const existingValueKrw = existingQty > 0 && markPrice > 0 ? existingQty * markPrice : 0;
+      const meaningfulExistingHold = existingValueKrw >= EXISTING_POSITION_MIN_KRW;
       if (existingQty > 0) {
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "account_existing_qty", existing_qty: existingQty });
+        emitEval("DEBUG_LIVE_PRECHECK", {
+          return_reason: meaningfulExistingHold ? "account_existing_qty" : "account_existing_qty_dust_ignored",
+          existing_qty: existingQty,
+          existing_value_krw: Number(existingValueKrw.toFixed(2)),
+          dust_ignored: !meaningfulExistingHold,
+          existing_position_min_krw: EXISTING_POSITION_MIN_KRW,
+        });
+      }
+      if (existingQty > 0 && meaningfulExistingHold) {
         continue; // no averaging / no existing hold
       }
       const liveOrderAvailableKrw = Math.max(0, Number(st.live_order_available_krw ?? st.krw_available ?? 0));
