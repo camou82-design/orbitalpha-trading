@@ -1,8 +1,20 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { tradingDataRoot } from "./paths.js";
+import { evaluateMvpSignal } from "./signal-engine.js";
 import { UPBIT_FEE_RATE } from "./strategy-risk-config.js";
-import { fetchTickers } from "./upbit-public.js";
+import { fetchMinuteCandles, fetchTickers } from "./upbit-public.js";
+
+/**
+ * Paper trading 전용 MVP 거래량 메인 임계 (signal-monitor·실거래는 env `ORBITALPHA_TRADING_VOLUME_THRESHOLD_MAIN` 기본 1.15 유지).
+ * 이 모듈에서만 사용 — 공용 env 기본값을 바꾸지 않음.
+ */
+const PAPER_VOLUME_THRESHOLD_MAIN = (() => {
+  const raw = process.env.ORBITALPHA_TRADING_PAPER_VOLUME_THRESHOLD_MAIN;
+  if (raw === undefined || raw === "") return 0.85;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 0.85;
+})();
 
 type PaperStateValue = "SIGNAL" | "OPEN" | "PARTIAL_EXIT" | "CLOSED_WIN" | "CLOSED_LOSS" | "CLOSED_TIMEOUT" | "SKIPPED";
 
@@ -362,6 +374,8 @@ export function createPaperTradingEngine(opts: {
         stop_loss_pct: PAPER_STOP_LOSS_PCT,
         timeout_minutes: PAPER_TIMEOUT_MS / 60_000,
         fee_rate: UPBIT_FEE_RATE,
+        /** Paper 전용 — `evaluateMvpSignal` 주입값 (실거래·signal-monitor와 분리) */
+        paper_volume_threshold_main: PAPER_VOLUME_THRESHOLD_MAIN,
       },
       account: {
         total_asset_krw: totalAssetKrw,
@@ -524,12 +538,34 @@ export function createPaperTradingEngine(opts: {
       }
 
       if (Object.keys(state.positions).length >= PAPER_MAX_OPEN) continue;
+
+      const candles5 = await fetchMinuteCandles(market, 5, 42);
+      const candles1 = await fetchMinuteCandles(market, 1, 30);
+      const mvpEv = evaluateMvpSignal(market, candles5, candles1, {
+        volumeThresholdMain: PAPER_VOLUME_THRESHOLD_MAIN,
+      });
+      if (!mvpEv.filter_pass) {
+        appendHistory({
+          ts: new Date().toISOString(),
+          market,
+          state: "SKIPPED",
+          note: `entry_blocked:paper_mvp_filter:paper_vol_main=${PAPER_VOLUME_THRESHOLD_MAIN}:vr=${mvpEv.volume_ratio.toFixed(4)}:${mvpEv.filter_fail_reason ?? "filter_pass"}`,
+          signal_strength: sig.signal_strength,
+          entry_price: px > 0 ? px : null,
+          exit_price: null,
+          qty: null,
+          pnl_krw: null,
+          pnl_pct: null,
+        });
+        continue;
+      }
+
       const entryAmountBase = isBreakout ? PAPER_ENTRY_KRW_PER_TRADE : PAPER_PROBE_ENTRY_KRW;
       const entryAmount = Math.max(5_000, Math.floor(entryAmountBase * entryScale));
 
       const entryNote = isBreakout
-        ? `paper_buy_opened:surge_scanner:breakout_confirmed:btc_risk_scaled_${entryScale}`
-        : `paper_buy_opened:surge_scanner:candidate_probe:btc_risk_scaled_${entryScale}`;
+        ? `paper_buy_opened:surge_scanner:breakout_confirmed:paper_mvp_ok:paper_vol_main_${PAPER_VOLUME_THRESHOLD_MAIN}:btc_risk_scaled_${entryScale}`
+        : `paper_buy_opened:surge_scanner:candidate_probe:paper_mvp_ok:paper_vol_main_${PAPER_VOLUME_THRESHOLD_MAIN}:btc_risk_scaled_${entryScale}`;
       const b = paperBuy(market, sig.signal_strength, px, entryNote, entryAmount);
       if (!b.ok) {
         appendHistory({
