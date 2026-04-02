@@ -234,6 +234,7 @@ async function main() {
       const btcState = snap.market_state === "risk_on" ? "strong" : snap.market_state === "neutral" ? "neutral" : "weak";
       app.log.info(
         {
+          gate_kind: ctx.isAdditionalBuy ? "add_to_position" : "new_entry",
           tag: "DEBUG_MARKET_FILTER_RESULT",
           symbol: ctx.market,
           btc_state: btcState,
@@ -255,6 +256,7 @@ async function main() {
     onEvent: (row) => opLog.event(row),
   });
   await strategy.init();
+  app.log.info({ tag: "DEBUG_LIVE_LOOP_STARTED", stage: "strategy_init_done" }, "DEBUG_LIVE_LOOP_STARTED");
   const pumpScanner = createPumpScanner(() => Object.keys((strategy.status() as any).open_positions ?? {}));
   const paper = createPaperTradingEngine({
     companyId: env.companyId,
@@ -266,8 +268,10 @@ async function main() {
   let lastStrategyTickAt: string | null = null;
   let lastScannerTickAt: string | null = null;
   let lastMarketStateTickAt: string | null = null;
+  app.log.info({ tag: "DEBUG_LIVE_LOOP_STARTED", interval_ms: 30_000 }, "DEBUG_LIVE_LOOP_STARTED");
   const strategyTimer = setInterval(() => {
     lastStrategyTickAt = new Date().toISOString();
+    app.log.info({ tag: "DEBUG_LIVE_LOOP_TICK", ts: lastStrategyTickAt }, "DEBUG_LIVE_LOOP_TICK");
     void strategy.tick().catch((e) => app.log.error({ err: String(e) }, "strategy_tick_failed"));
   }, 30_000);
   const scannerTimer = setInterval(() => {

@@ -294,6 +294,13 @@ export function createLiveDataStrategy(opts: {
   };
 
   const runTick = async () => {
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_LIVE_LOOP_TICK",
+        ts: new Date().toISOString(),
+        safety_guard_state: state.safety_guard.state,
+      }),
+    );
     if (state.daily.date !== todayKst()) {
       state.daily = { date: todayKst(), entry_count: 0, loss_pct: 0, stop_by_market: {} };
       state.safety_guard.order_fail_count_today = 0;
@@ -305,8 +312,29 @@ export function createLiveDataStrategy(opts: {
     }
 
     const tstatus = await opts.trade.status();
-    if (!tstatus.auto_trade_enabled || !tstatus.api_connected || !tstatus.live_enabled) return;
-    if (state.safety_guard.state === "자동정지") return;
+    if (!tstatus.auto_trade_enabled || !tstatus.api_connected || !tstatus.live_enabled) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_LOOP_SKIP",
+          reason: "trade_status_guard",
+          auto_trade_enabled: Boolean(tstatus.auto_trade_enabled),
+          api_connected: Boolean(tstatus.api_connected),
+          live_enabled: Boolean(tstatus.live_enabled),
+        }),
+      );
+      return;
+    }
+    if (state.safety_guard.state === "자동정지") {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_LOOP_SKIP",
+          reason: "safety_guard_stopped",
+          safety_guard_state: state.safety_guard.state,
+          safety_guard_reason: state.safety_guard.reason,
+        }),
+      );
+      return;
+    }
     const latestByMarket = new Map<string, any>();
     const latestAllSignals = new Map<string, any>();
     const logs = await opts.readLogs(220);
@@ -881,6 +909,14 @@ export function createLiveDataStrategy(opts: {
     const exceptionSlot = state.regime?.exception_slot_market ?? null;
     const entryUniverse = exceptionSlot ? [...MARKETS, exceptionSlot] : [...MARKETS];
     for (const market of entryUniverse) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_SYMBOL_EVAL_START",
+          symbol: market,
+          ts: new Date().toISOString(),
+          open_positions: Object.keys(state.positions).length,
+        }),
+      );
       if (Object.keys(state.positions).length >= 3) break;
       if (state.positions[market]) continue;
       const cool = state.cooldown_until[market];
