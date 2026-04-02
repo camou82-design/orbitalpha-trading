@@ -909,6 +909,16 @@ export function createLiveDataStrategy(opts: {
     const exceptionSlot = state.regime?.exception_slot_market ?? null;
     const entryUniverse = exceptionSlot ? [...MARKETS, exceptionSlot] : [...MARKETS];
     for (const market of entryUniverse) {
+      const emitEval = (tag: string, payload: Record<string, unknown>) => {
+        console.info(
+          JSON.stringify({
+            tag,
+            symbol: market,
+            ts: new Date().toISOString(),
+            ...payload,
+          }),
+        );
+      };
       console.info(
         JSON.stringify({
           tag: "DEBUG_LIVE_SYMBOL_EVAL_START",
@@ -917,30 +927,86 @@ export function createLiveDataStrategy(opts: {
           open_positions: Object.keys(state.positions).length,
         }),
       );
-      if (Object.keys(state.positions).length >= 3) break;
-      if (state.positions[market]) continue;
+      if (Object.keys(state.positions).length >= 3) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "max_positions_reached" });
+        break;
+      }
+      if (state.positions[market]) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "already_has_position" });
+        continue;
+      }
       const cool = state.cooldown_until[market];
-      if (cool && Date.now() < Date.parse(cool)) continue;
-      if ((state.daily.stop_by_market[market] ?? 0) >= 2) continue;
+      if (cool && Date.now() < Date.parse(cool)) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "cooldown_active", cooldown_until: cool });
+        continue;
+      }
+      if ((state.daily.stop_by_market[market] ?? 0) >= 2) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "stop_count_limit_reached" });
+        continue;
+      }
       const isExceptionMarket = !LEADER_MARKETS.has(market);
       const coreOpenCount = Object.keys(state.positions).filter((m) => LEADER_MARKETS.has(m)).length;
       const exceptionOpenCount = Object.keys(state.positions).filter((m) => !LEADER_MARKETS.has(m)).length;
-      if (isExceptionMarket && exceptionOpenCount >= 1) continue;
-      if (!isExceptionMarket && coreOpenCount >= 2) continue;
+      if (isExceptionMarket && exceptionOpenCount >= 1) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "exception_slot_full" });
+        continue;
+      }
+      if (!isExceptionMarket && coreOpenCount >= 2) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "core_slot_full" });
+        continue;
+      }
 
       const sig = latestAllSignals.get(market);
-      if (!sig) continue;
-      if (!sig.p.filter_pass) continue; // pass only
-      if ((sig.p.signal_type ?? "").toUpperCase() === "LOW") continue;
+      if (!sig) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "signal_missing" });
+        continue;
+      }
+      if (!sig.p.filter_pass) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "base_gate_failed" });
+        continue; // pass only
+      }
+      if ((sig.p.signal_type ?? "").toUpperCase() === "LOW") {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "score_below_threshold", signal_type: sig.p.signal_type ?? "LOW" });
+        continue;
+      }
       const exception = state.regime?.exception_candidates.find((x) => x.market === market) ?? null;
-      if (isExceptionMarket && !exception) continue;
+      if (isExceptionMarket && !exception) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "exception_not_selected" });
+        continue;
+      }
       const gate = opts.marketState.entryGate(sig.p, marketState);
       const signalScore = Number(gate.score ?? 0);
       const rel = (Number(changeRateBy.get(market) ?? 0) - btcChange) * 100;
       const vol = Number(sig.p.volume_ratio ?? 0);
       const reasonText = String(sig.p.signal_reason ?? "").toLowerCase();
+      const breakout = reasonText.includes("breakout");
       const trendOk = reasonText.includes("breakout") || reasonText.includes("trend") || reasonText.includes("reclaim");
+      const minBaseScore = 80;
+      const minBaseVol = 1.05;
+      emitEval("DEBUG_LIVE_SIGNAL_SCORE", {
+        score: Number(signalScore.toFixed(2)),
+        volume_ratio: Number(vol.toFixed(3)),
+        relative_strength: Number(rel.toFixed(3)),
+        trend_ok: trendOk,
+        breakout,
+      });
       const strongSymbolOverride = signalScore >= 80 && rel >= 0.5 && vol >= 1.05 && trendOk;
+      let detailedReason: string | null = null;
+      if (signalScore < minBaseScore) detailedReason = "score_below_threshold";
+      else if (vol < minBaseVol) detailedReason = "volume_ratio_low";
+      else if (!trendOk) detailedReason = "trend_not_ok";
+      else if (!breakout) detailedReason = "no_breakout";
+      else if (!gate.ok) detailedReason = "base_gate_failed";
+      emitEval("DEBUG_LIVE_BASE_GATE_RESULT", {
+        score: Number(signalScore.toFixed(2)),
+        volume_ratio: Number(vol.toFixed(3)),
+        relative_strength: Number(rel.toFixed(3)),
+        trend_ok: trendOk,
+        breakout,
+        base_gate_ok: gate.ok,
+        strong_symbol_override: strongSymbolOverride,
+        return_reason: !gate.ok && !strongSymbolOverride ? detailedReason ?? "base_gate_failed" : null,
+      });
       await appendLog({
         company_id: companyIdSchema.parse(opts.companyId),
         service_id: serviceIdSchema.parse(opts.serviceId),
@@ -958,12 +1024,18 @@ export function createLiveDataStrategy(opts: {
           strong_symbol_override: strongSymbolOverride,
         },
       });
-      if (!gate.ok && !strongSymbolOverride) continue;
+      if (!gate.ok && !strongSymbolOverride) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: detailedReason ?? "base_gate_failed" });
+        continue;
+      }
 
       const st = await opts.trade.status();
       const currency = market.replace("KRW-", "");
       const existingQty = Number(st.balances?.find((b: any) => b.currency === currency)?.balance ?? 0);
-      if (existingQty > 0) continue; // no averaging / no existing hold
+      if (existingQty > 0) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "account_existing_qty", existing_qty: existingQty });
+        continue; // no averaging / no existing hold
+      }
       const liveOrderAvailableKrw = Math.max(0, Number(st.live_order_available_krw ?? st.krw_available ?? 0));
       let orderKrw = Math.floor(liveOrderAvailableKrw * 0.2);
       orderKrw = Math.max(5000, Math.min(30000, orderKrw));
@@ -971,8 +1043,18 @@ export function createLiveDataStrategy(opts: {
       if (isExceptionMarket) {
         orderKrw = Math.floor(orderKrw * 0.9);
       }
-      if (orderKrw < 5000) continue;
-      if (liveOrderAvailableKrw < orderKrw) continue;
+      if (orderKrw < 5000) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "order_krw_below_min", order_krw: orderKrw });
+        continue;
+      }
+      if (liveOrderAvailableKrw < orderKrw) {
+        emitEval("DEBUG_LIVE_PRECHECK", {
+          return_reason: "insufficient_live_order_krw",
+          live_order_available_krw: liveOrderAvailableKrw,
+          order_krw: orderKrw,
+        });
+        continue;
+      }
       const strategyType: StrategyType = marketState.market_state === "risk_on" ? "momentum" : "stable";
       const signalPayloadForBuy = {
         ...sig.p,
