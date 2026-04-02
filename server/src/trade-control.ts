@@ -17,7 +17,7 @@ import crypto from "node:crypto";
 
 type TradeOrderSide = "buy" | "sell";
 type PositionBucket = "strategy" | "legacy";
-type ManagedMarket = "KRW-BTC" | "KRW-ETH" | "KRW-XRP" | "KRW-TRX";
+type ManagedMarket = "KRW-BTC" | "KRW-ETH" | "KRW-SOL" | "KRW-XRP" | "KRW-TRX";
 
 type LegacyBucketState = {
   qty: number;
@@ -75,8 +75,8 @@ type TradeState = {
 
 const TEST_ORDER_KRW = 5000;
 const COOLDOWN_MS = 20_000;
-const ALLOWED_MARKETS = new Set(["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"]);
-const MANAGED_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"] as const;
+const ALLOWED_MARKETS = new Set(["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX"]);
+const MANAGED_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX"] as const;
 const MAX_CONCURRENT_STRATEGY_POSITIONS = 2;
 const STRATEGY_RULES = {
   tp1_pct: 2.5,
@@ -192,12 +192,14 @@ export function createTradeControl(
     strategyPositions: {
       "KRW-BTC": { qty: 0, avg: 0, entries: 0, invested_krw_total: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
       "KRW-ETH": { qty: 0, avg: 0, entries: 0, invested_krw_total: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
+      "KRW-SOL": { qty: 0, avg: 0, entries: 0, invested_krw_total: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
       "KRW-XRP": { qty: 0, avg: 0, entries: 0, invested_krw_total: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
       "KRW-TRX": { qty: 0, avg: 0, entries: 0, invested_krw_total: 0, realized_pnl: 0, strategy_type: "stable", stop_loss_pct: STRATEGY_RISK_CONFIG.stable.stop_loss_pct, breakeven_arm_pct: STRATEGY_RISK_CONFIG.stable.breakeven_arm_pct, partial_take_profit_pct: STRATEGY_RISK_CONFIG.stable.partial_take_profit_pct, trailing_from_peak_pct: STRATEGY_RISK_CONFIG.stable.trailing_from_peak_pct },
     },
     legacyBuckets: {
       "KRW-BTC": { qty: 0, avg: 0, dca_count: 0, dca_max: ORDER_LIMITS.MAX_LEGACY_DCA_COUNT_PER_MARKET, dca_krw_total: 0, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
       "KRW-ETH": { qty: 0, avg: 0, dca_count: 0, dca_max: ORDER_LIMITS.MAX_LEGACY_DCA_COUNT_PER_MARKET, dca_krw_total: 0, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
+      "KRW-SOL": { qty: 0, avg: 0, dca_count: 0, dca_max: ORDER_LIMITS.MAX_LEGACY_DCA_COUNT_PER_MARKET, dca_krw_total: 0, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
       "KRW-XRP": { qty: 0, avg: 0, dca_count: 0, dca_max: ORDER_LIMITS.MAX_LEGACY_DCA_COUNT_PER_MARKET, dca_krw_total: 0, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
       "KRW-TRX": { qty: 0, avg: 0, dca_count: 0, dca_max: ORDER_LIMITS.MAX_LEGACY_DCA_COUNT_PER_MARKET, dca_krw_total: 0, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
     },
@@ -314,7 +316,8 @@ export function createTradeControl(
 
   const ensureOrderAllowed = async (side: TradeOrderSide, market: string, confirm: boolean, bucket: PositionBucket = "strategy") => {
     if (!state.autoTradeEnabled) throw new Error("Auto trade is disabled");
-    if (!ALLOWED_MARKETS.has(market)) throw new Error("Only KRW-BTC or KRW-XRP allowed for test");
+    if (bucket === "legacy" && !ALLOWED_MARKETS.has(market)) throw new Error("Legacy bucket market is not managed");
+    if (bucket === "strategy" && !market.startsWith("KRW-")) throw new Error("Only KRW-* market is allowed");
     if (!confirm) throw new Error("confirm=true required");
     if (!isLiveEnabled()) throw new Error("Live trading is disabled by environment guards");
     if (state.inFlight) throw new Error("Another order is in progress");

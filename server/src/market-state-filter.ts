@@ -19,6 +19,10 @@ export type MarketStateSnapshot = {
   btc_15m_trend: "up" | "down" | "flat";
   breadth_ratio: number;
   recent_close_bias: "up" | "down" | "flat";
+  /** BTC 약세 구간 보수 모드 여부 */
+  conservative_mode: boolean;
+  /** risk_off에서도 강한 대표 코인에 한해 신규 진입 예외 허용 */
+  exception_entry_allowed: boolean;
 };
 
 /** 주문 직전 게이트용 — UI `market-state` 와 동일 스냅샷 기준. */
@@ -118,18 +122,22 @@ export function createMarketStateFilter(args: {
     if (riskOffScore >= 2) marketState = "risk_off";
     else if (btc5 === "up" && btc15 === "up" && flowUp && r5 > -0.2 && r15 > -0.2 && !sharpDrop) marketState = "risk_on";
 
+    const conservativeMode = marketState === "risk_off";
     const snap: MarketStateSnapshot = {
       timestamp: new Date().toISOString(),
       market_state: marketState,
-      entry_policy: marketState === "risk_on" ? "적극 진입" : marketState === "neutral" ? "선별 진입" : "신규 진입 차단",
+      // risk_off도 "전면 차단" 대신 "보수적 선별 모드"로 운영
+      entry_policy: marketState === "risk_on" ? "적극 진입" : "선별 진입",
       market_bonus: marketState === "risk_on" ? 18 : marketState === "neutral" ? 0 : -100,
       min_entry_score: marketState === "risk_on" ? 70 : marketState === "neutral" ? 82 : 999,
-      regime_allows_new_and_additional_buys: marketState !== "risk_off",
+      regime_allows_new_and_additional_buys: true,
       order_limits: { ...ORDER_LIMITS },
       btc_5m_trend: btc5,
       btc_15m_trend: btc15,
       breadth_ratio: Number(breadth.toFixed(3)),
       recent_close_bias: flowUp ? "up" : flowDown ? "down" : "flat",
+      conservative_mode: conservativeMode,
+      exception_entry_allowed: conservativeMode,
     };
 
     if (!state.latest || state.latest.market_state !== snap.market_state) {
@@ -186,17 +194,6 @@ export function assertOrderBuyAllowed(
   args: { kind: "new_entry" | "add_to_position"; signalPayload: unknown | undefined },
 ): OrderBuyGateResult {
   const { market_state, entry_policy } = snap;
-
-  if (market_state === "risk_off") {
-    return {
-      ok: false,
-      market_state,
-      entry_policy,
-      new_entry_blocked: true,
-      add_entry_blocked: true,
-      blocked_reason: "market_state risk_off: 신규·추가 진입 차단",
-    };
-  }
 
   const g = runEntryScoreGate(snap.market_state, snap.min_entry_score, snap.market_bonus, args.signalPayload);
   if (!g.ok) {

@@ -119,9 +119,20 @@ type PersistedState = {
     next_dca_at: Record<string, string>;
     exit_stage: Record<string, 0 | 1 | 2>;
   };
+  regime?: {
+    btc_filter_state: "normal" | "weak";
+    conservative_mode: boolean;
+    exception_entry_allowed: boolean;
+    exception_candidates: Array<{ market: string; reason: string; relative_strength: number; signal_score: number }>;
+    exception_slot_market: string | null;
+    entry_size_pct: number;
+    last_updated_at: string;
+  };
 };
 
-const MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"] as const;
+const MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX"] as const;
+const LEADER_MARKETS = new Set<string>(MARKETS as unknown as string[]);
+const RISK_OFF_ENTRY_SCALE = 0.5;
 
 function todayKst() {
   return new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" });
@@ -167,13 +178,22 @@ export function createLiveDataStrategy(opts: {
       reason: "state_restore_pending",
       order_fail_count_today: 0,
       consecutive_losses: 0,
-      max_positions: 2,
+      max_positions: 3,
     },
     legacy: {
       dca_count: {},
       dca_locked: {},
       next_dca_at: {},
       exit_stage: {},
+    },
+    regime: {
+      btc_filter_state: "normal",
+      conservative_mode: false,
+      exception_entry_allowed: false,
+      exception_candidates: [],
+      exception_slot_market: null,
+      entry_size_pct: 1,
+      last_updated_at: new Date().toISOString(),
     },
   };
 
@@ -182,7 +202,18 @@ export function createLiveDataStrategy(opts: {
     await fs.writeFile(tradesFile, JSON.stringify(state.trades, null, 2), "utf8");
     await fs.writeFile(
       dailyFile,
-      JSON.stringify({ daily: state.daily, positions: state.positions, cooldown_until: state.cooldown_until, safety_guard: state.safety_guard, legacy: state.legacy }, null, 2),
+      JSON.stringify(
+        {
+          daily: state.daily,
+          positions: state.positions,
+          cooldown_until: state.cooldown_until,
+          safety_guard: state.safety_guard,
+          legacy: state.legacy,
+          regime: state.regime,
+        },
+        null,
+        2,
+      ),
       "utf8",
     );
   };
@@ -199,6 +230,7 @@ export function createLiveDataStrategy(opts: {
       state.cooldown_until = d.cooldown_until ?? state.cooldown_until;
       state.safety_guard = d.safety_guard ?? state.safety_guard;
       state.legacy = d.legacy ?? state.legacy;
+      state.regime = d.regime ?? state.regime;
     } catch {}
     state.safety_guard.state = "정상";
     state.safety_guard.reason = null;
@@ -235,6 +267,7 @@ export function createLiveDataStrategy(opts: {
       max_positions: state.safety_guard.max_positions,
       reentry_cooldowns: state.cooldown_until,
       legacy_management: state.legacy,
+      regime: state.regime,
     };
   };
 
@@ -274,18 +307,60 @@ export function createLiveDataStrategy(opts: {
     const tstatus = await opts.trade.status();
     if (!tstatus.auto_trade_enabled || !tstatus.api_connected || !tstatus.live_enabled) return;
     if (state.safety_guard.state === "자동정지") return;
-    const tickerRows = await fetchTickers([...MARKETS]);
-    const priceBy = new Map(tickerRows.map((r) => [r.market, r.trade_price]));
     const latestByMarket = new Map<string, any>();
+    const latestAllSignals = new Map<string, any>();
     const logs = await opts.readLogs(220);
     const marketState = await opts.marketState.evaluate();
+    const conservativeMode = marketState.market_state === "risk_off";
     for (const row of logs) {
       if (row.kind !== "signal" || !row.payload) continue;
       const p = mvpSignalPayloadV2Schema.safeParse(row.payload);
       if (!p.success) continue;
+      if (!latestAllSignals.has(p.data.market)) latestAllSignals.set(p.data.market, { ts: row.ts, p: p.data });
       if (!MARKETS.includes(p.data.market as any)) continue;
       if (!latestByMarket.has(p.data.market)) latestByMarket.set(p.data.market, { ts: row.ts, p: p.data });
     }
+    const exceptionPool = Array.from(latestAllSignals.entries())
+      .filter(([m]) => !LEADER_MARKETS.has(m) && m.startsWith("KRW-"))
+      .map(([market, sig]) => {
+        const gate = opts.marketState.entryGate(sig.p, marketState);
+        const signalScore = Number(gate.score ?? 0);
+        const vol = Number(sig.p.volume_ratio ?? 0);
+        const reasonText = String(sig.p.signal_reason ?? "").toLowerCase();
+        const rise3m = Number(sig.p.momentum_3m_pct ?? sig.p.price_change_3m_pct ?? 0);
+        const trendOk = reasonText.includes("breakout") || reasonText.includes("trend") || reasonText.includes("reclaim");
+        return { market, sig, signalScore, vol, rise3m, trendOk };
+      })
+      .filter((x) => x.signalScore >= 86 && x.vol >= 1.2 && x.rise3m >= 0.8 && x.trendOk)
+      .sort((a, b) => b.signalScore - a.signalScore || b.vol - a.vol);
+    const exceptionSlotMarket = exceptionPool[0]?.market ?? null;
+    const watchMarkets = exceptionSlotMarket ? [...MARKETS, exceptionSlotMarket] : [...MARKETS];
+    const tickerRows = await fetchTickers(watchMarkets);
+    const priceBy = new Map(tickerRows.map((r) => [r.market, r.trade_price]));
+    const changeRateBy = new Map(tickerRows.map((r) => [r.market, Number(r.signed_change_rate ?? 0)]));
+    const btcChange = Number(changeRateBy.get("KRW-BTC") ?? 0);
+    const btcWeak = conservativeMode || btcChange <= -0.004;
+    const exceptionCandidates: Array<{ market: string; reason: string; relative_strength: number; signal_score: number }> = [];
+    if (exceptionSlotMarket) {
+      const x = exceptionPool[0]!;
+      const rel = (Number(changeRateBy.get(exceptionSlotMarket) ?? 0) - btcChange) * 100;
+      exceptionCandidates.push({
+        market: exceptionSlotMarket,
+        reason: `exception_slot:rel_${rel.toFixed(2)}:score_${x.signalScore.toFixed(1)}:vol_${x.vol.toFixed(2)}:rise_${x.rise3m.toFixed(2)}`,
+        relative_strength: Number(rel.toFixed(3)),
+        signal_score: Number(x.signalScore.toFixed(1)),
+      });
+    }
+    exceptionCandidates.sort((a, b) => b.signal_score - a.signal_score || b.relative_strength - a.relative_strength);
+    state.regime = {
+      btc_filter_state: btcWeak ? "weak" : "normal",
+      conservative_mode: conservativeMode,
+      exception_entry_allowed: btcWeak,
+      exception_candidates: exceptionCandidates.slice(0, 1),
+      exception_slot_market: exceptionSlotMarket,
+      entry_size_pct: btcWeak ? RISK_OFF_ENTRY_SCALE : 1,
+      last_updated_at: new Date().toISOString(),
+    };
 
     // legacy buckets: no stop-loss, limited DCA, staged recovery exits.
     const legacyByMarket = (tstatus.legacy_positions ?? {}) as Record<
@@ -422,7 +497,12 @@ export function createLiveDataStrategy(opts: {
       let reasonExit = "";
       let stopTriggerKind: StopTriggerKind | null = null;
       let ratio = 1;
-      if (p.strategy_type === "stable") {
+      const weakModeTighterStop = (state.regime?.btc_filter_state ?? "normal") === "weak" ? -0.9 : null;
+      if (weakModeTighterStop !== null && pnlGross <= weakModeTighterStop) {
+        reasonExit = "btc_weak_tight_stop";
+        stopTriggerKind = "price_stop";
+      }
+      if (!reasonExit && p.strategy_type === "stable") {
         const s = STRATEGY_RISK_CONFIG.stable;
         if (!p.breakeven_armed && pnlGross >= s.breakeven_arm_pct) {
           p.breakeven_armed = true;
@@ -493,7 +573,7 @@ export function createLiveDataStrategy(opts: {
           reasonExit = "stable_time_stop_weak_rebound";
           stopTriggerKind = "time_stop";
         }
-      } else {
+      } else if (!reasonExit) {
         const m = STRATEGY_RISK_CONFIG.momentum;
         if (!p.breakeven_armed && pnlGross >= m.breakeven_arm_pct) {
           p.breakeven_armed = true;
@@ -796,17 +876,26 @@ export function createLiveDataStrategy(opts: {
       return;
     }
 
-    for (const market of MARKETS) {
-      if (Object.keys(state.positions).length >= 2) break;
+    const exceptionSlot = state.regime?.exception_slot_market ?? null;
+    const entryUniverse = exceptionSlot ? [...MARKETS, exceptionSlot] : [...MARKETS];
+    for (const market of entryUniverse) {
+      if (Object.keys(state.positions).length >= 3) break;
       if (state.positions[market]) continue;
       const cool = state.cooldown_until[market];
       if (cool && Date.now() < Date.parse(cool)) continue;
       if ((state.daily.stop_by_market[market] ?? 0) >= 2) continue;
+      const isExceptionMarket = !LEADER_MARKETS.has(market);
+      const coreOpenCount = Object.keys(state.positions).filter((m) => LEADER_MARKETS.has(m)).length;
+      const exceptionOpenCount = Object.keys(state.positions).filter((m) => !LEADER_MARKETS.has(m)).length;
+      if (isExceptionMarket && exceptionOpenCount >= 1) continue;
+      if (!isExceptionMarket && coreOpenCount >= 2) continue;
 
-      const sig = latestByMarket.get(market);
+      const sig = latestAllSignals.get(market);
       if (!sig) continue;
       if (!sig.p.filter_pass) continue; // pass only
       if ((sig.p.signal_type ?? "").toUpperCase() === "LOW") continue;
+      const exception = state.regime?.exception_candidates.find((x) => x.market === market) ?? null;
+      if (isExceptionMarket && !exception) continue;
 
       const st = await opts.trade.status();
       const currency = market.replace("KRW-", "");
@@ -815,11 +904,20 @@ export function createLiveDataStrategy(opts: {
       const liveOrderAvailableKrw = Math.max(0, Number(st.live_order_available_krw ?? st.krw_available ?? 0));
       let orderKrw = Math.floor(liveOrderAvailableKrw * 0.2);
       orderKrw = Math.max(5000, Math.min(30000, orderKrw));
+      if (btcWeak) {
+        orderKrw = Math.floor(orderKrw * RISK_OFF_ENTRY_SCALE);
+      }
+      if (isExceptionMarket) {
+        orderKrw = Math.floor(orderKrw * 0.9);
+      }
       if (orderKrw < 5000) continue;
       if (liveOrderAvailableKrw < orderKrw) continue;
       const strategyType: StrategyType = marketState.market_state === "risk_on" ? "momentum" : "stable";
+      const signalPayloadForBuy = exception
+        ? { ...sig.p, __allow_risk_off_entry: true, __risk_off_exception_reason: exception.reason }
+        : sig.p;
       try {
-        await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", sig.p);
+        await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", signalPayloadForBuy);
       } catch (e) {
         state.safety_guard.order_fail_count_today += 1;
         if (state.safety_guard.order_fail_count_today >= 3) {
@@ -848,7 +946,7 @@ export function createLiveDataStrategy(opts: {
       }
       const price = priceBy.get(market) ?? 0;
       const st2 = await opts.trade.status();
-      const qty = Number(st2.strategy_positions?.[market]?.qty ?? 0);
+      const qty = Number(st2.balances?.find((b: any) => b.currency === currency)?.balance ?? 0);
       state.positions[market] = {
         market,
         strategy_type: strategyType,
@@ -856,7 +954,11 @@ export function createLiveDataStrategy(opts: {
         entry_price: price,
         qty,
         order_krw: orderKrw,
-        reason_enter: sig.p.signal_reason ?? "signal_pass",
+        reason_enter: exception
+          ? `exception_slot_entry:${exception.reason}`
+          : btcWeak
+            ? `${sig.p.signal_reason ?? "signal_pass"}:btc_weak_size_reduced`
+            : sig.p.signal_reason ?? "signal_pass",
         signal_strength: sig.p.signal_type ?? "MID",
         volume_ratio: Number(sig.p.volume_ratio ?? 0),
         partial_tp_done: false,
@@ -871,7 +973,7 @@ export function createLiveDataStrategy(opts: {
         partial_tp_at: null,
       };
       state.daily.entry_count += 1;
-      state.cooldown_until[market] = new Date(Date.now() + 30 * 60_000).toISOString();
+      state.cooldown_until[market] = new Date(Date.now() + (isExceptionMarket ? 15 : 10) * 60_000).toISOString();
       state.trades.push({
         timestamp: new Date().toISOString(),
         entry_ts: new Date().toISOString(),
@@ -906,14 +1008,14 @@ export function createLiveDataStrategy(opts: {
         strategy_type: strategyType,
         market_state: marketState.market_state,
         side: "buy",
-        reason: sig.p.signal_reason ?? "signal_pass",
+        reason: exception ? exception.reason : sig.p.signal_reason ?? "signal_pass",
         balance_krw: Number(st2.krw_available ?? 0),
         position_qty: qty,
         avg_buy_price: price,
         current_price: price,
         pnl_net: 0,
         pnl_net_pct: 0,
-        note: "strategy entry",
+        note: exception ? "exception_entry_in_btc_weak_mode" : "strategy entry",
       });
     }
     await persist();

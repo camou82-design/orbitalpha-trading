@@ -15,6 +15,8 @@ type PaperPosition = {
   buy_fee_krw: number;
   signal_strength: string;
   take_profit_partial_done?: boolean;
+  take_profit_second_done?: boolean;
+  peak_price?: number;
   dca_count?: number;
   xrp_recovery_partial_done?: boolean;
 };
@@ -39,18 +41,31 @@ type PaperStateFile = {
   seen_signal_keys: string[];
 };
 
+type LifecycleState = "idle" | "candidate" | "entered" | "cooldown";
+type MarketLifecycle = {
+  state: LifecycleState;
+  state_since_ts: string;
+  cooldown_until_ts?: string;
+  candidate_score?: number;
+  last_reason?: string;
+};
+
 const PAPER_START_KRW = 500_000;
-const PAPER_ENTRY_KRW_PER_TRADE = 50_000;
-const PAPER_MAX_OPEN = 1;
+const PAPER_ENTRY_KRW_PER_TRADE = 45_000;
+const PAPER_PROBE_ENTRY_KRW = 20_000;
+const PAPER_MAX_OPEN = 3;
 const PAPER_TAKE_PROFIT_PCT = 2.8;
-const PAPER_STOP_LOSS_PCT = -1.2;
+const PAPER_STOP_LOSS_PCT = -1.0;
 const PAPER_TAKE_PROFIT_PARTIAL_PCT = 1.5;
 const PAPER_TAKE_PROFIT_FINAL_PCT = 3.0;
 const PAPER_TIMEOUT_MS = 10 * 60_000;
-const PAPER_EARLY_EXIT_FAST_MIN_MS = 90_000;
-const PAPER_EARLY_EXIT_FAST_MIN_FOLLOWTHROUGH_PCT = 0.1;
 const PAPER_EARLY_EXIT_MIN_MS = 2 * 60_000;
-const PAPER_EARLY_EXIT_MIN_FOLLOWTHROUGH_PCT = 0.3;
+const PAPER_EARLY_EXIT_STRENGTH_BREAK_PCT = -0.45;
+const PAPER_TRAILING_AFTER_TP2_DRAWDOWN_PCT = 1.0;
+const CANDIDATE_KEEP_MS = 3 * 60_000;
+const CANDIDATE_REEVAL_COOLDOWN_LOSS_MS = 3 * 60_000;
+const CANDIDATE_REEVAL_COOLDOWN_WIN_MS = 2 * 60_000;
+const CANDIDATE_MAX_TRACKED = 8;
 const XRP_DCA_TRIGGER_1_PCT = -2.0;
 const XRP_DCA_TRIGGER_2_PCT = -4.0;
 const XRP_DCA_MAX_COUNT = 2;
@@ -88,13 +103,27 @@ export function createPaperTradingEngine(opts: {
     positions: Record<string, PaperPosition>;
     history: PaperTradeEvent[];
     seenSignalKeys: Set<string>;
-    pendingBreakoutConfirmation: Map<string, { key: string; ts: string }>;
+    lifecycle: Map<string, MarketLifecycle>;
+    candidatePool: Map<string, { score: number; reason: string; status: string; detectedAt: number; signalStrength: string }>;
+    metrics: {
+      candidateCaptured: number;
+      entriesOpened: number;
+      entryLatencyMs: number[];
+      earlyExitCount: number;
+    };
   } = {
     cashKrw: PAPER_START_KRW,
     positions: {},
     history: [],
     seenSignalKeys: new Set<string>(),
-    pendingBreakoutConfirmation: new Map(),
+    lifecycle: new Map(),
+    candidatePool: new Map(),
+    metrics: {
+      candidateCaptured: 0,
+      entriesOpened: 0,
+      entryLatencyMs: [],
+      earlyExitCount: 0,
+    },
   };
 
   const trimHistoryAndSignals = () => {
@@ -135,25 +164,50 @@ export function createPaperTradingEngine(opts: {
     }
   };
 
-  const paperBuy = (market: string, signalStrength: string, entryPrice: number, note: string): { ok: boolean; reason?: string } => {
+  const setLifecycle = (market: string, next: LifecycleState, extra: Partial<MarketLifecycle> = {}) => {
+    const prev = state.lifecycle.get(market);
+    state.lifecycle.set(market, {
+      state: next,
+      state_since_ts: new Date().toISOString(),
+      cooldown_until_ts: prev?.cooldown_until_ts,
+      candidate_score: prev?.candidate_score,
+      last_reason: prev?.last_reason,
+      ...extra,
+    });
+  };
+
+  const getLifecycle = (market: string): MarketLifecycle => {
+    return state.lifecycle.get(market) ?? { state: "idle", state_since_ts: new Date().toISOString() };
+  };
+
+  const paperBuy = (
+    market: string,
+    signalStrength: string,
+    entryPrice: number,
+    note: string,
+    amountKrw = PAPER_ENTRY_KRW_PER_TRADE,
+  ): { ok: boolean; reason?: string } => {
     if (state.positions[market]) return { ok: false, reason: "already_open" };
     if (Object.keys(state.positions).length >= PAPER_MAX_OPEN) return { ok: false, reason: "max_open_positions" };
-    const buyFee = PAPER_ENTRY_KRW_PER_TRADE * UPBIT_FEE_RATE;
-    const totalNeed = PAPER_ENTRY_KRW_PER_TRADE + buyFee;
+    const orderKrw = Math.max(5_000, amountKrw);
+    const buyFee = orderKrw * UPBIT_FEE_RATE;
+    const totalNeed = orderKrw + buyFee;
     if (state.cashKrw < totalNeed) return { ok: false, reason: "insufficient_cash" };
     if (!(entryPrice > 0)) return { ok: false, reason: "invalid_price" };
 
-    const qty = PAPER_ENTRY_KRW_PER_TRADE / entryPrice;
+    const qty = orderKrw / entryPrice;
     state.cashKrw -= totalNeed;
     state.positions[market] = {
       market,
       entry_ts: new Date().toISOString(),
       entry_price: entryPrice,
       qty,
-      invested_krw: PAPER_ENTRY_KRW_PER_TRADE,
+      invested_krw: orderKrw,
       buy_fee_krw: buyFee,
       signal_strength: signalStrength,
       take_profit_partial_done: false,
+      take_profit_second_done: false,
+      peak_price: entryPrice,
       dca_count: 0,
       xrp_recovery_partial_done: false,
     };
@@ -169,6 +223,13 @@ export function createPaperTradingEngine(opts: {
       pnl_krw: null,
       pnl_pct: null,
     });
+    const c = state.candidatePool.get(market);
+    if (c) {
+      state.metrics.entryLatencyMs.push(Date.now() - c.detectedAt);
+      state.candidatePool.delete(market);
+    }
+    state.metrics.entriesOpened += 1;
+    setLifecycle(market, "entered", { last_reason: note });
     return { ok: true };
   };
 
@@ -216,6 +277,14 @@ export function createPaperTradingEngine(opts: {
       pnl_krw: pnlKrw,
       pnl_pct: pnlPct,
     });
+    if (ratioClamped >= 0.9999 || !state.positions[market]) {
+      const cd = closeState === "CLOSED_LOSS" ? CANDIDATE_REEVAL_COOLDOWN_LOSS_MS : CANDIDATE_REEVAL_COOLDOWN_WIN_MS;
+      setLifecycle(market, "cooldown", {
+        cooldown_until_ts: new Date(Date.now() + cd).toISOString(),
+        last_reason: note,
+      });
+    }
+    if (note.startsWith("early_exit:")) state.metrics.earlyExitCount += 1;
     return { ok: true };
   };
 
@@ -341,6 +410,19 @@ export function createPaperTradingEngine(opts: {
           status,
         });
       }
+      const life = getLifecycle(market);
+      if (life.state === "cooldown" && life.cooldown_until_ts && Date.now() < Date.parse(life.cooldown_until_ts)) continue;
+      if (life.state === "cooldown") setLifecycle(market, "idle");
+      watchMarkets.add(market);
+    }
+
+    // Keep strong candidates for a short window and re-evaluate quickly without re-scanning whole market.
+    for (const [market, c] of Array.from(state.candidatePool.entries())) {
+      if (Date.now() - c.detectedAt > CANDIDATE_KEEP_MS) {
+        state.candidatePool.delete(market);
+        if (!state.positions[market]) setLifecycle(market, "idle");
+        continue;
+      }
       watchMarkets.add(market);
     }
 
@@ -357,35 +439,6 @@ export function createPaperTradingEngine(opts: {
     }
 
     const orderedSignals = Array.from(latestSignalByMarket.entries()).sort((a, b) => b[1].score - a[1].score);
-    const pendingFailedThisTick = new Set<string>();
-    for (const [market] of state.pendingBreakoutConfirmation.entries()) {
-      const sig = latestSignalByMarket.get(market);
-      const reasonLower = String(sig?.reason ?? "").toLowerCase();
-      const signalState = reasonLower.includes("breakout_confirmed")
-        ? "돌파"
-        : reasonLower.includes("upper_hold_confirmed")
-          ? "상단유지"
-          : "기타";
-      const stillConfirmed = Boolean(sig) && sig!.status !== "예비후보" && sig!.score >= 75 && signalState === "돌파";
-      if (!stillConfirmed) {
-        const px = priceByMarket[market] ?? 0;
-        appendHistory({
-          ts: new Date().toISOString(),
-          market,
-          state: "SKIPPED",
-          note: "entry_blocked:breakout_not_confirmed_next_tick",
-          signal_strength: sig?.signal_strength ?? "SURGE_SCANNER",
-          entry_price: px > 0 ? px : null,
-          exit_price: null,
-          qty: null,
-          pnl_krw: null,
-          pnl_pct: null,
-        });
-        state.pendingBreakoutConfirmation.delete(market);
-        pendingFailedThisTick.add(market);
-      }
-    }
-
     for (const [market, sig] of orderedSignals) {
       if (state.seenSignalKeys.has(sig.key)) continue;
       state.seenSignalKeys.add(sig.key);
@@ -404,37 +457,22 @@ export function createPaperTradingEngine(opts: {
       });
 
       const px = priceByMarket[market] ?? 0;
-      if (pendingFailedThisTick.has(market)) continue;
-      const isPreCandidate = sig.status === "예비후보";
-      const scoreOk = sig.score >= 75;
+      const scoreOk = sig.score >= 60;
       const reasonLower = sig.reason.toLowerCase();
       const signalState = reasonLower.includes("breakout_confirmed")
         ? "돌파"
         : reasonLower.includes("upper_hold_confirmed")
           ? "상단유지"
           : "기타";
+      const isCandidateWatch = reasonLower.includes("candidate_watch");
+      const isBreakout = signalState === "돌파";
 
-      if (isPreCandidate) {
-        appendHistory({
-          ts: new Date().toISOString(),
-          market,
-          state: "SKIPPED",
-          note: "entry_blocked:pre_candidate",
-          signal_strength: sig.signal_strength,
-          entry_price: px > 0 ? px : null,
-          exit_price: null,
-          qty: null,
-          pnl_krw: null,
-          pnl_pct: null,
-        });
-        continue;
-      }
       if (!scoreOk) {
         appendHistory({
           ts: new Date().toISOString(),
           market,
           state: "SKIPPED",
-          note: "entry_blocked:score_below_75",
+          note: "entry_blocked:score_below_60",
           signal_strength: sig.signal_strength,
           entry_price: px > 0 ? px : null,
           exit_price: null,
@@ -444,7 +482,7 @@ export function createPaperTradingEngine(opts: {
         });
         continue;
       }
-      if (signalState !== "돌파") {
+      if (!isBreakout && !isCandidateWatch) {
         appendHistory({
           ts: new Date().toISOString(),
           market,
@@ -460,15 +498,30 @@ export function createPaperTradingEngine(opts: {
         continue;
       }
 
-      const pending = state.pendingBreakoutConfirmation.get(market);
-      if (!pending) {
-        state.pendingBreakoutConfirmation.set(market, { key: sig.key, ts: new Date().toISOString() });
-        continue;
+      const prior = state.candidatePool.get(market);
+      if (!prior) {
+        state.candidatePool.set(market, {
+          score: sig.score,
+          reason: sig.reason,
+          status: sig.status,
+          detectedAt: Date.now(),
+          signalStrength: sig.signal_strength,
+        });
+        state.metrics.candidateCaptured += 1;
+        setLifecycle(market, "candidate", { candidate_score: sig.score, last_reason: sig.reason });
       }
-      state.pendingBreakoutConfirmation.delete(market);
+      if (state.candidatePool.size > CANDIDATE_MAX_TRACKED) {
+        const weakest = Array.from(state.candidatePool.entries()).sort((a, b) => a[1].score - b[1].score)[0]?.[0];
+        if (weakest) state.candidatePool.delete(weakest);
+      }
 
-      const entryNote = "paper_buy_opened:surge_scanner:breakout_confirmed_second_tick";
-      const b = paperBuy(market, sig.signal_strength, px, entryNote);
+      if (Object.keys(state.positions).length >= PAPER_MAX_OPEN) continue;
+      const entryAmount = isBreakout ? PAPER_ENTRY_KRW_PER_TRADE : PAPER_PROBE_ENTRY_KRW;
+
+      const entryNote = isBreakout
+        ? "paper_buy_opened:surge_scanner:breakout_confirmed"
+        : "paper_buy_opened:surge_scanner:candidate_probe";
+      const b = paperBuy(market, sig.signal_strength, px, entryNote, entryAmount);
       if (!b.ok) {
         appendHistory({
           ts: new Date().toISOString(),
@@ -491,6 +544,7 @@ export function createPaperTradingEngine(opts: {
       const grossPct = ((px / p.entry_price) - 1) * 100;
       const heldMs = Date.now() - Date.parse(p.entry_ts);
       const heldMinutes = heldMs / 60_000;
+      p.peak_price = Math.max(Number(p.peak_price ?? p.entry_price), px);
 
       if (p.market === "KRW-XRP") {
         void paperDcaBuyXrp(p, px);
@@ -519,23 +573,26 @@ export function createPaperTradingEngine(opts: {
         continue;
       }
 
-      if (!p.take_profit_partial_done && grossPct >= PAPER_TAKE_PROFIT_PARTIAL_PCT) {
+      if (grossPct <= PAPER_STOP_LOSS_PCT) {
+        paperSell(p.market, px, "CLOSED_LOSS", "stop_loss_-1.0pct");
+      } else if (!p.take_profit_partial_done && grossPct >= PAPER_TAKE_PROFIT_PARTIAL_PCT) {
         const r = paperSell(p.market, px, "CLOSED_TIMEOUT", "take_profit_partial_1.5pct", 0.5);
         if (r.ok && state.positions[p.market]) state.positions[p.market]!.take_profit_partial_done = true;
-      } else if (grossPct >= PAPER_TAKE_PROFIT_FINAL_PCT) {
-        paperSell(p.market, px, "CLOSED_WIN", "take_profit_final_3.0pct");
-      } else if (grossPct <= PAPER_STOP_LOSS_PCT) {
-        paperSell(p.market, px, "CLOSED_LOSS", "stop_loss_-1.2pct");
-      } else if (
-        heldMs >= PAPER_EARLY_EXIT_FAST_MIN_MS &&
-        grossPct < PAPER_EARLY_EXIT_FAST_MIN_FOLLOWTHROUGH_PCT
-      ) {
-        paperSell(p.market, px, grossPct < 0 ? "CLOSED_LOSS" : "CLOSED_TIMEOUT", "early_exit:weak_followthrough_fast");
+      } else if (p.take_profit_partial_done && !p.take_profit_second_done && grossPct >= PAPER_TAKE_PROFIT_FINAL_PCT) {
+        const r = paperSell(p.market, px, "CLOSED_TIMEOUT", "take_profit_additional_3.0pct", 0.5);
+        if (r.ok && state.positions[p.market]) state.positions[p.market]!.take_profit_second_done = true;
       } else if (
         heldMs >= PAPER_EARLY_EXIT_MIN_MS &&
-        grossPct < PAPER_EARLY_EXIT_MIN_FOLLOWTHROUGH_PCT
+        grossPct <= PAPER_EARLY_EXIT_STRENGTH_BREAK_PCT
       ) {
-        paperSell(p.market, px, grossPct < 0 ? "CLOSED_LOSS" : "CLOSED_TIMEOUT", "early_exit:weak_followthrough");
+        paperSell(p.market, px, "CLOSED_LOSS", "early_exit:strength_breakdown");
+      } else if (
+        p.take_profit_second_done &&
+        p.peak_price &&
+        p.peak_price > 0 &&
+        ((p.peak_price - px) / p.peak_price) * 100 >= PAPER_TRAILING_AFTER_TP2_DRAWDOWN_PCT
+      ) {
+        paperSell(p.market, px, "CLOSED_WIN", "trailing_exit_after_tp2");
       } else if (heldMs >= PAPER_TIMEOUT_MS) {
         paperSell(p.market, px, "CLOSED_TIMEOUT", "time_exit_10m:surge_scanner");
       }
@@ -553,11 +610,32 @@ export function createPaperTradingEngine(opts: {
       if (p > 0) priceByMarket[t.market] = p;
     }
     const summary = buildSummary(priceByMarket);
+    const avgEntryLatencyMs =
+      state.metrics.entryLatencyMs.length > 0
+        ? state.metrics.entryLatencyMs.reduce((a, b) => a + b, 0) / state.metrics.entryLatencyMs.length
+        : 0;
+    const closed = state.history.filter((h) => h.state === "CLOSED_WIN" || h.state === "CLOSED_LOSS" || h.state === "CLOSED_TIMEOUT");
+    const wins = closed.filter((h) => (h.pnl_krw ?? 0) > 0).map((h) => Number(h.pnl_krw ?? 0));
+    const losses = closed.filter((h) => (h.pnl_krw ?? 0) < 0).map((h) => Math.abs(Number(h.pnl_krw ?? 0)));
+    const avgWin = wins.length > 0 ? wins.reduce((a, b) => a + b, 0) / wins.length : 0;
+    const avgLoss = losses.length > 0 ? losses.reduce((a, b) => a + b, 0) / losses.length : 0;
+    const avgWinLossRatio = avgLoss > 0 ? avgWin / avgLoss : 0;
 
     return {
       mode: "paper_trading",
       updated_at: new Date().toISOString(),
       ...summary,
+      execution_metrics: {
+        candidate_capture_count: state.metrics.candidateCaptured,
+        entry_count: state.metrics.entriesOpened,
+        entries_opened: state.metrics.entriesOpened,
+        avg_entry_latency_sec: Number((avgEntryLatencyMs / 1000).toFixed(2)),
+        early_exit_ratio:
+          closed.length > 0 ? Number((state.metrics.earlyExitCount / closed.length).toFixed(4)) : 0,
+        avg_win_loss_ratio: Number(avgWinLossRatio.toFixed(3)),
+        active_candidates_count: state.candidatePool.size,
+        tracked_candidates: state.candidatePool.size,
+      },
       holdings: Object.values(state.positions).map((p) => {
         const px = priceByMarket[p.market] ?? 0;
         const evalKrw = p.qty * px;
