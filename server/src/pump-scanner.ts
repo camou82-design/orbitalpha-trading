@@ -5,6 +5,7 @@ import {
   fetchMinuteCandles,
   fetchTickers,
   partitionKrwMarketsByUpbitValidity,
+  type FetchTickersOptions,
   type UpbitCandle,
   type UpbitTicker,
 } from "./upbit-public.js";
@@ -79,6 +80,18 @@ const CANDLE_BATCH_DELAY_MS = Math.max(0, Number(process.env.PUMP_SCANNER_CANDLE
 const CANDLE_429_MAX_ATTEMPTS = Math.max(1, Number(process.env.PUMP_SCANNER_CANDLE_429_MAX_ATTEMPTS ?? 2));
 const CANDLE_429_BASE_DELAY_MS = Math.max(500, Number(process.env.PUMP_SCANNER_CANDLE_429_BASE_DELAY_MS ?? 1_500));
 const CANDLE_SNAPSHOT_CACHE_TTL_MS = Math.max(1_000, Number(process.env.PUMP_SCANNER_CANDLE_CACHE_TTL_MS ?? 120_000));
+/** 알트 전수 티커 조회: 배치 크기·병렬·지연 (기본 대폭 축소 → tick 단축). 429 시 parallel↓·delay↑. */
+const PUMP_TICKER_BATCH_SIZE = Math.max(1, Math.min(120, Number(process.env.PUMP_SCANNER_TICKER_BATCH_SIZE ?? 80)));
+const PUMP_TICKER_BATCH_DELAY_MS = Math.max(0, Number(process.env.PUMP_SCANNER_TICKER_BATCH_DELAY_MS ?? 0));
+const PUMP_TICKER_PARALLEL = Math.max(1, Math.min(8, Number(process.env.PUMP_SCANNER_TICKER_PARALLEL ?? 3)));
+const PUMP_TIMING_LOG = (process.env.PUMP_SCANNER_TIMING_LOG ?? "1").toLowerCase() !== "0";
+
+const pumpAltTickerOptsBase: FetchTickersOptions = {
+  sortByCached24hVolume: false,
+  batchSize: PUMP_TICKER_BATCH_SIZE,
+  batchDelayMs: PUMP_TICKER_BATCH_DELAY_MS,
+  parallelTickerBatches: PUMP_TICKER_PARALLEL,
+};
 
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
@@ -390,6 +403,7 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
 
   const tick = async () => {
     try {
+    const tickT0 = Date.now();
     const heldMarkets = Array.from(new Set(getHeldMarkets().filter((m) => typeof m === "string" && m.length > 0)));
 
     const is429Excluded = (market: string) => {
@@ -398,6 +412,7 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
     };
 
     const baseTickers = await fetchTickers([...BASE_MARKETS]);
+    const tAfterBaseTickers = Date.now();
     const btc = baseTickers.find((t) => t.market === "KRW-BTC");
     const btcDropPenalty = btc && (btc.signed_change_rate ?? 0) < -0.01 ? 8 : 0;
 
@@ -429,12 +444,14 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
       altMarkets = altValidity.accepted;
     }
     const tickers = await fetchTickers(altMarkets, {
+      ...pumpAltTickerOptsBase,
       maxMarkets: altMarkets.length,
-      sortByCached24hVolume: false,
     });
+    const tAfterAltTickers = Date.now();
     const fetchedAltSet = new Set(tickers.map((t) => t.market));
     const heldMissingFromTicker = heldMarkets.filter((m) => !BASE_MARKET_SET.has(m) && !fetchedAltSet.has(m) && !is429Excluded(m));
     const heldExtraTickers = await fetchTickers(heldMissingFromTicker);
+    const tAfterHeldExtraTickers = Date.now();
 
     const momSel = selectMomentumTopM(tickers, {
       is429Excluded,
@@ -448,6 +465,7 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
     lastMomentumRankByMarket = momSel.nextRankByMarket;
     const momentumCandidates = momSel.momentumTop;
     const momentumScoreByMarket = momSel.momentumScoreByMarket;
+    const tAfterMomentum = Date.now();
 
     if (universeDebugLog) {
       console.info(
@@ -491,6 +509,7 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
       return (momentumScoreByMarket.get(b.market) ?? 0) - (momentumScoreByMarket.get(a.market) ?? 0);
     });
     const candleTargets = marketsRanked.slice(0, CANDLE_MAX_MARKETS_PER_TICK);
+    const tBeforeCandles = Date.now();
     const batches = chunk(candleTargets, CANDLE_BATCH_SIZE);
     for (let bi = 0; bi < batches.length; bi++) {
       const batch = batches[bi]!;
@@ -519,6 +538,7 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
         await sleep(CANDLE_BATCH_DELAY_MS);
       }
     }
+    const tAfterCandles = Date.now();
 
     rows.sort((a, b) => b.score - a.score);
     rows.forEach((r, i) => {
@@ -526,6 +546,34 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
     });
     state.rows = rows.slice(0, 15);
     state.updatedAt = new Date().toISOString();
+
+    if (PUMP_TIMING_LOG) {
+      const tickerBatchesAlt = Math.ceil(altMarkets.length / PUMP_TICKER_BATCH_SIZE);
+      const tickTotalMs = Date.now() - tickT0;
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_PUMP_SCANNER_TICK_TIMING",
+          tick_total_ms: tickTotalMs,
+          ticker_base_ms: tAfterBaseTickers - tickT0,
+          ticker_alt_ms: tAfterAltTickers - tAfterBaseTickers,
+          ticker_held_extra_ms: tAfterHeldExtraTickers - tAfterAltTickers,
+          ticker_phase_ms: tAfterHeldExtraTickers - tickT0,
+          momentum_ms: tAfterMomentum - tAfterHeldExtraTickers,
+          post_momentum_prep_ms: tBeforeCandles - tAfterMomentum,
+          candle_ms: tAfterCandles - tBeforeCandles,
+          alt_market_count: altMarkets.length,
+          ticker_returned: tickers.length,
+          ticker_batches_alt: tickerBatchesAlt,
+          ticker_batch_size: PUMP_TICKER_BATCH_SIZE,
+          ticker_parallel: PUMP_TICKER_PARALLEL,
+          ticker_batch_delay_ms: PUMP_TICKER_BATCH_DELAY_MS,
+          momentum_considered: momSel.totalConsidered,
+          momentum_top_m: MOMENTUM_TOP_M,
+          markets_to_score: marketsToScore.length,
+          candle_targets: candleTargets.length,
+        }),
+      );
+    }
 
     const priceBy = new Map(allTickers.map((t) => [t.market, t.trade_price]));
     for (const r of state.rows.slice(0, 8)) {

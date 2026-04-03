@@ -39,6 +39,12 @@ export type FetchTickersOptions = {
   maxMarkets?: number;
   /** false 이면 입력 순서 유지(모멘텀 유니버스 등). 기본 true. */
   sortByCached24hVolume?: boolean;
+  /** 기본 `UPBIT_TICKER_BATCH_SIZE`. pump 전체 유니버스 조회 시 크게 줄이면 HTTP 왕복 횟수 감소. */
+  batchSize?: number;
+  /** 기본 `UPBIT_TICKER_BATCH_DELAY_MS`. 0 이면 배치 간 대기 없음. */
+  batchDelayMs?: number;
+  /** 동시에 요청할 배치 수(1=기존 순차). 2~4 권장, 429 시 1로 낮춤. */
+  parallelTickerBatches?: number;
 };
 
 function sleep(ms: number): Promise<void> {
@@ -383,6 +389,55 @@ function chunk<T>(arr: T[], size: number): T[][] {
   return out;
 }
 
+async function fetchTickerBatchGroup(group: string[]): Promise<UpbitTicker[]> {
+  const out: UpbitTicker[] = [];
+  for (let attempt = 1; attempt <= Math.max(1, TICKER_429_MAX_ATTEMPTS); attempt++) {
+    try {
+      const rows: UpbitTicker[] = [];
+      const q = encodeURIComponent(group.join(","));
+      try {
+        rows.push(...(await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${q}`)));
+      } catch (batchErr) {
+        if (!is404MarketError(batchErr)) throw batchErr;
+        for (const market of group) {
+          try {
+            const sq = encodeURIComponent(market);
+            const one = await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${sq}`);
+            rows.push(...one);
+          } catch (singleErr) {
+            if (is404MarketError(singleErr)) {
+              markInvalidMarket(market);
+              continue;
+            }
+            throw singleErr;
+          }
+        }
+      }
+      const mapped = rows.map((r) => ({
+        ...r,
+        trade_price: numTradePrice((r as { trade_price?: unknown }).trade_price),
+      }));
+      for (const t of mapped) {
+        ticker24hVolumeHintByMarket.set(t.market, Number(t.acc_trade_price_24h ?? 0));
+      }
+      out.push(...mapped);
+      break;
+    } catch (e) {
+      const status = e instanceof UpbitHttpError ? e.status : undefined;
+      const is429 = status === 429 || (e instanceof Error && e.message.includes("429"));
+      if (!is429 || attempt >= Math.max(1, TICKER_429_MAX_ATTEMPTS)) {
+        console.warn(
+          `[upbit-ticker] batch_failed markets=${group.length} attempt=${attempt} status=${status ?? "unknown"} error=${e instanceof Error ? e.message : String(e)}`,
+        );
+        break;
+      }
+      const retryDelay = TICKER_429_RETRY_DELAY_MS * attempt;
+      await sleep(retryDelay);
+    }
+  }
+  return out;
+}
+
 export async function fetchTickers(markets: string[], opts?: FetchTickersOptions): Promise<UpbitTicker[]> {
   if (markets.length === 0) return [];
   const sanitized = await sanitizeKrwMarkets(markets);
@@ -394,62 +449,19 @@ export async function fetchTickers(markets: string[], opts?: FetchTickersOptions
       : [...sanitized].sort((a, b) => (ticker24hVolumeHintByMarket.get(b) ?? 0) - (ticker24hVolumeHintByMarket.get(a) ?? 0));
   const limited =
     maxCap >= ordered.length ? ordered : ordered.slice(0, Math.max(1, maxCap));
-  const batches = chunk(limited, Math.max(1, TICKER_BATCH_SIZE));
+  const batchSize = Math.max(1, opts?.batchSize ?? TICKER_BATCH_SIZE);
+  const batchDelayMs = opts?.batchDelayMs ?? TICKER_BATCH_DELAY_MS;
+  const parallelTickerBatches = Math.max(1, Math.min(20, opts?.parallelTickerBatches ?? 1));
+  const batches = chunk(limited, batchSize);
 
   const out: UpbitTicker[] = [];
-  for (let i = 0; i < batches.length; i++) {
-    const group = batches[i]!;
-    let done = false;
-    for (let attempt = 1; attempt <= Math.max(1, TICKER_429_MAX_ATTEMPTS); attempt++) {
-      try {
-        const rows: UpbitTicker[] = [];
-        const q = encodeURIComponent(group.join(","));
-        try {
-          rows.push(...(await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${q}`)));
-        } catch (batchErr) {
-          if (!is404MarketError(batchErr)) throw batchErr;
-          // 404(Code not found) 배치 실패 시 단건으로 격리하여 invalid 마켓을 blacklist 처리.
-          for (const market of group) {
-            try {
-              const sq = encodeURIComponent(market);
-              const one = await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${sq}`);
-              rows.push(...one);
-            } catch (singleErr) {
-              if (is404MarketError(singleErr)) {
-                markInvalidMarket(market);
-                continue;
-              }
-              throw singleErr;
-            }
-          }
-        }
-        const mapped = rows.map((r) => ({
-          ...r,
-          trade_price: numTradePrice((r as { trade_price?: unknown }).trade_price),
-        }));
-        for (const t of mapped) {
-          ticker24hVolumeHintByMarket.set(t.market, Number(t.acc_trade_price_24h ?? 0));
-        }
-        out.push(...mapped);
-        done = true;
-        break;
-      } catch (e) {
-        const status = e instanceof UpbitHttpError ? e.status : undefined;
-        const is429 = status === 429 || (e instanceof Error && e.message.includes("429"));
-        if (!is429 || attempt >= Math.max(1, TICKER_429_MAX_ATTEMPTS)) {
-          console.warn(
-            `[upbit-ticker] batch_failed markets=${group.length} attempt=${attempt} status=${status ?? "unknown"} error=${e instanceof Error ? e.message : String(e)}`,
-          );
-          break; // 부분 실패 허용
-        }
-        const retryDelay = TICKER_429_RETRY_DELAY_MS * attempt;
-        await sleep(retryDelay);
-      }
+  for (let i = 0; i < batches.length; i += parallelTickerBatches) {
+    const slice = batches.slice(i, i + parallelTickerBatches);
+    const results = await Promise.all(slice.map((g) => fetchTickerBatchGroup(g)));
+    for (const r of results) out.push(...r);
+    if (i + parallelTickerBatches < batches.length) {
+      await sleep(Math.max(0, batchDelayMs));
     }
-    if (i < batches.length - 1) {
-      await sleep(Math.max(0, TICKER_BATCH_DELAY_MS));
-    }
-    if (!done) continue;
   }
   return out;
 }
