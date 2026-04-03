@@ -62,11 +62,14 @@ type PerfRow = {
 };
 
 const SCANNER_INTERVAL_MS = Math.max(5_000, Number(process.env.PUMP_SCANNER_INTERVAL_MS ?? 60_000));
-const LIQUIDITY_SCAN_MIN_24H_KRW = 300_000_000; // 3억 이상만 스캔(단, 후보 제외 사유로도 표시)
 const LIQUIDITY_EXCLUDE_MIN_24H_KRW = 1_000_000_000; // 10억 이상만 후보 (그 미만은 "유동성 부족")
 const BASE_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"] as const;
 const BASE_MARKET_SET = new Set<string>(BASE_MARKETS as unknown as string[]);
-const MAX_NEW_CANDIDATE_MARKETS = 8;
+/** 캔들 분석 대상 후보 수 — 단기 모멘텀 상위 M (24h 거래대금 상위 고정 N 대체). */
+const MOMENTUM_TOP_M = Math.max(1, Math.min(200, Number(process.env.PUMP_SCANNER_MOMENTUM_TOP_M ?? process.env.MOMENTUM_TOP_M ?? 40)));
+/** 직전 스냅샷과 비교할 최대 창(분). acc24·가격 단기 변화에 사용. */
+const MOMENTUM_LOOKBACK_MIN = Math.max(1, Math.min(30, Number(process.env.PUMP_SCANNER_MOMENTUM_LOOKBACK_MIN ?? process.env.MOMENTUM_LOOKBACK_MIN ?? 3)));
+const USE_VOLUME_WEIGHT = (process.env.PUMP_SCANNER_USE_VOLUME_WEIGHT ?? process.env.USE_VOLUME_WEIGHT ?? "true").toLowerCase() === "true";
 const CANDLE_MAX_MARKETS_PER_TICK = Math.max(
   1,
   Number(process.env.PUMP_SCANNER_CANDLE_MAX_MARKETS_PER_TICK ?? process.env.UPBIT_TICKER_MAX_MARKETS_PER_TICK ?? 12),
@@ -192,6 +195,101 @@ function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btc
   };
 }
 
+/**
+ * 전체 KRW 티커 배치 조회 후, 단기 가격·(선택)거래대금 증가·순위 상승으로 모멘텀 점수 → 상위 M만 캔들 후보로 넘김.
+ * (캔들/scoreOne/MVP/paper 경로는 변경하지 않음.)
+ */
+function selectMomentumTopM(
+  tickers: UpbitTicker[],
+  opts: {
+    is429Excluded: (m: string) => boolean;
+    lookbackMin: number;
+    topM: number;
+    useVolumeWeight: boolean;
+    snapshot: Map<string, { ts: number; trade_price: number; acc24: number }>;
+    prevRankByMarket: Map<string, number>;
+  },
+): {
+  momentumTop: UpbitTicker[];
+  momentumScoreByMarket: Map<string, number>;
+  nextSnapshot: Map<string, { ts: number; trade_price: number; acc24: number }>;
+  nextRankByMarket: Map<string, number>;
+  totalConsidered: number;
+} {
+  const now = Date.now();
+  const lookbackMs = opts.lookbackMin * 60_000;
+
+  const sortedBySr = [...tickers.filter((t) => !opts.is429Excluded(t.market))].sort(
+    (a, b) => Number(b.signed_change_rate ?? 0) - Number(a.signed_change_rate ?? 0),
+  );
+
+  const currRankByMarket = new Map<string, number>();
+  sortedBySr.forEach((t, i) => currRankByMarket.set(t.market, i + 1));
+
+  const priceShorts: number[] = [];
+  const volDeltas: number[] = [];
+  const rankDeltas: number[] = [];
+
+  for (const t of sortedBySr) {
+    const sr = Math.abs(Number(t.signed_change_rate ?? 0));
+    const prev = opts.snapshot.get(t.market);
+    let volD = 0;
+    let priceComp = sr;
+
+    if (prev && now - prev.ts <= lookbackMs * 2) {
+      volD = Math.max(0, Number(t.acc_trade_price_24h ?? 0) - prev.acc24);
+      if (prev.trade_price > 0) {
+        const shortPct = Math.abs((t.trade_price - prev.trade_price) / prev.trade_price);
+        priceComp = Math.max(sr, shortPct);
+      }
+    }
+
+    priceShorts.push(priceComp);
+    volDeltas.push(volD);
+    const cr = currRankByMarket.get(t.market)!;
+    const pr = opts.prevRankByMarket.get(t.market);
+    rankDeltas.push(pr !== undefined ? Math.max(0, pr - cr) : 0);
+  }
+
+  const maxP = Math.max(...priceShorts, 1e-12);
+  const maxV = Math.max(...volDeltas, 1e-12);
+  const maxRD = Math.max(...rankDeltas, 1e-12);
+
+  const wP = opts.useVolumeWeight ? 0.35 : 0.5;
+  const wV = opts.useVolumeWeight ? 0.35 : 0;
+  const wR = opts.useVolumeWeight ? 0.3 : 0.5;
+  const wSum = wP + wV + wR;
+
+  const scored = sortedBySr.map((t, i) => {
+    const np = priceShorts[i]! / maxP;
+    const nv = volDeltas[i]! / maxV;
+    const nrd = rankDeltas[i]! / maxRD;
+    const momentum = ((wP * np + wV * nv + wR * nrd) / wSum) * 100;
+    return { t, momentum };
+  });
+
+  scored.sort((a, b) => b.momentum - a.momentum);
+  const momentumTop = scored.slice(0, opts.topM).map((x) => x.t);
+  const momentumScoreByMarket = new Map(scored.map((x) => [x.t.market, x.momentum]));
+
+  const nextSnapshot = new Map(opts.snapshot);
+  for (const t of sortedBySr) {
+    nextSnapshot.set(t.market, {
+      ts: now,
+      trade_price: t.trade_price,
+      acc24: Number(t.acc_trade_price_24h ?? 0),
+    });
+  }
+
+  return {
+    momentumTop,
+    momentumScoreByMarket,
+    nextSnapshot,
+    nextRankByMarket: currRankByMarket,
+    totalConsidered: sortedBySr.length,
+  };
+}
+
 export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
   const state = {
     rows: [] as ScannerRow[],
@@ -207,6 +305,8 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
   let cachedKrwMarkets: string[] | null = null;
   let cachedKrwMarketsAtMs = 0;
   const candleSnapshotCache = new Map<string, { c1: UpbitCandle[]; c5: UpbitCandle[]; fetchedAtMs: number }>();
+  let momentumSnapshot = new Map<string, { ts: number; trade_price: number; acc24: number }>();
+  let lastMomentumRankByMarket = new Map<string, number>();
 
   const debugEnabled =
     process.env.ORBITALPHA_TRADING_SCANNER_DEBUG === "1" ||
@@ -217,6 +317,12 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
     if (!debugEnabled) return;
     console.log("[pump-scanner]", event, payload);
   };
+
+  const universeDebugLog =
+    process.env.ORBITALPHA_TRADING_UNIVERSE_DEBUG === "1" ||
+    process.env.ORBITALPHA_TRADING_SCANNER_DEBUG === "1" ||
+    (process.env.DEBUG_LOG_ENABLED ?? "").toLowerCase() === "true" ||
+    (process.env.ORBITALPHA_TRADING_DEBUG_LOG_ENABLED ?? "").toLowerCase() === "true";
 
   const baseDir = path.join(tradingDataRoot(), "scanner");
   const perfFile = path.join(baseDir, "pump_scanner_performance.json");
@@ -322,15 +428,43 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
       }
       altMarkets = altValidity.accepted;
     }
-    const tickers = await fetchTickers(altMarkets);
+    const tickers = await fetchTickers(altMarkets, {
+      maxMarkets: altMarkets.length,
+      sortByCached24hVolume: false,
+    });
     const fetchedAltSet = new Set(tickers.map((t) => t.market));
     const heldMissingFromTicker = heldMarkets.filter((m) => !BASE_MARKET_SET.has(m) && !fetchedAltSet.has(m) && !is429Excluded(m));
     const heldExtraTickers = await fetchTickers(heldMissingFromTicker);
-    const liquidNew = tickers
-      .filter((t) => (t.acc_trade_price_24h ?? 0) >= LIQUIDITY_SCAN_MIN_24H_KRW)
-      .sort((a, b) => (b.acc_trade_price_24h ?? 0) - (a.acc_trade_price_24h ?? 0))
-      .slice(0, MAX_NEW_CANDIDATE_MARKETS)
-      .filter((t) => !is429Excluded(t.market));
+
+    const momSel = selectMomentumTopM(tickers, {
+      is429Excluded,
+      lookbackMin: MOMENTUM_LOOKBACK_MIN,
+      topM: MOMENTUM_TOP_M,
+      useVolumeWeight: USE_VOLUME_WEIGHT,
+      snapshot: momentumSnapshot,
+      prevRankByMarket: lastMomentumRankByMarket,
+    });
+    momentumSnapshot = momSel.nextSnapshot;
+    lastMomentumRankByMarket = momSel.nextRankByMarket;
+    const momentumCandidates = momSel.momentumTop;
+    const momentumScoreByMarket = momSel.momentumScoreByMarket;
+
+    if (universeDebugLog) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_UNIVERSE_SELECTION",
+          totalSymbols: altMarkets.length,
+          tickerReturned: tickers.length,
+          selectedSymbols: momentumCandidates.length,
+          considered: momSel.totalConsidered,
+          topMomentumSample: momentumCandidates.slice(0, 12).map((t) => t.market),
+          기준: {
+            price_change: "signed_change_rate + short-term vs prev snapshot within lookback",
+            volume_change: "delta acc_trade_price_24h vs prev snapshot when USE_VOLUME_WEIGHT",
+          },
+        }),
+      );
+    }
 
     const allTickers = [...baseTickers, ...tickers, ...heldExtraTickers];
     const tByMarket = new Map(allTickers.map((t) => [t.market, t]));
@@ -342,7 +476,7 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
       .filter((t) => !is429Excluded(t.market));
 
     const seen = new Set<string>();
-    const marketsToScore = [...heldTickers, ...liquidNew].filter((t) => {
+    const marketsToScore = [...heldTickers, ...momentumCandidates].filter((t) => {
       if (seen.has(t.market)) return false;
       seen.add(t.market);
       return true;
@@ -354,7 +488,7 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
       const heldBiasA = heldSet.has(a.market) ? 1 : 0;
       const heldBiasB = heldSet.has(b.market) ? 1 : 0;
       if (heldBiasA !== heldBiasB) return heldBiasB - heldBiasA;
-      return (b.acc_trade_price_24h ?? 0) - (a.acc_trade_price_24h ?? 0);
+      return (momentumScoreByMarket.get(b.market) ?? 0) - (momentumScoreByMarket.get(a.market) ?? 0);
     });
     const candleTargets = marketsRanked.slice(0, CANDLE_MAX_MARKETS_PER_TICK);
     const batches = chunk(candleTargets, CANDLE_BATCH_SIZE);

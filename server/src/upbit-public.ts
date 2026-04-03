@@ -33,6 +33,14 @@ export type UpbitTicker = {
   acc_trade_price_24h?: number;
 };
 
+/** `fetchTickers` 기본 동작(24h 힌트 정렬 + 상위 N개)은 그대로 — 옵션으로만 확장. */
+export type FetchTickersOptions = {
+  /** 기본: `UPBIT_TICKER_MAX_MARKETS_PER_TICK`(15). 전체 조회 시 `markets.length` 등 큰 값. */
+  maxMarkets?: number;
+  /** false 이면 입력 순서 유지(모멘텀 유니버스 등). 기본 true. */
+  sortByCached24hVolume?: boolean;
+};
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -375,12 +383,17 @@ function chunk<T>(arr: T[], size: number): T[][] {
   return out;
 }
 
-export async function fetchTickers(markets: string[]): Promise<UpbitTicker[]> {
+export async function fetchTickers(markets: string[], opts?: FetchTickersOptions): Promise<UpbitTicker[]> {
   if (markets.length === 0) return [];
   const sanitized = await sanitizeKrwMarkets(markets);
   if (sanitized.length === 0) return [];
-  const ranked = [...sanitized].sort((a, b) => (ticker24hVolumeHintByMarket.get(b) ?? 0) - (ticker24hVolumeHintByMarket.get(a) ?? 0));
-  const limited = ranked.slice(0, Math.max(1, TICKER_MAX_MARKETS_PER_TICK));
+  const maxCap = opts?.maxMarkets ?? TICKER_MAX_MARKETS_PER_TICK;
+  const ordered =
+    opts?.sortByCached24hVolume === false
+      ? [...sanitized]
+      : [...sanitized].sort((a, b) => (ticker24hVolumeHintByMarket.get(b) ?? 0) - (ticker24hVolumeHintByMarket.get(a) ?? 0));
+  const limited =
+    maxCap >= ordered.length ? ordered : ordered.slice(0, Math.max(1, maxCap));
   const batches = chunk(limited, Math.max(1, TICKER_BATCH_SIZE));
 
   const out: UpbitTicker[] = [];
