@@ -138,8 +138,6 @@ function singleFailedFilterId(parsed: NonNullable<ReturnType<typeof parseSignalP
 }
 
 const DASHBOARD_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"] as const;
-type DashboardMarket = (typeof DASHBOARD_MARKETS)[number];
-const DASHBOARD_MARKET_SET = new Set<string>(DASHBOARD_MARKETS as unknown as string[]);
 const UPBIT_FEE_RATE = 0.0005;
 
 /** API 구버전 대비 — 서버 `volume-thresholds`와 동기 */
@@ -344,6 +342,34 @@ type StrategyStatus = {
   >;
 };
 
+/** 감시·카드에 쓸 마켓: 기본 4종 + (실제 보유·전략/레거시/오픈포지션 마켓). slice(4) 제한 없음. */
+function deriveDisplayMarkets(trade: TradeStatus | null, strategy: StrategyStatus | null): string[] {
+  const extra = new Set<string>();
+  const DUST_NOTIONAL_KRW = 1000;
+  if (trade) {
+    for (const b of trade.balances ?? []) {
+      if (b.currency === "KRW") continue;
+      const m = `KRW-${b.currency}`;
+      const qtyRaw = Number(b.balance ?? 0) + Number(b.locked ?? 0);
+      const avg = Number(b.avg_buy_price ?? 0);
+      const notionalByCost = qtyRaw * avg;
+      if (Number.isFinite(qtyRaw) && qtyRaw > 0 && notionalByCost >= DUST_NOTIONAL_KRW) extra.add(m);
+    }
+    for (const k of Object.keys(trade.strategy_positions ?? {})) {
+      if (k.startsWith("KRW-")) extra.add(k);
+    }
+    for (const k of Object.keys(trade.legacy_positions ?? {})) {
+      if (k.startsWith("KRW-")) extra.add(k);
+    }
+    for (const k of Object.keys(strategy?.open_positions ?? {})) {
+      if (k.startsWith("KRW-")) extra.add(k);
+    }
+  }
+  for (const m of DASHBOARD_MARKETS) extra.delete(m);
+  const extrasSorted = [...extra].sort();
+  return [...DASHBOARD_MARKETS, ...extrasSorted];
+}
+
 type PumpScannerStatus = {
   mode?: string;
   updated_at: string | null;
@@ -499,26 +525,32 @@ function safeNum(v: unknown): number {
 }
 
 function toPaperPanelSummary(raw: unknown): PaperPanelSummary {
-  const r = (raw ?? {}) as Record<string, any>;
-  const account = (r.account ?? {}) as Record<string, any>;
-  const config = (r.config ?? {}) as Record<string, any>;
+  const r = (raw ?? {}) as Record<string, unknown>;
+  const account = (r.account && typeof r.account === "object" && r.account !== null ? r.account : {}) as Record<string, unknown>;
+  const config = (r.config && typeof r.config === "object" && r.config !== null ? r.config : {}) as Record<string, unknown>;
   const holdingsRaw = Array.isArray(r.holdings) ? r.holdings : [];
   const historyRaw = Array.isArray(r.recent_history) ? r.recent_history : [];
 
-  const openPositions = holdingsRaw.map((h: any) => ({
-    market: typeof h?.market === "string" ? h.market : "UNKNOWN",
-    entryTs: typeof h?.entry_ts === "string" ? h.entry_ts : "",
-    signalStrength: typeof h?.signal_strength === "string" ? h.signal_strength : "-",
-    unrealizedPnlPct: safeNum(h?.unrealized_pnl_pct),
-  }));
+  const openPositions = holdingsRaw.map((h: unknown) => {
+    const o = h && typeof h === "object" ? (h as Record<string, unknown>) : {};
+    return {
+      market: typeof o.market === "string" ? o.market : "UNKNOWN",
+      entryTs: typeof o.entry_ts === "string" ? o.entry_ts : "",
+      signalStrength: typeof o.signal_strength === "string" ? o.signal_strength : "-",
+      unrealizedPnlPct: safeNum(o.unrealized_pnl_pct),
+    };
+  });
 
-  const recentTrades = historyRaw.map((h: any) => ({
-    ts: typeof h?.ts === "string" ? h.ts : "",
-    market: typeof h?.market === "string" ? h.market : "UNKNOWN",
-    state: typeof h?.state === "string" ? h.state : "UNKNOWN",
-    note: typeof h?.note === "string" ? h.note : "-",
-    pnlPct: h?.pnl_pct == null ? null : safeNum(h?.pnl_pct),
-  }));
+  const recentTrades = historyRaw.map((h: unknown) => {
+    const o = h && typeof h === "object" ? (h as Record<string, unknown>) : {};
+    return {
+      ts: typeof o.ts === "string" ? o.ts : "",
+      market: typeof o.market === "string" ? o.market : "UNKNOWN",
+      state: typeof o.state === "string" ? o.state : "UNKNOWN",
+      note: typeof o.note === "string" ? o.note : "-",
+      pnlPct: o.pnl_pct == null ? null : safeNum(o.pnl_pct),
+    };
+  });
 
   return {
     totalEquity: safeNum(account.total_asset_krw),
@@ -1223,28 +1255,23 @@ export default function HomePage() {
     return "조건 대기";
   }, [trade, autoTradeEnabled, marketState, scanner]);
 
+  const displayMarkets = useMemo(() => deriveDisplayMarkets(trade, strategy), [trade, strategy]);
+
   const latestByMarket = useMemo(() => {
-    const result: Partial<
-      Record<
-        DashboardMarket,
-        { entry: SignalLogEntry; parsed: NonNullable<ReturnType<typeof parseSignalPayload>> } | null
-      >
-    > = {};
-    for (const m of DASHBOARD_MARKETS) result[m] = null;
+    const displaySet = new Set(displayMarkets);
+    const result: Record<string, { entry: SignalLogEntry; parsed: NonNullable<ReturnType<typeof parseSignalPayload>> } | null> =
+      {};
+    for (const m of displayMarkets) result[m] = null;
 
     for (const r of signalRows) {
       const market = r.parsed.p.market;
-      if (!DASHBOARD_MARKET_SET.has(market)) continue;
-      const key = market as DashboardMarket;
-      if (result[key] === null) {
-        result[key] = r;
+      if (!displaySet.has(market)) continue;
+      if (result[market] === null) {
+        result[market] = r;
       }
     }
-    return result as Record<
-      DashboardMarket,
-      { entry: SignalLogEntry; parsed: NonNullable<ReturnType<typeof parseSignalPayload>> } | null
-    >;
-  }, [signalRows]);
+    return result;
+  }, [signalRows, displayMarkets]);
 
   type CardTone = "pass" | "near" | "fail" | "none";
 
@@ -1296,7 +1323,10 @@ export default function HomePage() {
   const latestCycleRows = useMemo(
     () =>
       Object.values(latestByMarket)
-        .filter((r): r is NonNullable<(typeof latestByMarket)[DashboardMarket]> => Boolean(r))
+        .filter(
+          (r): r is { entry: SignalLogEntry; parsed: NonNullable<ReturnType<typeof parseSignalPayload>> } =>
+            Boolean(r),
+        )
         .sort((a, b) => toEpochMs(b.entry.ts) - toEpochMs(a.entry.ts))
         .slice(0, 4),
     [latestByMarket],
@@ -1308,7 +1338,7 @@ export default function HomePage() {
     let pass = 0;
     let watch = 0;
     let fail = 0;
-    for (const m of DASHBOARD_MARKETS) {
+    for (const m of displayMarkets) {
       const parsed = latestByMarket[m]?.parsed;
       const tone = getCardTone(parsed);
       if (tone === "pass") pass += 1;
@@ -1316,7 +1346,7 @@ export default function HomePage() {
       else fail += 1;
     }
     return { pass, watch, fail };
-  }, [latestByMarket]);
+  }, [latestByMarket, displayMarkets]);
 
   const holdingCards = useMemo(() => {
     const valuationTrade = trade;
@@ -1324,7 +1354,7 @@ export default function HomePage() {
     const strategyByMarket = valuationTrade?.strategy_positions ?? {};
     const legacyByMarket = valuationTrade?.legacy_positions ?? {};
     const DUST_NOTIONAL_KRW = 1000;
-    return DASHBOARD_MARKETS.map((m) => {
+    return displayMarkets.map((m) => {
       const currency = m.replace("KRW-", "");
       const bal = byCurrency.get(currency);
       const qtyRaw = Number(bal?.balance ?? 0) + Number(bal?.locked ?? 0);
@@ -1379,7 +1409,7 @@ export default function HomePage() {
         trailingStopPrice: Number(livePos?.trailing_stop_price ?? 0),
       };
     });
-  }, [trade, strategy]);
+  }, [trade, strategy, displayMarkets]);
 
   const holdingQtyByMarket = useMemo(() => {
     const map: Record<string, number> = {};
@@ -1716,12 +1746,12 @@ export default function HomePage() {
       </section>
 
       <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>
-        보유 자산 (BTC / ETH / XRP / TRX)
+        보유 자산
       </section>
       <section
         style={{
           display: "grid",
-          gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+          gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
           gap: "0.9rem",
           marginBottom: "1.15rem",
         }}
@@ -1730,7 +1760,7 @@ export default function HomePage() {
           const pnlColor = h.netPnl > 0 ? "#22c55e" : h.netPnl < 0 ? "#ef4444" : UI.muted;
           const retColor = h.netRet > 0 ? "#22c55e" : h.netRet < 0 ? "#ef4444" : UI.muted;
           const hasHolding = h.qty > 0;
-          const latest = latestByMarket[h.market as DashboardMarket] ?? null;
+          const latest = latestByMarket[h.market] ?? null;
           const entries = Number((trade?.strategy_positions?.[h.market]?.entries as number | undefined) ?? 0);
           const orderLimits = trade?.order_limits ?? marketState?.order_limits ?? ORDER_LIMITS;
           const additionalBuyStatus = formatAdditionalBuyStatus({
@@ -1834,12 +1864,12 @@ export default function HomePage() {
       <section
         style={{
           display: "grid",
-          gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+          gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
           gap: "0.8rem",
           marginBottom: "1rem",
         }}
       >
-        {DASHBOARD_MARKETS.map((market) => {
+        {displayMarkets.map((market) => {
           const latest = latestByMarket[market];
           const parsed = latest?.parsed;
           const tone = getCardTone(parsed);
