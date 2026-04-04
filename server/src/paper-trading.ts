@@ -71,6 +71,13 @@ const PAPER_STOP_LOSS_PCT = -1.0;
 const PAPER_TAKE_PROFIT_PARTIAL_PCT = 1.5;
 const PAPER_TAKE_PROFIT_FINAL_PCT = 3.0;
 const PAPER_TIMEOUT_MS = 10 * 60_000;
+/** surge_scanner 진입만 — 급등 후 추격 진입 시 10분 청산이 TP(1.5%/3%)·SL 전에 도달해 전부 TIMEOUT 되는 경우 완화. paper 전용. */
+const PAPER_SURGE_SCANNER_TIMEOUT_MS = (() => {
+  const raw = process.env.PAPER_SURGE_SCANNER_TIMEOUT_MINUTES;
+  if (raw === undefined || raw === "") return 30 * 60_000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 10 && n <= 180 ? n * 60_000 : 30 * 60_000;
+})();
 const PAPER_EARLY_EXIT_MIN_MS = 2 * 60_000;
 const PAPER_EARLY_EXIT_STRENGTH_BREAK_PCT = -0.45;
 const PAPER_TRAILING_AFTER_TP2_DRAWDOWN_PCT = 1.0;
@@ -96,6 +103,18 @@ const PAPER_BTC_WEAK_ENTRY_SCALE = 0.5;
 function toNum(v: unknown, d = 0): number {
   const n = Number(v);
   return Number.isFinite(n) ? n : d;
+}
+
+function paperTimeExitDeadlineMs(p: Pick<PaperPosition, "signal_strength">): number {
+  return p.signal_strength === "SURGE_SCANNER" ? PAPER_SURGE_SCANNER_TIMEOUT_MS : PAPER_TIMEOUT_MS;
+}
+
+function paperTimeExitNote(p: Pick<PaperPosition, "signal_strength">): string {
+  const ms = paperTimeExitDeadlineMs(p);
+  const m = Math.round(ms / 60_000);
+  return p.signal_strength === "SURGE_SCANNER"
+    ? `time_exit_${m}m:surge_scanner`
+    : `time_exit_${m}m:paper`;
 }
 
 export function createPaperTradingEngine(opts: {
@@ -376,6 +395,8 @@ export function createPaperTradingEngine(opts: {
         fee_rate: UPBIT_FEE_RATE,
         /** Paper 전용 — `evaluateMvpSignal` 주입값 (실거래·signal-monitor와 분리) */
         paper_volume_threshold_main: PAPER_VOLUME_THRESHOLD_MAIN,
+        /** surge_scanner 포지션 시간청산(분). 기본 30. `PAPER_SURGE_SCANNER_TIMEOUT_MINUTES` */
+        surge_scanner_timeout_minutes: PAPER_SURGE_SCANNER_TIMEOUT_MS / 60_000,
       },
       account: {
         total_asset_krw: totalAssetKrw,
@@ -612,8 +633,8 @@ export function createPaperTradingEngine(opts: {
           paperSell(p.market, px, "CLOSED_TIMEOUT", "recovery_exit");
           continue;
         }
-        if (heldMs >= PAPER_TIMEOUT_MS) {
-          paperSell(p.market, px, "CLOSED_TIMEOUT", "time_exit_10m:surge_scanner");
+        if (heldMs >= paperTimeExitDeadlineMs(p)) {
+          paperSell(p.market, px, "CLOSED_TIMEOUT", paperTimeExitNote(p));
         }
         continue;
       }
@@ -638,8 +659,8 @@ export function createPaperTradingEngine(opts: {
         ((p.peak_price - px) / p.peak_price) * 100 >= PAPER_TRAILING_AFTER_TP2_DRAWDOWN_PCT
       ) {
         paperSell(p.market, px, "CLOSED_WIN", "trailing_exit_after_tp2");
-      } else if (heldMs >= PAPER_TIMEOUT_MS) {
-        paperSell(p.market, px, "CLOSED_TIMEOUT", "time_exit_10m:surge_scanner");
+      } else if (heldMs >= paperTimeExitDeadlineMs(p)) {
+        paperSell(p.market, px, "CLOSED_TIMEOUT", paperTimeExitNote(p));
       }
     }
 
