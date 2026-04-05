@@ -29,8 +29,10 @@ type PaperPosition = {
   take_profit_partial_done?: boolean;
   take_profit_second_done?: boolean;
   peak_price?: number;
-  dca_count?: number;
-  xrp_recovery_partial_done?: boolean;
+  /** 진입 이후 최고 수익률(%) — 조기 실패 판단 */
+  max_up_pct?: number;
+  /** +3% 이상에서 러너 트레일 활성 */
+  runner_trail_armed?: boolean;
 };
 
 type PaperTradeEvent = {
@@ -64,37 +66,32 @@ type MarketLifecycle = {
 
 const PAPER_START_KRW = 500_000;
 const PAPER_ENTRY_KRW_PER_TRADE = 45_000;
-const PAPER_PROBE_ENTRY_KRW = 20_000;
-const PAPER_MAX_OPEN = 3;
-const PAPER_TAKE_PROFIT_PCT = 2.8;
-const PAPER_STOP_LOSS_PCT = -1.0;
-const PAPER_TAKE_PROFIT_PARTIAL_PCT = 1.5;
-const PAPER_TAKE_PROFIT_FINAL_PCT = 3.0;
-const PAPER_TIMEOUT_MS = 10 * 60_000;
-/** surge_scanner 진입만 — 급등 후 추격 진입 시 10분 청산이 TP(1.5%/3%)·SL 전에 도달해 전부 TIMEOUT 되는 경우 완화. paper 전용. */
+const PAPER_MAX_OPEN = 2;
+/** 급등주 모의매매 — 실제 진입 전용 (후보 추적과 분리) */
+const SURGE_ENTRY_MIN_SCORE = 75;
+const SURGE_ENTRY_MIN_SCORE_WHEN_OPEN = 82;
+const SURGE_MID_TIER_MIN_SCORE = 85;
+const SURGE_MIN_VOLUME_RATIO = 1.1;
+const SURGE_COOLDOWN_MS = 25 * 60_000;
+const SURGE_COOLDOWN_AFTER_LOSS_MS = 30 * 60_000;
+const SURGE_HARD_STOP_PCT = -2.5;
+const SURGE_EARLY_FAIL_MIN_MS = 6 * 60_000;
+const SURGE_EARLY_FAIL_MAX_UP_PCT = 0.25;
+const SURGE_EARLY_FAIL_PNL_PCT = -1.2;
+const SURGE_TP1_PCT = 1.5;
+const SURGE_TP1_RATIO = 0.4;
+const SURGE_TRAIL_ARM_PCT = 3.0;
+const SURGE_TRAIL_FROM_PEAK_PCT = 1.2;
+const PAPER_TIMEOUT_MS = 45 * 60_000;
+/** surge 후보 시간청산(백업) */
 const PAPER_SURGE_SCANNER_TIMEOUT_MS = (() => {
   const raw = process.env.PAPER_SURGE_SCANNER_TIMEOUT_MINUTES;
-  if (raw === undefined || raw === "") return 30 * 60_000;
+  if (raw === undefined || raw === "") return 45 * 60_000;
   const n = Number(raw);
-  return Number.isFinite(n) && n >= 10 && n <= 180 ? n * 60_000 : 30 * 60_000;
+  return Number.isFinite(n) && n >= 10 && n <= 180 ? n * 60_000 : 45 * 60_000;
 })();
-const PAPER_EARLY_EXIT_MIN_MS = 2 * 60_000;
-const PAPER_EARLY_EXIT_STRENGTH_BREAK_PCT = -0.45;
-const PAPER_TRAILING_AFTER_TP2_DRAWDOWN_PCT = 1.0;
 const CANDIDATE_KEEP_MS = 3 * 60_000;
-const CANDIDATE_REEVAL_COOLDOWN_LOSS_MS = 3 * 60_000;
-const CANDIDATE_REEVAL_COOLDOWN_WIN_MS = 2 * 60_000;
 const CANDIDATE_MAX_TRACKED = 8;
-const XRP_DCA_TRIGGER_1_PCT = -2.0;
-const XRP_DCA_TRIGGER_2_PCT = -4.0;
-const XRP_DCA_MAX_COUNT = 2;
-const XRP_DCA_BUY_KRW = 25_000;
-const XRP_RECOVERY_EXIT_MIN_PCT = 0;
-const XRP_RECOVERY_EXIT_MAX_PCT = 1.0;
-const XRP_RECOVERY_PARTIAL_MINUTES = 25;
-const XRP_RECOVERY_PARTIAL_PCT = -0.6;
-const XRP_RECOVERY_FULL_MINUTES = 40;
-const XRP_RECOVERY_FULL_PCT = -0.2;
 const PAPER_HISTORY_MAX = 200;
 const PAPER_SEEN_SIGNAL_MAX = 500;
 const PAPER_BTC_NEUTRAL_ENTRY_SCALE = 0.75;
@@ -117,6 +114,12 @@ function paperTimeExitNote(p: Pick<PaperPosition, "signal_strength">): string {
     : `time_exit_${m}m:paper`;
 }
 
+function scannerSignalTier(score: number): "LOW" | "MID" | "HIGH" {
+  if (score >= 80) return "HIGH";
+  if (score >= 65) return "MID";
+  return "LOW";
+}
+
 export function createPaperTradingEngine(opts: {
   companyId: string;
   serviceId: string;
@@ -126,6 +129,8 @@ export function createPaperTradingEngine(opts: {
     status: string;
     signal_key: string;
     reason: string;
+    breakout?: boolean;
+    volume_multiple?: number;
   }>;
 }) {
   const baseDir = path.join(tradingDataRoot(), "paper", opts.companyId, opts.serviceId);
@@ -241,8 +246,8 @@ export function createPaperTradingEngine(opts: {
       take_profit_partial_done: false,
       take_profit_second_done: false,
       peak_price: entryPrice,
-      dca_count: 0,
-      xrp_recovery_partial_done: false,
+      max_up_pct: 0,
+      runner_trail_armed: false,
     };
     appendHistory({
       ts: new Date().toISOString(),
@@ -262,7 +267,7 @@ export function createPaperTradingEngine(opts: {
       state.candidatePool.delete(market);
     }
     state.metrics.entriesOpened += 1;
-    setLifecycle(market, "entered", { last_reason: note });
+    setLifecycle(market, "entered", { last_reason: note, cooldown_until_ts: undefined });
     return { ok: true };
   };
 
@@ -311,55 +316,17 @@ export function createPaperTradingEngine(opts: {
       pnl_pct: pnlPct,
     });
     if (ratioClamped >= 0.9999 || !state.positions[market]) {
-      const cd = closeState === "CLOSED_LOSS" ? CANDIDATE_REEVAL_COOLDOWN_LOSS_MS : CANDIDATE_REEVAL_COOLDOWN_WIN_MS;
+      const lossExit =
+        closeState === "CLOSED_LOSS" ||
+        note.includes("hard_stop_loss") ||
+        note.includes("early_failure_cut");
+      const cdMs = lossExit ? SURGE_COOLDOWN_AFTER_LOSS_MS : SURGE_COOLDOWN_MS;
       setLifecycle(market, "cooldown", {
-        cooldown_until_ts: new Date(Date.now() + cd).toISOString(),
+        cooldown_until_ts: new Date(Date.now() + cdMs).toISOString(),
         last_reason: note,
       });
     }
-    if (note.startsWith("early_exit:")) state.metrics.earlyExitCount += 1;
-    return { ok: true };
-  };
-
-  const paperDcaBuyXrp = (p: PaperPosition, currentPrice: number): { ok: boolean; reason?: string } => {
-    if (p.market !== "KRW-XRP") return { ok: false, reason: "not_xrp" };
-    if (!(currentPrice > 0)) return { ok: false, reason: "invalid_price" };
-    const dcaCount = p.dca_count ?? 0;
-    if (dcaCount >= XRP_DCA_MAX_COUNT) return { ok: false, reason: "dca_max_reached" };
-
-    const grossPct = ((currentPrice / p.entry_price) - 1) * 100;
-    const trigger =
-      dcaCount === 0 ? XRP_DCA_TRIGGER_1_PCT : dcaCount === 1 ? XRP_DCA_TRIGGER_2_PCT : -999;
-    if (grossPct > trigger) return { ok: false, reason: "trigger_not_met" };
-
-    const buyFee = XRP_DCA_BUY_KRW * UPBIT_FEE_RATE;
-    const totalNeed = XRP_DCA_BUY_KRW + buyFee;
-    if (state.cashKrw < totalNeed) return { ok: false, reason: "insufficient_cash" };
-
-    const addQty = XRP_DCA_BUY_KRW / currentPrice;
-    const prevQty = p.qty;
-    const nextQty = prevQty + addQty;
-    const nextAvg = nextQty > 0 ? ((p.entry_price * prevQty) + (currentPrice * addQty)) / nextQty : p.entry_price;
-
-    state.cashKrw -= totalNeed;
-    p.qty = nextQty;
-    p.entry_price = nextAvg;
-    p.invested_krw += XRP_DCA_BUY_KRW;
-    p.buy_fee_krw += buyFee;
-    p.dca_count = dcaCount + 1;
-
-    appendHistory({
-      ts: new Date().toISOString(),
-      market: p.market,
-      state: "OPEN",
-      note: p.dca_count === 1 ? "dca_buy_1" : "dca_buy_2",
-      signal_strength: p.signal_strength,
-      entry_price: currentPrice,
-      exit_price: null,
-      qty: addQty,
-      pnl_krw: null,
-      pnl_pct: null,
-    });
+    if (note.startsWith("early_exit:") || note.includes("early_failure_cut")) state.metrics.earlyExitCount += 1;
     return { ok: true };
   };
 
@@ -389,8 +356,10 @@ export function createPaperTradingEngine(opts: {
         start_krw: PAPER_START_KRW,
         entry_krw_per_trade: PAPER_ENTRY_KRW_PER_TRADE,
         max_open_positions: PAPER_MAX_OPEN,
-        take_profit_pct: PAPER_TAKE_PROFIT_PCT,
-        stop_loss_pct: PAPER_STOP_LOSS_PCT,
+        surge_entry_min_score: SURGE_ENTRY_MIN_SCORE,
+        surge_hard_stop_pct: SURGE_HARD_STOP_PCT,
+        surge_tp1_pct: SURGE_TP1_PCT,
+        surge_tp1_ratio: SURGE_TP1_RATIO,
         timeout_minutes: PAPER_TIMEOUT_MS / 60_000,
         fee_rate: UPBIT_FEE_RATE,
         /** Paper 전용 — `evaluateMvpSignal` 주입값 (실거래·signal-monitor와 분리) */
@@ -425,6 +394,8 @@ export function createPaperTradingEngine(opts: {
         reason: string;
         score: number;
         status: string;
+        breakout: boolean;
+        volume_multiple: number;
       }
     >();
     const watchMarkets = new Set<string>(Object.keys(state.positions));
@@ -446,6 +417,8 @@ export function createPaperTradingEngine(opts: {
           reason,
           score,
           status,
+          breakout: sig.breakout === true,
+          volume_multiple: toNum(sig.volume_multiple, 0),
         });
       }
       const life = getLifecycle(market);
@@ -500,49 +473,11 @@ export function createPaperTradingEngine(opts: {
       });
 
       const px = priceByMarket[market] ?? 0;
-      const scoreOk = sig.score >= 60;
       const reasonLower = sig.reason.toLowerCase();
-      const signalState = reasonLower.includes("breakout_confirmed")
-        ? "돌파"
-        : reasonLower.includes("upper_hold_confirmed")
-          ? "상단유지"
-          : "기타";
-      const isCandidateWatch = reasonLower.includes("candidate_watch");
-      const isBreakout = signalState === "돌파";
+      const breakoutConfirmed = sig.breakout === true || reasonLower.includes("breakout_confirmed");
 
-      if (!scoreOk) {
-        appendHistory({
-          ts: new Date().toISOString(),
-          market,
-          state: "SKIPPED",
-          note: "entry_blocked:score_below_60",
-          signal_strength: sig.signal_strength,
-          entry_price: px > 0 ? px : null,
-          exit_price: null,
-          qty: null,
-          pnl_krw: null,
-          pnl_pct: null,
-        });
-        continue;
-      }
-      if (!isBreakout && !isCandidateWatch) {
-        appendHistory({
-          ts: new Date().toISOString(),
-          market,
-          state: "SKIPPED",
-          note: "entry_blocked:state_not_breakout",
-          signal_strength: sig.signal_strength,
-          entry_price: px > 0 ? px : null,
-          exit_price: null,
-          qty: null,
-          pnl_krw: null,
-          pnl_pct: null,
-        });
-        continue;
-      }
-
-      const prior = state.candidatePool.get(market);
-      if (!prior) {
+      const priorPool = state.candidatePool.get(market);
+      if (!priorPool && sig.score >= 45) {
         state.candidatePool.set(market, {
           score: sig.score,
           reason: sig.reason,
@@ -558,7 +493,90 @@ export function createPaperTradingEngine(opts: {
         if (weakest) state.candidatePool.delete(weakest);
       }
 
+      const lifeEntry = getLifecycle(market);
+      if (lifeEntry.cooldown_until_ts && Date.now() < Date.parse(lifeEntry.cooldown_until_ts)) {
+        appendHistory({
+          ts: new Date().toISOString(),
+          market,
+          state: "SKIPPED",
+          note: "cooldown_active",
+          signal_strength: sig.signal_strength,
+          entry_price: px > 0 ? px : null,
+          exit_price: null,
+          qty: null,
+          pnl_krw: null,
+          pnl_pct: null,
+        });
+        continue;
+      }
+
       if (Object.keys(state.positions).length >= PAPER_MAX_OPEN) continue;
+
+      const openN = Object.keys(state.positions).length;
+      const minScore = openN > 0 ? SURGE_ENTRY_MIN_SCORE_WHEN_OPEN : SURGE_ENTRY_MIN_SCORE;
+      if (sig.score < minScore) {
+        appendHistory({
+          ts: new Date().toISOString(),
+          market,
+          state: "SKIPPED",
+          note: "score_insufficient",
+          signal_strength: sig.signal_strength,
+          entry_price: px > 0 ? px : null,
+          exit_price: null,
+          qty: null,
+          pnl_krw: null,
+          pnl_pct: null,
+        });
+        continue;
+      }
+
+      const tier = scannerSignalTier(sig.score);
+      if (tier === "LOW") {
+        appendHistory({
+          ts: new Date().toISOString(),
+          market,
+          state: "SKIPPED",
+          note: "low_signal_blocked",
+          signal_strength: sig.signal_strength,
+          entry_price: px > 0 ? px : null,
+          exit_price: null,
+          qty: null,
+          pnl_krw: null,
+          pnl_pct: null,
+        });
+        continue;
+      }
+      if (tier === "MID" && sig.score < SURGE_MID_TIER_MIN_SCORE) {
+        appendHistory({
+          ts: new Date().toISOString(),
+          market,
+          state: "SKIPPED",
+          note: "mid_signal_blocked",
+          signal_strength: sig.signal_strength,
+          entry_price: px > 0 ? px : null,
+          exit_price: null,
+          qty: null,
+          pnl_krw: null,
+          pnl_pct: null,
+        });
+        continue;
+      }
+
+      if (!breakoutConfirmed) {
+        appendHistory({
+          ts: new Date().toISOString(),
+          market,
+          state: "SKIPPED",
+          note: "breakout_not_confirmed",
+          signal_strength: sig.signal_strength,
+          entry_price: px > 0 ? px : null,
+          exit_price: null,
+          qty: null,
+          pnl_krw: null,
+          pnl_pct: null,
+        });
+        continue;
+      }
 
       const candles5 = await fetchMinuteCandles(market, 5, 42);
       const candles1 = await fetchMinuteCandles(market, 1, 30);
@@ -581,12 +599,25 @@ export function createPaperTradingEngine(opts: {
         continue;
       }
 
-      const entryAmountBase = isBreakout ? PAPER_ENTRY_KRW_PER_TRADE : PAPER_PROBE_ENTRY_KRW;
-      const entryAmount = Math.max(5_000, Math.floor(entryAmountBase * entryScale));
+      const volEff = Math.max(mvpEv.volume_ratio, sig.volume_multiple);
+      if (volEff < SURGE_MIN_VOLUME_RATIO) {
+        appendHistory({
+          ts: new Date().toISOString(),
+          market,
+          state: "SKIPPED",
+          note: "low_volume_blocked",
+          signal_strength: sig.signal_strength,
+          entry_price: px > 0 ? px : null,
+          exit_price: null,
+          qty: null,
+          pnl_krw: null,
+          pnl_pct: null,
+        });
+        continue;
+      }
 
-      const entryNote = isBreakout
-        ? `paper_buy_opened:surge_scanner:breakout_confirmed:paper_mvp_ok:paper_vol_main_${PAPER_VOLUME_THRESHOLD_MAIN}:btc_risk_scaled_${entryScale}`
-        : `paper_buy_opened:surge_scanner:candidate_probe:paper_mvp_ok:paper_vol_main_${PAPER_VOLUME_THRESHOLD_MAIN}:btc_risk_scaled_${entryScale}`;
+      const entryAmount = Math.max(5_000, Math.floor(PAPER_ENTRY_KRW_PER_TRADE * entryScale));
+      const entryNote = `entry_allowed|high_signal_confirmed|volume_confirmed|breakout_confirmed|vr=${volEff.toFixed(3)}|score=${sig.score}|btc_scale=${entryScale}`;
       const b = paperBuy(market, sig.signal_strength, px, entryNote, entryAmount);
       if (!b.ok) {
         appendHistory({
@@ -609,57 +640,43 @@ export function createPaperTradingEngine(opts: {
       if (!(px > 0)) continue;
       const grossPct = ((px / p.entry_price) - 1) * 100;
       const heldMs = Date.now() - Date.parse(p.entry_ts);
-      const heldMinutes = heldMs / 60_000;
       p.peak_price = Math.max(Number(p.peak_price ?? p.entry_price), px);
+      p.max_up_pct = Math.max(p.max_up_pct ?? grossPct, grossPct);
 
-      if (p.market === "KRW-XRP") {
-        void paperDcaBuyXrp(p, px);
-        const grossPctAfterDca = ((px / p.entry_price) - 1) * 100;
-
-        if (grossPctAfterDca >= XRP_RECOVERY_EXIT_MIN_PCT && grossPctAfterDca <= XRP_RECOVERY_EXIT_MAX_PCT) {
-          paperSell(p.market, px, "CLOSED_TIMEOUT", "recovery_exit");
-          continue;
-        }
-        if (
-          heldMinutes >= XRP_RECOVERY_PARTIAL_MINUTES &&
-          !p.xrp_recovery_partial_done &&
-          grossPctAfterDca >= XRP_RECOVERY_PARTIAL_PCT
-        ) {
-          const r = paperSell(p.market, px, "CLOSED_TIMEOUT", "recovery_exit_partial", 0.5);
-          if (r.ok && state.positions[p.market]) state.positions[p.market]!.xrp_recovery_partial_done = true;
-          continue;
-        }
-        if (heldMinutes >= XRP_RECOVERY_FULL_MINUTES && grossPctAfterDca >= XRP_RECOVERY_FULL_PCT) {
-          paperSell(p.market, px, "CLOSED_TIMEOUT", "recovery_exit");
-          continue;
-        }
-        if (heldMs >= paperTimeExitDeadlineMs(p)) {
-          paperSell(p.market, px, "CLOSED_TIMEOUT", paperTimeExitNote(p));
+      if (grossPct <= SURGE_HARD_STOP_PCT) {
+        paperSell(p.market, px, "CLOSED_LOSS", "hard_stop_loss");
+        continue;
+      }
+      if (
+        heldMs >= SURGE_EARLY_FAIL_MIN_MS &&
+        (p.max_up_pct ?? 0) < SURGE_EARLY_FAIL_MAX_UP_PCT &&
+        grossPct <= SURGE_EARLY_FAIL_PNL_PCT
+      ) {
+        paperSell(p.market, px, "CLOSED_LOSS", "early_failure_cut");
+        continue;
+      }
+      if (!p.take_profit_partial_done && grossPct >= SURGE_TP1_PCT) {
+        const r = paperSell(p.market, px, "CLOSED_WIN", "partial_take_profit", SURGE_TP1_RATIO);
+        if (r.ok && state.positions[p.market]) {
+          state.positions[p.market]!.take_profit_partial_done = true;
+          state.positions[p.market]!.runner_trail_armed = false;
         }
         continue;
       }
-
-      if (grossPct <= PAPER_STOP_LOSS_PCT) {
-        paperSell(p.market, px, "CLOSED_LOSS", "stop_loss_-1.0pct");
-      } else if (!p.take_profit_partial_done && grossPct >= PAPER_TAKE_PROFIT_PARTIAL_PCT) {
-        const r = paperSell(p.market, px, "CLOSED_TIMEOUT", "take_profit_partial_1.5pct", 0.5);
-        if (r.ok && state.positions[p.market]) state.positions[p.market]!.take_profit_partial_done = true;
-      } else if (p.take_profit_partial_done && !p.take_profit_second_done && grossPct >= PAPER_TAKE_PROFIT_FINAL_PCT) {
-        const r = paperSell(p.market, px, "CLOSED_TIMEOUT", "take_profit_additional_3.0pct", 0.5);
-        if (r.ok && state.positions[p.market]) state.positions[p.market]!.take_profit_second_done = true;
-      } else if (
-        heldMs >= PAPER_EARLY_EXIT_MIN_MS &&
-        grossPct <= PAPER_EARLY_EXIT_STRENGTH_BREAK_PCT
-      ) {
-        paperSell(p.market, px, "CLOSED_LOSS", "early_exit:strength_breakdown");
-      } else if (
-        p.take_profit_second_done &&
-        p.peak_price &&
-        p.peak_price > 0 &&
-        ((p.peak_price - px) / p.peak_price) * 100 >= PAPER_TRAILING_AFTER_TP2_DRAWDOWN_PCT
-      ) {
-        paperSell(p.market, px, "CLOSED_WIN", "trailing_exit_after_tp2");
-      } else if (heldMs >= paperTimeExitDeadlineMs(p)) {
+      if (p.take_profit_partial_done) {
+        if (grossPct >= SURGE_TRAIL_ARM_PCT) {
+          p.runner_trail_armed = true;
+        }
+        const peak = Number(p.peak_price ?? 0);
+        if (p.runner_trail_armed && peak > 0) {
+          const ddFromPeak = ((peak - px) / peak) * 100;
+          if (ddFromPeak >= SURGE_TRAIL_FROM_PEAK_PCT) {
+            paperSell(p.market, px, "CLOSED_WIN", "runner_trailing_exit");
+            continue;
+          }
+        }
+      }
+      if (heldMs >= paperTimeExitDeadlineMs(p)) {
         paperSell(p.market, px, "CLOSED_TIMEOUT", paperTimeExitNote(p));
       }
     }

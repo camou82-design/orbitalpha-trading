@@ -645,6 +645,8 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
           market: r.market,
           score: r.score,
           status: r.status,
+          breakout: r.breakout,
+          volume_multiple: r.volume_multiple,
           signal_key: `${r.market}|${r.updated_at}|${r.score.toFixed(1)}|${r.status}`,
           reason: r.breakout
             ? `surge_scanner:breakout_confirmed:score_${r.score.toFixed(1)}`
