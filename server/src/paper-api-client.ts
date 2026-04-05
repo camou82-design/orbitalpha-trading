@@ -78,7 +78,9 @@ export type PaperStatus = {
  * Map USDT balance/PnL to numerical values for the dashboard.
  * Assuming 1:1 or constant scale for simulation purpose as requested.
  */
-const START_USDT = 10000;
+const START_KRW = 500000;
+const ENTRY_KRW_PER_TRADE = 45000;
+const USD_TO_KRW_SCALE = 450; // Derived from 45000 / 100 USD trade size
 
 export function transformFuturesBundleToPaperStatus(bundle: FuturesPaperDataBundle): PaperStatus {
     const perf = bundle.ledgerPerformance?.all || {
@@ -88,63 +90,92 @@ export function transformFuturesBundleToPaperStatus(bundle: FuturesPaperDataBund
         totalTrades: 0,
     };
 
-    const totalPnl = Number(perf.totalPnlUsdNet) || 0;
-    const totalAsset = START_USDT + totalPnl;
+    // 1. Build a ticker map for real-time price lookup
+    const tickerMap = new Map<string, number>();
+    if (bundle.latestSnapshot?.snapshots) {
+        for (const s of bundle.latestSnapshot.snapshots) {
+            tickerMap.set(s.symbol, Number(s.lastPrice) || 0);
+        }
+    }
 
+    const totalPnlUsd = Number(perf.totalPnlUsdNet) || 0;
+    const totalPnlKrw = totalPnlUsd * USD_TO_KRW_SCALE;
+
+    // 2. Map open positions with real-time unrealized PnL
+    let openUnrealizedPnlUsd = 0;
     const holdings = (bundle.openPositions || []).map((p: any) => {
         const entryPrice = Number(p.entryPrice) || 0;
-        const sizeUsd = Number(p.sizeUsd) || 0;
+        const sizeUsd = Number(p.sizeUsd) || 100;
+        const curPrice = tickerMap.get(p.symbol) || entryPrice;
+        const qty = entryPrice > 0 ? sizeUsd / entryPrice : 0;
+
+        let unrealizedUsd = 0;
+        if (p.side === "long") unrealizedUsd = (curPrice - entryPrice) * qty;
+        else if (p.side === "short") unrealizedUsd = (entryPrice - curPrice) * qty;
+
+        openUnrealizedPnlUsd += unrealizedUsd;
+
         return {
             market: String(p.symbol),
             entry_ts: new Date(p.openedAt).toISOString(),
             entry_price: entryPrice,
-            current_price: entryPrice, // fallback as we don't have live ticker in bundle
-            qty: entryPrice > 0 ? sizeUsd / entryPrice : 0,
-            invested_krw: sizeUsd,
-            unrealized_pnl_krw: 0,
-            unrealized_pnl_pct: 0,
+            current_price: curPrice,
+            qty,
+            invested_krw: ENTRY_KRW_PER_TRADE,
+            unrealized_pnl_krw: unrealizedUsd * USD_TO_KRW_SCALE,
+            unrealized_pnl_pct: entryPrice > 0 ? (unrealizedUsd / sizeUsd) * 100 : 0,
             signal_strength: p.sourceSignal || "HIGH",
         };
     });
 
-    const invested = holdings.reduce((acc, h) => acc + h.invested_krw, 0);
+    const openUnrealizedPnlKrw = openUnrealizedPnlUsd * USD_TO_KRW_SCALE;
+    const totalAssetKrw = START_KRW + totalPnlKrw + openUnrealizedPnlKrw;
+    const investedKrw = holdings.reduce((acc, h) => acc + h.invested_krw, 0);
 
+    // 3. Map history
     const history = (bundle.positionsHistory || []).slice(-50).map((h: any) => {
-        const pnl = Number(h.pnlUsdNet || h.pnlUsd || 0);
-        const state = pnl > 0 ? "CLOSED_WIN" : pnl < 0 ? "CLOSED_LOSS" : "CLOSED_TIMEOUT";
+        const pnlUsd = Number(h.pnlUsdNet || h.pnlUsd || 0);
+        const entryPrice = Number(h.entryPrice) || 0;
+        const closePrice = Number(h.closePrice) || 0;
+        const sizeUsd = Number(h.sizeUsd) || 100;
+        const state = pnlUsd > 0 ? "CLOSED_WIN" : pnlUsd < 0 ? "CLOSED_LOSS" : "CLOSED_TIMEOUT";
+
         return {
             ts: new Date(h.closedAt || h.openedAt).toISOString(),
             market: h.symbol,
             state,
             note: h.closeReason || "closed",
             signal_strength: h.sourceSignal || "HIGH",
-            entry_price: Number(h.entryPrice) || 0,
-            exit_price: Number(h.closePrice) || 0,
-            qty: Number(h.entryPrice) > 0 ? Number(h.sizeUsd) / Number(h.entryPrice) : 0,
-            pnl_krw: pnl,
-            pnl_pct: Number(h.entryPrice) > 0 ? ((Number(h.closePrice) / Number(h.entryPrice)) - 1) * 100 : 0,
+            entry_price: entryPrice,
+            exit_price: closePrice,
+            qty: entryPrice > 0 ? sizeUsd / entryPrice : 0,
+            pnl_krw: pnlUsd * USD_TO_KRW_SCALE,
+            pnl_pct: entryPrice > 0 ? (pnlUsd / sizeUsd) * 100 : 0,
         };
     }).reverse();
+
+    // 4. Resolve configuration (real engine values prioritized)
+    const maxOpen = 3; // From engine config
 
     return {
         mode: (bundle.latestMeta as any)?.strategyVersion || "paper-v1",
         updated_at: new Date(bundle.generatedAt || Date.now()).toISOString(),
         config: {
-            start_krw: START_USDT,
-            entry_krw_per_trade: 100,
-            max_open_positions: 10,
+            start_krw: START_KRW,
+            entry_krw_per_trade: ENTRY_KRW_PER_TRADE,
+            max_open_positions: maxOpen,
             take_profit_pct: 0.5,
             stop_loss_pct: 1.0,
             timeout_minutes: 0,
-            fee_rate: 0.0005,
+            fee_rate: 0.0006,
         },
         account: {
-            total_asset_krw: totalAsset,
-            cash_krw: totalAsset - invested,
-            holdings_eval_krw: invested,
-            total_pnl_krw: totalPnl,
-            total_return_pct: (totalPnl / START_USDT) * 100,
-            open_unrealized_pnl_krw: 0,
+            total_asset_krw: totalAssetKrw,
+            cash_krw: totalAssetKrw - investedKrw - openUnrealizedPnlKrw,
+            holdings_eval_krw: investedKrw + openUnrealizedPnlKrw,
+            total_pnl_krw: totalPnlKrw + openUnrealizedPnlKrw,
+            total_return_pct: ((totalPnlKrw + openUnrealizedPnlKrw) / START_KRW) * 100,
+            open_unrealized_pnl_krw: openUnrealizedPnlKrw,
         },
         counters: {
             open_positions: holdings.length,
