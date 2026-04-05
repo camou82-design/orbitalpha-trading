@@ -24,6 +24,7 @@ import { assertOrderBuyAllowed, createMarketStateFilter } from "./market-state-f
 import { createOperationalLogger } from "./operational-logs.js";
 import { readReplayRange } from "./replay-store.js";
 import { createPaperTradingEngine } from "./paper-trading.js";
+import { readLiveStrategyTradesRecent } from "./recent-strategy-trades.js";
 
 const cwd = process.cwd();
 const envRoots = [cwd, path.dirname(cwd)];
@@ -159,7 +160,15 @@ async function main() {
     reply.header("set-cookie", parts.join("; "));
   };
 
-  const protectedPrefixes = ["/api/v1/trade/", "/api/v1/account/", "/api/v1/orders/", "/api/v1/replay/", "/api/v1/debug/", "/api/v1/paper/"];
+  const protectedPrefixes = [
+    "/api/v1/trade/",
+    "/api/v1/trades/",
+    "/api/v1/account/",
+    "/api/v1/orders/",
+    "/api/v1/replay/",
+    "/api/v1/debug/",
+    "/api/v1/paper/",
+  ];
   const authAllowList = new Set(["/api/v1/auth/login", "/api/v1/auth/logout", "/api/v1/auth/session", "/api/v1/auth/me"]);
 
   app.addHook("onRequest", async (req, reply) => {
@@ -557,6 +566,24 @@ async function main() {
 
   app.get("/api/v1/trade/status", async (req) => buildTradeStatusResponse(req, "GET /api/v1/trade/status"));
   app.get("/api/v1/account/status", async (req) => buildTradeStatusResponse(req, "GET /api/v1/account/status"));
+  app.get("/api/v1/trades/recent", async (req) => {
+    const q = req.query as { limit?: string };
+    const n = Number(q.limit ?? 10);
+    const limit = Number.isFinite(n) ? n : 10;
+    const { relativePath, items, total_rows_in_file } = await readLiveStrategyTradesRecent({
+      companyId: env.companyId,
+      serviceId: env.serviceId,
+      limit,
+    });
+    return {
+      ok: true,
+      count: items.length,
+      limit: Math.max(1, Math.min(50, limit)),
+      source: relativePath.replace(/\\/g, "/"),
+      total_rows_in_file,
+      items,
+    };
+  });
   app.get("/api/v1/strategy/status", async () => {
     const s = strategy.status();
     const t = await trade.status();

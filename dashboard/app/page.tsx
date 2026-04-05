@@ -995,6 +995,18 @@ export default function HomePage() {
   const [scanner, setScanner] = useState<PumpScannerStatus | null>(null);
   const [paper, setPaper] = useState<PaperStatus | null>(null);
   const [paperPanelError, setPaperPanelError] = useState<string | null>(null);
+  const [recentLiveTrades, setRecentLiveTrades] = useState<
+    Array<{
+      timestamp?: string;
+      market?: string;
+      action?: string;
+      filled_qty?: number;
+      order_krw?: number;
+      pnl_krw?: number;
+      pnl_pct?: number;
+      reason_exit?: string;
+    }>
+  >([]);
   const [marketState, setMarketState] = useState<MarketStateStatus | null>(null);
   const [accountSyncState, setAccountSyncState] = useState<"idle" | "syncing" | "ok" | "error">("idle");
   const [lastClientTradeFailure, setLastClientTradeFailure] = useState<{ code: string; message: string } | null>(null);
@@ -1104,7 +1116,7 @@ export default function HomePage() {
           }
         }
 
-        const [c, l, tradePollRes, s, scannerStatus, paperStatus, marketStateStatus] = await Promise.all([
+        const [c, l, tradePollRes, s, scannerStatus, paperStatus, marketStateStatus, tradesRecentRes] = await Promise.all([
           fetch(`${apiBase}/api/v1/context?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()),
           fetch(`${apiBase}/api/v1/logs?limit=200&_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()),
           fetchTradeStatusDetailed(apiBase),
@@ -1117,6 +1129,10 @@ export default function HomePage() {
             })
             .catch(() => null),
           fetch(`${apiBase}/api/v1/market-state?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()).catch(() => null),
+          fetch(`${apiBase}/api/v1/trades/recent?limit=10&_=${ts}`, { cache: "no-store", credentials: "include" }).then(async (r) => {
+            if (!r.ok) return null;
+            return r.json().catch(() => null);
+          }).catch(() => null),
         ]);
         if (cancelled) return;
         setCtx({
@@ -1173,6 +1189,30 @@ export default function HomePage() {
           setPaperPanelError("모의매매 데이터를 불러오지 못했습니다");
         }
         if (marketStateStatus) setMarketState(marketStateStatus as MarketStateStatus);
+        if (
+          tradesRecentRes &&
+          typeof tradesRecentRes === "object" &&
+          (tradesRecentRes as Record<string, unknown>).ok === true &&
+          Array.isArray((tradesRecentRes as Record<string, unknown>).items)
+        ) {
+          const items = (tradesRecentRes as { items: unknown[] }).items;
+          setRecentLiveTrades(
+            items
+              .filter((x): x is Record<string, unknown> => Boolean(x) && typeof x === "object")
+              .map((x) => ({
+                timestamp: typeof x.timestamp === "string" ? x.timestamp : undefined,
+                market: typeof x.market === "string" ? x.market : undefined,
+                action: typeof x.action === "string" ? x.action : undefined,
+                filled_qty: typeof x.filled_qty === "number" ? x.filled_qty : Number(x.filled_qty),
+                order_krw: typeof x.order_krw === "number" ? x.order_krw : Number(x.order_krw),
+                pnl_krw: typeof x.pnl_krw === "number" ? x.pnl_krw : Number(x.pnl_krw),
+                pnl_pct: typeof x.pnl_pct === "number" ? x.pnl_pct : Number(x.pnl_pct),
+                reason_exit: typeof x.reason_exit === "string" ? x.reason_exit : undefined,
+              })),
+          );
+        } else if (!cancelled) {
+          setRecentLiveTrades([]);
+        }
         setLastUpdatedAt(new Date().toLocaleTimeString("ko-KR", { hour12: false }));
       } catch (e) {
         if (!cancelled) setErr(e instanceof Error ? e.message : "load failed");
@@ -2099,7 +2139,46 @@ export default function HomePage() {
                   )}
                 </div>
                 <div style={{ gridColumn: "1 / -1", border: "1px solid #28456f", borderRadius: 8, padding: "0.6rem", background: UI.cardSoftBg }}>
-                  <div style={{ fontSize: "0.78rem", color: UI.title, fontWeight: 800, marginBottom: 6 }}>최근 모의매매 내역</div>
+                  <div style={{ fontSize: "0.78rem", color: UI.title, fontWeight: 800, marginBottom: 6 }}>최근 실거래 전략 체결</div>
+                  <div style={{ fontSize: "0.7rem", color: UI.mutedSoft, marginBottom: 6 }}>/api/v1/trades/recent · live_strategy_trades.json</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    {recentLiveTrades.length === 0 ? (
+                      <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>체결 내역 없음 또는 로딩 중</div>
+                    ) : (
+                      recentLiveTrades.map((row, idx) => (
+                        <div
+                          key={`${row.timestamp ?? idx}-${row.market}-${row.action}-${idx}`}
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "132px 56px 44px 72px 72px 72px 1fr",
+                            gap: 6,
+                            fontSize: "0.72rem",
+                            color: UI.body,
+                            alignItems: "center",
+                          }}
+                        >
+                          <span style={{ color: UI.mutedSoft }}>{row.timestamp ? formatTsLocal(row.timestamp) : "-"}</span>
+                          <strong>{(row.market ?? "").replace("KRW-", "")}</strong>
+                          <span>{row.action ?? "-"}</span>
+                          <span style={{ color: UI.mutedSoft }}>
+                            {typeof row.filled_qty === "number" && Number.isFinite(row.filled_qty) ? row.filled_qty.toFixed(6) : "-"}
+                          </span>
+                          <span style={{ color: Number(row.pnl_krw ?? 0) >= 0 ? UI.pass : UI.fail }}>
+                            {typeof row.pnl_krw === "number" && Number.isFinite(row.pnl_krw)
+                              ? Math.round(row.pnl_krw).toLocaleString()
+                              : "-"}
+                          </span>
+                          <span style={{ color: Number(row.pnl_pct ?? 0) >= 0 ? UI.pass : UI.fail }}>
+                            {typeof row.pnl_pct === "number" && Number.isFinite(row.pnl_pct) ? `${row.pnl_pct.toFixed(2)}%` : "-"}
+                          </span>
+                          <span style={{ color: UI.mutedSoft, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={row.reason_exit}>
+                            {row.reason_exit ?? "—"}
+                          </span>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                  <div style={{ fontSize: "0.78rem", color: UI.title, fontWeight: 800, marginTop: 12, marginBottom: 6 }}>최근 모의매매 내역</div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                     {(paperSummary.recentTrades ?? []).slice(0, 10).map((h) => (
                       <div key={`${h.ts}-${h.market}-${h.state}`} style={{ display: "grid", gridTemplateColumns: "130px 70px 110px 1fr 90px", gap: 8, fontSize: "0.73rem", color: UI.body }}>
