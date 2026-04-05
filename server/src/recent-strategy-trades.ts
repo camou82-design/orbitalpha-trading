@@ -9,7 +9,6 @@ function isSignificantTradeRow(t: unknown): boolean {
   if (!t || typeof t !== "object") return false;
   const o = t as Record<string, unknown>;
   if (o.action !== "buy" && o.action !== "sell") return false;
-  if (Number(o.filled_qty ?? 0) <= 0) return false;
   const rex = String(o.reason_exit ?? "");
   if (NOISE_REASON_EXITS.has(rex)) return false;
   return true;
