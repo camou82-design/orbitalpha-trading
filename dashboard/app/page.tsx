@@ -1203,10 +1203,12 @@ export default function HomePage() {
                 timestamp: typeof x.timestamp === "string" ? x.timestamp : undefined,
                 market: typeof x.market === "string" ? x.market : undefined,
                 action: typeof x.action === "string" ? x.action : undefined,
-                filled_qty: typeof x.filled_qty === "number" ? x.filled_qty : Number(x.filled_qty),
-                order_krw: typeof x.order_krw === "number" ? x.order_krw : Number(x.order_krw),
-                pnl_krw: typeof x.pnl_krw === "number" ? x.pnl_krw : Number(x.pnl_krw),
-                pnl_pct: typeof x.pnl_pct === "number" ? x.pnl_pct : Number(x.pnl_pct),
+                filled_qty:
+                  typeof x.filled_qty === "number" && Number.isFinite(x.filled_qty) ? x.filled_qty : undefined,
+                order_krw:
+                  typeof x.order_krw === "number" && Number.isFinite(x.order_krw) ? x.order_krw : undefined,
+                pnl_krw: typeof x.pnl_krw === "number" && Number.isFinite(x.pnl_krw) ? x.pnl_krw : undefined,
+                pnl_pct: typeof x.pnl_pct === "number" && Number.isFinite(x.pnl_pct) ? x.pnl_pct : undefined,
                 reason_exit: typeof x.reason_exit === "string" ? x.reason_exit : undefined,
               })),
           );
@@ -2139,11 +2141,13 @@ export default function HomePage() {
                   )}
                 </div>
                 <div style={{ gridColumn: "1 / -1", border: "1px solid #28456f", borderRadius: 8, padding: "0.6rem", background: UI.cardSoftBg }}>
-                  <div style={{ fontSize: "0.78rem", color: UI.title, fontWeight: 800, marginBottom: 6 }}>최근 실거래 전략 체결</div>
-                  <div style={{ fontSize: "0.7rem", color: UI.mutedSoft, marginBottom: 6 }}>/api/v1/trades/recent · live_strategy_trades.json</div>
+                  <div style={{ fontSize: "0.78rem", color: UI.title, fontWeight: 800, marginBottom: 6 }}>최근 모의매매 내역</div>
+                  <div style={{ fontSize: "0.7rem", color: UI.mutedSoft, marginBottom: 6 }}>
+                    /api/v1/paper/status 와 별도로 <code style={{ fontSize: "0.68rem" }}>/api/v1/trades/recent</code> · live_strategy_trades.json (최신순 최대 10건)
+                  </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                     {recentLiveTrades.length === 0 ? (
-                      <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>체결 내역 없음 또는 로딩 중</div>
+                      <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>체결 내역 없음 또는 로딩 중 (서버에 라우트·파일이 있어야 표시됩니다)</div>
                     ) : (
                       recentLiveTrades.map((row, idx) => (
                         <div
@@ -2177,20 +2181,6 @@ export default function HomePage() {
                         </div>
                       ))
                     )}
-                  </div>
-                  <div style={{ fontSize: "0.78rem", color: UI.title, fontWeight: 800, marginTop: 12, marginBottom: 6 }}>최근 모의매매 내역</div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                    {(paperSummary.recentTrades ?? []).slice(0, 10).map((h) => (
-                      <div key={`${h.ts}-${h.market}-${h.state}`} style={{ display: "grid", gridTemplateColumns: "130px 70px 110px 1fr 90px", gap: 8, fontSize: "0.73rem", color: UI.body }}>
-                        <span style={{ color: UI.mutedSoft }}>{h.ts ? formatTsLocal(h.ts) : "-"}</span>
-                        <strong>{h.market.replace("KRW-", "")}</strong>
-                        <span>{h.state}</span>
-                        <span style={{ color: UI.mutedSoft }}>{h.note}</span>
-                        <span style={{ color: Number(h.pnlPct ?? 0) >= 0 ? UI.pass : UI.fail }}>
-                          {h.pnlPct == null ? "-" : `${Number(h.pnlPct).toFixed(2)}%`}
-                        </span>
-                      </div>
-                    ))}
                   </div>
                 </div>
               </div>
