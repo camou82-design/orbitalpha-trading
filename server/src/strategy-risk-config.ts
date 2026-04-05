@@ -67,3 +67,61 @@ export const STRATEGY_RISK_CONFIG = {
   },
 } as const;
 
+/** 신규 진입·파이프라인용 (로그에 사유 노출). */
+export const LIVE_ENTRY_PIPELINE = {
+  min_signal_strength_score: 62,
+  /** risk_on 구간 최소 거래량 비율 */
+  min_volume_ratio_risk_on: 1.06,
+  /** neutral(횡보에 가까운 장) 최소 거래량 비율 */
+  min_volume_ratio_neutral: 1.12,
+  sideways_strict_min_volume_ratio: 1.24,
+  rebreak_min_volume_ratio: 1.02,
+  overheated_volume_max: 2.95,
+} as const;
+
+/** MID 신호는 합성 점수·raw 동시 만족 시에만 진입 후보 유지 */
+export const LIVE_ENTRY_SIGNAL_GATES = {
+  mid_min_raw_strength_score: 66,
+  mid_min_entry_gate_score: 87,
+} as const;
+
+/**
+ * 신규로 연 `strict_exit` 포지션만 적용 — 기존 보유(복원 시 필드 없음)는 기존 익절/손절 곡선 유지.
+ * 짧은 손절, 일부 익절 후 넓은 트레일링(러너).
+ */
+export const STRICT_NEW_POSITION_EXIT = {
+  stable: {
+    hard_stop_pct: -1.45,
+    hard_stop_min_hold_min: 2,
+    early_cut_minutes: 22,
+    early_cut_max_peak_pct: 0.32,
+    early_cut_pnl_pct: -0.95,
+    breakeven_arm_pct: 1.55,
+    breakeven_floor_pct: 0.06,
+    partial_tp_pct: 2.15,
+    partial_tp_ratio: 0.38,
+    trailing_peak_pct: 2.05,
+    weak_hold_stop_minutes: 7,
+    catastrophic_exit_pct: -5.8,
+    giveup_minutes: 150,
+    min_peak_pct_skip_catastrophic: 0.34,
+  },
+  momentum: {
+    hard_stop_pct: -1.75,
+    hard_stop_min_hold_min: 2,
+    early_cut_minutes: 12,
+    early_cut_max_peak_pct: 0.38,
+    early_cut_pnl_pct: -1.1,
+    breakeven_arm_pct: 1.85,
+    breakeven_floor_pct: 0.08,
+    partial_tp_pct: 2.65,
+    partial_tp_ratio: 0.38,
+    trailing_peak_pct: 1.75,
+    catastrophic_exit_pct: -6.4,
+    giveup_minutes: 95,
+    min_peak_pct_skip_catastrophic: 0.42,
+  },
+  /** 전량 청산 후 동일 심볼 재진입 쿨다운(분) */
+  reentry_cooldown_minutes_after_close: 42,
+} as const;
+

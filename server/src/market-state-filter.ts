@@ -131,7 +131,7 @@ export function createMarketStateFilter(args: {
       // 분화 장세: risk_off도 차단이 아닌 축소 진입 모드로 운영.
       entry_policy: marketState === "risk_on" ? "적극 진입" : marketState === "neutral" ? "선별 진입" : "축소 진입",
       market_bonus: marketState === "risk_on" ? 18 : marketState === "neutral" ? 0 : -10,
-      min_entry_score: marketState === "risk_on" ? 70 : marketState === "neutral" ? 78 : 82,
+      min_entry_score: marketState === "risk_on" ? 82 : marketState === "neutral" ? 90 : 88,
       regime_allows_new_and_additional_buys: true,
       order_limits: { ...ORDER_LIMITS },
       btc_5m_trend: btc5,
@@ -187,16 +187,53 @@ export function createMarketStateFilter(args: {
 }
 
 /**
- * 신규 진입·추가매수(전략 물량 추가·레거시 DCA) 공통 게이트.
- * - 분화 장세 대응: 어떤 상태에서도 전면 차단하지 않고 진입은 허용.
- * - market-state는 차단기가 아니라 리스크 사이즈 조절 힌트만 제공.
+ * 신규 진입·추가매수 공통 게이트.
+ * - 신규: 장세(risk_off 차단) + entry score(min_entry_score) 반드시 통과.
+ * - 추가매수: risk_off 전면 차단(물타기/추가 진입 없음).
  */
 export function assertOrderBuyAllowed(
   snap: MarketStateSnapshot,
-  _args: { kind: "new_entry" | "add_to_position"; signalPayload: unknown | undefined },
+  args: { kind: "new_entry" | "add_to_position"; signalPayload: unknown | undefined },
 ): OrderBuyGateResult {
   const { market_state, entry_policy } = snap;
-  const size_scale = market_state === "risk_on" ? 1 : market_state === "neutral" ? 0.75 : 0.5;
+  const size_scale = market_state === "risk_on" ? 1 : market_state === "neutral" ? 0.72 : 0.45;
+
+  const deny = (
+    blocked_reason: string,
+    new_entry_blocked: boolean,
+    add_entry_blocked: boolean,
+  ): OrderBuyGateResult => ({
+    ok: false,
+    market_state,
+    entry_policy,
+    new_entry_blocked,
+    add_entry_blocked,
+    blocked_reason,
+    size_scale: 0,
+  });
+
+  if (args.kind === "new_entry") {
+    if (market_state === "risk_off") {
+      return deny("risk_off: 신규 진입 금지", true, false);
+    }
+    const g = runEntryScoreGate(market_state, snap.min_entry_score, snap.market_bonus, args.signalPayload);
+    if (!g.ok) {
+      return deny(g.reason, true, false);
+    }
+    return {
+      ok: true,
+      market_state,
+      entry_policy,
+      new_entry_blocked: false,
+      add_entry_blocked: false,
+      blocked_reason: null,
+      size_scale,
+    };
+  }
+
+  if (market_state === "risk_off") {
+    return deny("risk_off: 추가 매수·DCA 금지", false, true);
+  }
 
   return {
     ok: true,

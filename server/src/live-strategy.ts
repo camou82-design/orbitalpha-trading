@@ -1,13 +1,20 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { SignalLogEntry } from "@orbitalpha/shared";
-import { companyIdSchema, mvpSignalPayloadV2Schema, serviceIdSchema } from "@orbitalpha/shared";
+import {
+  companyIdSchema,
+  mvpSignalPayloadV2Schema,
+  serviceIdSchema,
+  signalStrengthScore,
+} from "@orbitalpha/shared";
 import { tradingDataRoot } from "./paths.js";
 import { appendLog } from "./log-store.js";
 import { fetchMinuteCandles, fetchTickers, partitionKrwMarketsByUpbitValidity } from "./upbit-public.js";
 import {
+  LIVE_ENTRY_SIGNAL_GATES,
   RECOVERY_EXIT_CONFIG,
   STRATEGY_RISK_CONFIG,
+  STRICT_NEW_POSITION_EXIT,
   UPBIT_FEE_RATE,
   UPBIT_MIN_ORDER_KRW,
   grossPnlPct,
@@ -15,6 +22,7 @@ import {
   type StopTriggerKind,
   type StrategyType,
 } from "./strategy-risk-config.js";
+import { ENTRY_PIPELINE_MID_SCORE_FLOOR, evaluateSpotLongEntryPipeline } from "./live-entry-pipeline.js";
 
 type TradeApi = {
   status: () => Promise<any>;
@@ -37,6 +45,8 @@ type MarketStateApi = {
     market_state: "risk_on" | "neutral" | "risk_off";
     min_entry_score: number;
     market_bonus: number;
+    btc_5m_trend?: "up" | "down" | "flat";
+    btc_15m_trend?: "up" | "down" | "flat";
   }>;
   entryGate: (
     payload: unknown,
@@ -64,6 +74,8 @@ type StrategyPosition = {
   current_net_pnl_pct: number;
   breakeven_armed_at: string | null;
   partial_tp_at: string | null;
+  /** 복원 시 없으면 기존 보유 — 신규만 엄격 손익 곡선 */
+  strict_exit?: boolean;
 };
 
 type StrategyTradeRow = {
@@ -286,7 +298,7 @@ export function createLiveDataStrategy(opts: {
       reason: "state_restore_pending",
       order_fail_count_today: 0,
       consecutive_losses: 0,
-      max_positions: 3,
+      max_positions: 2,
     },
     legacy: {
       dca_count: {},
@@ -557,8 +569,10 @@ export function createLiveDataStrategy(opts: {
       const nextDcaAt = state.legacy.next_dca_at[market];
       const dcaCooldownPassed = !nextDcaAt || Date.now() >= Date.parse(nextDcaAt);
 
-      // DCA only when market is not collapsing, signal supports rebound, and capped by count/size.
-      if (opts.trade.placeLegacyDcaBuy && !locked && dcaCount < dcaMax && dcaCooldownPassed) {
+      // 손실 구간 레거시 물타기 금지 — 회복 기대 DCA 없음
+      if (pnlGross < 0) {
+        /* skip legacy DCA */
+      } else if (opts.trade.placeLegacyDcaBuy && !locked && dcaCount < dcaMax && dcaCooldownPassed) {
         const krw = Number(tstatus.krw_available ?? 0);
         const orderKrw = Math.floor(Math.max(5000, Math.min(12000, krw * 0.06)));
         if (orderKrw >= 5000 && krw > orderKrw * 1.2 && legacySignalAllowsDca(sig)) {
@@ -676,164 +690,225 @@ export function createLiveDataStrategy(opts: {
         stopTriggerKind = "price_stop";
       }
       if (!reasonExit && p.strategy_type === "stable") {
-        const s = STRATEGY_RISK_CONFIG.stable;
-        if (!p.breakeven_armed && pnlGross >= s.breakeven_arm_pct) {
-          p.breakeven_armed = true;
-          p.breakeven_armed_at = new Date().toISOString();
-          state.trades.push({
-            timestamp: p.breakeven_armed_at,
-            entry_ts: p.entry_ts,
-            market,
-            action: "buy",
-            order_krw: 0,
-            filled_qty: 0,
-            avg_buy_price: p.entry_price,
-            exit_price: now,
-            pnl_krw: 0,
-            pnl_pct: pnlGross,
-            reason_enter: p.reason_enter,
-            reason_exit: "breakeven_armed",
-            holding_minutes: holdMin,
-            signal_strength: p.signal_strength,
-            volume_ratio: p.volume_ratio,
-            strategy_tag: "live_data_mode_v1",
-            strategy_type: p.strategy_type,
-            stop_trigger_kind: "breakeven_protect",
-            current_net_pnl_pct: pnlGross,
-            liquidation_reason: "breakeven_armed",
-            remaining_qty: p.qty,
-            highest_price_after_entry: p.highest_price_after_entry,
-            trailing_stop_price: p.trailing_stop_price,
-            breakeven_armed_at: p.breakeven_armed_at,
-            partial_tp_at: p.partial_tp_at,
-          });
-          await opts.onEvent?.({
-            timestamp: p.breakeven_armed_at,
-            event_type: "breakeven_armed",
-            market,
-            strategy_type: p.strategy_type,
-            market_state: null,
-            side: "sell",
-            reason: "breakeven_protect",
-            balance_krw: null,
-            position_qty: p.qty,
-            avg_buy_price: p.entry_price,
-            current_price: now,
-            pnl_net: null,
-            pnl_net_pct: pnlGross,
-            note: "stable breakeven armed",
-          });
+        const xs = p.strict_exit ? STRICT_NEW_POSITION_EXIT.stable : null;
+        const s = xs
+          ? {
+              breakeven_arm_pct: xs.breakeven_arm_pct,
+              breakeven_floor_pct: xs.breakeven_floor_pct,
+              partial_take_profit_pct: xs.partial_tp_pct,
+              partial_take_profit_ratio: xs.partial_tp_ratio,
+              trailing_from_peak_pct: xs.trailing_peak_pct,
+            }
+          : STRATEGY_RISK_CONFIG.stable;
+        const weakHoldMin = xs ? xs.weak_hold_stop_minutes : STRATEGY_RISK_CONFIG.stable.weak_hold_stop_minutes;
+        const recv = xs
+          ? {
+              giveup_minutes: xs.giveup_minutes,
+              min_peak_pct_to_skip_catastrophic: xs.min_peak_pct_skip_catastrophic,
+              catastrophic_exit_pct: xs.catastrophic_exit_pct,
+            }
+          : RECOVERY_EXIT_CONFIG.stable;
+
+        if (xs) {
+          if (holdMin >= xs.hard_stop_min_hold_min && pnlGross <= xs.hard_stop_pct) {
+            reasonExit = "strict_hard_stop_loss";
+            stopTriggerKind = "price_stop";
+          }
+          if (!reasonExit && holdMin >= xs.early_cut_minutes && p.max_pnl_pct < xs.early_cut_max_peak_pct && pnlGross <= xs.early_cut_pnl_pct) {
+            reasonExit = "strict_early_loss_cut";
+            stopTriggerKind = "price_stop";
+          }
         }
-        p.trailing_stop_price = p.highest_price_after_entry * (1 - s.trailing_from_peak_pct / 100);
-        if (!p.partial_tp_done && pnlGross >= s.partial_take_profit_pct) {
-          reasonExit = "partial_take_profit";
-          ratio = s.partial_take_profit_ratio;
-          stopTriggerKind = null;
-        } else if (p.partial_tp_done && now <= p.trailing_stop_price) {
-          reasonExit = "trailing_take_profit";
-          stopTriggerKind = "time_stop";
-        } else if (p.breakeven_armed && pnlGross <= s.breakeven_floor_pct) {
-          reasonExit = "breakeven_exit";
-          stopTriggerKind = "breakeven_protect";
-        } else if (
-          holdMin >= RECOVERY_EXIT_CONFIG.stable.giveup_minutes &&
-          p.max_pnl_pct < RECOVERY_EXIT_CONFIG.stable.min_peak_pct_to_skip_catastrophic &&
-          pnlGross <= RECOVERY_EXIT_CONFIG.stable.catastrophic_exit_pct
-        ) {
-          reasonExit = `stable_catastrophic_exit_${RECOVERY_EXIT_CONFIG.stable.catastrophic_exit_pct}`;
-          stopTriggerKind = "price_stop";
-        } else if (holdMin >= STRATEGY_RISK_CONFIG.stable.weak_hold_stop_minutes && p.max_pnl_pct < 0.35 && pnlGross < 0) {
-          reasonExit = "stable_time_stop_weak_rebound";
-          stopTriggerKind = "time_stop";
+        if (!reasonExit) {
+          if (!p.breakeven_armed && pnlGross >= s.breakeven_arm_pct) {
+            p.breakeven_armed = true;
+            p.breakeven_armed_at = new Date().toISOString();
+            state.trades.push({
+              timestamp: p.breakeven_armed_at,
+              entry_ts: p.entry_ts,
+              market,
+              action: "buy",
+              order_krw: 0,
+              filled_qty: 0,
+              avg_buy_price: p.entry_price,
+              exit_price: now,
+              pnl_krw: 0,
+              pnl_pct: pnlGross,
+              reason_enter: p.reason_enter,
+              reason_exit: "breakeven_armed",
+              holding_minutes: holdMin,
+              signal_strength: p.signal_strength,
+              volume_ratio: p.volume_ratio,
+              strategy_tag: "live_data_mode_v1",
+              strategy_type: p.strategy_type,
+              stop_trigger_kind: "breakeven_protect",
+              current_net_pnl_pct: pnlGross,
+              liquidation_reason: "breakeven_armed",
+              remaining_qty: p.qty,
+              highest_price_after_entry: p.highest_price_after_entry,
+              trailing_stop_price: p.trailing_stop_price,
+              breakeven_armed_at: p.breakeven_armed_at,
+              partial_tp_at: p.partial_tp_at,
+            });
+            await opts.onEvent?.({
+              timestamp: p.breakeven_armed_at,
+              event_type: "breakeven_armed",
+              market,
+              strategy_type: p.strategy_type,
+              market_state: null,
+              side: "sell",
+              reason: "breakeven_protect",
+              balance_krw: null,
+              position_qty: p.qty,
+              avg_buy_price: p.entry_price,
+              current_price: now,
+              pnl_net: null,
+              pnl_net_pct: pnlGross,
+              note: p.strict_exit ? "stable breakeven armed (strict_new)" : "stable breakeven armed",
+            });
+          }
+          p.trailing_stop_price = p.highest_price_after_entry * (1 - s.trailing_from_peak_pct / 100);
+          if (!p.partial_tp_done && pnlGross >= s.partial_take_profit_pct) {
+            reasonExit = p.strict_exit ? "partial_take_profit_1st_strict" : "partial_take_profit";
+            ratio = s.partial_take_profit_ratio;
+            stopTriggerKind = null;
+          } else if (p.partial_tp_done && now <= p.trailing_stop_price) {
+            reasonExit = p.strict_exit ? "trailing_runner_exit_strict" : "trailing_take_profit";
+            stopTriggerKind = "time_stop";
+          } else if (p.breakeven_armed && pnlGross <= s.breakeven_floor_pct) {
+            reasonExit = "breakeven_exit";
+            stopTriggerKind = "breakeven_protect";
+          } else if (
+            holdMin >= recv.giveup_minutes &&
+            p.max_pnl_pct < recv.min_peak_pct_to_skip_catastrophic &&
+            pnlGross <= recv.catastrophic_exit_pct
+          ) {
+            reasonExit = `stable_catastrophic_exit_${recv.catastrophic_exit_pct}`;
+            stopTriggerKind = "price_stop";
+          } else if (holdMin >= weakHoldMin && p.max_pnl_pct < 0.35 && pnlGross < 0) {
+            reasonExit = "stable_time_stop_weak_rebound";
+            stopTriggerKind = "time_stop";
+          }
         }
       } else if (!reasonExit) {
-        const m = STRATEGY_RISK_CONFIG.momentum;
-        if (!p.breakeven_armed && pnlGross >= m.breakeven_arm_pct) {
-          p.breakeven_armed = true;
-          p.breakeven_armed_at = new Date().toISOString();
-          state.trades.push({
-            timestamp: p.breakeven_armed_at,
-            entry_ts: p.entry_ts,
-            market,
-            action: "buy",
-            order_krw: 0,
-            filled_qty: 0,
-            avg_buy_price: p.entry_price,
-            exit_price: now,
-            pnl_krw: 0,
-            pnl_pct: pnlGross,
-            reason_enter: p.reason_enter,
-            reason_exit: "breakeven_armed",
-            holding_minutes: holdMin,
-            signal_strength: p.signal_strength,
-            volume_ratio: p.volume_ratio,
-            strategy_tag: "live_data_mode_v1",
-            strategy_type: p.strategy_type,
-            stop_trigger_kind: "breakeven_protect",
-            current_net_pnl_pct: pnlGross,
-            liquidation_reason: "breakeven_armed",
-            remaining_qty: p.qty,
-            highest_price_after_entry: p.highest_price_after_entry,
-            trailing_stop_price: p.trailing_stop_price,
-            breakeven_armed_at: p.breakeven_armed_at,
-            partial_tp_at: p.partial_tp_at,
-          });
-          await opts.onEvent?.({
-            timestamp: p.breakeven_armed_at,
-            event_type: "breakeven_armed",
-            market,
-            strategy_type: p.strategy_type,
-            market_state: null,
-            side: "sell",
-            reason: "breakeven_protect",
-            balance_krw: null,
-            position_qty: p.qty,
-            avg_buy_price: p.entry_price,
-            current_price: now,
-            pnl_net: null,
-            pnl_net_pct: pnlGross,
-            note: "momentum breakeven armed",
-          });
-        }
-        p.trailing_stop_price = p.highest_price_after_entry * (1 - m.trailing_from_peak_pct / 100);
-        if (!p.partial_tp_done && pnlGross >= m.partial_take_profit_pct) {
-          reasonExit = "partial_take_profit";
-          ratio = m.partial_take_profit_ratio;
-        } else if (p.partial_tp_done && now <= p.trailing_stop_price) {
-          reasonExit = "trailing_take_profit";
-          stopTriggerKind = "time_stop";
-        } else if (p.breakeven_armed && pnlGross <= m.breakeven_floor_pct) {
-          reasonExit = "momentum_breakeven_protect";
-          stopTriggerKind = "breakeven_protect";
-        } else if (
-          holdMin >= RECOVERY_EXIT_CONFIG.momentum.giveup_minutes &&
-          p.max_pnl_pct < RECOVERY_EXIT_CONFIG.momentum.min_peak_pct_to_skip_catastrophic &&
-          pnlGross <= RECOVERY_EXIT_CONFIG.momentum.catastrophic_exit_pct
-        ) {
-          reasonExit = `momentum_catastrophic_exit_${RECOVERY_EXIT_CONFIG.momentum.catastrophic_exit_pct}`;
-          stopTriggerKind = "price_stop";
-        } else {
-          try {
-            const c1 = await fetchMinuteCandles(market, 1, 8);
-            const last = c1[c1.length - 1];
-            const prev = c1[c1.length - 2];
-            if (last && prev) {
-              const lastNotional = last.candle_acc_trade_volume * last.trade_price;
-              const prevNotional = Math.max(1, prev.candle_acc_trade_volume * prev.trade_price);
-              const dealDrop = lastNotional / prevNotional < 0.45;
-              const range = Math.max(1e-9, last.high_price - last.low_price);
-              const closeLow = (last.trade_price - last.low_price) / range < 0.28;
-              const upperWickWeak = (last.high_price - last.trade_price) / range > 0.55 && last.trade_price <= last.opening_price;
-              const breakoutLowBreak = last.trade_price < prev.low_price;
-              if (dealDrop || closeLow || upperWickWeak || breakoutLowBreak) {
-                reasonExit = "momentum_pattern_break";
-                stopTriggerKind = "pattern_break";
-              }
+        const xm = p.strict_exit ? STRICT_NEW_POSITION_EXIT.momentum : null;
+        const m = xm
+          ? {
+              breakeven_arm_pct: xm.breakeven_arm_pct,
+              breakeven_floor_pct: xm.breakeven_floor_pct,
+              partial_take_profit_pct: xm.partial_tp_pct,
+              partial_take_profit_ratio: xm.partial_tp_ratio,
+              trailing_from_peak_pct: xm.trailing_peak_pct,
+              time_stop_min_minutes: STRATEGY_RISK_CONFIG.momentum.time_stop_min_minutes,
+              time_stop_max_minutes: STRATEGY_RISK_CONFIG.momentum.time_stop_max_minutes,
             }
-          } catch {}
-          if (!reasonExit && holdMin >= m.time_stop_min_minutes && holdMin <= m.time_stop_max_minutes && p.max_pnl_pct < 0.8 && pnlGross <= -0.1) {
-            reasonExit = "momentum_time_stop";
+          : STRATEGY_RISK_CONFIG.momentum;
+        const recvM = xm
+          ? {
+              giveup_minutes: xm.giveup_minutes,
+              min_peak_pct_to_skip_catastrophic: xm.min_peak_pct_skip_catastrophic,
+              catastrophic_exit_pct: xm.catastrophic_exit_pct,
+            }
+          : RECOVERY_EXIT_CONFIG.momentum;
+
+        if (xm) {
+          if (holdMin >= xm.hard_stop_min_hold_min && pnlGross <= xm.hard_stop_pct) {
+            reasonExit = "strict_hard_stop_loss";
+            stopTriggerKind = "price_stop";
+          }
+          if (!reasonExit && holdMin >= xm.early_cut_minutes && p.max_pnl_pct < xm.early_cut_max_peak_pct && pnlGross <= xm.early_cut_pnl_pct) {
+            reasonExit = "strict_early_loss_cut";
+            stopTriggerKind = "price_stop";
+          }
+        }
+        if (!reasonExit) {
+          if (!p.breakeven_armed && pnlGross >= m.breakeven_arm_pct) {
+            p.breakeven_armed = true;
+            p.breakeven_armed_at = new Date().toISOString();
+            state.trades.push({
+              timestamp: p.breakeven_armed_at,
+              entry_ts: p.entry_ts,
+              market,
+              action: "buy",
+              order_krw: 0,
+              filled_qty: 0,
+              avg_buy_price: p.entry_price,
+              exit_price: now,
+              pnl_krw: 0,
+              pnl_pct: pnlGross,
+              reason_enter: p.reason_enter,
+              reason_exit: "breakeven_armed",
+              holding_minutes: holdMin,
+              signal_strength: p.signal_strength,
+              volume_ratio: p.volume_ratio,
+              strategy_tag: "live_data_mode_v1",
+              strategy_type: p.strategy_type,
+              stop_trigger_kind: "breakeven_protect",
+              current_net_pnl_pct: pnlGross,
+              liquidation_reason: "breakeven_armed",
+              remaining_qty: p.qty,
+              highest_price_after_entry: p.highest_price_after_entry,
+              trailing_stop_price: p.trailing_stop_price,
+              breakeven_armed_at: p.breakeven_armed_at,
+              partial_tp_at: p.partial_tp_at,
+            });
+            await opts.onEvent?.({
+              timestamp: p.breakeven_armed_at,
+              event_type: "breakeven_armed",
+              market,
+              strategy_type: p.strategy_type,
+              market_state: null,
+              side: "sell",
+              reason: "breakeven_protect",
+              balance_krw: null,
+              position_qty: p.qty,
+              avg_buy_price: p.entry_price,
+              current_price: now,
+              pnl_net: null,
+              pnl_net_pct: pnlGross,
+              note: p.strict_exit ? "momentum breakeven armed (strict_new)" : "momentum breakeven armed",
+            });
+          }
+          p.trailing_stop_price = p.highest_price_after_entry * (1 - m.trailing_from_peak_pct / 100);
+          if (!p.partial_tp_done && pnlGross >= m.partial_take_profit_pct) {
+            reasonExit = p.strict_exit ? "partial_take_profit_1st_strict" : "partial_take_profit";
+            ratio = m.partial_take_profit_ratio;
+          } else if (p.partial_tp_done && now <= p.trailing_stop_price) {
+            reasonExit = p.strict_exit ? "trailing_runner_exit_strict" : "trailing_take_profit";
             stopTriggerKind = "time_stop";
+          } else if (p.breakeven_armed && pnlGross <= m.breakeven_floor_pct) {
+            reasonExit = "momentum_breakeven_protect";
+            stopTriggerKind = "breakeven_protect";
+          } else if (
+            holdMin >= recvM.giveup_minutes &&
+            p.max_pnl_pct < recvM.min_peak_pct_to_skip_catastrophic &&
+            pnlGross <= recvM.catastrophic_exit_pct
+          ) {
+            reasonExit = `momentum_catastrophic_exit_${recvM.catastrophic_exit_pct}`;
+            stopTriggerKind = "price_stop";
+          } else {
+            try {
+              const c1 = await fetchMinuteCandles(market, 1, 8);
+              const last = c1[c1.length - 1];
+              const prev = c1[c1.length - 2];
+              if (last && prev) {
+                const lastNotional = last.candle_acc_trade_volume * last.trade_price;
+                const prevNotional = Math.max(1, prev.candle_acc_trade_volume * prev.trade_price);
+                const dealDrop = lastNotional / prevNotional < 0.45;
+                const range = Math.max(1e-9, last.high_price - last.low_price);
+                const closeLow = (last.trade_price - last.low_price) / range < 0.28;
+                const upperWickWeak = (last.high_price - last.trade_price) / range > 0.55 && last.trade_price <= last.opening_price;
+                const breakoutLowBreak = last.trade_price < prev.low_price;
+                if (dealDrop || closeLow || upperWickWeak || breakoutLowBreak) {
+                  reasonExit = "momentum_pattern_break";
+                  stopTriggerKind = "pattern_break";
+                }
+              }
+            } catch {}
+            if (!reasonExit && holdMin >= m.time_stop_min_minutes && holdMin <= m.time_stop_max_minutes && p.max_pnl_pct < 0.8 && pnlGross <= -0.1) {
+              reasonExit = "momentum_time_stop";
+              stopTriggerKind = "time_stop";
+            }
           }
         }
       }
@@ -943,9 +1018,9 @@ export function createLiveDataStrategy(opts: {
       await opts.onEvent?.({
         timestamp: row.timestamp,
         event_type:
-          reasonExit === "partial_take_profit"
+          reasonExit === "partial_take_profit" || reasonExit === "partial_take_profit_1st_strict"
             ? "partial_take_profit"
-            : reasonExit === "trailing_take_profit"
+            : reasonExit === "trailing_take_profit" || reasonExit === "trailing_runner_exit_strict"
               ? "trailing_take_profit"
               : reasonExit === "breakeven_exit" || reasonExit === "momentum_breakeven_protect"
                 ? "breakeven_exit"
@@ -976,13 +1051,12 @@ export function createLiveDataStrategy(opts: {
       }
       if (qtyAfter <= 0) {
         delete state.positions[market];
-        const stableStopCooldown =
-          p.strategy_type === "stable"
-            ? STRATEGY_RISK_CONFIG.stable.reentry_cooldown_minutes_after_stop
-            : STRATEGY_RISK_CONFIG.stable.reentry_cooldown_minutes_after_stop;
-        state.cooldown_until[market] = new Date(Date.now() + stableStopCooldown * 60_000).toISOString();
+        const cdMin = p.strict_exit
+          ? STRICT_NEW_POSITION_EXIT.reentry_cooldown_minutes_after_close
+          : STRATEGY_RISK_CONFIG.stable.reentry_cooldown_minutes_after_stop;
+        state.cooldown_until[market] = new Date(Date.now() + cdMin * 60_000).toISOString();
       } else {
-        if (!p.partial_tp_done && reasonExit === "partial_take_profit") {
+        if (!p.partial_tp_done && (reasonExit === "partial_take_profit" || reasonExit === "partial_take_profit_1st_strict")) {
           p.partial_tp_done = true;
           p.partial_tp_at = new Date().toISOString();
           p.realized_partial_profit += Math.round(netPnlKrw);
@@ -1095,7 +1169,7 @@ export function createLiveDataStrategy(opts: {
           open_positions: Object.keys(state.positions).length,
         }),
       );
-      if (Object.keys(state.positions).length >= 3) {
+      if (Object.keys(state.positions).length >= state.safety_guard.max_positions) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "max_positions_reached" });
         break;
       }
@@ -1119,8 +1193,8 @@ export function createLiveDataStrategy(opts: {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "exception_slot_full" });
         continue;
       }
-      if (!isExceptionMarket && coreOpenCount >= 2) {
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "core_slot_full" });
+      if (!isExceptionMarket && coreOpenCount >= 1) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "core_slot_full", note: "max_one_core_symbol" });
         continue;
       }
 
@@ -1140,6 +1214,91 @@ export function createLiveDataStrategy(opts: {
         });
         continue;
       }
+      const exception = state.regime?.exception_candidates.find((x) => x.market === market) ?? null;
+      const rawStrength = signalStrengthScore(sig.p);
+      if (rawStrength >= ENTRY_PIPELINE_MID_SCORE_FLOOR) {
+        await appendLog({
+          company_id: companyIdSchema.parse(opts.companyId),
+          service_id: serviceIdSchema.parse(opts.serviceId),
+          ts: new Date().toISOString(),
+          kind: "system",
+          message: "candidate_detected",
+          payload: {
+            symbol: market,
+            signal_strength_score: rawStrength,
+            filter_pass: Boolean(sig.p.filter_pass),
+          },
+        });
+        emitEval("candidate_detected", {
+          signal_strength_score: rawStrength,
+          filter_pass: Boolean(sig.p.filter_pass),
+        });
+      }
+      if (rawStrength < ENTRY_PIPELINE_MID_SCORE_FLOOR) {
+        await appendLog({
+          company_id: companyIdSchema.parse(opts.companyId),
+          service_id: serviceIdSchema.parse(opts.serviceId),
+          ts: new Date().toISOString(),
+          kind: "system",
+          message: "blocked_low_signal",
+          payload: { symbol: market, signal_strength_score: rawStrength, floor: ENTRY_PIPELINE_MID_SCORE_FLOOR },
+        });
+        emitEval("blocked_low_signal", { signal_strength_score: rawStrength });
+        continue;
+      }
+      if (marketState.market_state === "risk_off") {
+        await appendLog({
+          company_id: companyIdSchema.parse(opts.companyId),
+          service_id: serviceIdSchema.parse(opts.serviceId),
+          ts: new Date().toISOString(),
+          kind: "system",
+          message: "entry_skipped_risk_off",
+          payload: { symbol: market, market_state: marketState.market_state, note: "no_exception_entries" },
+        });
+        emitEval("entry_skipped_risk_off", { symbol: market, market_state: marketState.market_state });
+        continue;
+      }
+      const sigTypeUpper = (sig.p.signal_type ?? "").toUpperCase();
+      if (sigTypeUpper === "LOW") {
+        await appendLog({
+          company_id: companyIdSchema.parse(opts.companyId),
+          service_id: serviceIdSchema.parse(opts.serviceId),
+          ts: new Date().toISOString(),
+          kind: "system",
+          message: "entry_blocked_signal_strength",
+          payload: { symbol: market, signal_type: sigTypeUpper, reason: "LOW_never_enters" },
+        });
+        emitEval("entry_blocked_signal_strength", { symbol: market, signal_type: "LOW" });
+        continue;
+      }
+      if (sigTypeUpper === "MID") {
+        const gatePrev = opts.marketState.entryGate(sig.p, marketState);
+        const composite = Number(gatePrev.score ?? 0);
+        if (rawStrength < LIVE_ENTRY_SIGNAL_GATES.mid_min_raw_strength_score || composite < LIVE_ENTRY_SIGNAL_GATES.mid_min_entry_gate_score) {
+          await appendLog({
+            company_id: companyIdSchema.parse(opts.companyId),
+            service_id: serviceIdSchema.parse(opts.serviceId),
+            ts: new Date().toISOString(),
+            kind: "system",
+            message: "entry_blocked_signal_strength",
+            payload: {
+              symbol: market,
+              signal_type: "MID",
+              raw_strength: rawStrength,
+              composite_score: composite,
+              need_raw_gte: LIVE_ENTRY_SIGNAL_GATES.mid_min_raw_strength_score,
+              need_composite_gte: LIVE_ENTRY_SIGNAL_GATES.mid_min_entry_gate_score,
+            },
+          });
+          emitEval("entry_blocked_signal_strength", {
+            symbol: market,
+            signal_type: "MID",
+            raw_strength: rawStrength,
+            composite_score: composite,
+          });
+          continue;
+        }
+      }
       const filterPass = Boolean(sig.p.filter_pass);
       const signalTypeLow = (sig.p.signal_type ?? "").toUpperCase() === "LOW";
       const gate = opts.marketState.entryGate(sig.p, marketState);
@@ -1151,8 +1310,9 @@ export function createLiveDataStrategy(opts: {
       const reasonText = String(sig.p.signal_reason ?? "").toLowerCase();
       const breakout = reasonText.includes("breakout");
       const trendOk = reasonText.includes("breakout") || reasonText.includes("trend") || reasonText.includes("reclaim");
-      const minBaseScore = 80;
-      const minBaseVol = 1.05;
+      const openForGate = Object.keys(state.positions).length;
+      const minBaseScore = openForGate >= 1 ? 88 : 83;
+      const minBaseVol = openForGate >= 1 ? 1.14 : 1.08;
       emitEval("DEBUG_LIVE_SIGNAL_SCORE", {
         score: Number(signalScore.toFixed(2)),
         volume_ratio: Number(vol.toFixed(3)),
@@ -1169,7 +1329,6 @@ export function createLiveDataStrategy(opts: {
         else if (!breakout) detailedReason = "no_breakout";
         else if (!filterPass || !baseGateOriginalResult) detailedReason = "base_gate_failed";
       }
-      const exception = state.regime?.exception_candidates.find((x) => x.market === market) ?? null;
       emitEval("DEBUG_LIVE_BASE_GATE_RESULT", {
         score: Number(signalScore.toFixed(2)),
         volume_ratio: Number(vol.toFixed(3)),
@@ -1209,6 +1368,50 @@ export function createLiveDataStrategy(opts: {
       }
       if (!gateOk && !strongSymbolOverride) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: detailedReason ?? "base_gate_failed" });
+        continue;
+      }
+
+      let entryPipelineDetail: Record<string, unknown> = {};
+      try {
+        const candles5 = await fetchMinuteCandles(market, 5, 48);
+        const pr = evaluateSpotLongEntryPipeline({
+          market,
+          payload: sig.p,
+          candles5,
+          marketState: {
+            market_state: marketState.market_state,
+            btc_5m_trend: marketState.btc_5m_trend ?? "flat",
+            btc_15m_trend: marketState.btc_15m_trend ?? "flat",
+          },
+          volumeRatio: vol,
+        });
+        if (!pr.ok) {
+          await appendLog({
+            company_id: companyIdSchema.parse(opts.companyId),
+            service_id: serviceIdSchema.parse(opts.serviceId),
+            ts: new Date().toISOString(),
+            kind: "system",
+            message: pr.message,
+            payload: pr.detail,
+          });
+          emitEval(pr.message, pr.detail);
+          continue;
+        }
+        entryPipelineDetail = pr.detail;
+      } catch (e) {
+        await appendLog({
+          company_id: companyIdSchema.parse(opts.companyId),
+          service_id: serviceIdSchema.parse(opts.serviceId),
+          ts: new Date().toISOString(),
+          kind: "system",
+          message: "blocked_trend_filter",
+          payload: {
+            symbol: market,
+            sub: "candles_fetch_failed",
+            error: String(e).slice(0, 400),
+          },
+        });
+        emitEval("blocked_trend_filter", { symbol: market, sub: "candles_fetch_failed" });
         continue;
       }
 
@@ -1258,6 +1461,20 @@ export function createLiveDataStrategy(opts: {
       };
       try {
         await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", signalPayloadForBuy);
+        await appendLog({
+          company_id: companyIdSchema.parse(opts.companyId),
+          service_id: serviceIdSchema.parse(opts.serviceId),
+          ts: new Date().toISOString(),
+          kind: "system",
+          message: "entry_opened",
+          payload: {
+            symbol: market,
+            order_krw: orderKrw,
+            strategy_type: strategyType,
+            entry_pipeline: entryPipelineDetail,
+          },
+        });
+        emitEval("entry_opened", { symbol: market, order_krw: orderKrw });
       } catch (e) {
         state.safety_guard.order_fail_count_today += 1;
         if (state.safety_guard.order_fail_count_today >= 3) {
@@ -1311,9 +1528,10 @@ export function createLiveDataStrategy(opts: {
         current_net_pnl_pct: 0,
         breakeven_armed_at: null,
         partial_tp_at: null,
+        strict_exit: true,
       };
       state.daily.entry_count += 1;
-      state.cooldown_until[market] = new Date(Date.now() + (isExceptionMarket ? 15 : 10) * 60_000).toISOString();
+      state.cooldown_until[market] = new Date(Date.now() + (isExceptionMarket ? 28 : 18) * 60_000).toISOString();
       state.trades.push({
         timestamp: new Date().toISOString(),
         entry_ts: new Date().toISOString(),
