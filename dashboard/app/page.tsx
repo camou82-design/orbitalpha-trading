@@ -1189,15 +1189,15 @@ export default function HomePage() {
           setPaperPanelError("모의매매 데이터를 불러오지 못했습니다");
         }
         if (marketStateStatus) setMarketState(marketStateStatus as MarketStateStatus);
-        if (
-          tradesRecentRes &&
-          typeof tradesRecentRes === "object" &&
-          (tradesRecentRes as Record<string, unknown>).ok === true &&
-          Array.isArray((tradesRecentRes as Record<string, unknown>).items)
-        ) {
-          const items = (tradesRecentRes as { items: unknown[] }).items;
+        /** /api/v1/trades/recent 는 `{ items: [...] }` 객체 형태 — 응답 전체를 배열로 가정하면 안 됨 */
+        const recentItemsRaw: unknown[] | null = Array.isArray(tradesRecentRes)
+          ? tradesRecentRes
+          : tradesRecentRes && typeof tradesRecentRes === "object" && Array.isArray((tradesRecentRes as Record<string, unknown>).items)
+            ? ((tradesRecentRes as Record<string, unknown>).items as unknown[])
+            : null;
+        if (recentItemsRaw !== null && !cancelled) {
           setRecentLiveTrades(
-            items
+            recentItemsRaw
               .filter((x): x is Record<string, unknown> => Boolean(x) && typeof x === "object")
               .map((x) => ({
                 timestamp: typeof x.timestamp === "string" ? x.timestamp : undefined,
@@ -2146,9 +2146,7 @@ export default function HomePage() {
                     /api/v1/paper/status 와 별도로 <code style={{ fontSize: "0.68rem" }}>/api/v1/trades/recent</code> · live_strategy_trades.json (최신순 최대 10건)
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                    {recentLiveTrades.length === 0 ? (
-                      <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>체결 내역 없음 또는 로딩 중 (서버에 라우트·파일이 있어야 표시됩니다)</div>
-                    ) : (
+                    {recentLiveTrades.length > 0 ? (
                       recentLiveTrades.map((row, idx) => (
                         <div
                           key={`${row.timestamp ?? idx}-${row.market}-${row.action}-${idx}`}
@@ -2180,6 +2178,8 @@ export default function HomePage() {
                           </span>
                         </div>
                       ))
+                    ) : (
+                      <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>체결 내역 없음 또는 로딩 중 (서버에 라우트·파일이 있어야 표시됩니다)</div>
                     )}
                   </div>
                 </div>
