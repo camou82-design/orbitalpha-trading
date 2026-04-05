@@ -13,6 +13,7 @@ import { loadEnv } from "./env.js";
 import { getMonitorInstanceSnapshot } from "./monitor-instance-meta.js";
 import { acquireSignalServerProcessLock } from "./monitor-process-lock.js";
 import { startSignalMonitor } from "./signal-monitor.js";
+import { transformFuturesBundleToPaperStatus } from "./paper-api-client.js";
 import { readRecentLogs } from "./log-store.js";
 import { resolveWatchMarkets } from "./upbit-public.js";
 import { VOLUME_THRESHOLD_BY_MARKET } from "./volume-thresholds.js";
@@ -568,7 +569,25 @@ async function main() {
     };
   });
   app.get("/api/v1/scanner/status", async () => pumpScanner.status());
-  app.get("/api/v1/paper/status", async () => paper.status());
+  app.get("/api/v1/paper/status", async () => {
+    if (env.futuresPaperApiUrl) {
+      try {
+        const r = await fetch(env.futuresPaperApiUrl, {
+          headers: {
+            "x-orbitalpha-futures-paper-token": env.futuresPaperApiSecret ?? "",
+          },
+        });
+        if (r.ok) {
+          const bundle = (await r.json()) as any;
+          return transformFuturesBundleToPaperStatus(bundle);
+        }
+        app.log.error({ status: r.status, url: env.futuresPaperApiUrl }, "futures_paper_api_not_ok");
+      } catch (e) {
+        app.log.error({ err: String(e) }, "futures_paper_fetch_failed");
+      }
+    }
+    return paper.status();
+  });
   app.get("/api/v1/market-state", async () => {
     const latest = marketFilter.status();
     if (latest) return latest;
