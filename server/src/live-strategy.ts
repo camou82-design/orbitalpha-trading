@@ -173,8 +173,8 @@ function resolveExcludeHeldSymbolsFromUniverse(): boolean {
 const EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE = resolveExcludeHeldSymbolsFromUniverse();
 
 /**
- * true(기본): 전략 state 에 이미 열린 심볼도 entry_universe·파이프라인·placeBuy 시도까지 진행 (기존 보유/슬롯 무시 평가).
- * false: 오픈 전략 심볼은 universe 에서 제외하고 `strategy_position_open_blocks_reentry` 로 차단 (레거시).
+ * 스냅샷·디버그용 감사 필드만. 유니버스/프리체크는 항상 오픈 심볼 평가를 막지 않음.
+ * (과거 false 시 universe 제외·동일 심볼 오픈 포지션 시 조기 return 하던 프리체크가 있었음 — 제거됨.)
  */
 function resolveLiveAllowEntryEvalOnOpenStrategySymbol(): boolean {
   const v = parseEnvBoolExplicit(process.env.LIVE_ALLOW_ENTRY_EVAL_ON_OPEN_STRATEGY_SYMBOL);
@@ -1175,9 +1175,8 @@ export function createLiveDataStrategy(opts: {
         if (valueKrw >= EXISTING_POSITION_MIN_KRW) heldMeaningfulMarkets.add(mk);
       }
     }
-    /** LIVE_ALLOW_ENTRY_EVAL_ON_OPEN_STRATEGY_SYMBOL=false 일 때만 오픈 전략 심볼을 universe 에서 제외. */
+    /** 오픈 전략 심볼은 항상 후보 유니버스에 유지 (신규 진입 평가·추가 매수 판단). 거래소 의미 보유 제외만 EXCLUDE_HELD 로 적용. */
     const entryUniverse = baseEntryUniverse.filter((m) => {
-      if (!LIVE_ALLOW_ENTRY_EVAL_ON_OPEN_STRATEGY_SYMBOL && openStrategyMarkets.has(m)) return false;
       if (heldMeaningfulMarkets.has(m)) return false;
       return true;
     });
@@ -1204,8 +1203,9 @@ export function createLiveDataStrategy(opts: {
         live_allow_entry_eval_on_open_strategy_symbol: LIVE_ALLOW_ENTRY_EVAL_ON_OPEN_STRATEGY_SYMBOL,
         exclude_held_symbols_from_universe: EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE,
         max_positions_cap: state.safety_guard.max_positions,
-        core_one_symbol_limit_removed: true,
-        note: "core_slot_full gate removed; only max_positions and exception_slot rules apply",
+        leader_core_one_symbol_precheck_removed: true,
+        exception_one_slot_precheck_removed: true,
+        note: "legacy_leader_slot_and_exception_slot_count_prechecks_removed; max_positions_cooldown_pipeline_gates_remain",
       }),
     );
     console.info(
@@ -1225,9 +1225,7 @@ export function createLiveDataStrategy(opts: {
           process.env.LIVE_EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE !== undefined &&
           process.env.LIVE_EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE !== "",
         strategy_open_markets: [...openStrategyMarkets],
-        strategy_open_excluded_from_universe: LIVE_ALLOW_ENTRY_EVAL_ON_OPEN_STRATEGY_SYMBOL
-          ? []
-          : [...openStrategyMarkets],
+        strategy_open_excluded_from_universe: [],
         exchange_meaningful_hold_markets_removed_from_universe: [...heldMeaningfulMarkets],
         account_hold_snapshot_by_market: accountHoldSnapshot,
         debug_include_universe_markets_env: DEBUG_INCLUDE_UNIVERSE_MARKETS,
@@ -1266,23 +1264,12 @@ export function createLiveDataStrategy(opts: {
         break;
       }
       if (state.positions[market]) {
-        if (!LIVE_ALLOW_ENTRY_EVAL_ON_OPEN_STRATEGY_SYMBOL) {
-          emitEval("DEBUG_LIVE_PRECHECK", {
-            return_reason: "strategy_position_open_blocks_reentry",
-            precheck_domain: "strategy_state",
-            strategy_position_exists: true,
-            blocks_entry: true,
-            live_allow_entry_eval_on_open_strategy_symbol: false,
-          });
-          continue;
-        }
         emitEval("DEBUG_LIVE_PRECHECK", {
-          return_reason: "policy_skip_same_symbol_strategy_block",
+          return_reason: "same_symbol_open_continue_entry_eval",
           precheck_domain: "strategy_state",
           strategy_position_exists: true,
           blocks_entry: false,
-          live_allow_entry_eval_on_open_strategy_symbol: true,
-          note: "evaluation_continues_same_symbol_allowed_by_policy",
+          note: "open_strategy_position_does_not_skip_pipeline_or_order_attempt",
         });
       }
       const cool = state.cooldown_until[market];
@@ -1295,11 +1282,6 @@ export function createLiveDataStrategy(opts: {
         continue;
       }
       const isExceptionMarket = !LEADER_MARKETS.has(market);
-      const exceptionOpenCount = Object.keys(state.positions).filter((m) => !LEADER_MARKETS.has(m)).length;
-      if (isExceptionMarket && exceptionOpenCount >= 1) {
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "exception_slot_full" });
-        continue;
-      }
       const sig = latestAllSignals.get(market);
       if (!sig) {
         const missingDetail = buildLiveSignalMissingDetail(market, logs);
