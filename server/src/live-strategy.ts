@@ -147,6 +147,8 @@ const LEADER_MARKETS = new Set<string>(MARKETS as unknown as string[]);
 const RISK_OFF_ENTRY_SCALE = 0.5;
 const EXISTING_POSITION_MIN_KRW = Math.max(1000, Number(process.env.LIVE_EXISTING_POSITION_MIN_KRW ?? 5000));
 const DEBUG_FORCE_BASE_GATE = String(process.env.DEBUG_FORCE_BASE_GATE ?? "").toLowerCase() === "true";
+/** 운영에서 `DEBUG_LIVE_ENTRY_POLICY_SNAPSHOT`으로 dist 빌드 정합성 확인. 2=동일심볼은 same_symbol_open_continue_entry_eval 만(레거시 차단 문자열 없음). */
+const LIVE_PRECHECK_EMITTER_REVISION = 2;
 
 /** 명시적 true/false만 인정, 미설정이면 null */
 function parseEnvBoolExplicit(value: string | undefined): boolean | null {
@@ -1200,6 +1202,7 @@ export function createLiveDataStrategy(opts: {
       JSON.stringify({
         tag: "DEBUG_LIVE_ENTRY_POLICY_SNAPSHOT",
         ts: new Date().toISOString(),
+        precheck_emitter_revision: LIVE_PRECHECK_EMITTER_REVISION,
         live_allow_entry_eval_on_open_strategy_symbol: LIVE_ALLOW_ENTRY_EVAL_ON_OPEN_STRATEGY_SYMBOL,
         exclude_held_symbols_from_universe: EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE,
         max_positions_cap: state.safety_guard.max_positions,
