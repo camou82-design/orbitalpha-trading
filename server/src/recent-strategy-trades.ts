@@ -11,6 +11,8 @@ function isSignificantTradeRow(t: unknown): boolean {
   if (o.action !== "buy" && o.action !== "sell") return false;
   const rex = String(o.reason_exit ?? "");
   if (NOISE_REASON_EXITS.has(rex)) return false;
+  /** 주문 실패/미체결 스냅샷은 recent trades에서 제외 (전략 평가 로그와 구분) */
+  if (o.action === "buy" && Number(o.filled_qty ?? 0) === 0) return false;
   return true;
 }
 

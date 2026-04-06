@@ -147,7 +147,30 @@ const LEADER_MARKETS = new Set<string>(MARKETS as unknown as string[]);
 const RISK_OFF_ENTRY_SCALE = 0.5;
 const EXISTING_POSITION_MIN_KRW = Math.max(1000, Number(process.env.LIVE_EXISTING_POSITION_MIN_KRW ?? 5000));
 const DEBUG_FORCE_BASE_GATE = String(process.env.DEBUG_FORCE_BASE_GATE ?? "").toLowerCase() === "true";
-const DEBUG_EXCLUDE_HELD_SYMBOLS = String(process.env.DEBUG_EXCLUDE_HELD_SYMBOLS ?? "").toLowerCase() === "true";
+
+/** 명시적 true/false만 인정, 미설정이면 null */
+function parseEnvBoolExplicit(value: string | undefined): boolean | null {
+  if (value === undefined || value === "") return null;
+  const s = String(value).toLowerCase().trim();
+  if (s === "true" || value === "1" || s === "yes") return true;
+  if (s === "false" || value === "0" || s === "no") return false;
+  return null;
+}
+
+/**
+ * true: 거래소 의미 보유 심볼을 entry_universe 에서 제외 (옵션).
+ * 기본 false — 기존 현물 보유가 있어도 전략이 해당 종목을 후보로 평가 가능.
+ * 우선순위: LIVE_EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE → DEBUG_EXCLUDE_HELD_SYMBOLS(레거시) → 기본 false
+ */
+function resolveExcludeHeldSymbolsFromUniverse(): boolean {
+  const live = parseEnvBoolExplicit(process.env.LIVE_EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE);
+  if (live !== null) return live;
+  const dbg = parseEnvBoolExplicit(process.env.DEBUG_EXCLUDE_HELD_SYMBOLS);
+  if (dbg !== null) return dbg;
+  return false;
+}
+
+const EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE = resolveExcludeHeldSymbolsFromUniverse();
 const DEBUG_INCLUDE_UNIVERSE_MARKETS = String(process.env.DEBUG_INCLUDE_UNIVERSE_MARKETS ?? "")
   .split(",")
   .map((s) => s.trim().toUpperCase())
@@ -1127,8 +1150,9 @@ export function createLiveDataStrategy(opts: {
     const baseEntryUniverse = Array.from(
       new Set([...MARKETS, ...(exceptionSlot ? [exceptionSlot] : []), ...debugUniverseExtra]),
     );
+    const openStrategyMarkets = new Set(Object.keys(state.positions));
     const heldMeaningfulMarkets = new Set<string>();
-    if (DEBUG_EXCLUDE_HELD_SYMBOLS) {
+    if (EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE) {
       for (const b of Array.isArray(tstatus.balances) ? tstatus.balances : []) {
         const currency = String((b as any).currency ?? "").toUpperCase();
         if (!currency || currency === "KRW") continue;
@@ -1139,14 +1163,46 @@ export function createLiveDataStrategy(opts: {
         if (valueKrw >= EXISTING_POSITION_MIN_KRW) heldMeaningfulMarkets.add(mk);
       }
     }
-    const entryUniverse = baseEntryUniverse.filter((m) => !heldMeaningfulMarkets.has(m));
+    /** 전략 오픈 슬롯만 universe 에서 제외. 거래소 보유는 EXCLUDE_HELD 가 true 일 때만 제외. */
+    const entryUniverse = baseEntryUniverse.filter(
+      (m) => !openStrategyMarkets.has(m) && !heldMeaningfulMarkets.has(m),
+    );
+
+    const accountHoldSnapshot: Record<string, { qty: number; value_krw: number; meaningful: boolean }> = {};
+    for (const b of Array.isArray(tstatus.balances) ? tstatus.balances : []) {
+      const currency = String((b as any).currency ?? "").toUpperCase();
+      if (!currency || currency === "KRW") continue;
+      const mk = `KRW-${currency}`;
+      const qty = Number((b as any).balance ?? 0);
+      const px = Number(priceBy.get(mk) ?? (b as any).avg_buy_price ?? 0);
+      const valueKrw = qty > 0 && px > 0 ? qty * px : 0;
+      accountHoldSnapshot[mk] = {
+        qty,
+        value_krw: Number(valueKrw.toFixed(2)),
+        meaningful: valueKrw >= EXISTING_POSITION_MIN_KRW,
+      };
+    }
+
     console.info(
       JSON.stringify({
         tag: "DEBUG_LIVE_CANDIDATE_UNIVERSE",
-        debug_exclude_held_symbols: DEBUG_EXCLUDE_HELD_SYMBOLS,
+        exclude_held_symbols_from_universe: EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE,
+        exclude_held_resolved_by:
+          parseEnvBoolExplicit(process.env.LIVE_EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE) !== null
+            ? "LIVE_EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE"
+            : parseEnvBoolExplicit(process.env.DEBUG_EXCLUDE_HELD_SYMBOLS) !== null
+              ? "DEBUG_EXCLUDE_HELD_SYMBOLS"
+              : "default_false",
+        debug_exclude_held_symbols_legacy_env:
+          process.env.DEBUG_EXCLUDE_HELD_SYMBOLS !== undefined && process.env.DEBUG_EXCLUDE_HELD_SYMBOLS !== "",
+        live_exclude_held_env_set:
+          process.env.LIVE_EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE !== undefined &&
+          process.env.LIVE_EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE !== "",
+        strategy_open_markets_excluded: [...openStrategyMarkets],
+        exchange_meaningful_hold_markets_removed_from_universe: [...heldMeaningfulMarkets],
+        account_hold_snapshot_by_market: accountHoldSnapshot,
         debug_include_universe_markets_env: DEBUG_INCLUDE_UNIVERSE_MARKETS,
         debug_include_universe_markets_resolved: debugUniverseExtra,
-        held_filtered_markets: [...heldMeaningfulMarkets],
         entry_universe: entryUniverse,
       }),
     );
@@ -1161,12 +1217,18 @@ export function createLiveDataStrategy(opts: {
           }),
         );
       };
+      const acctSnap = accountHoldSnapshot[market];
       console.info(
         JSON.stringify({
           tag: "DEBUG_LIVE_SYMBOL_EVAL_START",
           symbol: market,
           ts: new Date().toISOString(),
-          open_positions: Object.keys(state.positions).length,
+          open_strategy_positions_count: Object.keys(state.positions).length,
+          strategy_position_exists: Boolean(state.positions[market]),
+          account_existing_qty: acctSnap?.qty ?? 0,
+          account_existing_value_krw: acctSnap?.value_krw ?? 0,
+          account_meaningful_hold: acctSnap?.meaningful ?? false,
+          entry_universe_includes_symbol: true,
         }),
       );
       if (Object.keys(state.positions).length >= state.safety_guard.max_positions) {
@@ -1174,7 +1236,13 @@ export function createLiveDataStrategy(opts: {
         break;
       }
       if (state.positions[market]) {
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "already_has_position" });
+        emitEval("DEBUG_LIVE_PRECHECK", {
+          return_reason: "strategy_position_open_blocks_reentry",
+          precheck_domain: "strategy_state",
+          strategy_position_exists: true,
+          blocks_entry: true,
+          note: "same_symbol_open_in_engine_state_only_exchange_hold_does_not_trigger_this",
+        });
         continue;
       }
       const cool = state.cooldown_until[market];
@@ -1421,18 +1489,16 @@ export function createLiveDataStrategy(opts: {
       const markPrice = Number(priceBy.get(market) ?? 0);
       const existingValueKrw = existingQty > 0 && markPrice > 0 ? existingQty * markPrice : 0;
       const meaningfulExistingHold = existingValueKrw >= EXISTING_POSITION_MIN_KRW;
-      if (existingQty > 0) {
-        emitEval("DEBUG_LIVE_PRECHECK", {
-          return_reason: meaningfulExistingHold ? "account_existing_qty" : "account_existing_qty_dust_ignored",
-          existing_qty: existingQty,
-          existing_value_krw: Number(existingValueKrw.toFixed(2)),
-          dust_ignored: !meaningfulExistingHold,
-          existing_position_min_krw: EXISTING_POSITION_MIN_KRW,
-        });
-      }
-      if (existingQty > 0 && meaningfulExistingHold) {
-        continue; // no averaging / no existing hold
-      }
+      emitEval("DEBUG_LIVE_EXCHANGE_HOLD_INFO", {
+        precheck_domain: "exchange_account",
+        account_existing_qty: existingQty,
+        account_existing_value_krw: Number(existingValueKrw.toFixed(2)),
+        meaningful_exchange_hold: meaningfulExistingHold,
+        existing_position_min_krw: EXISTING_POSITION_MIN_KRW,
+        strategy_position_exists: Boolean(state.positions[market]),
+        blocks_entry: false,
+        note: "exchange_hold_does_not_block_strategy_entry_eval",
+      });
       const liveOrderAvailableKrw = Math.max(0, Number(st.live_order_available_krw ?? st.krw_available ?? 0));
       let orderKrw = Math.floor(liveOrderAvailableKrw * 0.2);
       orderKrw = Math.max(5000, Math.min(30000, orderKrw));
