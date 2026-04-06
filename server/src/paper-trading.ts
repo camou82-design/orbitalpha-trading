@@ -1,20 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { tradingDataRoot } from "./paths.js";
-import { evaluateMvpSignal } from "./signal-engine.js";
 import { UPBIT_FEE_RATE } from "./strategy-risk-config.js";
-import { fetchMinuteCandles, fetchTickers } from "./upbit-public.js";
-
-/**
- * Paper trading 전용 MVP 거래량 메인 임계 (signal-monitor·실거래는 env `ORBITALPHA_TRADING_VOLUME_THRESHOLD_MAIN` 기본 1.15 유지).
- * 이 모듈에서만 사용 — 공용 env 기본값을 바꾸지 않음.
- */
-const PAPER_VOLUME_THRESHOLD_MAIN = (() => {
-  const raw = process.env.ORBITALPHA_TRADING_PAPER_VOLUME_THRESHOLD_MAIN;
-  if (raw === undefined || raw === "") return 0.85;
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : 0.85;
-})();
+import { fetchTickers } from "./upbit-public.js";
 
 type PaperStateValue = "SIGNAL" | "OPEN" | "PARTIAL_EXIT" | "CLOSED_WIN" | "CLOSED_LOSS" | "CLOSED_TIMEOUT" | "SKIPPED";
 
@@ -33,6 +21,8 @@ type PaperPosition = {
   max_up_pct?: number;
   /** +3% 이상에서 러너 트레일 활성 */
   runner_trail_armed?: boolean;
+  /** pump surge 2차(70%) 배분 완료 여부 */
+  surge_add_leg_done?: boolean;
 };
 
 type PaperTradeEvent = {
@@ -55,7 +45,7 @@ type PaperStateFile = {
   seen_signal_keys: string[];
 };
 
-type LifecycleState = "idle" | "candidate" | "entered" | "cooldown";
+type LifecycleState = "idle" | "pre_entry" | "entered" | "cooldown";
 type MarketLifecycle = {
   state: LifecycleState;
   state_since_ts: string;
@@ -67,21 +57,20 @@ type MarketLifecycle = {
 const PAPER_START_KRW = 500_000;
 const PAPER_ENTRY_KRW_PER_TRADE = 45_000;
 const PAPER_MAX_OPEN = 2;
-/** 급등주 모의매매 — 실제 진입 전용 (후보 추적과 분리) */
-const SURGE_ENTRY_MIN_SCORE = 75;
-const SURGE_ENTRY_MIN_SCORE_WHEN_OPEN = 82;
-const SURGE_MID_TIER_MIN_SCORE = 85;
-const SURGE_MIN_VOLUME_RATIO = 1.1;
+/** pump 스캐너 1차 선진입 비중 · 2차 돌파 추격 비중 */
+const SURGE_EARLY_ALLOC_RATIO = 0.3;
+const SURGE_ADD_ALLOC_RATIO = 0.7;
+/** 스캐너 피드와 동일: 1차는 거래량 배수 > 이 값 (기본 1.2) */
+const SURGE_EARLY_VOLUME_RATIO_MIN = Math.max(1.0, Number(process.env.PUMP_SCANNER_EARLY_VOLUME_RATIO_MIN ?? 1.2));
+/** 진입가 대비 손절(%) — -0.5 ~ -1 구간으로 clamp, 기본 -0.75 */
+const SURGE_STOP_LOSS_PCT = (() => {
+  const raw = process.env.PAPER_SURGE_STOP_LOSS_PCT;
+  const n = raw === undefined || raw === "" ? -0.75 : Number(raw);
+  if (!Number.isFinite(n)) return -0.75;
+  return Math.max(-1, Math.min(-0.5, n));
+})();
 const SURGE_COOLDOWN_MS = 25 * 60_000;
 const SURGE_COOLDOWN_AFTER_LOSS_MS = 30 * 60_000;
-const SURGE_HARD_STOP_PCT = -2.5;
-const SURGE_EARLY_FAIL_MIN_MS = 6 * 60_000;
-const SURGE_EARLY_FAIL_MAX_UP_PCT = 0.25;
-const SURGE_EARLY_FAIL_PNL_PCT = -1.2;
-const SURGE_TP1_PCT = 1.5;
-const SURGE_TP1_RATIO = 0.4;
-const SURGE_TRAIL_ARM_PCT = 3.0;
-const SURGE_TRAIL_FROM_PEAK_PCT = 1.2;
 const PAPER_TIMEOUT_MS = 45 * 60_000;
 /** surge 후보 시간청산(백업) */
 const PAPER_SURGE_SCANNER_TIMEOUT_MS = (() => {
@@ -114,10 +103,13 @@ function paperTimeExitNote(p: Pick<PaperPosition, "signal_strength">): string {
     : `time_exit_${m}m:paper`;
 }
 
-function scannerSignalTier(score: number): "LOW" | "MID" | "HIGH" {
-  if (score >= 80) return "HIGH";
-  if (score >= 65) return "MID";
-  return "LOW";
+function logPumpScannerDebug(payload: Record<string, unknown>) {
+  const on =
+    (process.env.DEBUG_LOG_ENABLED ?? "").toLowerCase() === "true" ||
+    (process.env.ORBITALPHA_TRADING_DEBUG_LOG_ENABLED ?? "").toLowerCase() === "true" ||
+    process.env.ORBITALPHA_TRADING_SCANNER_DEBUG === "1";
+  if (!on) return;
+  console.info(JSON.stringify({ tag: "DEBUG_PAPER_PUMP_SCANNER", ts: new Date().toISOString(), ...payload }));
 }
 
 export function createPaperTradingEngine(opts: {
@@ -131,6 +123,8 @@ export function createPaperTradingEngine(opts: {
     reason: string;
     breakout?: boolean;
     volume_multiple?: number;
+    early_entry_eligible?: boolean;
+    add_entry_eligible?: boolean;
   }>;
 }) {
   const baseDir = path.join(tradingDataRoot(), "paper", opts.companyId, opts.serviceId);
@@ -142,9 +136,10 @@ export function createPaperTradingEngine(opts: {
     history: PaperTradeEvent[];
     seenSignalKeys: Set<string>;
     lifecycle: Map<string, MarketLifecycle>;
-    candidatePool: Map<string, { score: number; reason: string; status: string; detectedAt: number; signalStrength: string }>;
+    /** 스캐너 기준 진입 직전(선·추가 진입 조건 감시), 과거 candidate_pool */
+    preEntryWatch: Map<string, { score: number; reason: string; status: string; detectedAt: number; signalStrength: string }>;
     metrics: {
-      candidateCaptured: number;
+      preEntryWatchHits: number;
       entriesOpened: number;
       entryLatencyMs: number[];
       earlyExitCount: number;
@@ -155,9 +150,9 @@ export function createPaperTradingEngine(opts: {
     history: [],
     seenSignalKeys: new Set<string>(),
     lifecycle: new Map(),
-    candidatePool: new Map(),
+    preEntryWatch: new Map(),
     metrics: {
-      candidateCaptured: 0,
+      preEntryWatchHits: 0,
       entriesOpened: 0,
       entryLatencyMs: [],
       earlyExitCount: 0,
@@ -197,6 +192,11 @@ export function createPaperTradingEngine(opts: {
       state.history = Array.isArray(raw.history) ? (raw.history as PaperTradeEvent[]) : [];
       state.seenSignalKeys = new Set(Array.isArray(raw.seen_signal_keys) ? raw.seen_signal_keys : []);
       trimHistoryAndSignals();
+      for (const p of Object.values(state.positions)) {
+        if (p.signal_strength !== "SURGE_SCANNER") continue;
+        if (p.surge_add_leg_done !== undefined) continue;
+        p.surge_add_leg_done = p.invested_krw >= PAPER_ENTRY_KRW_PER_TRADE * 0.42;
+      }
     } catch {
       /* first boot */
     }
@@ -248,6 +248,7 @@ export function createPaperTradingEngine(opts: {
       peak_price: entryPrice,
       max_up_pct: 0,
       runner_trail_armed: false,
+      ...(signalStrength === "SURGE_SCANNER" ? { surge_add_leg_done: false } : {}),
     };
     appendHistory({
       ts: new Date().toISOString(),
@@ -261,13 +262,56 @@ export function createPaperTradingEngine(opts: {
       pnl_krw: null,
       pnl_pct: null,
     });
-    const c = state.candidatePool.get(market);
+    const c = state.preEntryWatch.get(market);
     if (c) {
       state.metrics.entryLatencyMs.push(Date.now() - c.detectedAt);
-      state.candidatePool.delete(market);
+      state.preEntryWatch.delete(market);
     }
     state.metrics.entriesOpened += 1;
     setLifecycle(market, "entered", { last_reason: note, cooldown_until_ts: undefined });
+    return { ok: true };
+  };
+
+  const paperSurgeAddBuy = (
+    market: string,
+    entryPrice: number,
+    note: string,
+    amountKrw: number,
+  ): { ok: boolean; reason?: string } => {
+    const p = state.positions[market];
+    if (!p) return { ok: false, reason: "position_not_found" };
+    if (p.signal_strength !== "SURGE_SCANNER") return { ok: false, reason: "not_surge" };
+    if (p.surge_add_leg_done === true) return { ok: false, reason: "add_leg_done" };
+    const orderKrw = Math.max(5_000, amountKrw);
+    const buyFee = orderKrw * UPBIT_FEE_RATE;
+    const totalNeed = orderKrw + buyFee;
+    if (state.cashKrw < totalNeed) return { ok: false, reason: "insufficient_cash" };
+    if (!(entryPrice > 0)) return { ok: false, reason: "invalid_price" };
+
+    const addQty = orderKrw / entryPrice;
+    const newQty = p.qty + addQty;
+    const newEntryPx = (p.entry_price * p.qty + entryPrice * addQty) / newQty;
+
+    state.cashKrw -= totalNeed;
+    p.qty = newQty;
+    p.entry_price = newEntryPx;
+    p.invested_krw += orderKrw;
+    p.buy_fee_krw += buyFee;
+    p.surge_add_leg_done = true;
+    p.peak_price = Math.max(Number(p.peak_price ?? p.entry_price), entryPrice);
+
+    appendHistory({
+      ts: new Date().toISOString(),
+      market,
+      state: "OPEN",
+      note,
+      signal_strength: p.signal_strength,
+      entry_price: newEntryPx,
+      exit_price: null,
+      qty: addQty,
+      pnl_krw: null,
+      pnl_pct: null,
+    });
     return { ok: true };
   };
 
@@ -319,7 +363,8 @@ export function createPaperTradingEngine(opts: {
       const lossExit =
         closeState === "CLOSED_LOSS" ||
         note.includes("hard_stop_loss") ||
-        note.includes("early_failure_cut");
+        note.includes("early_failure_cut") ||
+        note.includes("surge_stop_loss");
       const cdMs = lossExit ? SURGE_COOLDOWN_AFTER_LOSS_MS : SURGE_COOLDOWN_MS;
       setLifecycle(market, "cooldown", {
         cooldown_until_ts: new Date(Date.now() + cdMs).toISOString(),
@@ -356,14 +401,12 @@ export function createPaperTradingEngine(opts: {
         start_krw: PAPER_START_KRW,
         entry_krw_per_trade: PAPER_ENTRY_KRW_PER_TRADE,
         max_open_positions: PAPER_MAX_OPEN,
-        surge_entry_min_score: SURGE_ENTRY_MIN_SCORE,
-        surge_hard_stop_pct: SURGE_HARD_STOP_PCT,
-        surge_tp1_pct: SURGE_TP1_PCT,
-        surge_tp1_ratio: SURGE_TP1_RATIO,
+        surge_early_alloc_ratio: SURGE_EARLY_ALLOC_RATIO,
+        surge_add_alloc_ratio: SURGE_ADD_ALLOC_RATIO,
+        surge_early_volume_ratio_min: SURGE_EARLY_VOLUME_RATIO_MIN,
+        surge_stop_loss_pct: SURGE_STOP_LOSS_PCT,
         timeout_minutes: PAPER_TIMEOUT_MS / 60_000,
         fee_rate: UPBIT_FEE_RATE,
-        /** Paper 전용 — `evaluateMvpSignal` 주입값 (실거래·signal-monitor와 분리) */
-        paper_volume_threshold_main: PAPER_VOLUME_THRESHOLD_MAIN,
         /** surge_scanner 포지션 시간청산(분). 기본 30. `PAPER_SURGE_SCANNER_TIMEOUT_MINUTES` */
         surge_scanner_timeout_minutes: PAPER_SURGE_SCANNER_TIMEOUT_MS / 60_000,
       },
@@ -396,6 +439,8 @@ export function createPaperTradingEngine(opts: {
         status: string;
         breakout: boolean;
         volume_multiple: number;
+        early_entry_eligible: boolean;
+        add_entry_eligible: boolean;
       }
     >();
     const watchMarkets = new Set<string>(Object.keys(state.positions));
@@ -419,6 +464,8 @@ export function createPaperTradingEngine(opts: {
           status,
           breakout: sig.breakout === true,
           volume_multiple: toNum(sig.volume_multiple, 0),
+          early_entry_eligible: sig.early_entry_eligible === true,
+          add_entry_eligible: sig.add_entry_eligible === true,
         });
       }
       const life = getLifecycle(market);
@@ -427,10 +474,9 @@ export function createPaperTradingEngine(opts: {
       watchMarkets.add(market);
     }
 
-    // Keep strong candidates for a short window and re-evaluate quickly without re-scanning whole market.
-    for (const [market, c] of Array.from(state.candidatePool.entries())) {
+    for (const [market, c] of Array.from(state.preEntryWatch.entries())) {
       if (Date.now() - c.detectedAt > CANDIDATE_KEEP_MS) {
-        state.candidatePool.delete(market);
+        state.preEntryWatch.delete(market);
         if (!state.positions[market]) setLifecycle(market, "idle");
         continue;
       }
@@ -456,177 +502,72 @@ export function createPaperTradingEngine(opts: {
 
     const orderedSignals = Array.from(latestSignalByMarket.entries()).sort((a, b) => b[1].score - a[1].score);
     for (const [market, sig] of orderedSignals) {
-      if (state.seenSignalKeys.has(sig.key)) continue;
-      state.seenSignalKeys.add(sig.key);
-
-      appendHistory({
-        ts: new Date().toISOString(),
-        market,
-        state: "SIGNAL",
-        note: `signal_detected:surge_scanner:${sig.reason}`,
-        signal_strength: sig.signal_strength,
-        entry_price: null,
-        exit_price: null,
-        qty: null,
-        pnl_krw: null,
-        pnl_pct: null,
-      });
-
       const px = priceByMarket[market] ?? 0;
-      const reasonLower = sig.reason.toLowerCase();
-      const breakoutConfirmed = sig.breakout === true || reasonLower.includes("breakout_confirmed");
 
-      const priorPool = state.candidatePool.get(market);
-      if (!priorPool && sig.score >= 45) {
-        state.candidatePool.set(market, {
+      if (!state.seenSignalKeys.has(sig.key)) {
+        state.seenSignalKeys.add(sig.key);
+        appendHistory({
+          ts: new Date().toISOString(),
+          market,
+          state: "SIGNAL",
+          note: `signal_detected:surge_scanner:${sig.reason}`,
+          signal_strength: sig.signal_strength,
+          entry_price: null,
+          exit_price: null,
+          qty: null,
+          pnl_krw: null,
+          pnl_pct: null,
+        });
+      }
+
+      const watchWorthy = sig.score >= 45 || sig.early_entry_eligible || sig.add_entry_eligible;
+      const priorPool = state.preEntryWatch.get(market);
+      if (!priorPool && watchWorthy) {
+        state.preEntryWatch.set(market, {
           score: sig.score,
           reason: sig.reason,
           status: sig.status,
           detectedAt: Date.now(),
           signalStrength: sig.signal_strength,
         });
-        state.metrics.candidateCaptured += 1;
-        setLifecycle(market, "candidate", { candidate_score: sig.score, last_reason: sig.reason });
+        state.metrics.preEntryWatchHits += 1;
+        setLifecycle(market, "pre_entry", { candidate_score: sig.score, last_reason: sig.reason });
       }
-      if (state.candidatePool.size > CANDIDATE_MAX_TRACKED) {
-        const weakest = Array.from(state.candidatePool.entries()).sort((a, b) => a[1].score - b[1].score)[0]?.[0];
-        if (weakest) state.candidatePool.delete(weakest);
+      if (state.preEntryWatch.size > CANDIDATE_MAX_TRACKED) {
+        const weakest = Array.from(state.preEntryWatch.entries()).sort((a, b) => a[1].score - b[1].score)[0]?.[0];
+        if (weakest) state.preEntryWatch.delete(weakest);
       }
 
       const lifeEntry = getLifecycle(market);
-      if (lifeEntry.cooldown_until_ts && Date.now() < Date.parse(lifeEntry.cooldown_until_ts)) {
-        appendHistory({
-          ts: new Date().toISOString(),
-          market,
-          state: "SKIPPED",
-          note: "cooldown_active",
-          signal_strength: sig.signal_strength,
-          entry_price: px > 0 ? px : null,
-          exit_price: null,
-          qty: null,
-          pnl_krw: null,
-          pnl_pct: null,
-        });
-        continue;
-      }
+      if (lifeEntry.cooldown_until_ts && Date.now() < Date.parse(lifeEntry.cooldown_until_ts)) continue;
 
+      if (state.positions[market]) continue;
       if (Object.keys(state.positions).length >= PAPER_MAX_OPEN) continue;
 
-      const openN = Object.keys(state.positions).length;
-      const minScore = openN > 0 ? SURGE_ENTRY_MIN_SCORE_WHEN_OPEN : SURGE_ENTRY_MIN_SCORE;
-      if (sig.score < minScore) {
-        appendHistory({
-          ts: new Date().toISOString(),
-          market,
-          state: "SKIPPED",
-          note: "score_insufficient",
-          signal_strength: sig.signal_strength,
-          entry_price: px > 0 ? px : null,
-          exit_price: null,
-          qty: null,
-          pnl_krw: null,
-          pnl_pct: null,
-        });
-        continue;
-      }
+      const volOk = sig.volume_multiple > SURGE_EARLY_VOLUME_RATIO_MIN;
+      if (!sig.early_entry_eligible || !volOk) continue;
+      if (!(px > 0)) continue;
 
-      const tier = scannerSignalTier(sig.score);
-      if (tier === "LOW") {
-        appendHistory({
-          ts: new Date().toISOString(),
+      const earlyAmount = Math.max(5_000, Math.floor(PAPER_ENTRY_KRW_PER_TRADE * SURGE_EARLY_ALLOC_RATIO * entryScale));
+      const earlyNote = `early_entry:surge_30pct|vr=${sig.volume_multiple.toFixed(3)}|score=${sig.score}|btc_scale=${entryScale}`;
+      const b = paperBuy(market, sig.signal_strength, px, earlyNote, earlyAmount);
+      if (b.ok) {
+        logPumpScannerDebug({
+          early_entry_triggered: true,
           market,
-          state: "SKIPPED",
-          note: "low_signal_blocked",
-          signal_strength: sig.signal_strength,
-          entry_price: px > 0 ? px : null,
-          exit_price: null,
-          qty: null,
-          pnl_krw: null,
-          pnl_pct: null,
+          price: px,
+          volume_multiple: sig.volume_multiple,
+          score: sig.score,
+          early_krw: earlyAmount,
         });
-        continue;
-      }
-      if (tier === "MID" && sig.score < SURGE_MID_TIER_MIN_SCORE) {
+      } else {
         appendHistory({
           ts: new Date().toISOString(),
           market,
           state: "SKIPPED",
-          note: "mid_signal_blocked",
+          note: `early_entry_blocked:${b.reason ?? "unknown"}`,
           signal_strength: sig.signal_strength,
-          entry_price: px > 0 ? px : null,
-          exit_price: null,
-          qty: null,
-          pnl_krw: null,
-          pnl_pct: null,
-        });
-        continue;
-      }
-
-      if (!breakoutConfirmed) {
-        appendHistory({
-          ts: new Date().toISOString(),
-          market,
-          state: "SKIPPED",
-          note: "breakout_not_confirmed",
-          signal_strength: sig.signal_strength,
-          entry_price: px > 0 ? px : null,
-          exit_price: null,
-          qty: null,
-          pnl_krw: null,
-          pnl_pct: null,
-        });
-        continue;
-      }
-
-      const candles5 = await fetchMinuteCandles(market, 5, 42);
-      const candles1 = await fetchMinuteCandles(market, 1, 30);
-      const mvpEv = evaluateMvpSignal(market, candles5, candles1, {
-        volumeThresholdMain: PAPER_VOLUME_THRESHOLD_MAIN,
-      });
-      if (!mvpEv.filter_pass) {
-        appendHistory({
-          ts: new Date().toISOString(),
-          market,
-          state: "SKIPPED",
-          note: `entry_blocked:paper_mvp_filter:paper_vol_main=${PAPER_VOLUME_THRESHOLD_MAIN}:vr=${mvpEv.volume_ratio.toFixed(4)}:${mvpEv.filter_fail_reason ?? "filter_pass"}`,
-          signal_strength: sig.signal_strength,
-          entry_price: px > 0 ? px : null,
-          exit_price: null,
-          qty: null,
-          pnl_krw: null,
-          pnl_pct: null,
-        });
-        continue;
-      }
-
-      const volEff = Math.max(mvpEv.volume_ratio, sig.volume_multiple);
-      if (volEff < SURGE_MIN_VOLUME_RATIO) {
-        appendHistory({
-          ts: new Date().toISOString(),
-          market,
-          state: "SKIPPED",
-          note: "low_volume_blocked",
-          signal_strength: sig.signal_strength,
-          entry_price: px > 0 ? px : null,
-          exit_price: null,
-          qty: null,
-          pnl_krw: null,
-          pnl_pct: null,
-        });
-        continue;
-      }
-
-      const entryAmount = Math.max(5_000, Math.floor(PAPER_ENTRY_KRW_PER_TRADE * entryScale));
-      const entryNote = `entry_allowed|high_signal_confirmed|volume_confirmed|breakout_confirmed|vr=${volEff.toFixed(3)}|score=${sig.score}|btc_scale=${entryScale}`;
-      const b = paperBuy(market, sig.signal_strength, px, entryNote, entryAmount);
-      if (!b.ok) {
-        appendHistory({
-          ts: new Date().toISOString(),
-          market,
-          state: "SKIPPED",
-          note: `entry_blocked:${b.reason ?? "unknown"}`,
-          signal_strength: sig.signal_strength,
-          entry_price: px > 0 ? px : null,
+          entry_price: px,
           exit_price: null,
           qty: null,
           pnl_krw: null,
@@ -634,6 +575,31 @@ export function createPaperTradingEngine(opts: {
         });
       }
     }
+
+    const trySurgeAddLegs = () => {
+      for (const p of Object.values(state.positions)) {
+        if (p.signal_strength !== "SURGE_SCANNER") continue;
+        if (p.surge_add_leg_done === true) continue;
+        const sig = latestSignalByMarket.get(p.market);
+        if (!sig?.add_entry_eligible) continue;
+        const px = priceByMarket[p.market] ?? 0;
+        if (!(px > 0)) continue;
+        const addAmount = Math.max(5_000, Math.floor(PAPER_ENTRY_KRW_PER_TRADE * SURGE_ADD_ALLOC_RATIO * entryScale));
+        const addNote = `add_entry:surge_70pct|score=${sig.score}|btc_scale=${entryScale}|${sig.breakout ? "high20" : "box_top"}`;
+        const r = paperSurgeAddBuy(p.market, px, addNote, addAmount);
+        if (r.ok) {
+          logPumpScannerDebug({
+            add_entry_triggered: true,
+            market: p.market,
+            price: px,
+            score: sig.score,
+            add_krw: addAmount,
+            entry_vwap: state.positions[p.market]?.entry_price,
+          });
+        }
+      }
+    };
+    trySurgeAddLegs();
 
     for (const p of Object.values(state.positions)) {
       const px = priceByMarket[p.market] ?? 0;
@@ -643,20 +609,35 @@ export function createPaperTradingEngine(opts: {
       p.peak_price = Math.max(Number(p.peak_price ?? p.entry_price), px);
       p.max_up_pct = Math.max(p.max_up_pct ?? grossPct, grossPct);
 
-      if (grossPct <= SURGE_HARD_STOP_PCT) {
+      if (p.signal_strength === "SURGE_SCANNER") {
+        if (grossPct <= SURGE_STOP_LOSS_PCT) {
+          logPumpScannerDebug({
+            stop_loss_triggered: true,
+            market: p.market,
+            price: px,
+            entry_price: p.entry_price,
+            gross_pct: Number(grossPct.toFixed(4)),
+            stop_loss_pct: SURGE_STOP_LOSS_PCT,
+          });
+          paperSell(p.market, px, "CLOSED_LOSS", `surge_stop_loss:${SURGE_STOP_LOSS_PCT}`);
+          continue;
+        }
+        if (heldMs >= paperTimeExitDeadlineMs(p)) {
+          paperSell(p.market, px, "CLOSED_TIMEOUT", paperTimeExitNote(p));
+        }
+        continue;
+      }
+
+      if (grossPct <= -2.5) {
         paperSell(p.market, px, "CLOSED_LOSS", "hard_stop_loss");
         continue;
       }
-      if (
-        heldMs >= SURGE_EARLY_FAIL_MIN_MS &&
-        (p.max_up_pct ?? 0) < SURGE_EARLY_FAIL_MAX_UP_PCT &&
-        grossPct <= SURGE_EARLY_FAIL_PNL_PCT
-      ) {
+      if (heldMs >= 6 * 60_000 && (p.max_up_pct ?? 0) < 0.25 && grossPct <= -1.2) {
         paperSell(p.market, px, "CLOSED_LOSS", "early_failure_cut");
         continue;
       }
-      if (!p.take_profit_partial_done && grossPct >= SURGE_TP1_PCT) {
-        const r = paperSell(p.market, px, "CLOSED_WIN", "partial_take_profit", SURGE_TP1_RATIO);
+      if (!p.take_profit_partial_done && grossPct >= 1.5) {
+        const r = paperSell(p.market, px, "CLOSED_WIN", "partial_take_profit", 0.4);
         if (r.ok && state.positions[p.market]) {
           state.positions[p.market]!.take_profit_partial_done = true;
           state.positions[p.market]!.runner_trail_armed = false;
@@ -664,13 +645,13 @@ export function createPaperTradingEngine(opts: {
         continue;
       }
       if (p.take_profit_partial_done) {
-        if (grossPct >= SURGE_TRAIL_ARM_PCT) {
+        if (grossPct >= 3.0) {
           p.runner_trail_armed = true;
         }
         const peak = Number(p.peak_price ?? 0);
         if (p.runner_trail_armed && peak > 0) {
           const ddFromPeak = ((peak - px) / peak) * 100;
-          if (ddFromPeak >= SURGE_TRAIL_FROM_PEAK_PCT) {
+          if (ddFromPeak >= 1.2) {
             paperSell(p.market, px, "CLOSED_WIN", "runner_trailing_exit");
             continue;
           }
@@ -709,15 +690,15 @@ export function createPaperTradingEngine(opts: {
       updated_at: new Date().toISOString(),
       ...summary,
       execution_metrics: {
-        candidate_capture_count: state.metrics.candidateCaptured,
+        pre_entry_watch_hits: state.metrics.preEntryWatchHits,
         entry_count: state.metrics.entriesOpened,
         entries_opened: state.metrics.entriesOpened,
         avg_entry_latency_sec: Number((avgEntryLatencyMs / 1000).toFixed(2)),
         early_exit_ratio:
           closed.length > 0 ? Number((state.metrics.earlyExitCount / closed.length).toFixed(4)) : 0,
         avg_win_loss_ratio: Number(avgWinLossRatio.toFixed(3)),
-        active_candidates_count: state.candidatePool.size,
-        tracked_candidates: state.candidatePool.size,
+        active_pre_entry_watch_count: state.preEntryWatch.size,
+        tracked_pre_entry_watch: state.preEntryWatch.size,
       },
       holdings: Object.values(state.positions).map((p) => {
         const px = priceByMarket[p.market] ?? 0;

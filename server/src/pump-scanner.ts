@@ -14,11 +14,16 @@ type ScannerRow = {
   rank: number;
   market: string;
   score: number;
-  status: "진입후보" | "강관찰" | "예비후보" | "제외";
+  /** 제외 | 모니터링(약한 진입 직전) | 진입직전(강한 진입 직전·선진입 구간) */
+  status: "진입직전" | "모니터링" | "제외";
   volume_multiple: number;
   breakout: boolean;
   close_upper_hold: boolean;
   rise_3m_pct: number;
+  /** 거래량 배수>임계 + 초기 상승 — 돌파 전 선진입(1차) 후보 */
+  early_entry_eligible: boolean;
+  /** 직전 고점(20봉) 돌파 또는 단기 박스 상단 돌파 — 2차 추격 진입 후보 */
+  add_entry_eligible: boolean;
   /** When status is "제외", show why it was excluded. */
   exclude_reasons?: string[];
   /** 최초 후보 포착 시각 (performance row timestamp). */
@@ -37,6 +42,8 @@ type PendingEval = {
   status: ScannerRow["status"];
   volume_multiple: number;
   breakout: boolean;
+  early_entry_eligible: boolean;
+  add_entry_eligible: boolean;
   entry_price: number;
   due3: number;
   due5: number;
@@ -53,6 +60,8 @@ type PerfRow = {
   status: ScannerRow["status"];
   volume_multiple: number;
   breakout: boolean;
+  early_entry_eligible: boolean;
+  add_entry_eligible: boolean;
   captured_at: string;
   saved_3m: boolean;
   saved_5m: boolean;
@@ -85,6 +94,12 @@ const PUMP_TICKER_BATCH_SIZE = Math.max(1, Math.min(120, Number(process.env.PUMP
 const PUMP_TICKER_BATCH_DELAY_MS = Math.max(0, Number(process.env.PUMP_SCANNER_TICKER_BATCH_DELAY_MS ?? 0));
 const PUMP_TICKER_PARALLEL = Math.max(1, Math.min(8, Number(process.env.PUMP_SCANNER_TICKER_PARALLEL ?? 3)));
 const PUMP_TIMING_LOG = (process.env.PUMP_SCANNER_TIMING_LOG ?? "1").toLowerCase() !== "0";
+/** 1차 선진입: 분봉 거래량 배수(직전 20봉 대비) 최소 — 기본 1.2 */
+const PUMP_EARLY_VOLUME_RATIO_MIN = Math.max(1.0, Number(process.env.PUMP_SCANNER_EARLY_VOLUME_RATIO_MIN ?? 1.2));
+/** 1차 선진입: 최근 3분 상승률(%) 최소 — 초기 상승 신호 */
+const PUMP_EARLY_RISE_3M_MIN_PCT = Number(process.env.PUMP_SCANNER_EARLY_RISE_3M_MIN_PCT ?? 0.25);
+/** 박스 상단: 직전 N개 완료 봉(현재 봉 제외) 고가 최대 */
+const PUMP_BOX_LOOKBACK_BARS = Math.max(5, Math.min(30, Number(process.env.PUMP_SCANNER_BOX_LOOKBACK_BARS ?? 10)));
 
 const pumpAltTickerOptsBase: FetchTickersOptions = {
   sortByCached24hVolume: false,
@@ -98,9 +113,8 @@ function clamp(n: number, min: number, max: number) {
 }
 
 function toStatus(score: number): ScannerRow["status"] {
-  if (score >= 80) return "진입후보";
-  if (score >= 65) return "강관찰";
-  if (score >= 50) return "예비후보";
+  if (score >= 72) return "진입직전";
+  if (score >= 52) return "모니터링";
   return "제외";
 }
 
@@ -181,6 +195,20 @@ function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btc
   // Ensure ONT-like breakouts don't get stuck as "제외".
   if (!liquidityBad && hasOnAltAltPattern) score = Math.max(score, 65);
 
+  const completedBeforeLast = c1.slice(-(PUMP_BOX_LOOKBACK_BARS + 1), -1);
+  const boxTop =
+    completedBeforeLast.length >= 5 ? Math.max(...completedBeforeLast.map((c) => c.high_price)) : high20;
+  const boxTopBreakout = completedBeforeLast.length >= 5 && last.trade_price > boxTop;
+  const initialRiseSignal =
+    rise3mPct >= PUMP_EARLY_RISE_3M_MIN_PCT ||
+    (recent3.length >= 2 && recent3[recent3.length - 1]!.trade_price > recent3[0]!.trade_price * 1.0015);
+  const earlyEntryEligible =
+    !liquidityBad && volumeMultiple > PUMP_EARLY_VOLUME_RATIO_MIN && initialRiseSignal;
+  const addEntryEligible = !liquidityBad && (breakout || boxTopBreakout);
+
+  if (earlyEntryEligible) score = Math.max(score, 54);
+  if (addEntryEligible) score = Math.max(score, 56);
+
   const status = toStatus(score);
   const exclude_reasons: string[] = [];
   if (liquidityBad) exclude_reasons.push("유동성 부족");
@@ -196,6 +224,10 @@ function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btc
     breakout,
     closeUpperHold,
     rise3mPct,
+    earlyEntryEligible,
+    addEntryEligible,
+    boxTop,
+    boxTopBreakout,
     price: ticker.trade_price,
     exclude_reasons:
       status === "제외"
@@ -210,7 +242,7 @@ function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btc
 
 /**
  * 전체 KRW 티커 배치 조회 후, 단기 가격·(선택)거래대금 증가·순위 상승으로 모멘텀 점수 → 상위 M만 캔들 후보로 넘김.
- * (캔들/scoreOne/MVP/paper 경로는 변경하지 않음.)
+ * (캔들·scoreOne·모멘텀 선별 경로; paper surge 진입은 `paper-trading`에서 스캐너 피드 기준 처리.)
  */
 function selectMomentumTopM(
   tickers: UpbitTicker[],
@@ -530,9 +562,22 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
           breakout: s.breakout,
           close_upper_hold: s.closeUpperHold,
           rise_3m_pct: Number(s.rise3mPct.toFixed(2)),
+          early_entry_eligible: s.earlyEntryEligible,
+          add_entry_eligible: s.addEntryEligible,
           exclude_reasons: s.exclude_reasons,
           updated_at: new Date().toISOString(),
         });
+        if (s.earlyEntryEligible) {
+          dbg("early_entry_eligible", { market: t.market, volume_multiple: s.volumeMultiple, rise_3m_pct: s.rise3mPct });
+        }
+        if (s.addEntryEligible) {
+          dbg("add_entry_eligible", {
+            market: t.market,
+            breakout: s.breakout,
+            box_top_breakout: s.boxTopBreakout,
+            volume_multiple: s.volumeMultiple,
+          });
+        }
       }
       if (bi < batches.length - 1) {
         await sleep(CANDLE_BATCH_DELAY_MS);
@@ -589,6 +634,8 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
         breakout: r.breakout,
         close_upper_hold: r.close_upper_hold,
         rise_3m_pct: r.rise_3m_pct,
+        early_entry_eligible: r.early_entry_eligible,
+        add_entry_eligible: r.add_entry_eligible,
       });
       state.perf.push({
         timestamp: ts,
@@ -597,6 +644,8 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
         status: r.status,
         volume_multiple: r.volume_multiple,
         breakout: r.breakout,
+        early_entry_eligible: r.early_entry_eligible,
+        add_entry_eligible: r.add_entry_eligible,
         captured_at: ts,
         saved_3m: false,
         saved_5m: false,
@@ -612,6 +661,8 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
         status: r.status,
         volume_multiple: r.volume_multiple,
         breakout: r.breakout,
+        early_entry_eligible: r.early_entry_eligible,
+        add_entry_eligible: r.add_entry_eligible,
         entry_price: priceBy.get(r.market) ?? 0,
         due3: Date.now() + 3 * 60_000,
         due5: Date.now() + 5 * 60_000,
@@ -647,12 +698,14 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
           status: r.status,
           breakout: r.breakout,
           volume_multiple: r.volume_multiple,
-          signal_key: `${r.market}|${r.updated_at}|${r.score.toFixed(1)}|${r.status}`,
-          reason: r.breakout
-            ? `surge_scanner:breakout_confirmed:score_${r.score.toFixed(1)}`
-            : r.close_upper_hold
-              ? `surge_scanner:upper_hold_confirmed:score_${r.score.toFixed(1)}`
-              : `surge_scanner:candidate_watch:score_${r.score.toFixed(1)}`,
+          early_entry_eligible: r.early_entry_eligible,
+          add_entry_eligible: r.add_entry_eligible,
+          signal_key: `${r.market}|${r.updated_at}|${r.score.toFixed(1)}|${r.status}|e${r.early_entry_eligible ? 1 : 0}a${r.add_entry_eligible ? 1 : 0}`,
+          reason: r.early_entry_eligible
+            ? `surge_scanner:pre_breakout_early:vr_${r.volume_multiple.toFixed(2)}:score_${r.score.toFixed(1)}`
+            : r.add_entry_eligible
+              ? `surge_scanner:add_leg_ready:${r.breakout ? "high20" : "box_top"}:score_${r.score.toFixed(1)}`
+              : `surge_scanner:pre_entry_watch:score_${r.score.toFixed(1)}`,
         })),
     status: () => {
       // Latest perf per market for post verification columns.

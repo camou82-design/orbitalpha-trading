@@ -377,7 +377,7 @@ type PumpScannerStatus = {
     rank: number;
     market: string;
     score: number;
-    status: "진입후보" | "강관찰" | "예비후보" | "제외";
+    status: "진입직전" | "모니터링" | "제외";
     volume_multiple: number;
     breakout: boolean;
     close_upper_hold: boolean;
@@ -2061,7 +2061,7 @@ export default function HomePage() {
                   <strong style={{ color: UI.title }}>#{it.rank}</strong>
                   <strong style={{ color: UI.title }}>{it.market.replace("KRW-", "")}</strong>
                   <span style={{ color: it.score >= 80 ? "#22c55e" : it.score >= 65 ? "#f59e0b" : UI.body, fontWeight: 800 }}>{it.score.toFixed(1)}</span>
-                  <span style={{ color: it.status === "진입후보" ? "#22c55e" : it.status === "강관찰" ? "#f59e0b" : UI.body }}>{statusLabel}</span>
+                  <span style={{ color: it.status === "진입직전" ? "#22c55e" : it.status === "모니터링" ? "#f59e0b" : UI.body }}>{statusLabel}</span>
                   <span style={{ color: UI.body }}>x{it.volume_multiple.toFixed(2)}</span>
                   <span style={{ color: it.breakout ? "#22c55e" : UI.muted }}>{it.breakout ? "돌파" : "-"}</span>
                   <span style={{ color: it.close_upper_hold ? "#22c55e" : UI.muted }}>{it.close_upper_hold ? "상단유지" : "-"}</span>
