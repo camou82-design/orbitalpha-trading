@@ -156,6 +156,12 @@ const LIVE_LEGACY_DCA_BUY_ENABLED = String(process.env.LIVE_LEGACY_DCA_BUY_ENABL
 const LIVE_ENTRY_UTILIZATION_TARGET = Math.max(0.05, Math.min(0.98, Number(process.env.LIVE_ENTRY_UTILIZATION_TARGET ?? 0.85)));
 const LIVE_MIN_ENTRY_KRW = Math.max(5_000, Number(process.env.LIVE_MIN_ENTRY_KRW ?? 50_000));
 const LIVE_MAX_ENTRY_KRW = Math.max(LIVE_MIN_ENTRY_KRW, Number(process.env.LIVE_MAX_ENTRY_KRW ?? 250_000));
+const LIVE_MAX_POSITIONS_CAP = (() => {
+  const raw = process.env.LIVE_MAX_POSITIONS_CAP;
+  const n = raw === undefined || raw === "" ? 6 : Number(raw);
+  return Number.isFinite(n) ? Math.max(1, Math.min(12, Math.floor(n))) : 6;
+})();
+const LIVE_CAPITAL_BUFFER_RATIO = Math.max(0, Math.min(0.5, Number(process.env.LIVE_CAPITAL_BUFFER_RATIO ?? 0.1)));
 
 /** 명시적 true/false만 인정, 미설정이면 null */
 function parseEnvBoolExplicit(value: string | undefined): boolean | null {
@@ -342,7 +348,7 @@ export function createLiveDataStrategy(opts: {
       reason: "state_restore_pending",
       order_fail_count_today: 0,
       consecutive_losses: 0,
-      max_positions: 2,
+      max_positions: LIVE_MAX_POSITIONS_CAP,
     },
     legacy: {
       dca_count: {},
@@ -459,6 +465,9 @@ export function createLiveDataStrategy(opts: {
 
   const runTick = async () => {
     try {
+    // 운영 최종값 단일화: persisted 값과 무관하게 매 tick env cap으로 재설정.
+    state.safety_guard.max_positions = LIVE_MAX_POSITIONS_CAP;
+
     console.info(
       JSON.stringify({
         tag: "DEBUG_LIVE_LOOP_TICK",
@@ -1507,6 +1516,60 @@ export function createLiveDataStrategy(opts: {
       if (heldMeaningfulMarkets.has(m)) return false;
       return true;
     });
+
+    // --- Capital allocation (weighted) ---
+    const strategyUsableKrwForAlloc = Math.max(
+      0,
+      Number(tstatus.strategy_available_krw ?? tstatus.live_order_available_krw ?? tstatus.krw_available ?? 0),
+    );
+    const capitalForNewEntriesKrwBase = Math.floor(strategyUsableKrwForAlloc * (1 - LIVE_CAPITAL_BUFFER_RATIO));
+    const capitalForNewEntriesKrw = Math.floor(capitalForNewEntriesKrwBase * entrySizePct);
+    const maxSymbolCapRatio = 0.25;
+    const maxSymbolCapKrw = Math.floor(capitalForNewEntriesKrw * maxSymbolCapRatio);
+    const minOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, LIVE_MIN_ENTRY_KRW);
+
+    const candidateMeta = entryUniverse
+      .map((m) => {
+        const s = latestAllSignals.get(m);
+        if (!s?.p) return null;
+        const gate = opts.marketState.entryGate(s.p, marketState);
+        const score = Number(gate.score ?? 0);
+        const tier = score >= 90 ? "A" : score >= 80 ? "B" : "C";
+        const weight = tier === "A" ? 1.35 : tier === "B" ? 1.0 : 0.7;
+        return { symbol: m, score, tier, weight };
+      })
+      .filter((x): x is { symbol: string; score: number; tier: "A" | "B" | "C"; weight: number } => Boolean(x));
+    const totalWeight = candidateMeta.reduce((acc, x) => acc + x.weight, 0);
+    const perPositionBudgetBySymbol = new Map<string, number>();
+    if (totalWeight > 0 && capitalForNewEntriesKrw > 0) {
+      for (const c of candidateMeta) {
+        const raw = Math.floor(capitalForNewEntriesKrw * (c.weight / totalWeight));
+        const capped = Math.min(maxSymbolCapKrw > 0 ? maxSymbolCapKrw : raw, raw);
+        const clipped = Math.max(minOrderKrw, Math.min(LIVE_MAX_ENTRY_KRW, capped));
+        perPositionBudgetBySymbol.set(c.symbol, clipped);
+      }
+    }
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_LIVE_CAPITAL_POLICY",
+        ts: new Date().toISOString(),
+        max_positions_cap: state.safety_guard.max_positions,
+        strategy_usable_krw: strategyUsableKrwForAlloc,
+        capital_buffer_ratio: LIVE_CAPITAL_BUFFER_RATIO,
+        capital_for_new_entries_krw: capitalForNewEntriesKrw,
+        allocation_mode: "weighted",
+        max_symbol_cap_ratio: maxSymbolCapRatio,
+        candidate_weights: candidateMeta
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 12)
+          .map((x) => ({ symbol: x.symbol, entry_score: Number(x.score.toFixed(2)), tier: x.tier, weight: x.weight })),
+        per_position_budget_krw_by_symbol: Array.from(perPositionBudgetBySymbol.entries())
+          .slice(0, 12)
+          .map(([symbol, krw]) => ({ symbol, per_position_budget_krw: krw })),
+        open_positions: Object.keys(state.positions).length,
+        remaining_slots: Math.max(0, state.safety_guard.max_positions - Object.keys(state.positions).length),
+      }),
+    );
     console.info(
       JSON.stringify({
         tag: "DEBUG_ENTRY_UNIVERSE_CREATED",
@@ -2042,12 +2105,12 @@ export function createLiveDataStrategy(opts: {
         blocks_entry: false,
         note: "exchange_hold_does_not_block_strategy_entry_eval",
       });
-      const liveOrderAvailableKrw = Math.max(0, Number(st.live_order_available_krw ?? st.krw_available ?? 0));
+    const liveOrderAvailableKrw = Math.max(0, Number(st.live_order_available_krw ?? st.krw_available ?? 0));
       const openCountNow = Object.keys(state.positions).length;
-      const remainingSlots = Math.max(1, state.safety_guard.max_positions - openCountNow);
+      const remainingSlots = Math.max(0, state.safety_guard.max_positions - openCountNow);
       const maxAllocKrw = Math.floor(liveOrderAvailableKrw * LIVE_ENTRY_UTILIZATION_TARGET * entrySizePct);
-      const plannedBaseKrw = Math.floor(maxAllocKrw / remainingSlots);
-      let orderKrw = Math.max(LIVE_MIN_ENTRY_KRW, Math.min(LIVE_MAX_ENTRY_KRW, plannedBaseKrw));
+      const baseBudget = perPositionBudgetBySymbol.get(market) ?? minOrderKrw;
+      let orderKrw = Math.max(minOrderKrw, Math.min(LIVE_MAX_ENTRY_KRW, baseBudget));
       if (isExceptionMarket) orderKrw = Math.floor(orderKrw * 0.9);
 
       const stPos = st.strategy_positions?.[market];
@@ -2060,8 +2123,13 @@ export function createLiveDataStrategy(opts: {
         available_krw: liveOrderAvailableKrw,
         max_alloc_krw: maxAllocKrw,
         planned_entry_krw: orderKrw,
-        min_entry_krw: LIVE_MIN_ENTRY_KRW,
+        min_entry_krw: minOrderKrw,
         max_entry_krw: LIVE_MAX_ENTRY_KRW,
+        allocation_mode: "weighted",
+        allocation_weight: candidateMeta.find((c) => c.symbol === market)?.weight ?? null,
+        allocation_tier: candidateMeta.find((c) => c.symbol === market)?.tier ?? null,
+        per_position_budget_krw: baseBudget,
+        max_symbol_cap_ratio: 0.25,
         per_market_cap_krw: ORDER_LIMITS.MAX_STRATEGY_INVESTED_KRW_PER_MARKET,
         per_market_remaining_krw: remainingPerMarket,
         entry_score: gateScore,
