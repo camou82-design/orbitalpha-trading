@@ -150,6 +150,8 @@ const EXISTING_POSITION_MIN_KRW = Math.max(1000, Number(process.env.LIVE_EXISTIN
 const DEBUG_FORCE_BASE_GATE = String(process.env.DEBUG_FORCE_BASE_GATE ?? "").toLowerCase() === "true";
 /** 운영에서 `DEBUG_LIVE_ENTRY_POLICY_SNAPSHOT`으로 dist 빌드 정합성 확인. 2=동일심볼은 same_symbol_open_continue_entry_eval 만(레거시 차단 문자열 없음). */
 const LIVE_PRECHECK_EMITTER_REVISION = 2;
+/** 운영에서 dist 실행 코드가 최신인지 확인용(로그에 항상 포함). */
+const LIVE_STRATEGY_TRACE_REVISION = 3;
 const LIVE_LEGACY_DCA_BUY_ENABLED = String(process.env.LIVE_LEGACY_DCA_BUY_ENABLED ?? "false").toLowerCase() === "true";
 const LIVE_ENTRY_UTILIZATION_TARGET = Math.max(0.05, Math.min(0.98, Number(process.env.LIVE_ENTRY_UTILIZATION_TARGET ?? 0.85)));
 const LIVE_MIN_ENTRY_KRW = Math.max(5_000, Number(process.env.LIVE_MIN_ENTRY_KRW ?? 50_000));
@@ -462,6 +464,7 @@ export function createLiveDataStrategy(opts: {
         tag: "DEBUG_LIVE_LOOP_TICK",
         ts: new Date().toISOString(),
         safety_guard_state: state.safety_guard.state,
+        live_strategy_trace_revision: LIVE_STRATEGY_TRACE_REVISION,
       }),
     );
     if (state.daily.date !== todayKst()) {
@@ -480,6 +483,7 @@ export function createLiveDataStrategy(opts: {
         JSON.stringify({
           tag: "DEBUG_LIVE_LOOP_SKIP",
           reason: "trade_status_guard",
+          stage: "before_signal_load",
           auto_trade_enabled: Boolean(tstatus.auto_trade_enabled),
           api_connected: Boolean(tstatus.api_connected),
           live_enabled: Boolean(tstatus.live_enabled),
@@ -492,6 +496,7 @@ export function createLiveDataStrategy(opts: {
         JSON.stringify({
           tag: "DEBUG_LIVE_LOOP_SKIP",
           reason: "safety_guard_stopped",
+          stage: "before_signal_load",
           safety_guard_state: state.safety_guard.state,
           safety_guard_reason: state.safety_guard.reason,
         }),
@@ -579,11 +584,25 @@ export function createLiveDataStrategy(opts: {
       JSON.stringify({
         tag: "DEBUG_SCANNER_UNIVERSE",
         ts: new Date().toISOString(),
+        live_strategy_trace_revision: LIVE_STRATEGY_TRACE_REVISION,
         watchlist_count: watchMarkets.length,
         signal_map_count: signalMapCount,
         market_signal_count: marketSignalsCount,
         filter_pass_count: filterPassCount,
         top_symbols: topSignals.map((x) => `${x.market}:${x.score.toFixed(1)}:vr_${x.vol.toFixed(2)}${x.filter_pass ? ":pass" : ""}`),
+      }),
+    );
+
+    // DEBUG_SCANNER_UNIVERSE 직후 도달 보장 로그 (여기가 안 보이면 dist/런타임 불일치 또는 즉시 예외).
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_AFTER_SCANNER_REACHED",
+        ts: new Date().toISOString(),
+        live_strategy_trace_revision: LIVE_STRATEGY_TRACE_REVISION,
+        watch_markets_count: watchMarkets.length,
+        signal_map_count: signalMapCount,
+        planned_entry_universe_count: watchMarkets.length, // entryUniverse 계산 전이므로 예정값으로만 남김
+        planned_entry_universe_symbols: watchMarkets.slice(0, 5),
       }),
     );
 
