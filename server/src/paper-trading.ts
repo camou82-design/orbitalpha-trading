@@ -63,7 +63,12 @@ type MarketLifecycle = {
 
 const PAPER_START_KRW = 500_000;
 const PAPER_ENTRY_KRW_PER_TRADE = 45_000;
-const PAPER_MAX_OPEN = 2;
+/** 일반(legacy surge 등) 포지션 전용 cap. `PAPER_MAX_OPEN`은 하위 호환 fallback */
+const PAPER_NORMAL_MAX_OPEN = (() => {
+  const raw = process.env.PAPER_NORMAL_MAX_OPEN ?? process.env.PAPER_MAX_OPEN;
+  const n = raw === undefined || raw === "" ? 2 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0, Math.min(10, Math.floor(n))) : 2;
+})();
 
 // --- Paper entry timing (early-first) ---
 const PAPER_ENTRY_SIGNAL_STALE_SECONDS = (() => {
@@ -193,6 +198,19 @@ function emitPaper(tag: string, payload: Record<string, unknown> = {}) {
   console.info(JSON.stringify({ tag, ts: new Date().toISOString(), ...payload }));
 }
 
+function countPaperSlots(positions: Record<string, PaperPosition>): {
+  early_open_positions: number;
+  normal_open_positions: number;
+} {
+  let early_open_positions = 0;
+  let normal_open_positions = 0;
+  for (const p of Object.values(positions)) {
+    if (p.position_stage === "early_active") early_open_positions++;
+    else normal_open_positions++;
+  }
+  return { early_open_positions, normal_open_positions };
+}
+
 export function createPaperTradingEngine(opts: {
   companyId: string;
   serviceId: string;
@@ -305,9 +323,15 @@ export function createPaperTradingEngine(opts: {
     entryPrice: number,
     note: string,
     amountKrw = PAPER_ENTRY_KRW_PER_TRADE,
+    slot: "early" | "normal" = "normal",
   ): { ok: boolean; reason?: string } => {
     if (state.positions[market]) return { ok: false, reason: "already_open" };
-    if (Object.keys(state.positions).length >= PAPER_MAX_OPEN) return { ok: false, reason: "max_open_positions" };
+    const { early_open_positions, normal_open_positions } = countPaperSlots(state.positions);
+    if (slot === "early") {
+      if (early_open_positions >= PAPER_EARLY_ENTRY_MAX_OPEN) return { ok: false, reason: "early_max_open_positions" };
+    } else {
+      if (normal_open_positions >= PAPER_NORMAL_MAX_OPEN) return { ok: false, reason: "normal_max_open_positions" };
+    }
     const orderKrw = Math.max(5_000, amountKrw);
     const buyFee = orderKrw * UPBIT_FEE_RATE;
     const totalNeed = orderKrw + buyFee;
@@ -329,6 +353,7 @@ export function createPaperTradingEngine(opts: {
       peak_price: entryPrice,
       max_up_pct: 0,
       runner_trail_armed: false,
+      position_stage: slot === "early" ? "early_active" : "normal_active",
       ...(signalStrength === "SURGE_SCANNER" ? { surge_add_leg_done: false } : {}),
     };
     appendHistory({
@@ -477,11 +502,15 @@ export function createPaperTradingEngine(opts: {
     const losses = closed.filter((h) => h.state === "CLOSED_LOSS").length;
     const timeouts = closed.filter((h) => h.state === "CLOSED_TIMEOUT").length;
 
+    const slots = countPaperSlots(state.positions);
     return {
       config: {
         start_krw: PAPER_START_KRW,
         entry_krw_per_trade: PAPER_ENTRY_KRW_PER_TRADE,
-        max_open_positions: PAPER_MAX_OPEN,
+        /** UI/호환: 동시에 열 수 있는 총 슬롯(early+normal) */
+        max_open_positions: PAPER_NORMAL_MAX_OPEN + PAPER_EARLY_ENTRY_MAX_OPEN,
+        normal_max_open_positions: PAPER_NORMAL_MAX_OPEN,
+        early_max_open_positions: PAPER_EARLY_ENTRY_MAX_OPEN,
         surge_early_alloc_ratio: SURGE_EARLY_ALLOC_RATIO,
         surge_add_alloc_ratio: SURGE_ADD_ALLOC_RATIO,
         surge_early_volume_ratio_min: SURGE_EARLY_VOLUME_RATIO_MIN,
@@ -501,6 +530,8 @@ export function createPaperTradingEngine(opts: {
       },
       counters: {
         open_positions: openPositions.length,
+        early_open_positions: slots.early_open_positions,
+        normal_open_positions: slots.normal_open_positions,
         closed_wins: wins,
         closed_losses: losses,
         closed_timeouts: timeouts,
@@ -611,13 +642,20 @@ export function createPaperTradingEngine(opts: {
       const breakoutNow = recentHigh > 0 ? px >= recentHigh : false;
       const promoteNow = breakoutNow || grossPct >= PAPER_EARLY_PROMOTION_PCT || heldSec >= PAPER_EARLY_PROMOTION_MAX_SECONDS;
       if (promoteNow) {
+        const { normal_open_positions } = countPaperSlots(state.positions);
+        /** 승격 대상 p는 아직 early이므로 normal 카운트에 미포함 */
+        const promotionNormalCapOverride = normal_open_positions >= PAPER_NORMAL_MAX_OPEN;
         p.position_stage = "normal_active";
+        const slotsAfterPromo = countPaperSlots(state.positions);
         emitPaper("DEBUG_PAPER_EARLY_ENTRY_EXIT", {
           market: p.market,
           early_entry_fail_triggered: false,
           exit_reason: "promoted_to_normal",
           held_seconds: heldSec,
           pnl_gross_pct: Number(grossPct.toFixed(4)),
+          promotion_normal_cap_override: promotionNormalCapOverride,
+          normal_open_positions_after: slotsAfterPromo.normal_open_positions,
+          early_open_positions_after: slotsAfterPromo.early_open_positions,
         });
         continue;
       }
@@ -637,13 +675,21 @@ export function createPaperTradingEngine(opts: {
 
     for (const [market, sig] of orderedSignals) {
       const px = priceByMarket[market] ?? 0;
+      const slotSnap = countPaperSlots(state.positions);
+      const posHere = state.positions[market];
       emitPaper("DEBUG_PAPER_PRECHECK_ENTER", {
         market,
         early_entry_eligible: sig.early_entry_eligible,
         volume_multiple: sig.volume_multiple,
         price: px,
         open_positions: Object.keys(state.positions).length,
-        max_positions: PAPER_MAX_OPEN,
+        normal_open_positions: slotSnap.normal_open_positions,
+        early_open_positions: slotSnap.early_open_positions,
+        normal_max_positions: PAPER_NORMAL_MAX_OPEN,
+        early_max_positions: PAPER_EARLY_ENTRY_MAX_OPEN,
+        max_positions: PAPER_NORMAL_MAX_OPEN + PAPER_EARLY_ENTRY_MAX_OPEN,
+        position_stage: posHere?.position_stage ?? null,
+        slot_domain: "both",
       });
 
       if (!state.seenSignalKeys.has(sig.key)) {
@@ -690,11 +736,6 @@ export function createPaperTradingEngine(opts: {
         emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "already_open", stage: "ordered_signals_loop" });
         continue;
       }
-      if (Object.keys(state.positions).length >= PAPER_MAX_OPEN) {
-        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "max_open_positions", stage: "ordered_signals_loop" });
-        continue;
-      }
-
       if (!(px > 0)) {
         emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "invalid_or_missing_price", stage: "ordered_signals_loop" });
         continue;
@@ -825,8 +866,16 @@ export function createPaperTradingEngine(opts: {
       const earlyScoreOk = sig.score >= earlyMinScore;
       const earlyAllowed = earlySlotOk && earlyFreshOk && earlyNearHighOk && earlyVolOk && earlyScoreOk;
 
+      const slotAtEarlyDecision = countPaperSlots(state.positions);
       emitPaper("DEBUG_PAPER_EARLY_ENTRY_DECISION", {
         market,
+        slot_domain: "early",
+        normal_open_positions: slotAtEarlyDecision.normal_open_positions,
+        early_open_positions: slotAtEarlyDecision.early_open_positions,
+        normal_max_positions: PAPER_NORMAL_MAX_OPEN,
+        early_max_positions: PAPER_EARLY_ENTRY_MAX_OPEN,
+        /** 신규 진입 평가 구간: 이미 보유면 상단에서 continue */
+        position_stage: null,
         seconds_since_signal: secondsSinceSignal,
         price_change_since_signal_pct: priceChangeSinceSignalPct,
         distance_from_local_high_pct: distanceFromLocalHighPct,
@@ -836,7 +885,7 @@ export function createPaperTradingEngine(opts: {
         early_entry_block_reason: earlyAllowed
           ? null
           : !earlySlotOk
-            ? "early_slot_full"
+            ? "early_max_open_positions"
             : !earlyFreshOk
               ? "signal_not_fresh"
               : !earlyNearHighOk
@@ -851,11 +900,10 @@ export function createPaperTradingEngine(opts: {
       if (earlyAllowed) {
         const earlyAmount = Math.max(5_000, Math.floor(PAPER_ENTRY_KRW_PER_TRADE * 0.4 * entryScale));
         emitPaper("DEBUG_PAPER_ORDER_ATTEMPT", { market, order_krw: earlyAmount, stage: "paper_early_entry" });
-        const b = paperBuy(market, "SURGE_SCANNER", px, "paper_early_entry", earlyAmount);
+        const b = paperBuy(market, "SURGE_SCANNER", px, "paper_early_entry", earlyAmount, "early");
         if (b.ok) {
           const filled = (state.positions as any)[market] as any;
           if (filled) {
-            filled.position_stage = "early_active";
             filled.signal_ts = signalTs;
             filled.signal_price = signalPrice;
             filled.entry_recent_high = localHigh > 0 ? localHigh : null;
@@ -874,6 +922,18 @@ export function createPaperTradingEngine(opts: {
       }
 
       // 2) normal entry fallback (only if early not allowed)
+      const normalSlotsSnap = countPaperSlots(state.positions);
+      if (normalSlotsSnap.normal_open_positions >= PAPER_NORMAL_MAX_OPEN) {
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", {
+          market,
+          reason: "normal_max_open_positions",
+          stage: "ordered_signals_loop",
+          slot_domain: "normal",
+          normal_open_positions: normalSlotsSnap.normal_open_positions,
+          normal_max_positions: PAPER_NORMAL_MAX_OPEN,
+        });
+        continue;
+      }
       const volOkLegacy = sig.volume_multiple > SURGE_EARLY_VOLUME_RATIO_MIN;
       if (!sig.early_entry_eligible || !volOkLegacy) {
         emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "early_not_ok_and_no_normal_path", stage: "ordered_signals_loop" });
@@ -883,7 +943,7 @@ export function createPaperTradingEngine(opts: {
       const earlyAmount = Math.max(5_000, Math.floor(PAPER_ENTRY_KRW_PER_TRADE * SURGE_EARLY_ALLOC_RATIO * entryScale));
       const earlyNote = `early_entry:surge_30pct|vr=${sig.volume_multiple.toFixed(3)}|score=${sig.score}|btc_scale=${entryScale}`;
       emitPaper("DEBUG_PAPER_ORDER_ATTEMPT", { market, order_krw: earlyAmount, stage: "legacy_early_entry" });
-      const b = paperBuy(market, sig.signal_strength, px, earlyNote, earlyAmount);
+      const b = paperBuy(market, sig.signal_strength, px, earlyNote, earlyAmount, "normal");
       if (b.ok) {
         const filled = (state.positions as any)[market] as any;
         emitPaper("DEBUG_PAPER_ORDER_FILLED", {
@@ -1057,6 +1117,7 @@ export function createPaperTradingEngine(opts: {
           unrealized_pnl_krw: pnlKrw,
           unrealized_pnl_pct: pnlPct,
           signal_strength: p.signal_strength,
+          position_stage: p.position_stage ?? null,
         };
       }),
       recent_history: state.history.slice(-40).reverse(),
