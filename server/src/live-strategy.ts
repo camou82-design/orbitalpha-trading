@@ -163,6 +163,36 @@ const LIVE_MAX_POSITIONS_CAP = (() => {
 })();
 const LIVE_CAPITAL_BUFFER_RATIO = Math.max(0, Math.min(0.5, Number(process.env.LIVE_CAPITAL_BUFFER_RATIO ?? 0.1)));
 
+// --- Exit stabilization (grace + fee-aware loss guard) ---
+const LIVE_EXIT_GRACE_SECONDS = (() => {
+  const raw = process.env.LIVE_EXIT_GRACE_SECONDS;
+  const n = raw === undefined || raw === "" ? 120 : Number(raw);
+  return Number.isFinite(n) ? Math.max(30, Math.min(600, Math.floor(n))) : 120;
+})();
+const LIVE_EXIT_FEE_BUFFER_PCT = (() => {
+  const raw = process.env.LIVE_EXIT_FEE_BUFFER_PCT;
+  const n = raw === undefined || raw === "" ? 0.25 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0, Math.min(2.0, n)) : 0.25;
+})();
+/** 미세 손실 즉시청산 방지: 이 손실(%)보다 작으면(덜 음수면) 조기 stop성 exit를 억제 */
+const LIVE_MIN_EXIT_LOSS_PCT = (() => {
+  const raw = process.env.LIVE_MIN_EXIT_LOSS_PCT;
+  const n = raw === undefined || raw === "" ? -0.45 : Number(raw);
+  return Number.isFinite(n) ? Math.max(-5, Math.min(-0.05, n)) : -0.45;
+})();
+/** 급락/비상 손절(%) — grace 중에도 허용 */
+const LIVE_EMERGENCY_STOP_LOSS_PCT = (() => {
+  const raw = process.env.LIVE_EMERGENCY_STOP_LOSS_PCT;
+  const n = raw === undefined || raw === "" ? -1.8 : Number(raw);
+  return Number.isFinite(n) ? Math.max(-20, Math.min(-0.5, n)) : -1.8;
+})();
+/** 진입 직후(초) stop성 exit 억제 구간 — grace와 별개로 “미세 손실” 방어용 */
+const LIVE_EXIT_EARLY_LOSS_GUARD_SECONDS = (() => {
+  const raw = process.env.LIVE_EXIT_EARLY_LOSS_GUARD_SECONDS;
+  const n = raw === undefined || raw === "" ? 300 : Number(raw);
+  return Number.isFinite(n) ? Math.max(60, Math.min(1800, Math.floor(n))) : 300;
+})();
+
 /** 명시적 true/false만 인정, 미설정이면 null */
 function parseEnvBoolExplicit(value: string | undefined): boolean | null {
   if (value === undefined || value === "") return null;
@@ -964,6 +994,10 @@ export function createLiveDataStrategy(opts: {
       }
       const now = rawPx;
       const pnlGross = grossPnlPct(p.entry_price, now);
+      const heldMs = Math.max(0, Date.now() - Date.parse(p.entry_ts));
+      const withinGracePeriod = heldMs < LIVE_EXIT_GRACE_SECONDS * 1000;
+      const feeRoundTripPct = UPBIT_FEE_RATE * 2 * 100;
+      const netPnlPctEst = pnlGross - feeRoundTripPct - LIVE_EXIT_FEE_BUFFER_PCT;
       p.max_pnl_pct = Math.max(p.max_pnl_pct, pnlGross);
       p.current_net_pnl_pct = pnlGross;
       if (now > p.highest_price_after_entry) {
@@ -1003,6 +1037,11 @@ export function createLiveDataStrategy(opts: {
       const weakModeTighterStop = (state.regime?.btc_filter_state ?? "neutral") === "weak" ? -0.9 : null;
       if (weakModeTighterStop !== null && pnlGross <= weakModeTighterStop) {
         reasonExit = "btc_weak_tight_stop";
+        stopTriggerKind = "price_stop";
+      }
+      // Emergency stop loss — always allowed even within grace period.
+      if (!reasonExit && pnlGross <= LIVE_EMERGENCY_STOP_LOSS_PCT) {
+        reasonExit = "emergency_stop_loss";
         stopTriggerKind = "price_stop";
       }
       if (!reasonExit && p.strategy_type === "stable") {
@@ -1230,6 +1269,22 @@ export function createLiveDataStrategy(opts: {
       }
       if (!reasonExit) continue;
 
+      // Early micro-loss guard: avoid selling on tiny negative noise immediately after entry.
+      const isStopLike =
+        /stop|loss|catastrophic|time_stop_weak_rebound|momentum_time_stop/i.test(reasonExit) ||
+        stopTriggerKind === "price_stop";
+      const withinEarlyLossGuard = heldMs < LIVE_EXIT_EARLY_LOSS_GUARD_SECONDS * 1000;
+      const blockedByMicroLoss = withinEarlyLossGuard && isStopLike && netPnlPctEst > LIVE_MIN_EXIT_LOSS_PCT && reasonExit !== "emergency_stop_loss";
+
+      const emergencyExit =
+        reasonExit === "emergency_stop_loss" ||
+        reasonExit === "btc_weak_tight_stop" ||
+        reasonExit === "strict_hard_stop_loss" ||
+        reasonExit === "strict_early_loss_cut";
+
+      const exitBlockedByGrace = withinGracePeriod && !emergencyExit;
+      const exitAllowed = !exitBlockedByGrace && !blockedByMicroLoss;
+
       const beforeQty = p.qty;
       const ratioClamped = Math.min(1, Math.max(0.01, ratio));
       const intendedSellQty = beforeQty * ratioClamped;
@@ -1241,15 +1296,39 @@ export function createLiveDataStrategy(opts: {
           tag: "DEBUG_LIVE_EXIT_DECISION",
           ts: new Date().toISOString(),
           symbol: market,
-          exit_reason: reasonExit,
-          unrealized_pnl_pct: pnlGross,
-          hold_minutes: holdMin,
-          trend_ok: null,
-          recovery_ok: null,
-          stop_loss_hit: /stop|loss|catastrophic|btc_weak_tight_stop/i.test(reasonExit),
-          take_profit_hit: /take_profit|partial_take_profit|trailing|breakeven/i.test(reasonExit),
+          position_id: `${market}|${p.entry_ts}`,
+          opened_at: p.entry_ts,
+          held_seconds: Math.floor(heldMs / 1000),
+          within_grace_period: withinGracePeriod,
+          entry_price: p.entry_price,
+          current_price: now,
+          peak_price_after_entry: p.highest_price_after_entry,
+          drawdown_from_peak_pct: grossPnlPct(p.highest_price_after_entry, now),
+          gross_pnl_pct: pnlGross,
+          net_pnl_pct: netPnlPctEst,
+          market_state: state.regime?.btc_filter_state ?? null,
+          exit_reason: exitBlockedByGrace ? "blocked_by_grace_period" : blockedByMicroLoss ? "blocked_by_micro_loss_guard" : reasonExit,
+          exit_reason_detail: {
+            chosen_reason: reasonExit,
+            stop_trigger_kind: stopTriggerKind,
+            fee_round_trip_pct: feeRoundTripPct,
+            fee_buffer_pct: LIVE_EXIT_FEE_BUFFER_PCT,
+            min_exit_loss_pct: LIVE_MIN_EXIT_LOSS_PCT,
+            emergency_stop_loss_pct: LIVE_EMERGENCY_STOP_LOSS_PCT,
+            grace_seconds: LIVE_EXIT_GRACE_SECONDS,
+            early_loss_guard_seconds: LIVE_EXIT_EARLY_LOSS_GUARD_SECONDS,
+          },
+          exit_blocked_by_grace_period: exitBlockedByGrace,
+          exit_allowed: exitAllowed,
+          emergency_exit: emergencyExit,
+          trend_state: null,
+          pullback_state: null,
         }),
       );
+
+      if (!exitAllowed) {
+        continue;
+      }
 
       if (intendedSellQty <= 0) {
         await appendLog({
@@ -1351,6 +1430,8 @@ export function createLiveDataStrategy(opts: {
           tag: "DEBUG_LIVE_SELL_FILLED",
           ts: new Date().toISOString(),
           symbol: market,
+          position_id: `${market}|${p.entry_ts}`,
+          opened_at: p.entry_ts,
           filled_qty: soldQty,
           filled_price: now,
           pnl_pct: netPnlPctValue,
