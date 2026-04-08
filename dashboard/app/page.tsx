@@ -991,6 +991,53 @@ export default function HomePage() {
   const tradeInitialSyncDoneRef = useRef(false);
   const prevPathnameRef = useRef<string | null>(null);
 
+  const heldLiveSymbols = useMemo(() => {
+    const out = new Set<string>();
+    const DUST_NOTIONAL_KRW = 1000;
+    for (const b of trade?.balances ?? []) {
+      if (!b || typeof b !== "object") continue;
+      const o = b as Record<string, unknown>;
+      const currency = String(o.currency ?? "").toUpperCase();
+      if (!currency || currency === "KRW") continue;
+      const qtyRaw = Number(o.balance ?? 0) + Number(o.locked ?? 0);
+      const avg = Number(o.avg_buy_price ?? 0);
+      const notionalByCost = qtyRaw * avg;
+      if (Number.isFinite(qtyRaw) && qtyRaw > 0 && notionalByCost >= DUST_NOTIONAL_KRW) out.add(`KRW-${currency}`);
+    }
+    return [...out].sort();
+  }, [trade]);
+
+  const scannerItemsExcludingHeld = useMemo(() => {
+    const before = Array.isArray(scanner?.items) ? scanner!.items : [];
+    const held = new Set(heldLiveSymbols);
+    const after = before.filter((it) => !held.has(it.market));
+    const excluded = before.filter((it) => held.has(it.market)).map((it) => it.market);
+    return { before, after, excluded };
+  }, [scanner, heldLiveSymbols]);
+
+  useEffect(() => {
+    if (!scanner?.items?.length) return;
+    try {
+      const beforeSymbols = scannerItemsExcludingHeld.before.map((x) => x.market).slice(0, 50);
+      const afterSymbols = scannerItemsExcludingHeld.after.map((x) => x.market).slice(0, 50);
+      const excludedSymbols = scannerItemsExcludingHeld.excluded.slice(0, 50);
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_SCANNER_EXCLUDING_HELD",
+          ts: new Date().toISOString(),
+          held_symbols: heldLiveSymbols,
+          scanner_symbols_before: beforeSymbols,
+          scanner_symbols_after: afterSymbols,
+          excluded_held_symbols: excludedSymbols,
+          before_count: scannerItemsExcludingHeld.before.length,
+          after_count: scannerItemsExcludingHeld.after.length,
+        }),
+      );
+    } catch {
+      // ignore logging failures
+    }
+  }, [scanner?.updated_at, heldLiveSymbols.join(","), scannerItemsExcludingHeld.before.length, scannerItemsExcludingHeld.after.length]);
+
   useEffect(() => {
     const prev = prevPathnameRef.current;
     prevPathnameRef.current = pathname;
@@ -1977,7 +2024,7 @@ export default function HomePage() {
             갱신 {scanner?.updated_at ? formatTsLocal(scanner.updated_at) : "-"}
           </div>
         </div>
-        {scanner?.items?.length ? (
+        {scannerItemsExcludingHeld.after.length ? (
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <div
               style={{
@@ -2003,7 +2050,7 @@ export default function HomePage() {
               <span>10분후</span>
               <span>갱신</span>
             </div>
-            {scanner.items.map((it) => {
+            {scannerItemsExcludingHeld.after.map((it) => {
               const reasonsText = it.exclude_reasons?.slice(0, 2).join(", ");
               const statusLabel =
                 it.status === "제외" && reasonsText
