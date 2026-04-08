@@ -650,10 +650,10 @@ export function createLiveDataStrategy(opts: {
 
     // entryUniverse 입력(신호/필터/완화 플래그) 가시화 — 스캐너 이후 단계가 왜 조용한지 판별.
     const marketsWithSignal = Array.from(latestAllSignals.keys()).slice(0, 40);
-    const marketsWithFilterPass = Array.from(latestAllSignals.entries())
+    const filterPassCandidates = Array.from(latestAllSignals.entries())
       .filter(([, s]) => Boolean(s?.p?.filter_pass))
-      .map(([m]) => m)
-      .slice(0, 40);
+      .map(([m]) => m);
+    const marketsWithFilterPass = filterPassCandidates.slice(0, 40);
     const marketsWithScore = topSignals.slice(0, 12).map((x) => `${x.market}:${x.score.toFixed(1)}`);
     const relaxedFlagCounts = Array.from(latestAllSignals.values()).reduce(
       (acc, s) => {
@@ -685,6 +685,19 @@ export function createLiveDataStrategy(opts: {
         markets_with_filter_pass: marketsWithFilterPass,
         markets_with_score: marketsWithScore,
         relaxed_flag_counts: relaxedFlagCounts,
+      }),
+    );
+
+    // filter_pass 후보가 downstream 입력으로 실제로 핸드오프되는지 진단.
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_FILTER_PASS_HANDOFF",
+        ts: new Date().toISOString(),
+        filter_pass_count: filterPassCount,
+        filter_pass_symbols: marketsWithFilterPass.slice(0, 10),
+        source_array_name: "filterPassCandidates",
+        watch_markets_count: watchMarkets.length,
+        watch_markets_symbols: watchMarkets.slice(0, 10),
       }),
     );
 
@@ -727,7 +740,41 @@ export function createLiveDataStrategy(opts: {
       }),
     );
 
-    const tickerRows = await fetchTickers(watchMarkets, { debugCaller: "live-strategy" });
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_TICKER_FETCH_START",
+        ts: new Date().toISOString(),
+        stage: "after_scanner_before_tickers",
+        requested_count: watchMarkets.length,
+        requested_symbols: watchMarkets.slice(0, 12),
+      }),
+    );
+    let tickerRows: Awaited<ReturnType<typeof fetchTickers>> = [];
+    try {
+      tickerRows = await fetchTickers(watchMarkets, { debugCaller: "live-strategy" });
+    } catch (e) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_TICKER_FETCH_ERROR",
+          ts: new Date().toISOString(),
+          stage: "after_scanner_before_tickers",
+          reason: "fetch_tickers_throw",
+          error_message: e instanceof Error ? e.message : String(e),
+          requested_symbols: watchMarkets.slice(0, 30),
+        }),
+      );
+      throw e;
+    }
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_TICKER_FETCH_DONE",
+        ts: new Date().toISOString(),
+        stage: "after_scanner_after_tickers",
+        requested_count: watchMarkets.length,
+        ticker_rows_count: tickerRows.length,
+        ticker_symbols: tickerRows.map((r) => r.market).slice(0, 12),
+      }),
+    );
     const priceBy = new Map(tickerRows.map((r) => [r.market, r.trade_price]));
     const changeRateBy = new Map(tickerRows.map((r) => [r.market, Number(r.signed_change_rate ?? 0)]));
     const btcChange = Number(changeRateBy.get("KRW-BTC") ?? 0);
@@ -1348,8 +1395,35 @@ export function createLiveDataStrategy(opts: {
     }
 
     const exceptionSlot = state.regime?.exception_slot_market ?? null;
-    const baseEntryUniverse = Array.from(
-      new Set([...MARKETS, ...(exceptionSlot ? [exceptionSlot] : []), ...debugUniverseExtra]),
+    const fallbackUsed = filterPassCandidates.length === 0;
+    const inputSourceKind = fallbackUsed ? "legacy_fallback" : "filter_pass_primary";
+    const primary = fallbackUsed ? watchMarkets : filterPassCandidates;
+    const baseEntryUniverseInput = Array.from(new Set([...primary, ...(exceptionSlot ? [exceptionSlot] : []), ...debugUniverseExtra]));
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_ENTRY_INPUT_SOURCE",
+        ts: new Date().toISOString(),
+        stage: "before_base_entry_universe",
+        input_source_kind: inputSourceKind,
+        input_count: baseEntryUniverseInput.length,
+        input_symbols: baseEntryUniverseInput.slice(0, 12),
+        filter_pass_count: filterPassCandidates.length,
+        fallback_used: fallbackUsed,
+        note: fallbackUsed
+          ? "filter_pass_candidates empty → fallback to watchMarkets"
+          : "primary=filter_pass_candidates + secondary(exceptionSlot, debugUniverseExtra)",
+      }),
+    );
+    const baseEntryUniverse = baseEntryUniverseInput;
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_BASE_ENTRY_UNIVERSE_CREATED",
+        ts: new Date().toISOString(),
+        stage: "after_base_entry_universe",
+        source_input_kind: inputSourceKind,
+        base_entry_universe_count: baseEntryUniverse.length,
+        base_entry_universe_symbols: baseEntryUniverse.slice(0, 12),
+      }),
     );
     const openStrategyMarkets = new Set(Object.keys(state.positions));
     const heldMeaningfulMarkets = new Set<string>();
