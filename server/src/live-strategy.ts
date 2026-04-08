@@ -618,6 +618,85 @@ export function createLiveDataStrategy(opts: {
       }),
     );
 
+    // entryUniverse 입력(신호/필터/완화 플래그) 가시화 — 스캐너 이후 단계가 왜 조용한지 판별.
+    const marketsWithSignal = Array.from(latestAllSignals.keys()).slice(0, 40);
+    const marketsWithFilterPass = Array.from(latestAllSignals.entries())
+      .filter(([, s]) => Boolean(s?.p?.filter_pass))
+      .map(([m]) => m)
+      .slice(0, 40);
+    const marketsWithScore = topSignals.slice(0, 12).map((x) => `${x.market}:${x.score.toFixed(1)}`);
+    const relaxedFlagCounts = Array.from(latestAllSignals.values()).reduce(
+      (acc, s) => {
+        const p = s?.p;
+        if (!p) return acc;
+        if (p.would_pass_with_pullback_relaxed) acc.pullback_relaxed += 1;
+        if (p.would_pass_with_vol_close_relaxed_a) acc.vol_close_relaxed_a += 1;
+        if (p.would_pass_with_breakout_relaxed_a) acc.breakout_relaxed_a += 1;
+        if (p.pair_pass_breakout_b_and_pullback_relaxed) acc.pair_breakout_pullback += 1;
+        if (p.pair_pass_breakout_b_and_vol_close_a) acc.pair_breakout_volclose += 1;
+        return acc;
+      },
+      {
+        pullback_relaxed: 0,
+        vol_close_relaxed_a: 0,
+        breakout_relaxed_a: 0,
+        pair_breakout_pullback: 0,
+        pair_breakout_volclose: 0,
+      },
+    );
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_ENTRY_UNIVERSE_INPUT",
+        ts: new Date().toISOString(),
+        watch_markets_count: watchMarkets.length,
+        signal_map_count: signalMapCount,
+        filter_pass_count: filterPassCount,
+        markets_with_signal: marketsWithSignal,
+        markets_with_filter_pass: marketsWithFilterPass,
+        markets_with_score: marketsWithScore,
+        relaxed_flag_counts: relaxedFlagCounts,
+      }),
+    );
+
+    // filter_pass=false가 많은 경우, 어떤 하위 필터가 가장 자주 실패하는지 집계(원인 계수화).
+    const filterFailBreakdown = (() => {
+      const out = {
+        volume_failed_count: 0,
+        breakout_failed_count: 0,
+        trend_failed_count: 0,
+        vol_close_failed_count: 0,
+        pullback_failed_count: 0,
+        data_failed_count: 0,
+        other_failed_count: 0,
+        samples: [] as string[],
+      };
+      for (const [m, s] of latestAllSignals.entries()) {
+        const p = s?.p;
+        const filters = Array.isArray(p?.filters) ? p.filters : [];
+        if (filters.length === 0) continue;
+        const failed = filters.filter((f: any) => f && f.passed === false).map((f: any) => String(f.id));
+        if (failed.length === 0) continue;
+        for (const id of failed) {
+          if (id.includes("volume_increase")) out.volume_failed_count += 1;
+          else if (id.includes("box_breakout")) out.breakout_failed_count += 1;
+          else if (id.includes("pullback")) out.pullback_failed_count += 1;
+          else if (id.includes("vol") && id.includes("close")) out.vol_close_failed_count += 1;
+          else if (id.includes("data")) out.data_failed_count += 1;
+          else if (id.includes("trend") || id.includes("ema")) out.trend_failed_count += 1;
+          else out.other_failed_count += 1;
+        }
+        if (out.samples.length < 8) out.samples.push(`${m}:${failed.slice(0, 3).join(",")}`);
+      }
+      return out;
+    })();
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_FILTER_PASS_BREAKDOWN",
+        ts: new Date().toISOString(),
+        ...filterFailBreakdown,
+      }),
+    );
+
     const tickerRows = await fetchTickers(watchMarkets, { debugCaller: "live-strategy" });
     const priceBy = new Map(tickerRows.map((r) => [r.market, r.trade_price]));
     const changeRateBy = new Map(tickerRows.map((r) => [r.market, Number(r.signed_change_rate ?? 0)]));
@@ -1254,6 +1333,11 @@ export function createLiveDataStrategy(opts: {
         signal_map_count: signalMapCount,
         entry_universe_count: entryUniverse.length,
         first_symbols: entryUniverse.slice(0, 8),
+        entry_universe_symbols: entryUniverse.slice(0, 5),
+        dropped_symbols_with_reason: baseEntryUniverse
+          .filter((m) => !entryUniverse.includes(m))
+          .map((m) => ({ symbol: m, reason: heldMeaningfulMarkets.has(m) ? "held_meaningful" : "filtered" }))
+          .slice(0, 20),
       }),
     );
 
