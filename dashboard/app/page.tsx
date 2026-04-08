@@ -1015,6 +1015,37 @@ export default function HomePage() {
     return { before, after, excluded };
   }, [scanner, heldLiveSymbols]);
 
+  const accountPositionsCount = heldLiveSymbols.length;
+  const ap = useMemo(() => accountPortfolioForKpi(trade?.account_portfolio ?? null), [trade]);
+  const accountTotalEquity = Number(ap?.krw_total_krw ?? trade?.total_krw ?? trade?.krw_available ?? 0);
+  const accountAvailableKrw = Number(ap?.krw_available_krw ?? trade?.krw_available ?? 0);
+  const accountPnlKrw = Number(ap?.net_pnl_krw ?? 0);
+  const accountPnlPct = Number(ap?.net_return_pct ?? 0);
+
+  const strategyOpenPositions = useMemo(() => {
+    const ops = strategy?.open_positions ?? {};
+    return Object.values(ops).filter((p) => Number((p as { remaining_qty?: unknown } | null | undefined)?.remaining_qty ?? 0) > 0).length;
+  }, [strategy]);
+  const strategyMaxPositions = Math.max(1, Math.floor(Number(strategy?.max_positions ?? 6)));
+  const strategyRemainingSlots = Math.max(0, strategyMaxPositions - strategyOpenPositions);
+  const strategyUsableKrw = Math.max(0, Number(strategy?.strategy_available_krw ?? 0));
+  const perPositionBudgetKrw = Math.floor((strategyUsableKrw * 0.9) / Math.max(1, strategyMaxPositions));
+  const strategyCurrentUsedKrw = strategyOpenPositions * perPositionBudgetKrw;
+  const strategyMaxNeededKrw = strategyMaxPositions * perPositionBudgetKrw;
+  const entryPossible = strategyRemainingSlots > 0 && strategyUsableKrw >= perPositionBudgetKrw && perPositionBudgetKrw > 0;
+  const blockReason: "slot" | "fund" | "condition" | "none" = (() => {
+    if (strategyRemainingSlots <= 0) return "slot";
+    if (!(strategyUsableKrw >= perPositionBudgetKrw) || perPositionBudgetKrw <= 0) return "fund";
+    if (scannerItemsExcludingHeld.after.length === 0) return "condition";
+    return "none";
+  })();
+  const engineStatusLine = (() => {
+    if (blockReason === "slot") return "슬롯 부족으로 신규 진입 차단";
+    if (blockReason === "fund") return "자금 부족으로 신규 진입 차단";
+    if (blockReason === "condition") return "진입 조건 미충족";
+    return "신규 진입 가능 상태";
+  })();
+
   useEffect(() => {
     if (!scanner?.items?.length) return;
     try {
@@ -1037,6 +1068,34 @@ export default function HomePage() {
       // ignore logging failures
     }
   }, [scanner?.updated_at, heldLiveSymbols.join(","), scannerItemsExcludingHeld.before.length, scannerItemsExcludingHeld.after.length]);
+
+  useEffect(() => {
+    try {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_UI_ACCOUNT_STRATEGY_SPLIT",
+          ts: new Date().toISOString(),
+          account_positions_count: accountPositionsCount,
+          strategy_open_positions: strategyOpenPositions,
+          strategy_max_positions: strategyMaxPositions,
+          available_krw: accountAvailableKrw,
+          per_position_budget_krw: perPositionBudgetKrw,
+          entry_possible: entryPossible,
+          block_reason: blockReason,
+        }),
+      );
+    } catch {
+      // ignore logging failures
+    }
+  }, [
+    accountPositionsCount,
+    strategyOpenPositions,
+    strategyMaxPositions,
+    accountAvailableKrw,
+    perPositionBudgetKrw,
+    entryPossible,
+    blockReason,
+  ]);
 
   useEffect(() => {
     const prev = prevPathnameRef.current;
@@ -1806,7 +1865,64 @@ export default function HomePage() {
       </section>
 
       <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>
-        보유 자산
+        계좌 상태
+      </section>
+      <section
+        style={{
+          background: UI.cardBg,
+          border: `1px solid ${UI.border}`,
+          borderRadius: 12,
+          padding: "0.8rem 1rem",
+          marginBottom: "0.85rem",
+          boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.32)",
+        }}
+      >
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, fontSize: "0.78rem", color: UI.body }}>
+          <div>총 자산: <strong>{Math.round(accountTotalEquity).toLocaleString()}</strong></div>
+          <div>보유 종목 수: <strong>{accountPositionsCount}</strong></div>
+          <div>가용 현금: <strong>{Math.round(accountAvailableKrw).toLocaleString()}</strong></div>
+          <div>
+            평가손익:{" "}
+            <strong style={{ color: accountPnlKrw >= 0 ? UI.pass : UI.fail }}>
+              {Math.round(accountPnlKrw).toLocaleString()} ({accountPnlPct.toFixed(2)}%)
+            </strong>
+          </div>
+        </div>
+      </section>
+
+      <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>
+        전략 운용 상태
+      </section>
+      <section
+        style={{
+          background: UI.cardBg,
+          border: `1px solid ${UI.border}`,
+          borderRadius: 12,
+          padding: "0.8rem 1rem",
+          marginBottom: "1.05rem",
+          boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.32)",
+        }}
+      >
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, fontSize: "0.78rem", color: UI.body }}>
+          <div>사용 중 슬롯: <strong>{strategyOpenPositions}/{strategyMaxPositions}</strong></div>
+          <div>남은 슬롯: <strong>{strategyRemainingSlots}</strong></div>
+          <div>종목당 투자금: <strong>{Math.round(perPositionBudgetKrw).toLocaleString()}</strong></div>
+          <div>현재 사용 자금: <strong>{Math.round(strategyCurrentUsedKrw).toLocaleString()}</strong></div>
+          <div>최대 필요 자금: <strong>{Math.round(strategyMaxNeededKrw).toLocaleString()}</strong></div>
+          <div>
+            신규 진입 가능 여부:{" "}
+            <strong style={{ color: entryPossible ? UI.pass : UI.fail }}>
+              {entryPossible ? "YES" : "NO"}
+            </strong>
+          </div>
+        </div>
+        <div style={{ marginTop: 8, fontSize: "0.78rem", color: UI.mutedSoft }}>
+          엔진 상태: <strong style={{ color: entryPossible ? UI.pass : UI.watch }}>{engineStatusLine}</strong>
+        </div>
+      </section>
+
+      <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>
+        계좌 보유 종목 (Account Holdings)
       </section>
       <section
         style={{
