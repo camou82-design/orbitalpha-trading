@@ -112,6 +112,10 @@ function logPumpScannerDebug(payload: Record<string, unknown>) {
   console.info(JSON.stringify({ tag: "DEBUG_PAPER_PUMP_SCANNER", ts: new Date().toISOString(), ...payload }));
 }
 
+function emitPaper(tag: string, payload: Record<string, unknown> = {}) {
+  console.info(JSON.stringify({ tag, ts: new Date().toISOString(), ...payload }));
+}
+
 export function createPaperTradingEngine(opts: {
   companyId: string;
   serviceId: string;
@@ -429,6 +433,10 @@ export function createPaperTradingEngine(opts: {
 
   const tick = async () => {
     const scannerSignals = opts.getScannerSignals();
+    emitPaper("DEBUG_PAPER_SIGNAL_HANDOFF", {
+      scanner_signals_length: scannerSignals.length,
+      markets: scannerSignals.map((s) => String((s as any)?.market ?? "")).filter((m) => m).slice(0, 50),
+    });
     const latestSignalByMarket = new Map<
       string,
       {
@@ -501,8 +509,20 @@ export function createPaperTradingEngine(opts: {
     const entryScale = btcTier === "weak" ? PAPER_BTC_WEAK_ENTRY_SCALE : btcTier === "neutral" ? PAPER_BTC_NEUTRAL_ENTRY_SCALE : 1;
 
     const orderedSignals = Array.from(latestSignalByMarket.entries()).sort((a, b) => b[1].score - a[1].score);
+    emitPaper("DEBUG_PAPER_ENTRY_UNIVERSE_CREATED", {
+      ordered_signals_length: orderedSignals.length,
+      symbols: orderedSignals.map(([m]) => m).slice(0, 50),
+    });
     for (const [market, sig] of orderedSignals) {
       const px = priceByMarket[market] ?? 0;
+      emitPaper("DEBUG_PAPER_PRECHECK_ENTER", {
+        market,
+        early_entry_eligible: sig.early_entry_eligible,
+        volume_multiple: sig.volume_multiple,
+        price: px,
+        open_positions: Object.keys(state.positions).length,
+        max_positions: PAPER_MAX_OPEN,
+      });
 
       if (!state.seenSignalKeys.has(sig.key)) {
         state.seenSignalKeys.add(sig.key);
@@ -539,19 +559,52 @@ export function createPaperTradingEngine(opts: {
       }
 
       const lifeEntry = getLifecycle(market);
-      if (lifeEntry.cooldown_until_ts && Date.now() < Date.parse(lifeEntry.cooldown_until_ts)) continue;
+      if (lifeEntry.cooldown_until_ts && Date.now() < Date.parse(lifeEntry.cooldown_until_ts)) {
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "cooldown_active", stage: "ordered_signals_loop" });
+        continue;
+      }
 
-      if (state.positions[market]) continue;
-      if (Object.keys(state.positions).length >= PAPER_MAX_OPEN) continue;
+      if (state.positions[market]) {
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "already_open", stage: "ordered_signals_loop" });
+        continue;
+      }
+      if (Object.keys(state.positions).length >= PAPER_MAX_OPEN) {
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "max_open_positions", stage: "ordered_signals_loop" });
+        continue;
+      }
 
       const volOk = sig.volume_multiple > SURGE_EARLY_VOLUME_RATIO_MIN;
-      if (!sig.early_entry_eligible || !volOk) continue;
-      if (!(px > 0)) continue;
+      if (!sig.early_entry_eligible) {
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "early_entry_not_eligible", stage: "ordered_signals_loop" });
+        continue;
+      }
+      if (!volOk) {
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", {
+          market,
+          reason: "volume_ratio_below_min",
+          stage: "ordered_signals_loop",
+          volume_multiple: sig.volume_multiple,
+          volume_min: SURGE_EARLY_VOLUME_RATIO_MIN,
+        });
+        continue;
+      }
+      if (!(px > 0)) {
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "invalid_or_missing_price", stage: "ordered_signals_loop" });
+        continue;
+      }
 
       const earlyAmount = Math.max(5_000, Math.floor(PAPER_ENTRY_KRW_PER_TRADE * SURGE_EARLY_ALLOC_RATIO * entryScale));
       const earlyNote = `early_entry:surge_30pct|vr=${sig.volume_multiple.toFixed(3)}|score=${sig.score}|btc_scale=${entryScale}`;
+      emitPaper("DEBUG_PAPER_ORDER_ATTEMPT", { market, order_krw: earlyAmount, stage: "early_entry" });
       const b = paperBuy(market, sig.signal_strength, px, earlyNote, earlyAmount);
       if (b.ok) {
+        const filled = (state.positions as any)[market] as any;
+        emitPaper("DEBUG_PAPER_ORDER_FILLED", {
+          market,
+          qty: Number(filled?.qty ?? 0),
+          price: Number(filled?.entry_price ?? px),
+          stage: "early_entry",
+        });
         logPumpScannerDebug({
           early_entry_triggered: true,
           market,
@@ -561,6 +614,7 @@ export function createPaperTradingEngine(opts: {
           early_krw: earlyAmount,
         });
       } else {
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: b.reason ?? "unknown", stage: "paperBuy" });
         appendHistory({
           ts: new Date().toISOString(),
           market,
