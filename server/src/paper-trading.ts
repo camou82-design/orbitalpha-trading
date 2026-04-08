@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { tradingDataRoot } from "./paths.js";
 import { UPBIT_FEE_RATE } from "./strategy-risk-config.js";
-import { fetchTickers } from "./upbit-public.js";
+import { fetchMinuteCandles, fetchTickers } from "./upbit-public.js";
 
 type PaperStateValue = "SIGNAL" | "OPEN" | "PARTIAL_EXIT" | "CLOSED_WIN" | "CLOSED_LOSS" | "CLOSED_TIMEOUT" | "SKIPPED";
 
@@ -14,6 +14,10 @@ type PaperPosition = {
   invested_krw: number;
   buy_fee_krw: number;
   signal_strength: string;
+  position_stage?: "early_active" | "normal_active";
+  signal_ts?: string | null;
+  signal_price?: number | null;
+  entry_recent_high?: number | null;
   take_profit_partial_done?: boolean;
   take_profit_second_done?: boolean;
   peak_price?: number;
@@ -52,11 +56,67 @@ type MarketLifecycle = {
   cooldown_until_ts?: string;
   candidate_score?: number;
   last_reason?: string;
+  first_seen_ts?: string;
+  first_seen_price?: number;
+  last_local_high?: number;
 };
 
 const PAPER_START_KRW = 500_000;
 const PAPER_ENTRY_KRW_PER_TRADE = 45_000;
 const PAPER_MAX_OPEN = 2;
+
+// --- Paper entry timing (early-first) ---
+const PAPER_ENTRY_SIGNAL_STALE_SECONDS = (() => {
+  const raw = process.env.PAPER_ENTRY_SIGNAL_STALE_SECONDS;
+  const n = raw === undefined || raw === "" ? 90 : Number(raw);
+  return Number.isFinite(n) ? Math.max(15, Math.min(600, Math.floor(n))) : 90;
+})();
+const PAPER_MAX_CHASE_FROM_SIGNAL_PCT = (() => {
+  const raw = process.env.PAPER_MAX_CHASE_FROM_SIGNAL_PCT;
+  const n = raw === undefined || raw === "" ? 0.8 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0.1, Math.min(8, n)) : 0.8;
+})();
+/** (high-now)/high*100 < 이 값이면 고점 추격으로 간주, 진입 차단 */
+const PAPER_MAX_ENTRY_NEAR_HIGH_PCT = (() => {
+  const raw = process.env.PAPER_MAX_ENTRY_NEAR_HIGH_PCT;
+  const n = raw === undefined || raw === "" ? 0.25 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0.05, Math.min(3, n)) : 0.25;
+})();
+const PAPER_EARLY_ENTRY_MAX_OPEN = (() => {
+  const raw = process.env.PAPER_EARLY_ENTRY_MAX_OPEN;
+  const n = raw === undefined || raw === "" ? 2 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0, Math.min(5, Math.floor(n))) : 2;
+})();
+const PAPER_EARLY_ENTRY_MIN_VOLUME_RATIO = (() => {
+  const raw = process.env.PAPER_EARLY_ENTRY_MIN_VOLUME_RATIO;
+  const n = raw === undefined || raw === "" ? 1.2 : Number(raw);
+  return Number.isFinite(n) ? Math.max(1.0, Math.min(6, n)) : 1.2;
+})();
+const PAPER_EARLY_ENTRY_MAX_SIGNAL_SECONDS = (() => {
+  const raw = process.env.PAPER_EARLY_ENTRY_MAX_SIGNAL_SECONDS;
+  const n = raw === undefined || raw === "" ? 20 : Number(raw);
+  return Number.isFinite(n) ? Math.max(5, Math.min(120, Math.floor(n))) : 20;
+})();
+const PAPER_EARLY_ENTRY_FAIL_SECONDS = (() => {
+  const raw = process.env.PAPER_EARLY_ENTRY_FAIL_SECONDS;
+  const n = raw === undefined || raw === "" ? 45 : Number(raw);
+  return Number.isFinite(n) ? Math.max(10, Math.min(300, Math.floor(n))) : 45;
+})();
+const PAPER_EARLY_ENTRY_FAIL_LOSS_PCT = (() => {
+  const raw = process.env.PAPER_EARLY_ENTRY_FAIL_LOSS_PCT;
+  const n = raw === undefined || raw === "" ? -0.5 : Number(raw);
+  return Number.isFinite(n) ? Math.max(-5, Math.min(-0.1, n)) : -0.5;
+})();
+const PAPER_EARLY_PROMOTION_PCT = (() => {
+  const raw = process.env.PAPER_EARLY_PROMOTION_PCT;
+  const n = raw === undefined || raw === "" ? 0.4 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0.1, Math.min(3, n)) : 0.4;
+})();
+const PAPER_EARLY_PROMOTION_MAX_SECONDS = (() => {
+  const raw = process.env.PAPER_EARLY_PROMOTION_MAX_SECONDS;
+  const n = raw === undefined || raw === "" ? 60 : Number(raw);
+  return Number.isFinite(n) ? Math.max(10, Math.min(300, Math.floor(n))) : 60;
+})();
 /** pump 스캐너 1차 선진입 비중 · 2차 돌파 추격 비중 */
 const SURGE_EARLY_ALLOC_RATIO = 0.3;
 const SURGE_ADD_ALLOC_RATIO = 0.7;
@@ -479,6 +539,13 @@ export function createPaperTradingEngine(opts: {
       const life = getLifecycle(market);
       if (life.state === "cooldown" && life.cooldown_until_ts && Date.now() < Date.parse(life.cooldown_until_ts)) continue;
       if (life.state === "cooldown") setLifecycle(market, "idle");
+      if (!life.first_seen_ts) {
+        setLifecycle(market, life.state, {
+          first_seen_ts: new Date().toISOString(),
+          first_seen_price: undefined,
+          last_local_high: undefined,
+        });
+      }
       watchMarkets.add(market);
     }
 
@@ -513,6 +580,44 @@ export function createPaperTradingEngine(opts: {
       ordered_signals_length: orderedSignals.length,
       symbols: orderedSignals.map(([m]) => m).slice(0, 50),
     });
+
+    // 0) Manage early-active positions: promote or fast-cut before evaluating new entries
+    for (const p of Object.values(state.positions)) {
+      if (p.signal_strength !== "SURGE_SCANNER") continue;
+      if (p.position_stage !== "early_active") continue;
+      const px = priceByMarket[p.market] ?? 0;
+      if (!(px > 0)) continue;
+      const heldSec = Math.max(0, Math.floor((Date.now() - Date.parse(p.entry_ts)) / 1000));
+      const grossPct = ((px / p.entry_price) - 1) * 100;
+      const life = getLifecycle(p.market);
+      const recentHigh = Number(p.entry_recent_high ?? life.last_local_high ?? 0);
+      const breakoutNow = recentHigh > 0 ? px >= recentHigh : false;
+      const promoteNow = breakoutNow || grossPct >= PAPER_EARLY_PROMOTION_PCT || heldSec >= PAPER_EARLY_PROMOTION_MAX_SECONDS;
+      if (promoteNow) {
+        p.position_stage = "normal_active";
+        emitPaper("DEBUG_PAPER_EARLY_ENTRY_EXIT", {
+          market: p.market,
+          early_entry_fail_triggered: false,
+          exit_reason: "promoted_to_normal",
+          held_seconds: heldSec,
+          pnl_gross_pct: Number(grossPct.toFixed(4)),
+        });
+        continue;
+      }
+      const failByTime = heldSec >= PAPER_EARLY_ENTRY_FAIL_SECONDS;
+      const failByLoss = grossPct <= PAPER_EARLY_ENTRY_FAIL_LOSS_PCT;
+      if (failByTime || failByLoss) {
+        emitPaper("DEBUG_PAPER_EARLY_ENTRY_EXIT", {
+          market: p.market,
+          early_entry_fail_triggered: true,
+          exit_reason: failByLoss ? "early_fail_loss" : "early_breakout_failed",
+          held_seconds: heldSec,
+          pnl_gross_pct: Number(grossPct.toFixed(4)),
+        });
+        paperSell(p.market, px, "CLOSED_LOSS", failByLoss ? "paper_early_fail_loss" : "paper_early_breakout_failed");
+      }
+    }
+
     for (const [market, sig] of orderedSignals) {
       const px = priceByMarket[market] ?? 0;
       emitPaper("DEBUG_PAPER_PRECHECK_ENTER", {
@@ -573,29 +678,138 @@ export function createPaperTradingEngine(opts: {
         continue;
       }
 
-      const volOk = sig.volume_multiple > SURGE_EARLY_VOLUME_RATIO_MIN;
-      if (!sig.early_entry_eligible) {
-        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "early_entry_not_eligible", stage: "ordered_signals_loop" });
-        continue;
-      }
-      if (!volOk) {
-        emitPaper("DEBUG_PAPER_BLOCK_REASON", {
-          market,
-          reason: "volume_ratio_below_min",
-          stage: "ordered_signals_loop",
-          volume_multiple: sig.volume_multiple,
-          volume_min: SURGE_EARLY_VOLUME_RATIO_MIN,
-        });
-        continue;
-      }
       if (!(px > 0)) {
         emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "invalid_or_missing_price", stage: "ordered_signals_loop" });
         continue;
       }
 
+      // Timing guard inputs (signal freshness + chase + near-high + volume fade)
+      const signalTs = lifeEntry.first_seen_ts ?? null;
+      const signalPrice = Number(lifeEntry.first_seen_price ?? px);
+      const secondsSinceSignal = signalTs ? Math.max(0, Math.floor((Date.now() - Date.parse(signalTs)) / 1000)) : null;
+      let localHigh = Number(lifeEntry.last_local_high ?? 0);
+      let distanceFromLocalHighPct: number | null = null;
+      let priceChangeSinceSignalPct: number | null = null;
+      let volumeRatio1m5: number | null = null;
+      try {
+        const c1 = await fetchMinuteCandles(market, 1, 12);
+        const highs = c1.map((x: any) => Number(x.high_price ?? 0)).filter((n: number) => Number.isFinite(n) && n > 0);
+        if (highs.length > 0) localHigh = Math.max(...highs);
+        if (localHigh > 0) distanceFromLocalHighPct = ((localHigh - px) / localHigh) * 100;
+        if (signalPrice > 0) priceChangeSinceSignalPct = ((px / signalPrice) - 1) * 100;
+        if (c1.length >= 7) {
+          const last = c1[c1.length - 1] as any;
+          const prev5 = c1.slice(-6, -1) as any[];
+          const lastNotional = Number(last.candle_acc_trade_volume ?? 0) * Number(last.trade_price ?? 0);
+          const prevAvg =
+            prev5.reduce((acc, r) => acc + Number(r.candle_acc_trade_volume ?? 0) * Number(r.trade_price ?? 0), 0) /
+            Math.max(1, prev5.length);
+          if (Number.isFinite(lastNotional) && Number.isFinite(prevAvg) && prevAvg > 0) {
+            volumeRatio1m5 = lastNotional / prevAvg;
+          }
+        }
+      } catch {
+        // ignore candle failures
+      }
+      setLifecycle(market, lifeEntry.state, {
+        first_seen_ts: signalTs ?? undefined,
+        first_seen_price: signalPrice,
+        last_local_high: localHigh > 0 ? localHigh : undefined,
+      });
+
+      let timingBlockReason: string | null = null;
+      if (secondsSinceSignal !== null && secondsSinceSignal > PAPER_ENTRY_SIGNAL_STALE_SECONDS) timingBlockReason = "signal_stale";
+      else if (priceChangeSinceSignalPct !== null && priceChangeSinceSignalPct > PAPER_MAX_CHASE_FROM_SIGNAL_PCT)
+        timingBlockReason = "chase_too_high";
+      else if (distanceFromLocalHighPct !== null && distanceFromLocalHighPct < PAPER_MAX_ENTRY_NEAR_HIGH_PCT)
+        timingBlockReason = "near_high_entry";
+      else if (volumeRatio1m5 !== null && volumeRatio1m5 < 0.65) timingBlockReason = "volume_faded";
+
+      if (timingBlockReason) {
+        emitPaper("DEBUG_PAPER_ENTRY_TIMING_GUARD", {
+          market,
+          reason: timingBlockReason,
+          seconds_since_signal: secondsSinceSignal,
+          price_change_since_signal_pct: priceChangeSinceSignalPct,
+          distance_from_local_high_pct: distanceFromLocalHighPct,
+          volume_ratio: volumeRatio1m5,
+        });
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: `timing_guard:${timingBlockReason}`, stage: "ordered_signals_loop" });
+        continue;
+      }
+
+      // 1) Early entry first (aggressive)
+      const earlyMinScoreDefault = Math.max(0, sig.score - 10);
+      const earlyMinScore = (() => {
+        const raw = process.env.PAPER_EARLY_ENTRY_MIN_SCORE;
+        const n = raw === undefined || raw === "" ? earlyMinScoreDefault : Number(raw);
+        return Number.isFinite(n) ? n : earlyMinScoreDefault;
+      })();
+      const earlySlotsUsed = Object.values(state.positions).filter((p) => p.position_stage === "early_active").length;
+      const earlySlotOk = earlySlotsUsed < PAPER_EARLY_ENTRY_MAX_OPEN;
+      const earlyFreshOk = secondsSinceSignal !== null && secondsSinceSignal <= PAPER_EARLY_ENTRY_MAX_SIGNAL_SECONDS;
+      const earlyNearHighOk = distanceFromLocalHighPct !== null && distanceFromLocalHighPct <= PAPER_MAX_ENTRY_NEAR_HIGH_PCT;
+      const earlyVolOk = volumeRatio1m5 !== null && volumeRatio1m5 >= PAPER_EARLY_ENTRY_MIN_VOLUME_RATIO;
+      const earlyScoreOk = sig.score >= earlyMinScore;
+      const earlyAllowed = earlySlotOk && earlyFreshOk && earlyNearHighOk && earlyVolOk && earlyScoreOk;
+
+      emitPaper("DEBUG_PAPER_EARLY_ENTRY_DECISION", {
+        market,
+        seconds_since_signal: secondsSinceSignal,
+        price_change_since_signal_pct: priceChangeSinceSignalPct,
+        distance_from_local_high_pct: distanceFromLocalHighPct,
+        volume_ratio: volumeRatio1m5,
+        early_entry_allowed: earlyAllowed,
+        early_entry_block_reason: earlyAllowed
+          ? null
+          : !earlySlotOk
+            ? "early_slot_full"
+            : !earlyFreshOk
+              ? "signal_not_fresh"
+              : !earlyNearHighOk
+                ? "near_high_requirement_failed"
+                : !earlyVolOk
+                  ? "volume_not_strong"
+                  : !earlyScoreOk
+                    ? "score_too_low"
+                    : "unknown",
+      });
+
+      if (earlyAllowed) {
+        const earlyAmount = Math.max(5_000, Math.floor(PAPER_ENTRY_KRW_PER_TRADE * 0.4 * entryScale));
+        emitPaper("DEBUG_PAPER_ORDER_ATTEMPT", { market, order_krw: earlyAmount, stage: "paper_early_entry" });
+        const b = paperBuy(market, "SURGE_SCANNER", px, "paper_early_entry", earlyAmount);
+        if (b.ok) {
+          const filled = (state.positions as any)[market] as any;
+          if (filled) {
+            filled.position_stage = "early_active";
+            filled.signal_ts = signalTs;
+            filled.signal_price = signalPrice;
+            filled.entry_recent_high = localHigh > 0 ? localHigh : null;
+          }
+          emitPaper("DEBUG_PAPER_EARLY_ENTRY_FILLED", {
+            market,
+            order_krw: earlyAmount,
+            qty: Number(filled?.qty ?? 0),
+            price: px,
+            seconds_since_signal: secondsSinceSignal,
+            volume_ratio: volumeRatio1m5,
+          });
+          continue;
+        }
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: `paperBuy:${b.reason ?? "unknown"}`, stage: "paper_early_entry" });
+      }
+
+      // 2) normal entry fallback (only if early not allowed)
+      const volOkLegacy = sig.volume_multiple > SURGE_EARLY_VOLUME_RATIO_MIN;
+      if (!sig.early_entry_eligible || !volOkLegacy) {
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "early_not_ok_and_no_normal_path", stage: "ordered_signals_loop" });
+        continue;
+      }
+
       const earlyAmount = Math.max(5_000, Math.floor(PAPER_ENTRY_KRW_PER_TRADE * SURGE_EARLY_ALLOC_RATIO * entryScale));
       const earlyNote = `early_entry:surge_30pct|vr=${sig.volume_multiple.toFixed(3)}|score=${sig.score}|btc_scale=${entryScale}`;
-      emitPaper("DEBUG_PAPER_ORDER_ATTEMPT", { market, order_krw: earlyAmount, stage: "early_entry" });
+      emitPaper("DEBUG_PAPER_ORDER_ATTEMPT", { market, order_krw: earlyAmount, stage: "legacy_early_entry" });
       const b = paperBuy(market, sig.signal_strength, px, earlyNote, earlyAmount);
       if (b.ok) {
         const filled = (state.positions as any)[market] as any;
