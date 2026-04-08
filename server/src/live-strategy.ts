@@ -489,6 +489,21 @@ export function createLiveDataStrategy(opts: {
           live_enabled: Boolean(tstatus.live_enabled),
         }),
       );
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_EARLY_EXIT",
+          ts: new Date().toISOString(),
+          stage: "before_signal_load",
+          reason: "trade_status_guard",
+          watch_markets_count: null,
+          signal_map_count: null,
+          markets_with_filter_pass_count: null,
+          base_entry_universe_count: null,
+          entry_universe_count: null,
+          symbol: null,
+          note: "trade status guard return",
+        }),
+      );
       return;
     }
     if (state.safety_guard.state === "자동정지") {
@@ -499,6 +514,21 @@ export function createLiveDataStrategy(opts: {
           stage: "before_signal_load",
           safety_guard_state: state.safety_guard.state,
           safety_guard_reason: state.safety_guard.reason,
+        }),
+      );
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_EARLY_EXIT",
+          ts: new Date().toISOString(),
+          stage: "before_signal_load",
+          reason: "safety_guard_stopped",
+          watch_markets_count: null,
+          signal_map_count: null,
+          markets_with_filter_pass_count: null,
+          base_entry_universe_count: null,
+          entry_universe_count: null,
+          symbol: null,
+          note: String(state.safety_guard.reason ?? ""),
         }),
       );
       return;
@@ -1299,6 +1329,21 @@ export function createLiveDataStrategy(opts: {
     const openCount = Object.keys(state.positions).length;
     if (openCount >= state.safety_guard.max_positions) {
       await persist();
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_EARLY_EXIT",
+          ts: new Date().toISOString(),
+          stage: "after_entry_universe_filter",
+          reason: "max_positions_reached",
+          watch_markets_count: watchMarkets.length,
+          signal_map_count: signalMapCount,
+          markets_with_filter_pass_count: filterPassCount,
+          base_entry_universe_count: null,
+          entry_universe_count: null,
+          symbol: null,
+          note: "open positions already at cap",
+        }),
+      );
       return;
     }
 
@@ -1326,6 +1371,26 @@ export function createLiveDataStrategy(opts: {
     });
     console.info(
       JSON.stringify({
+        tag: "DEBUG_ENTRY_UNIVERSE_CREATED",
+        ts: new Date().toISOString(),
+        stage: "after_entry_universe_filter",
+        markets_with_filter_pass_count: filterPassCount,
+        markets_with_filter_pass_symbols: marketsWithFilterPass.slice(0, 10),
+        base_entry_universe_count: baseEntryUniverse.length,
+        base_entry_universe_symbols: baseEntryUniverse.slice(0, 10),
+        entry_universe_count: entryUniverse.length,
+        entry_universe_symbols: entryUniverse.slice(0, 5),
+        dropped_symbols_with_reason: baseEntryUniverse
+          .filter((m) => !entryUniverse.includes(m))
+          .map((m) => ({
+            symbol: m,
+            reason: heldMeaningfulMarkets.has(m) ? "held" : "excluded",
+          }))
+          .slice(0, 20),
+      }),
+    );
+    console.info(
+      JSON.stringify({
         tag: "DEBUG_LIVE_STAGE_TRACE",
         ts: new Date().toISOString(),
         stage: "entry_universe_created",
@@ -1340,6 +1405,24 @@ export function createLiveDataStrategy(opts: {
           .slice(0, 20),
       }),
     );
+
+    if (entryUniverse.length === 0) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_EARLY_EXIT",
+          ts: new Date().toISOString(),
+          stage: "after_entry_universe_filter",
+          reason: "entry_universe_empty",
+          watch_markets_count: watchMarkets.length,
+          signal_map_count: signalMapCount,
+          markets_with_filter_pass_count: filterPassCount,
+          base_entry_universe_count: baseEntryUniverse.length,
+          entry_universe_count: 0,
+          symbol: null,
+          note: "no symbols left for precheck loop",
+        }),
+      );
+    }
 
     const accountHoldSnapshot: Record<string, { qty: number; value_krw: number; meaningful: boolean }> = {};
     for (const b of Array.isArray(tstatus.balances) ? tstatus.balances : []) {
@@ -1442,6 +1525,23 @@ export function createLiveDataStrategy(opts: {
           }),
         );
       };
+
+      // precheck 루프 진입 강제 로그 (이게 없으면 entryUniverse가 비었거나 루프 전에서 끊긴 것)
+      const sigPre = latestAllSignals.get(market);
+      const gatePre = sigPre ? opts.marketState.entryGate(sigPre.p, marketState) : null;
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_PRECHECK_ENTER",
+          ts: new Date().toISOString(),
+          stage: "precheck_enter",
+          symbol: market,
+          entry_score: gatePre ? Number(gatePre.score ?? 0) : null,
+          market_state: marketState.market_state,
+          position_exists: Boolean(state.positions[market]),
+          open_positions: Object.keys(state.positions).length,
+          max_positions: state.safety_guard.max_positions,
+        }),
+      );
       const acctSnap = accountHoldSnapshot[market];
       console.info(
         JSON.stringify({
@@ -1460,25 +1560,25 @@ export function createLiveDataStrategy(opts: {
       if (Object.keys(state.positions).length >= state.safety_guard.max_positions) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "max_positions_reached" });
         bumpSkip("max_positions_reached");
+        console.info(
+          JSON.stringify({
+            tag: "DEBUG_LIVE_EARLY_EXIT",
+            ts: new Date().toISOString(),
+            stage: "inside_precheck_loop",
+            reason: "break:max_positions_reached",
+            watch_markets_count: watchMarkets.length,
+            signal_map_count: signalMapCount,
+            markets_with_filter_pass_count: filterPassCount,
+            base_entry_universe_count: baseEntryUniverse.length,
+            entry_universe_count: entryUniverse.length,
+            symbol: market,
+            note: "break from loop due to max positions cap",
+          }),
+        );
         break;
       }
 
-      // PRECHECK 진입 직전 강제 로그 — 운영에서 PRECHECK 로그가 아예 안 찍히는 문제 추적용.
-      const sigPre = latestAllSignals.get(market);
-      const gatePre = sigPre ? opts.marketState.entryGate(sigPre.p, marketState) : null;
-      console.info(
-        JSON.stringify({
-          tag: "DEBUG_LIVE_PRECHECK_ENTER",
-          ts: new Date().toISOString(),
-          symbol: market,
-          market_state: marketState.market_state,
-          entry_score: gatePre ? Number(gatePre.score ?? 0) : null,
-          position_exists: Boolean(state.positions[market]),
-          max_positions: state.safety_guard.max_positions,
-          open_positions: Object.keys(state.positions).length,
-          has_signal: Boolean(sigPre),
-        }),
-      );
+      // (moved to top of loop) keep only one PRECHECK_ENTER per symbol
       if (state.positions[market]) {
         emitEval("DEBUG_LIVE_PRECHECK", {
           return_reason: "same_symbol_open_continue_entry_eval",
