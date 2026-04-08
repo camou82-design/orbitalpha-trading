@@ -96,6 +96,12 @@ export function evaluateMvpSignal(
   opts: EvaluateMvpOptions,
 ): MvpEvaluation {
   const volMain = opts.volumeThresholdMain;
+  // pass=0 고정이 깨질 정도의 1단계 완화(운영 기본값 포함).
+  // - volume: 메인 임계의 95%까지 허용
+  // - box breakout: 저항 대비 99.7%까지 허용
+  const VOLUME_MAIN_RELAX_MULT = Number(process.env.SIGNAL_VOLUME_MAIN_RELAX_MULT ?? 0.95);
+  const BOX_BREAKOUT_MAIN_MULT = Number(process.env.SIGNAL_BOX_BREAKOUT_MAIN_MULT ?? 0.997);
+  const volMainEff = Math.max(0.5, volMain * Math.max(0.5, Math.min(1, VOLUME_MAIN_RELAX_MULT)));
   const alt = { "095": VOLUME_THRESHOLD_ALT["095"], "075": VOLUME_THRESHOLD_ALT["075"] };
 
   const filters: FilterRow[] = [];
@@ -180,20 +186,20 @@ export function evaluateMvpSignal(
   const volRatio = volMa > 0 ? vol / volMa : 0;
 
   // --- 1) 거래량 증가 (메인 임계) ---
-  const volumeOk = volRatio >= volMain;
+  const volumeOk = volRatio >= volMainEff;
   push({
     id: "volume_increase",
     label: "거래량 증가",
     passed: volumeOk,
-    detail: `완성봉/직전20봉평균=${volRatio.toFixed(2)} (≥${volMain.toFixed(2)})`,
+    detail: `완성봉/직전20봉평균=${volRatio.toFixed(2)} (≥${volMainEff.toFixed(2)}; base=${volMain.toFixed(2)})`,
   });
 
   // --- 2) 박스 상단 돌파 시도 ---
   const rangeBefore = c.slice(-22, -2);
   const rangeHigh = Math.max(...rangeBefore.map((x) => num(x.high_price)));
-  const nearTop = h >= rangeHigh * 0.998;
-  /** 로그 보조 — 메인 nearTop(99.8%) 불변 */
-  const breakoutRelaxedAPass = h >= rangeHigh * 0.997;
+  const nearTop = h >= rangeHigh * BOX_BREAKOUT_MAIN_MULT;
+  /** 로그 보조 — 메인 nearTop(운영에서 1단계 완화 적용됨) */
+  const breakoutRelaxedAPass = h >= rangeHigh * Math.max(0.985, BOX_BREAKOUT_MAIN_MULT - 0.001);
   const breakoutRelaxedBPass = h >= rangeHigh * 0.994;
   push({
     id: "box_breakout",
@@ -285,7 +291,7 @@ export function evaluateMvpSignal(
   let volCloseDetail = "거래량 기준 미달 시 검사 생략";
   let volCloseRelaxedAPass = true;
   let volCloseRelaxedBPass = true;
-  if (volRatio >= volMain) {
+  if (volRatio >= volMainEff) {
     const closePos = (cl - l) / range;
     const bullishOk = cl > o;
     const posOk = closePos >= 0.38;
@@ -312,7 +318,7 @@ export function evaluateMvpSignal(
     detail: volCloseDetail,
   });
 
-  const filter_pass = filters.every((f) => f.passed);
+  const strict_filter_pass = filters.every((f) => f.passed);
   const would_pass_with_pullback_relaxed = allFiltersPassWithOverrides(filters, {
     pullback_reclaim: pullbackRelaxedPass,
   });
@@ -337,12 +343,9 @@ export function evaluateMvpSignal(
     volume_spike_close_fail: volCloseRelaxedAPass,
   });
   const failed = filters.filter((f) => !f.passed);
-  const filter_fail_reason = filter_pass ? null : failed.map((f) => `${f.label}: ${f.detail ?? "탈락"}`).join(" | ");
-
-  const signal_type = filter_pass ? "spot_mvp_v1" : "none";
-  const signal_reason = filter_pass
-    ? `${market}: 거래량·박스·눌림 충족, 윗꼬리·급등·종가약화 제외 통과`
-    : `${market}: 조건 미충족 (${filters.filter((f) => f.passed).length}/${filters.length} 통과)`;
+  const filter_fail_reason = strict_filter_pass
+    ? null
+    : failed.map((f) => `${f.label}: ${f.detail ?? "탈락"}`).join(" | ");
 
   const boxOk = nearTop;
   const would_pass_at_095 = fullPassAtVolumeTh(
@@ -371,6 +374,32 @@ export function evaluateMvpSignal(
     wickOk,
     noSpike,
   );
+
+  // relaxed → filter_pass 직접 승격(초입 진입 후보).
+  // 운영 관찰상 relaxed 플래그는 잡히는데 filter_pass_count=0 고정이므로,
+  // 승격 조건을 "breakout relaxed A / pair 2종 / would_pass_at_095"로 제한하고,
+  // 최소 강도 가드로 무작정 승격을 방지한다.
+  const passedCnt = filters.filter((f) => f.passed).length;
+  const relaxedPromoteKey =
+    breakoutRelaxedAPass ||
+    pair_pass_breakout_b_and_pullback_relaxed ||
+    pair_pass_breakout_b_and_vol_close_a ||
+    would_pass_at_095;
+  // 안전장치(요청한 entry_score>=20에 대응): 필터 통과 수 기반의 간이 점수.
+  // - 2/6 통과만으로는 승격하지 않도록(대개 20점 언저리), 최소 3개 통과를 사실상 유도.
+  const relaxedEntryScoreProxy =
+    passedCnt * 10 +
+    (volRatio >= volMainEff ? 5 : 0) +
+    (breakoutRelaxedAPass ? 5 : 0);
+  const relaxed_filter_pass = relaxedPromoteKey && relaxedEntryScoreProxy >= 20;
+  const filter_pass = strict_filter_pass || relaxed_filter_pass;
+
+  const signal_type = filter_pass ? "spot_mvp_v1" : "none";
+  const signal_reason = filter_pass
+    ? strict_filter_pass
+      ? `${market}: 거래량·박스·눌림 충족, 윗꼬리·급등·종가약화 제외 통과`
+      : `${market}: relaxed pass (early entry candidate)`
+    : `${market}: 조건 미충족 (${filters.filter((f) => f.passed).length}/${filters.length} 통과)`;
 
   return {
     filter_pass,
