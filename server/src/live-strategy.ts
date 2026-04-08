@@ -515,6 +515,17 @@ export function createLiveDataStrategy(opts: {
       );
       return;
     }
+
+    // holdings_universe: 현재 계좌 보유 종목(관리/청산/표시용). discovery/entry_universe/precheck 경로에서는 제외한다.
+    const heldSymbols = Array.from(Array.isArray(tstatus.balances) ? tstatus.balances : [])
+      .map((b: any) => {
+        const currency = String(b?.currency ?? "").toUpperCase();
+        const qty = Number(b?.balance ?? 0);
+        if (!currency || currency === "KRW" || !(qty > 0)) return null;
+        return `KRW-${currency}`;
+      })
+      .filter((x: any): x is string => Boolean(x) && String(x).startsWith("KRW-"));
+    const heldSymbolSet = new Set<string>([...heldSymbols, ...Object.keys(state.positions)]);
     if (state.safety_guard.state === "자동정지") {
       console.info(
         JSON.stringify({
@@ -663,6 +674,19 @@ export function createLiveDataStrategy(opts: {
       .filter(([, s]) => Boolean(s?.p?.filter_pass))
       .map(([m]) => m);
     const marketsWithFilterPass = filterPassCandidates.slice(0, 40);
+    const filterPassCandidatesExcludingHeld = filterPassCandidates.filter((m) => !heldSymbolSet.has(m));
+    const marketsWithFilterPassExcludingHeld = filterPassCandidatesExcludingHeld.slice(0, 40);
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_DISCOVERY_UNIVERSE_EXCLUDING_HELD",
+        ts: new Date().toISOString(),
+        held_symbols: Array.from(heldSymbolSet).slice(0, 20),
+        filter_pass_symbols: marketsWithFilterPass.slice(0, 20),
+        discovery_symbols: marketsWithFilterPassExcludingHeld.slice(0, 20),
+        excluded_held_symbols: marketsWithFilterPass.filter((m) => heldSymbolSet.has(m)).slice(0, 20),
+        discovery_count: marketsWithFilterPassExcludingHeld.length,
+      }),
+    );
     const marketsWithScore = topSignals.slice(0, 12).map((x) => `${x.market}:${x.score.toFixed(1)}`);
     const relaxedFlagCounts = Array.from(latestAllSignals.values()).reduce(
       (acc, s) => {
@@ -752,12 +776,13 @@ export function createLiveDataStrategy(opts: {
     // 진입 후보 집합(base/precheck)과 ticker fetch 집합(보유/기준가 보강)을 개념적으로 분리한다.
     const fallbackUsedForPrimary = filterPassCandidates.length === 0;
     const tickerRequestSourceKind = fallbackUsedForPrimary ? "fallback" : "filter_pass_primary";
-    const primaryForUniverse = fallbackUsedForPrimary ? watchMarkets : filterPassCandidates;
+    const watchMarketsExcludingHeld = watchMarkets.filter((m) => !heldSymbolSet.has(m));
+    const primaryForUniverse = fallbackUsedForPrimary ? watchMarketsExcludingHeld : filterPassCandidatesExcludingHeld;
     const baseInputSymbols = Array.from(
       new Set([...primaryForUniverse, ...(exceptionSlotMarket ? [exceptionSlotMarket] : []), ...debugUniverseExtra]),
     );
     // 보유 포지션 평가/표시 보강 + BTC 기준가 보강(레짐/스케일 계산용)
-    const heldExtraSymbols = Array.from(new Set(["KRW-BTC", ...Object.keys(state.positions)])).filter((m) => m.startsWith("KRW-"));
+    const heldExtraSymbols = Array.from(new Set(["KRW-BTC", ...Array.from(heldSymbolSet)])).filter((m) => m.startsWith("KRW-"));
     const tickerRequestedSymbols = Array.from(new Set([...baseInputSymbols, ...heldExtraSymbols]));
     console.info(
       JSON.stringify({
@@ -770,6 +795,8 @@ export function createLiveDataStrategy(opts: {
         ticker_requested_symbols: tickerRequestedSymbols.slice(0, 20),
         filter_pass_symbols: filterPassCandidates.slice(0, 20),
         watch_markets_symbols: watchMarkets.slice(0, 20),
+        held_symbols: Array.from(heldSymbolSet).slice(0, 20),
+        discovery_symbols: primaryForUniverse.slice(0, 20),
         open_position_symbols: Object.keys(state.positions),
       }),
     );
@@ -1209,6 +1236,21 @@ export function createLiveDataStrategy(opts: {
       const intendedSellValueKrw = intendedSellQty * now;
       const pnlNetUnit = netPnlPctPerUnit(p.entry_price, now);
 
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_EXIT_DECISION",
+          ts: new Date().toISOString(),
+          symbol: market,
+          exit_reason: reasonExit,
+          unrealized_pnl_pct: pnlGross,
+          hold_minutes: holdMin,
+          trend_ok: null,
+          recovery_ok: null,
+          stop_loss_hit: /stop|loss|catastrophic|btc_weak_tight_stop/i.test(reasonExit),
+          take_profit_hit: /take_profit|partial_take_profit|trailing|breakeven/i.test(reasonExit),
+        }),
+      );
+
       if (intendedSellQty <= 0) {
         await appendLog({
           company_id: companyIdSchema.parse(opts.companyId),
@@ -1304,6 +1346,19 @@ export function createLiveDataStrategy(opts: {
         partial_tp_at: p.partial_tp_at,
       };
       state.trades.push(row);
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_SELL_FILLED",
+          ts: new Date().toISOString(),
+          symbol: market,
+          filled_qty: soldQty,
+          filled_price: now,
+          pnl_pct: netPnlPctValue,
+          pnl_krw: Math.round(netPnlKrw),
+          exit_reason: reasonExit,
+          open_positions_after: qtyAfter <= 0 ? Math.max(0, Object.keys(state.positions).length - 1) : Object.keys(state.positions).length,
+        }),
+      );
       await opts.onEvent?.({
         timestamp: row.timestamp,
         event_type:
@@ -1407,9 +1462,9 @@ export function createLiveDataStrategy(opts: {
       return;
     }
     const exceptionSlot = state.regime?.exception_slot_market ?? null;
-    const fallbackUsed = filterPassCandidates.length === 0;
+    const fallbackUsed = filterPassCandidatesExcludingHeld.length === 0;
     const inputSourceKind = fallbackUsed ? "legacy_fallback" : "filter_pass_primary";
-    const primary = fallbackUsed ? watchMarkets : filterPassCandidates;
+    const primary = fallbackUsed ? watchMarkets.filter((m) => !heldSymbolSet.has(m)) : filterPassCandidatesExcludingHeld;
     const baseEntryUniverseInput = Array.from(new Set([...primary, ...(exceptionSlot ? [exceptionSlot] : []), ...debugUniverseExtra]));
     console.info(
       JSON.stringify({
@@ -1419,7 +1474,7 @@ export function createLiveDataStrategy(opts: {
         input_source_kind: inputSourceKind,
         input_count: baseEntryUniverseInput.length,
         input_symbols: baseEntryUniverseInput.slice(0, 12),
-        filter_pass_count: filterPassCandidates.length,
+        filter_pass_count: filterPassCandidatesExcludingHeld.length,
         fallback_used: fallbackUsed,
         note: fallbackUsed
           ? "filter_pass_candidates empty → fallback to watchMarkets"
@@ -1511,8 +1566,9 @@ export function createLiveDataStrategy(opts: {
         if (valueKrw >= EXISTING_POSITION_MIN_KRW) heldMeaningfulMarkets.add(mk);
       }
     }
-    /** 오픈 전략 심볼은 항상 후보 유니버스에 유지 (신규 진입 평가·추가 매수 판단). 거래소 의미 보유 제외만 EXCLUDE_HELD 로 적용. */
+    /** discovery_universe: 신규 급등주 탐색/진입용. 현재 보유(holdings) 종목은 제외한다. */
     const entryUniverse = baseEntryUniverse.filter((m) => {
+      if (heldSymbolSet.has(m)) return false;
       if (heldMeaningfulMarkets.has(m)) return false;
       return true;
     });
@@ -1575,6 +1631,8 @@ export function createLiveDataStrategy(opts: {
         tag: "DEBUG_ENTRY_UNIVERSE_CREATED",
         ts: new Date().toISOString(),
         stage: "after_entry_universe_filter",
+        held_symbols: Array.from(heldSymbolSet).slice(0, 20),
+        excluded_held_symbols: baseEntryUniverse.filter((m) => heldSymbolSet.has(m)).slice(0, 20),
         markets_with_filter_pass_count: filterPassCount,
         markets_with_filter_pass_symbols: marketsWithFilterPass.slice(0, 10),
         base_entry_universe_count: baseEntryUniverse.length,
@@ -1585,7 +1643,7 @@ export function createLiveDataStrategy(opts: {
           .filter((m) => !entryUniverse.includes(m))
           .map((m) => ({
             symbol: m,
-            reason: heldMeaningfulMarkets.has(m) ? "held" : "excluded",
+            reason: heldSymbolSet.has(m) ? "held" : heldMeaningfulMarkets.has(m) ? "held_meaningful" : "excluded",
           }))
           .slice(0, 20),
       }),
@@ -2205,6 +2263,7 @@ export function createLiveDataStrategy(opts: {
       const price = priceBy.get(market) ?? 0;
       const st2 = await opts.trade.status();
       const qty = Number(st2.balances?.find((b: any) => b.currency === currency)?.balance ?? 0);
+      const strategyPositionExistsBefore = Boolean(state.positions[market]);
       state.positions[market] = {
         market,
         strategy_type: strategyType,
@@ -2233,6 +2292,19 @@ export function createLiveDataStrategy(opts: {
       };
       state.daily.entry_count += 1;
       state.cooldown_until[market] = new Date(Date.now() + (isExceptionMarket ? 28 : 18) * 60_000).toISOString();
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_BUY_FILLED",
+          ts: new Date().toISOString(),
+          symbol: market,
+          order_krw: orderKrw,
+          filled_qty: qty,
+          filled_price: price,
+          strategy_position_exists_before: strategyPositionExistsBefore,
+          open_positions_after: Object.keys(state.positions).length,
+          reason: state.positions[market]?.reason_enter ?? null,
+        }),
+      );
       state.trades.push({
         timestamp: new Date().toISOString(),
         entry_ts: new Date().toISOString(),
