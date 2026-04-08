@@ -740,18 +740,36 @@ export function createLiveDataStrategy(opts: {
       }),
     );
 
+    // ticker 요청 입력 소스는 baseEntryUniverseInput과 동일하게 정렬한다.
+    const fallbackUsedForPrimary = filterPassCandidates.length === 0;
+    const tickerRequestSourceKind = fallbackUsedForPrimary ? "fallback" : "filter_pass_primary";
+    const primaryForUniverseAndTicker = fallbackUsedForPrimary ? watchMarkets : filterPassCandidates;
+    const tickerRequestedSymbols = Array.from(
+      new Set(["KRW-BTC", ...primaryForUniverseAndTicker, ...(exceptionSlotMarket ? [exceptionSlotMarket] : []), ...debugUniverseExtra]),
+    );
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_TICKER_REQUEST_SOURCE",
+        ts: new Date().toISOString(),
+        stage: "after_scanner_before_tickers",
+        source_kind: tickerRequestSourceKind,
+        requested_symbols: tickerRequestedSymbols.slice(0, 20),
+        filter_pass_symbols: filterPassCandidates.slice(0, 20),
+        watch_markets_symbols: watchMarkets.slice(0, 20),
+      }),
+    );
     console.info(
       JSON.stringify({
         tag: "DEBUG_TICKER_FETCH_START",
         ts: new Date().toISOString(),
         stage: "after_scanner_before_tickers",
-        requested_count: watchMarkets.length,
-        requested_symbols: watchMarkets.slice(0, 12),
+        requested_count: tickerRequestedSymbols.length,
+        requested_symbols: tickerRequestedSymbols.slice(0, 20),
       }),
     );
     let tickerRows: Awaited<ReturnType<typeof fetchTickers>> = [];
     try {
-      tickerRows = await fetchTickers(watchMarkets, { debugCaller: "live-strategy" });
+      tickerRows = await fetchTickers(tickerRequestedSymbols, { debugCaller: "live-strategy" });
     } catch (e) {
       console.info(
         JSON.stringify({
@@ -760,7 +778,7 @@ export function createLiveDataStrategy(opts: {
           stage: "after_scanner_before_tickers",
           reason: "fetch_tickers_throw",
           error_message: e instanceof Error ? e.message : String(e),
-          requested_symbols: watchMarkets.slice(0, 30),
+          requested_symbols: tickerRequestedSymbols.slice(0, 30),
         }),
       );
       throw e;
@@ -770,9 +788,9 @@ export function createLiveDataStrategy(opts: {
         tag: "DEBUG_TICKER_FETCH_DONE",
         ts: new Date().toISOString(),
         stage: "after_scanner_after_tickers",
-        requested_count: watchMarkets.length,
+        requested_count: tickerRequestedSymbols.length,
         ticker_rows_count: tickerRows.length,
-        ticker_symbols: tickerRows.map((r) => r.market).slice(0, 12),
+        ticker_symbols: tickerRows.map((r) => r.market).slice(0, 20),
       }),
     );
     const priceBy = new Map(tickerRows.map((r) => [r.market, r.trade_price]));
@@ -1373,32 +1391,13 @@ export function createLiveDataStrategy(opts: {
       await persist();
       return;
     }
-    const openCount = Object.keys(state.positions).length;
-    if (openCount >= state.safety_guard.max_positions) {
-      await persist();
-      console.info(
-        JSON.stringify({
-          tag: "DEBUG_LIVE_EARLY_EXIT",
-          ts: new Date().toISOString(),
-          stage: "after_entry_universe_filter",
-          reason: "max_positions_reached",
-          watch_markets_count: watchMarkets.length,
-          signal_map_count: signalMapCount,
-          markets_with_filter_pass_count: filterPassCount,
-          base_entry_universe_count: null,
-          entry_universe_count: null,
-          symbol: null,
-          note: "open positions already at cap",
-        }),
-      );
-      return;
-    }
-
     const exceptionSlot = state.regime?.exception_slot_market ?? null;
     const fallbackUsed = filterPassCandidates.length === 0;
     const inputSourceKind = fallbackUsed ? "legacy_fallback" : "filter_pass_primary";
     const primary = fallbackUsed ? watchMarkets : filterPassCandidates;
-    const baseEntryUniverseInput = Array.from(new Set([...primary, ...(exceptionSlot ? [exceptionSlot] : []), ...debugUniverseExtra]));
+    const baseEntryUniverseInput = Array.from(
+      new Set([...primary, ...(exceptionSlot ? [exceptionSlot] : []), ...debugUniverseExtra]),
+    );
     console.info(
       JSON.stringify({
         tag: "DEBUG_ENTRY_INPUT_SOURCE",
@@ -1417,6 +1416,18 @@ export function createLiveDataStrategy(opts: {
     const baseEntryUniverse = baseEntryUniverseInput;
     console.info(
       JSON.stringify({
+        tag: "DEBUG_BASE_ENTRY_SOURCE_MATCH",
+        ts: new Date().toISOString(),
+        stage: "after_base_entry_universe",
+        base_input_symbols: baseEntryUniverse.slice(0, 20),
+        ticker_requested_symbols: tickerRequestedSymbols.slice(0, 20),
+        symbols_match_boolean:
+          baseEntryUniverse.length === tickerRequestedSymbols.length &&
+          baseEntryUniverse.every((m) => tickerRequestedSymbols.includes(m)),
+      }),
+    );
+    console.info(
+      JSON.stringify({
         tag: "DEBUG_BASE_ENTRY_UNIVERSE_CREATED",
         ts: new Date().toISOString(),
         stage: "after_base_entry_universe",
@@ -1425,6 +1436,41 @@ export function createLiveDataStrategy(opts: {
         base_entry_universe_symbols: baseEntryUniverse.slice(0, 12),
       }),
     );
+
+    // max_positions cap 상태를 더 자세히 로깅하고, 조기 종료되더라도 입력 source 로그는 이미 남긴 상태여야 함.
+    const openCount = Object.keys(state.positions).length;
+    if (openCount >= state.safety_guard.max_positions) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_POSITION_CAP_STATE",
+          ts: new Date().toISOString(),
+          open_positions: openCount,
+          max_positions: state.safety_guard.max_positions,
+          open_position_symbols: Object.keys(state.positions),
+          entry_universe_count: null,
+          filter_pass_count: filterPassCount,
+          requested_symbols: tickerRequestedSymbols.slice(0, 20),
+          note: "max_positions reached; precheck loop skipped",
+        }),
+      );
+      await persist();
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_EARLY_EXIT",
+          ts: new Date().toISOString(),
+          stage: "after_base_entry_universe",
+          reason: "max_positions_reached",
+          watch_markets_count: watchMarkets.length,
+          signal_map_count: signalMapCount,
+          markets_with_filter_pass_count: filterPassCount,
+          base_entry_universe_count: baseEntryUniverse.length,
+          entry_universe_count: null,
+          symbol: null,
+          note: "open positions already at cap",
+        }),
+      );
+      return;
+    }
     const openStrategyMarkets = new Set(Object.keys(state.positions));
     const heldMeaningfulMarkets = new Set<string>();
     if (EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE) {
