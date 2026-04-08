@@ -456,6 +456,7 @@ export function createLiveDataStrategy(opts: {
   };
 
   const runTick = async () => {
+    try {
     console.info(
       JSON.stringify({
         tag: "DEBUG_LIVE_LOOP_TICK",
@@ -583,6 +584,18 @@ export function createLiveDataStrategy(opts: {
         market_signal_count: marketSignalsCount,
         filter_pass_count: filterPassCount,
         top_symbols: topSignals.map((x) => `${x.market}:${x.score.toFixed(1)}:vr_${x.vol.toFixed(2)}${x.filter_pass ? ":pass" : ""}`),
+      }),
+    );
+
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_LIVE_STAGE_TRACE",
+        ts: new Date().toISOString(),
+        stage: "scanner_universe_ready",
+        watch_markets_count: watchMarkets.length,
+        signal_map_count: signalMapCount,
+        entry_universe_count: null,
+        first_symbols: watchMarkets.slice(0, 8),
       }),
     );
 
@@ -1213,6 +1226,17 @@ export function createLiveDataStrategy(opts: {
       if (heldMeaningfulMarkets.has(m)) return false;
       return true;
     });
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_LIVE_STAGE_TRACE",
+        ts: new Date().toISOString(),
+        stage: "entry_universe_created",
+        watch_markets_count: watchMarkets.length,
+        signal_map_count: signalMapCount,
+        entry_universe_count: entryUniverse.length,
+        first_symbols: entryUniverse.slice(0, 8),
+      }),
+    );
 
     const accountHoldSnapshot: Record<string, { qty: number; value_krw: number; meaningful: boolean }> = {};
     for (const b of Array.isArray(tstatus.balances) ? tstatus.balances : []) {
@@ -1278,7 +1302,32 @@ export function createLiveDataStrategy(opts: {
     let selectedCount = 0;
     const topCandidates: Array<{ market: string; score: number; vol: number; breakout: boolean }> = [];
 
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_LIVE_STAGE_TRACE",
+        ts: new Date().toISOString(),
+        stage: "before_entry_universe_loop",
+        watch_markets_count: watchMarkets.length,
+        signal_map_count: signalMapCount,
+        entry_universe_count: entryUniverse.length,
+        first_symbols: entryUniverse.slice(0, 8),
+      }),
+    );
+
     for (const market of entryUniverse) {
+      if (scannedCount === 0) {
+        console.info(
+          JSON.stringify({
+            tag: "DEBUG_LIVE_STAGE_TRACE",
+            ts: new Date().toISOString(),
+            stage: "entered_entry_universe_loop",
+            watch_markets_count: watchMarkets.length,
+            signal_map_count: signalMapCount,
+            entry_universe_count: entryUniverse.length,
+            first_symbols: entryUniverse.slice(0, 8),
+          }),
+        );
+      }
       scannedCount += 1;
       const emitEval = (tag: string, payload: Record<string, unknown>) => {
         console.info(
@@ -1310,6 +1359,23 @@ export function createLiveDataStrategy(opts: {
         bumpSkip("max_positions_reached");
         break;
       }
+
+      // PRECHECK 진입 직전 강제 로그 — 운영에서 PRECHECK 로그가 아예 안 찍히는 문제 추적용.
+      const sigPre = latestAllSignals.get(market);
+      const gatePre = sigPre ? opts.marketState.entryGate(sigPre.p, marketState) : null;
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_PRECHECK_ENTER",
+          ts: new Date().toISOString(),
+          symbol: market,
+          market_state: marketState.market_state,
+          entry_score: gatePre ? Number(gatePre.score ?? 0) : null,
+          position_exists: Boolean(state.positions[market]),
+          max_positions: state.safety_guard.max_positions,
+          open_positions: Object.keys(state.positions).length,
+          has_signal: Boolean(sigPre),
+        }),
+      );
       if (state.positions[market]) {
         emitEval("DEBUG_LIVE_PRECHECK", {
           return_reason: "same_symbol_open_continue_entry_eval",
@@ -1494,8 +1560,34 @@ export function createLiveDataStrategy(opts: {
       if (!detailedReason) {
         candidateCount += 1;
         topCandidates.push({ market, score: signalScore, vol, breakout });
+        if (candidateCount <= 2) {
+          console.info(
+            JSON.stringify({
+              tag: "DEBUG_LIVE_CANDIDATE_TRACE",
+              ts: new Date().toISOString(),
+              symbol: market,
+              score: Number(signalScore.toFixed(2)),
+              filter_pass: filterPass,
+              breakout,
+              skipped_reason: null,
+            }),
+          );
+        }
       } else {
         bumpSkip(detailedReason);
+        if (candidateCount === 0 && scannedCount <= 2) {
+          console.info(
+            JSON.stringify({
+              tag: "DEBUG_LIVE_CANDIDATE_TRACE",
+              ts: new Date().toISOString(),
+              symbol: market,
+              score: Number(signalScore.toFixed(2)),
+              filter_pass: filterPass,
+              breakout,
+              skipped_reason: detailedReason,
+            }),
+          );
+        }
       }
       await appendLog({
         company_id: companyIdSchema.parse(opts.companyId),
@@ -1819,6 +1911,16 @@ export function createLiveDataStrategy(opts: {
       );
     }
     await persist();
+    } catch (e) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_TICK_ERROR",
+          ts: new Date().toISOString(),
+          error: e instanceof Error ? e.message : String(e),
+          stack: e instanceof Error ? String(e.stack ?? "").slice(0, 800) : null,
+        }),
+      );
+    }
   };
 
   return {
