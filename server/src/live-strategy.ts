@@ -4,6 +4,7 @@ import type { SignalLogEntry } from "@orbitalpha/shared";
 import {
   companyIdSchema,
   mvpSignalPayloadV2Schema,
+  ORDER_LIMITS,
   serviceIdSchema,
   signalStrengthScore,
 } from "@orbitalpha/shared";
@@ -149,6 +150,10 @@ const EXISTING_POSITION_MIN_KRW = Math.max(1000, Number(process.env.LIVE_EXISTIN
 const DEBUG_FORCE_BASE_GATE = String(process.env.DEBUG_FORCE_BASE_GATE ?? "").toLowerCase() === "true";
 /** 운영에서 `DEBUG_LIVE_ENTRY_POLICY_SNAPSHOT`으로 dist 빌드 정합성 확인. 2=동일심볼은 same_symbol_open_continue_entry_eval 만(레거시 차단 문자열 없음). */
 const LIVE_PRECHECK_EMITTER_REVISION = 2;
+const LIVE_LEGACY_DCA_BUY_ENABLED = String(process.env.LIVE_LEGACY_DCA_BUY_ENABLED ?? "false").toLowerCase() === "true";
+const LIVE_ENTRY_UTILIZATION_TARGET = Math.max(0.05, Math.min(0.98, Number(process.env.LIVE_ENTRY_UTILIZATION_TARGET ?? 0.85)));
+const LIVE_MIN_ENTRY_KRW = Math.max(5_000, Number(process.env.LIVE_MIN_ENTRY_KRW ?? 50_000));
+const LIVE_MAX_ENTRY_KRW = Math.max(LIVE_MIN_ENTRY_KRW, Number(process.env.LIVE_MAX_ENTRY_KRW ?? 250_000));
 
 /** 명시적 true/false만 인정, 미설정이면 null */
 function parseEnvBoolExplicit(value: string | undefined): boolean | null {
@@ -606,19 +611,19 @@ export function createLiveDataStrategy(opts: {
       const nextDcaAt = state.legacy.next_dca_at[market];
       const dcaCooldownPassed = !nextDcaAt || Date.now() >= Date.parse(nextDcaAt);
 
-      // 손실 구간 레거시 물타기 금지 — 회복 기대 DCA 없음
-      if (pnlGross < 0) {
-        /* skip legacy DCA */
-      } else if (opts.trade.placeLegacyDcaBuy && !locked && dcaCount < dcaMax && dcaCooldownPassed) {
-        const krw = Number(tstatus.krw_available ?? 0);
-        const orderKrw = Math.floor(Math.max(5000, Math.min(12000, krw * 0.06)));
-        if (orderKrw >= 5000 && krw > orderKrw * 1.2 && legacySignalAllowsDca(sig)) {
-          try {
-            await opts.trade.placeLegacyDcaBuy(market, true, orderKrw, sig?.p);
-            state.legacy.dca_count[market] = dcaCount + 1;
-            state.legacy.next_dca_at[market] = new Date(Date.now() + 20 * 60_000).toISOString();
-            state.legacy.dca_locked[market] = dcaCount + 1 >= dcaMax;
-          } catch {}
+      // 레거시 DCA 매수는 기본 비활성화 (새 진입/추가매수 정책에 통합).
+      if (LIVE_LEGACY_DCA_BUY_ENABLED && pnlGross >= 0) {
+        if (opts.trade.placeLegacyDcaBuy && !locked && dcaCount < dcaMax && dcaCooldownPassed) {
+          const krw = Number(tstatus.krw_available ?? 0);
+          const orderKrw = Math.floor(Math.max(5000, Math.min(12000, krw * 0.06)));
+          if (orderKrw >= 5000 && krw > orderKrw * 1.2 && legacySignalAllowsDca(sig)) {
+            try {
+              await opts.trade.placeLegacyDcaBuy(market, true, orderKrw, sig?.p);
+              state.legacy.dca_count[market] = dcaCount + 1;
+              state.legacy.next_dca_at[market] = new Date(Date.now() + 20 * 60_000).toISOString();
+              state.legacy.dca_locked[market] = dcaCount + 1 >= dcaMax;
+            } catch {}
+          }
         }
       }
 
@@ -1395,17 +1400,29 @@ export function createLiveDataStrategy(opts: {
       const rel = (Number(changeRateBy.get(market) ?? 0) - btcChange) * 100;
       const vol = Number(sig.p.volume_ratio ?? 0);
       const reasonText = String(sig.p.signal_reason ?? "").toLowerCase();
-      const breakout = reasonText.includes("breakout");
+      const parsedV2 = mvpSignalPayloadV2Schema.safeParse(sig.p);
+      const breakoutRelaxed =
+        parsedV2.success &&
+        (Boolean(parsedV2.data.would_pass_with_breakout_relaxed_a) ||
+          Boolean(parsedV2.data.would_pass_with_breakout_relaxed_b) ||
+          Boolean(parsedV2.data.breakout_relaxed_a_pass) ||
+          Boolean(parsedV2.data.breakout_relaxed_b_pass) ||
+          Boolean(parsedV2.data.pair_pass_breakout_b_and_pullback_relaxed) ||
+          Boolean(parsedV2.data.pair_pass_breakout_b_and_vol_close_a));
+      const breakout = reasonText.includes("breakout") || breakoutRelaxed;
       const trendOk = reasonText.includes("breakout") || reasonText.includes("trend") || reasonText.includes("reclaim");
       const openForGate = Object.keys(state.positions).length;
       const minBaseScore = openForGate >= 1 ? 88 : 83;
       const minBaseVol = openForGate >= 1 ? 1.14 : 1.08;
+      const earlySurgeOk = !breakout && trendOk && vol >= 1.25 && signalScore >= (openForGate >= 1 ? 84 : 80);
       emitEval("DEBUG_LIVE_SIGNAL_SCORE", {
         score: Number(signalScore.toFixed(2)),
         volume_ratio: Number(vol.toFixed(3)),
         relative_strength: Number(rel.toFixed(3)),
         trend_ok: trendOk,
         breakout,
+        breakout_relaxed: breakoutRelaxed,
+        early_surge_ok: earlySurgeOk,
       });
       const strongSymbolOverride = signalScore >= 80 && rel >= 0.5 && vol >= 1.05 && trendOk;
       let detailedReason: string | null = null;
@@ -1413,7 +1430,7 @@ export function createLiveDataStrategy(opts: {
         if (signalTypeLow || signalScore < minBaseScore) detailedReason = "score_below_threshold";
         else if (vol < minBaseVol) detailedReason = "volume_ratio_low";
         else if (!trendOk) detailedReason = "trend_not_ok";
-        else if (!breakout) detailedReason = "no_breakout";
+        else if (!breakout && !earlySurgeOk) detailedReason = "no_breakout";
         else if (!filterPass || !baseGateOriginalResult) detailedReason = "base_gate_failed";
       }
       emitEval("DEBUG_LIVE_BASE_GATE_RESULT", {
@@ -1422,6 +1439,8 @@ export function createLiveDataStrategy(opts: {
         relative_strength: Number(rel.toFixed(3)),
         trend_ok: trendOk,
         breakout,
+        breakout_relaxed: breakoutRelaxed,
+        early_surge_ok: earlySurgeOk,
         filter_pass: filterPass,
         signal_type: sig.p.signal_type ?? "MID",
         base_gate_ok: gateOk,
@@ -1482,6 +1501,16 @@ export function createLiveDataStrategy(opts: {
             payload: pr.detail,
           });
           emitEval(pr.message, pr.detail);
+          emitEval("DEBUG_LIVE_DECISION_LINE", {
+            available_krw: Number((await opts.trade.status()).live_order_available_krw ?? 0),
+            planned_entry_krw: null,
+            entry_score: Number(signalScore.toFixed(2)),
+            min_entry_score: marketState.min_entry_score,
+            volume_ratio: Number(vol.toFixed(3)),
+            breakout,
+            breakout_relaxed: breakoutRelaxed,
+            final_block_reason: pr.message,
+          });
           continue;
         }
         entryPipelineDetail = pr.detail;
@@ -1499,6 +1528,16 @@ export function createLiveDataStrategy(opts: {
           },
         });
         emitEval("blocked_trend_filter", { symbol: market, sub: "candles_fetch_failed" });
+        emitEval("DEBUG_LIVE_DECISION_LINE", {
+          available_krw: Number((await opts.trade.status()).live_order_available_krw ?? 0),
+          planned_entry_krw: null,
+          entry_score: Number(signalScore.toFixed(2)),
+          min_entry_score: marketState.min_entry_score,
+          volume_ratio: Number(vol.toFixed(3)),
+          breakout,
+          breakout_relaxed: breakoutRelaxed,
+          final_block_reason: "candles_fetch_failed",
+        });
         continue;
       }
 
@@ -1519,12 +1558,32 @@ export function createLiveDataStrategy(opts: {
         note: "exchange_hold_does_not_block_strategy_entry_eval",
       });
       const liveOrderAvailableKrw = Math.max(0, Number(st.live_order_available_krw ?? st.krw_available ?? 0));
-      let orderKrw = Math.floor(liveOrderAvailableKrw * 0.2);
-      orderKrw = Math.max(5000, Math.min(30000, orderKrw));
-      orderKrw = Math.floor(orderKrw * entrySizePct);
-      if (isExceptionMarket) {
-        orderKrw = Math.floor(orderKrw * 0.9);
-      }
+      const openCountNow = Object.keys(state.positions).length;
+      const remainingSlots = Math.max(1, state.safety_guard.max_positions - openCountNow);
+      const maxAllocKrw = Math.floor(liveOrderAvailableKrw * LIVE_ENTRY_UTILIZATION_TARGET * entrySizePct);
+      const plannedBaseKrw = Math.floor(maxAllocKrw / remainingSlots);
+      let orderKrw = Math.max(LIVE_MIN_ENTRY_KRW, Math.min(LIVE_MAX_ENTRY_KRW, plannedBaseKrw));
+      if (isExceptionMarket) orderKrw = Math.floor(orderKrw * 0.9);
+
+      const stPos = st.strategy_positions?.[market];
+      const investedSoFar = Math.max(0, Number(stPos?.invested_krw_total ?? 0));
+      const remainingPerMarket = Math.max(0, ORDER_LIMITS.MAX_STRATEGY_INVESTED_KRW_PER_MARKET - investedSoFar);
+      orderKrw = Math.min(orderKrw, remainingPerMarket);
+
+      const gateScore = Number(opts.marketState.entryGate(sig.p, marketState).score ?? 0);
+      emitEval("DEBUG_LIVE_ORDER_SIZING", {
+        available_krw: liveOrderAvailableKrw,
+        max_alloc_krw: maxAllocKrw,
+        planned_entry_krw: orderKrw,
+        min_entry_krw: LIVE_MIN_ENTRY_KRW,
+        max_entry_krw: LIVE_MAX_ENTRY_KRW,
+        per_market_cap_krw: ORDER_LIMITS.MAX_STRATEGY_INVESTED_KRW_PER_MARKET,
+        per_market_remaining_krw: remainingPerMarket,
+        entry_score: gateScore,
+        min_entry_score: marketState.min_entry_score,
+        entry_size_pct: entrySizePct,
+        legacy_dca_buy_enabled: LIVE_LEGACY_DCA_BUY_ENABLED,
+      });
       if (orderKrw < 5000) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "order_krw_below_min", order_krw: orderKrw });
         continue;

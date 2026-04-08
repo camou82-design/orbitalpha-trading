@@ -19,6 +19,17 @@ export function signalStrengthScore(payload: unknown): number {
   if (sigType === "MID") score += 6;
   const vr = Number(p.data.volume_ratio ?? 0);
   if (vr >= 1.2) score += 10;
+  if (vr >= 1.35) score += 6;
+  if (vr >= 1.5) score += 6;
+
+  // 급등 초입 포착: 완전 통과 전이라도 "완화 통과" 신호가 있으면 score를 과도하게 낮추지 않음.
+  if (p.data.would_pass_with_pullback_relaxed) score += 6;
+  if (p.data.would_pass_with_vol_close_relaxed_a) score += 5;
+  if (p.data.would_pass_with_vol_close_relaxed_b) score += 3;
+  if (p.data.would_pass_with_breakout_relaxed_a) score += 5;
+  if (p.data.would_pass_with_breakout_relaxed_b) score += 3;
+  if (p.data.pair_pass_breakout_b_and_pullback_relaxed) score += 4;
+  if (p.data.pair_pass_breakout_b_and_vol_close_a) score += 4;
   return Math.min(100, score);
 }
 

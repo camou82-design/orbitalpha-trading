@@ -131,7 +131,8 @@ export function createMarketStateFilter(args: {
       // 분화 장세: risk_off도 차단이 아닌 축소 진입 모드로 운영.
       entry_policy: marketState === "risk_on" ? "적극 진입" : marketState === "neutral" ? "선별 진입" : "축소 진입",
       market_bonus: marketState === "risk_on" ? 18 : marketState === "neutral" ? 0 : -10,
-      min_entry_score: marketState === "risk_on" ? 82 : marketState === "neutral" ? 90 : 88,
+      // 과거 neutral=90 컷은 신규진입·추가매수(대시보드 표기 포함)를 과도하게 보수적으로 만들었음.
+      min_entry_score: marketState === "risk_on" ? 72 : marketState === "neutral" ? 76 : 88,
       regime_allows_new_and_additional_buys: true,
       order_limits: { ...ORDER_LIMITS },
       btc_5m_trend: btc5,

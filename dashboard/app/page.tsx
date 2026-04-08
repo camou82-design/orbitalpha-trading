@@ -93,18 +93,8 @@ function formatAdditionalBuyStatus(params: {
     } else if (investedKrw + stepKrw > orderLimits.MAX_STRATEGY_INVESTED_KRW_PER_MARKET) {
       parts.push("전략: 누적 투입 KRW 상한");
     } else {
-      const g = runEntryScoreGate(ms, marketState.min_entry_score, marketState.market_bonus, signalPayload);
-      parts.push(g.ok ? "전략 추가: 가능" : `전략 추가: ${g.reason}`);
-    }
-  }
-  if (legacyQty > 0) {
-    if (!legacyDcaAvailable || legacyDcaCount >= legacyDcaMax) {
-      parts.push(`레거시 DCA: 횟수 상한 (${legacyDcaMax}회)`);
-    } else if (legacyDcaKrw + stepKrw > orderLimits.MAX_LEGACY_DCA_KRW_PER_MARKET) {
-      parts.push("레거시 DCA: 누적 KRW 상한");
-    } else {
-      const g = runEntryScoreGate(ms, marketState.min_entry_score, marketState.market_bonus, signalPayload);
-      parts.push(g.ok ? "레거시 DCA: 가능" : `레거시 DCA: ${g.reason}`);
+      // 서버 게이트(추가매수)는 risk_off에서만 차단이며, score gate는 신규진입 전용이다.
+      parts.push("전략 추가: 가능");
     }
   }
 

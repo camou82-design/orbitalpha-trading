@@ -69,7 +69,14 @@ export function evaluateSpotLongEntryPipeline(input: Readonly<{
 
   const parsed = mvpSignalPayloadV2Schema.safeParse(input.payload);
   const filterPass = parsed.success && parsed.data.filter_pass;
-  if (!filterPass) {
+  const relaxedPass =
+    parsed.success &&
+    (Boolean(parsed.data.would_pass_with_pullback_relaxed) ||
+      Boolean(parsed.data.would_pass_with_vol_close_relaxed_a) ||
+      Boolean(parsed.data.would_pass_with_breakout_relaxed_a) ||
+      Boolean(parsed.data.pair_pass_breakout_b_and_pullback_relaxed) ||
+      Boolean(parsed.data.pair_pass_breakout_b_and_vol_close_a));
+  if (!filterPass && !relaxedPass) {
     return {
       ok: false,
       message: "blocked_trend_filter",
@@ -77,7 +84,7 @@ export function evaluateSpotLongEntryPipeline(input: Readonly<{
         symbol: input.market,
         sub: "mvp_filter_pass_false",
         signal_strength_score: score,
-        note: "MID+ 후보라도 6필터 완전 통과 전에는 진입하지 않음",
+        note: "filter_pass=false and no relaxed pass flags",
       },
     };
   }
@@ -107,6 +114,8 @@ export function evaluateSpotLongEntryPipeline(input: Readonly<{
   const lastClose = closes[closes.length - 1]!;
   const stacked = e5 > e13 * 1.0005 && e13 > e34 * 1.0005;
   const looseTrend = e13 > e34 * 1.0003 && lastClose > e5;
+  const emaGap5_13_pct = e13 > 0 ? ((e5 / e13) - 1) * 100 : 0;
+  const emaGap13_34_pct = e34 > 0 ? ((e13 / e34) - 1) * 100 : 0;
   if (!stacked && !looseTrend) {
     return {
       ok: false,
@@ -118,6 +127,8 @@ export function evaluateSpotLongEntryPipeline(input: Readonly<{
         e13,
         e34,
         last_close: lastClose,
+        ema_gap_5_13_pct: Number(emaGap5_13_pct.toFixed(4)),
+        ema_gap_13_34_pct: Number(emaGap13_34_pct.toFixed(4)),
       },
     };
   }
