@@ -82,6 +82,23 @@ const PAPER_MAX_ENTRY_NEAR_HIGH_PCT = (() => {
   const n = raw === undefined || raw === "" ? 0.25 : Number(raw);
   return Number.isFinite(n) ? Math.max(0.05, Math.min(3, n)) : 0.25;
 })();
+/** 초입 직후: near_high 단독일 때 timing guard 예외 (늦은 추격과 분리) */
+const PAPER_NEAR_HIGH_EARLY_BYPASS_SECONDS = (() => {
+  const raw = process.env.PAPER_NEAR_HIGH_EARLY_BYPASS_SECONDS;
+  const n = raw === undefined || raw === "" ? 8 : Number(raw);
+  return Number.isFinite(n) ? Math.max(5, Math.min(12, Math.floor(n))) : 8;
+})();
+const PAPER_NEAR_HIGH_EARLY_BYPASS_MAX_CHASE_PCT = (() => {
+  const raw = process.env.PAPER_NEAR_HIGH_EARLY_BYPASS_MAX_CHASE_PCT;
+  const n = raw === undefined || raw === "" ? 0.25 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0.05, Math.min(0.5, n)) : 0.25;
+})();
+const PAPER_NEAR_HIGH_EARLY_BYPASS_MIN_VOLUME_RATIO = (() => {
+  const raw = process.env.PAPER_NEAR_HIGH_EARLY_BYPASS_MIN_VOLUME_RATIO;
+  /** 기본은 early 진입 min volume과 맞춰 bypass 후 곧바로 volume_not_strong에 걸리지 않게 함 */
+  const n = raw === undefined || raw === "" ? 1.2 : Number(raw);
+  return Number.isFinite(n) ? Math.max(1.0, Math.min(3.0, n)) : 1.2;
+})();
 const PAPER_EARLY_ENTRY_MAX_OPEN = (() => {
   const raw = process.env.PAPER_EARLY_ENTRY_MAX_OPEN;
   const n = raw === undefined || raw === "" ? 2 : Number(raw);
@@ -717,18 +734,76 @@ export function createPaperTradingEngine(opts: {
         last_local_high: localHigh > 0 ? localHigh : undefined,
       });
 
+      // Early min score (needed for near-high bypass + early entry gate)
+      const earlyMinScoreDefault = Math.max(0, sig.score - 10);
+      const earlyMinScore = (() => {
+        const raw = process.env.PAPER_EARLY_ENTRY_MIN_SCORE;
+        const n = raw === undefined || raw === "" ? earlyMinScoreDefault : Number(raw);
+        return Number.isFinite(n) ? n : earlyMinScoreDefault;
+      })();
+
+      const stale = secondsSinceSignal !== null && secondsSinceSignal > PAPER_ENTRY_SIGNAL_STALE_SECONDS;
+      const chase = priceChangeSinceSignalPct !== null && priceChangeSinceSignalPct > PAPER_MAX_CHASE_FROM_SIGNAL_PCT;
+      const faded = volumeRatio1m5 !== null && volumeRatio1m5 < 0.65;
+      const nearHighRisk =
+        distanceFromLocalHighPct !== null && distanceFromLocalHighPct < PAPER_MAX_ENTRY_NEAR_HIGH_PCT;
+
+      /** stale/chase/faded 없이 near_high만 걸린 초입 구간이면 timing 차단 면제 */
+      const nearHighBypassApplied =
+        nearHighRisk &&
+        !stale &&
+        !chase &&
+        !faded &&
+        secondsSinceSignal !== null &&
+        secondsSinceSignal <= PAPER_NEAR_HIGH_EARLY_BYPASS_SECONDS &&
+        (priceChangeSinceSignalPct === null || priceChangeSinceSignalPct <= PAPER_NEAR_HIGH_EARLY_BYPASS_MAX_CHASE_PCT) &&
+        volumeRatio1m5 !== null &&
+        volumeRatio1m5 >= PAPER_NEAR_HIGH_EARLY_BYPASS_MIN_VOLUME_RATIO &&
+        sig.score >= earlyMinScore;
+
+      if (nearHighRisk) {
+        let bypassDetail: string;
+        if (nearHighBypassApplied) {
+          bypassDetail = "applied_fresh_low_chase_volume_alive_score_ok";
+        } else if (stale) {
+          bypassDetail = "blocked_pair_stale_signal";
+        } else if (chase) {
+          bypassDetail = "blocked_pair_chase_too_high";
+        } else if (faded) {
+          bypassDetail = "blocked_pair_volume_faded";
+        } else if (secondsSinceSignal === null || secondsSinceSignal > PAPER_NEAR_HIGH_EARLY_BYPASS_SECONDS) {
+          bypassDetail = "signal_not_fresh_enough_for_bypass";
+        } else if (priceChangeSinceSignalPct !== null && priceChangeSinceSignalPct > PAPER_NEAR_HIGH_EARLY_BYPASS_MAX_CHASE_PCT) {
+          bypassDetail = "chase_above_bypass_max";
+        } else if (volumeRatio1m5 === null || volumeRatio1m5 < PAPER_NEAR_HIGH_EARLY_BYPASS_MIN_VOLUME_RATIO) {
+          bypassDetail = "volume_below_bypass_min";
+        } else if (sig.score < earlyMinScore) {
+          bypassDetail = "score_below_min_for_bypass";
+        } else {
+          bypassDetail = "unknown";
+        }
+        emitPaper("DEBUG_PAPER_NEAR_HIGH_BYPASS", {
+          market,
+          seconds_since_signal: secondsSinceSignal,
+          price_change_since_signal_pct: priceChangeSinceSignalPct,
+          distance_from_local_high_pct: distanceFromLocalHighPct,
+          volume_ratio: volumeRatio1m5,
+          near_high_bypass_applied: nearHighBypassApplied,
+          near_high_bypass_reason: bypassDetail,
+        });
+      }
+
       let timingBlockReason: string | null = null;
-      if (secondsSinceSignal !== null && secondsSinceSignal > PAPER_ENTRY_SIGNAL_STALE_SECONDS) timingBlockReason = "signal_stale";
-      else if (priceChangeSinceSignalPct !== null && priceChangeSinceSignalPct > PAPER_MAX_CHASE_FROM_SIGNAL_PCT)
-        timingBlockReason = "chase_too_high";
-      else if (distanceFromLocalHighPct !== null && distanceFromLocalHighPct < PAPER_MAX_ENTRY_NEAR_HIGH_PCT)
-        timingBlockReason = "near_high_entry";
-      else if (volumeRatio1m5 !== null && volumeRatio1m5 < 0.65) timingBlockReason = "volume_faded";
+      if (stale) timingBlockReason = "signal_stale";
+      else if (chase) timingBlockReason = "chase_too_high";
+      else if (faded) timingBlockReason = "volume_faded";
+      else if (nearHighRisk && !nearHighBypassApplied) timingBlockReason = "near_high_entry";
 
       if (timingBlockReason) {
         emitPaper("DEBUG_PAPER_ENTRY_TIMING_GUARD", {
           market,
           reason: timingBlockReason,
+          near_high_bypass_applied: nearHighBypassApplied,
           seconds_since_signal: secondsSinceSignal,
           price_change_since_signal_pct: priceChangeSinceSignalPct,
           distance_from_local_high_pct: distanceFromLocalHighPct,
@@ -739,16 +814,13 @@ export function createPaperTradingEngine(opts: {
       }
 
       // 1) Early entry first (aggressive)
-      const earlyMinScoreDefault = Math.max(0, sig.score - 10);
-      const earlyMinScore = (() => {
-        const raw = process.env.PAPER_EARLY_ENTRY_MIN_SCORE;
-        const n = raw === undefined || raw === "" ? earlyMinScoreDefault : Number(raw);
-        return Number.isFinite(n) ? n : earlyMinScoreDefault;
-      })();
       const earlySlotsUsed = Object.values(state.positions).filter((p) => p.position_stage === "early_active").length;
       const earlySlotOk = earlySlotsUsed < PAPER_EARLY_ENTRY_MAX_OPEN;
       const earlyFreshOk = secondsSinceSignal !== null && secondsSinceSignal <= PAPER_EARLY_ENTRY_MAX_SIGNAL_SECONDS;
-      const earlyNearHighOk = distanceFromLocalHighPct !== null && distanceFromLocalHighPct <= PAPER_MAX_ENTRY_NEAR_HIGH_PCT;
+      const earlyNearHighOkRaw =
+        distanceFromLocalHighPct !== null && distanceFromLocalHighPct <= PAPER_MAX_ENTRY_NEAR_HIGH_PCT;
+      /** timing에서 near_high 단독 bypass 통과 시에도 early의 “고점 근접” 조건은 동일 밴드로 충족된 것으로 본다 */
+      const earlyNearHighOk = earlyNearHighOkRaw || nearHighBypassApplied;
       const earlyVolOk = volumeRatio1m5 !== null && volumeRatio1m5 >= PAPER_EARLY_ENTRY_MIN_VOLUME_RATIO;
       const earlyScoreOk = sig.score >= earlyMinScore;
       const earlyAllowed = earlySlotOk && earlyFreshOk && earlyNearHighOk && earlyVolOk && earlyScoreOk;
@@ -759,6 +831,7 @@ export function createPaperTradingEngine(opts: {
         price_change_since_signal_pct: priceChangeSinceSignalPct,
         distance_from_local_high_pct: distanceFromLocalHighPct,
         volume_ratio: volumeRatio1m5,
+        near_high_bypass_applied: nearHighBypassApplied,
         early_entry_allowed: earlyAllowed,
         early_entry_block_reason: earlyAllowed
           ? null
