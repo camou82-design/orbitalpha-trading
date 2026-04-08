@@ -560,7 +560,33 @@ export function createLiveDataStrategy(opts: {
     const watchMarkets = Array.from(
       new Set([...MARKETS, ...(exceptionSlotMarket ? [exceptionSlotMarket] : []), ...debugUniverseExtra]),
     );
-    const tickerRows = await fetchTickers(watchMarkets);
+
+    const allSignalsArr = Array.from(latestAllSignals.values());
+    const filterPassCount = allSignalsArr.filter((x) => Boolean(x?.p?.filter_pass)).length;
+    const signalMapCount = latestAllSignals.size;
+    const marketSignalsCount = latestByMarket.size;
+    const topSignals = Array.from(latestAllSignals.entries())
+      .map(([m, s]) => {
+        const gate = opts.marketState.entryGate(s.p, marketState);
+        const score = Number(gate.score ?? 0);
+        const vol = Number(s.p.volume_ratio ?? 0);
+        return { market: m, score, vol, filter_pass: Boolean(s.p.filter_pass) };
+      })
+      .sort((a, b) => b.score - a.score || b.vol - a.vol)
+      .slice(0, 8);
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_SCANNER_UNIVERSE",
+        ts: new Date().toISOString(),
+        watchlist_count: watchMarkets.length,
+        signal_map_count: signalMapCount,
+        market_signal_count: marketSignalsCount,
+        filter_pass_count: filterPassCount,
+        top_symbols: topSignals.map((x) => `${x.market}:${x.score.toFixed(1)}:vr_${x.vol.toFixed(2)}${x.filter_pass ? ":pass" : ""}`),
+      }),
+    );
+
+    const tickerRows = await fetchTickers(watchMarkets, { debugCaller: "live-strategy" });
     const priceBy = new Map(tickerRows.map((r) => [r.market, r.trade_price]));
     const changeRateBy = new Map(tickerRows.map((r) => [r.market, Number(r.signed_change_rate ?? 0)]));
     const btcChange = Number(changeRateBy.get("KRW-BTC") ?? 0);
@@ -1241,7 +1267,19 @@ export function createLiveDataStrategy(opts: {
         entry_universe: entryUniverse,
       }),
     );
+
+    // 매 틱 1회 — 후보 생성/선정 요약 및 0건 원인 집계.
+    const skippedByReason: Record<string, number> = {};
+    const bumpSkip = (reason: string) => {
+      skippedByReason[reason] = (skippedByReason[reason] ?? 0) + 1;
+    };
+    let scannedCount = 0;
+    let candidateCount = 0;
+    let selectedCount = 0;
+    const topCandidates: Array<{ market: string; score: number; vol: number; breakout: boolean }> = [];
+
     for (const market of entryUniverse) {
+      scannedCount += 1;
       const emitEval = (tag: string, payload: Record<string, unknown>) => {
         console.info(
           JSON.stringify({
@@ -1269,6 +1307,7 @@ export function createLiveDataStrategy(opts: {
       );
       if (Object.keys(state.positions).length >= state.safety_guard.max_positions) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "max_positions_reached" });
+        bumpSkip("max_positions_reached");
         break;
       }
       if (state.positions[market]) {
@@ -1283,10 +1322,12 @@ export function createLiveDataStrategy(opts: {
       const cool = state.cooldown_until[market];
       if (cool && Date.now() < Date.parse(cool)) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "cooldown_active", cooldown_until: cool });
+        bumpSkip("cooldown_active");
         continue;
       }
       if ((state.daily.stop_by_market[market] ?? 0) >= 2) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "stop_count_limit_reached" });
+        bumpSkip("stop_count_limit_reached");
         continue;
       }
       const isExceptionMarket = !LEADER_MARKETS.has(market);
@@ -1304,6 +1345,7 @@ export function createLiveDataStrategy(opts: {
           return_reason: String(missingDetail.primary_reason ?? "signal_missing"),
           signal_missing_detail: true,
         });
+        bumpSkip(String(missingDetail.primary_reason ?? "signal_missing"));
         continue;
       }
       const exception = state.regime?.exception_candidates.find((x) => x.market === market) ?? null;
@@ -1449,6 +1491,12 @@ export function createLiveDataStrategy(opts: {
         strong_symbol_override: strongSymbolOverride,
         return_reason: !gateOk && !strongSymbolOverride ? detailedReason ?? "base_gate_failed" : null,
       });
+      if (!detailedReason) {
+        candidateCount += 1;
+        topCandidates.push({ market, score: signalScore, vol, breakout });
+      } else {
+        bumpSkip(detailedReason);
+      }
       await appendLog({
         company_id: companyIdSchema.parse(opts.companyId),
         service_id: serviceIdSchema.parse(opts.serviceId),
@@ -1470,10 +1518,12 @@ export function createLiveDataStrategy(opts: {
       });
       if (isExceptionMarket && !exception) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "exception_not_selected" });
+        bumpSkip("exception_not_selected");
         continue;
       }
       if (!gateOk && !strongSymbolOverride) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: detailedReason ?? "base_gate_failed" });
+        bumpSkip(detailedReason ?? "base_gate_failed");
         continue;
       }
 
@@ -1511,6 +1561,7 @@ export function createLiveDataStrategy(opts: {
             breakout_relaxed: breakoutRelaxed,
             final_block_reason: pr.message,
           });
+          bumpSkip(pr.message);
           continue;
         }
         entryPipelineDetail = pr.detail;
@@ -1538,6 +1589,7 @@ export function createLiveDataStrategy(opts: {
           breakout_relaxed: breakoutRelaxed,
           final_block_reason: "candles_fetch_failed",
         });
+        bumpSkip("candles_fetch_failed");
         continue;
       }
 
@@ -1586,6 +1638,7 @@ export function createLiveDataStrategy(opts: {
       });
       if (orderKrw < 5000) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "order_krw_below_min", order_krw: orderKrw });
+        bumpSkip("order_krw_below_min");
         continue;
       }
       if (liveOrderAvailableKrw < orderKrw) {
@@ -1594,6 +1647,7 @@ export function createLiveDataStrategy(opts: {
           live_order_available_krw: liveOrderAvailableKrw,
           order_krw: orderKrw,
         });
+        bumpSkip("insufficient_live_order_krw");
         continue;
       }
       const strategyType: StrategyType = marketState.market_state === "risk_on" ? "momentum" : "stable";
@@ -1619,6 +1673,7 @@ export function createLiveDataStrategy(opts: {
           },
         });
         emitEval("entry_opened", { symbol: market, order_krw: orderKrw });
+        selectedCount += 1;
       } catch (e) {
         state.safety_guard.order_fail_count_today += 1;
         if (state.safety_guard.order_fail_count_today >= 3) {
@@ -1643,6 +1698,7 @@ export function createLiveDataStrategy(opts: {
           });
         }
         await persist();
+        bumpSkip("order_failed");
         continue;
       }
       const price = priceBy.get(market) ?? 0;
@@ -1726,6 +1782,41 @@ export function createLiveDataStrategy(opts: {
           .filter(Boolean)
           .join("|"),
       });
+    }
+
+    topCandidates.sort((a, b) => b.score - a.score || b.vol - a.vol);
+    const topSymbols = topCandidates
+      .slice(0, 8)
+      .map((x) => `${x.market}:${x.score.toFixed(1)}:vr_${x.vol.toFixed(2)}${x.breakout ? ":br" : ""}`);
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_LIVE_CANDIDATE_SUMMARY",
+        ts: new Date().toISOString(),
+        universe_count: entryUniverse.length,
+        scanned_count: scannedCount,
+        candidate_count: candidateCount,
+        selected_count: selectedCount,
+        skipped_by_reason: skippedByReason,
+        top_symbols: topSymbols,
+      }),
+    );
+    if (candidateCount === 0) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_EMPTY_CANDIDATES",
+          ts: new Date().toISOString(),
+          no_watchlist: entryUniverse.length === 0,
+          no_signal: Boolean(skippedByReason["not_in_signal_monitor_logs"] ?? 0) || signalMapCount === 0,
+          no_filter_pass: filterPassCount === 0,
+          rate_limited:
+            Boolean(skippedByReason["candles_fetch_failed"] ?? 0) ||
+            Boolean(skippedByReason["volume_filter_failed"] ?? 0),
+          no_breakout: Boolean(skippedByReason["no_breakout"] ?? 0),
+          market_state_block: marketState.market_state === "risk_off",
+          max_positions_reached: Boolean(skippedByReason["max_positions_reached"] ?? 0),
+          skipped_by_reason: skippedByReason,
+        }),
+      );
     }
     await persist();
   };
