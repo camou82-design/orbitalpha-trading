@@ -193,6 +193,51 @@ const LIVE_EXIT_EARLY_LOSS_GUARD_SECONDS = (() => {
   return Number.isFinite(n) ? Math.max(60, Math.min(1800, Math.floor(n))) : 300;
 })();
 
+// --- Entry timing (avoid late chase entries) ---
+const LIVE_ENTRY_SIGNAL_STALE_SECONDS = (() => {
+  const raw = process.env.LIVE_ENTRY_SIGNAL_STALE_SECONDS;
+  const n = raw === undefined || raw === "" ? 240 : Number(raw);
+  return Number.isFinite(n) ? Math.max(30, Math.min(1800, Math.floor(n))) : 240;
+})();
+const LIVE_MAX_CHASE_FROM_SIGNAL_PCT = (() => {
+  const raw = process.env.LIVE_MAX_CHASE_FROM_SIGNAL_PCT;
+  const n = raw === undefined || raw === "" ? 1.2 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0.2, Math.min(8, n)) : 1.2;
+})();
+/** 최근 로컬 고점에 너무 근접(되밀림 여지 적음)한 추격 진입 차단: (고점-현재)/고점*100 < 이 값이면 차단 */
+const LIVE_MAX_ENTRY_NEAR_HIGH_PCT = (() => {
+  const raw = process.env.LIVE_MAX_ENTRY_NEAR_HIGH_PCT;
+  const n = raw === undefined || raw === "" ? 0.35 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0.05, Math.min(3, n)) : 0.35;
+})();
+const LIVE_WEAK_MARKET_MIN_SCORE = (() => {
+  const raw = process.env.LIVE_WEAK_MARKET_MIN_SCORE;
+  const n = raw === undefined || raw === "" ? 84 : Number(raw);
+  return Number.isFinite(n) ? Math.max(50, Math.min(100, n)) : 84;
+})();
+const LIVE_WEAK_MARKET_MAX_CHASE_PCT = (() => {
+  const raw = process.env.LIVE_WEAK_MARKET_MAX_CHASE_PCT;
+  const n = raw === undefined || raw === "" ? 0.7 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0.1, Math.min(5, n)) : 0.7;
+})();
+const LIVE_WEAK_MARKET_MIN_VOLUME_RATIO = (() => {
+  const raw = process.env.LIVE_WEAK_MARKET_MIN_VOLUME_RATIO;
+  const n = raw === undefined || raw === "" ? 1.25 : Number(raw);
+  return Number.isFinite(n) ? Math.max(1.0, Math.min(5, n)) : 1.25;
+})();
+
+// --- Weak-market exit small relax (keep protection, reduce over-sensitivity) ---
+const LIVE_BTC_WEAK_TIGHT_STOP_PCT = (() => {
+  const raw = process.env.LIVE_BTC_WEAK_TIGHT_STOP_PCT;
+  const n = raw === undefined || raw === "" ? -1.1 : Number(raw);
+  return Number.isFinite(n) ? Math.max(-5, Math.min(-0.2, n)) : -1.1;
+})();
+const LIVE_STABLE_WEAK_REBOUND_TIME_STOP_MINUTES = (() => {
+  const raw = process.env.LIVE_STABLE_WEAK_REBOUND_TIME_STOP_MINUTES;
+  const n = raw === undefined || raw === "" ? 18 : Number(raw);
+  return Number.isFinite(n) ? Math.max(6, Math.min(90, Math.floor(n))) : 18;
+})();
+
 /** 명시적 true/false만 인정, 미설정이면 null */
 function parseEnvBoolExplicit(value: string | undefined): boolean | null {
   if (value === undefined || value === "") return null;
@@ -1034,7 +1079,7 @@ export function createLiveDataStrategy(opts: {
       let reasonExit = "";
       let stopTriggerKind: StopTriggerKind | null = null;
       let ratio = 1;
-      const weakModeTighterStop = (state.regime?.btc_filter_state ?? "neutral") === "weak" ? -0.9 : null;
+      const weakModeTighterStop = (state.regime?.btc_filter_state ?? "neutral") === "weak" ? LIVE_BTC_WEAK_TIGHT_STOP_PCT : null;
       if (weakModeTighterStop !== null && pnlGross <= weakModeTighterStop) {
         reasonExit = "btc_weak_tight_stop";
         stopTriggerKind = "price_stop";
@@ -1055,7 +1100,7 @@ export function createLiveDataStrategy(opts: {
               trailing_from_peak_pct: xs.trailing_peak_pct,
             }
           : STRATEGY_RISK_CONFIG.stable;
-        const weakHoldMin = xs ? xs.weak_hold_stop_minutes : STRATEGY_RISK_CONFIG.stable.weak_hold_stop_minutes;
+        const weakHoldMin = xs ? xs.weak_hold_stop_minutes : LIVE_STABLE_WEAK_REBOUND_TIME_STOP_MINUTES;
         const recv = xs
           ? {
               giveup_minutes: xs.giveup_minutes,
@@ -1999,6 +2044,143 @@ export function createLiveDataStrategy(opts: {
           payload: { symbol: market, market_state: marketState.market_state, note: "no_exception_entries" },
         });
         emitEval("entry_skipped_risk_off", { symbol: market, market_state: marketState.market_state });
+        continue;
+      }
+
+      // Late-entry diagnostics & guard (entry timing)
+      const signalTs = typeof sig.ts === "string" ? sig.ts : null;
+      const signalTsMs = signalTs ? Date.parse(signalTs) : NaN;
+      const nowMs = Date.now();
+      const secondsSinceSignal = Number.isFinite(signalTsMs) ? Math.max(0, Math.floor((nowMs - signalTsMs) / 1000)) : null;
+      const currentPrice = Number(priceBy.get(market) ?? 0);
+      // Approximate signal price by nearest minute candle close at/before signal timestamp.
+      let signalPriceApprox: number | null = null;
+      let recent1mRet: number | null = null;
+      let recent3mRet: number | null = null;
+      let recent5mRet: number | null = null;
+      let localHigh: number | null = null;
+      let distanceFromLocalHighPct: number | null = null;
+      let priceChangeSinceSignalPct: number | null = null;
+      let volumeFadeTriggered = false;
+      try {
+        // Small window; used for timing guard + high proximity.
+        const c1 = await fetchMinuteCandles(market, 1, 12);
+        const closes = c1.map((x: any) => Number(x.trade_price ?? 0)).filter((n: number) => Number.isFinite(n) && n > 0);
+        const highs = c1.map((x: any) => Number(x.high_price ?? 0)).filter((n: number) => Number.isFinite(n) && n > 0);
+        if (highs.length > 0) localHigh = Math.max(...highs);
+        if (localHigh && currentPrice > 0) distanceFromLocalHighPct = ((localHigh - currentPrice) / localHigh) * 100;
+        if (closes.length >= 2) recent1mRet = ((closes[closes.length - 1] / closes[closes.length - 2]) - 1) * 100;
+        if (closes.length >= 4) recent3mRet = ((closes[closes.length - 1] / closes[closes.length - 4]) - 1) * 100;
+        if (closes.length >= 6) recent5mRet = ((closes[closes.length - 1] / closes[closes.length - 6]) - 1) * 100;
+
+        if (Number.isFinite(signalTsMs)) {
+          // candle timestamp is `candle_date_time_utc` in upbit response (string ISO-ish). fall back other keys.
+          let best: { t: number; px: number } | null = null;
+          for (const x of c1 as any[]) {
+            const tRaw = String((x as any).candle_date_time_utc ?? (x as any).candle_date_time_kst ?? "");
+            const t = Date.parse(tRaw);
+            const px = Number((x as any).trade_price ?? 0);
+            if (!Number.isFinite(t) || !(px > 0)) continue;
+            if (t <= signalTsMs && (!best || t > best.t)) best = { t, px };
+          }
+          if (best) signalPriceApprox = best.px;
+          if (signalPriceApprox && currentPrice > 0) priceChangeSinceSignalPct = ((currentPrice / signalPriceApprox) - 1) * 100;
+        }
+
+        // Volume fade heuristic: latest notional vs avg previous 5 notional.
+        if (c1.length >= 7) {
+          const last = c1[c1.length - 1] as any;
+          const prev5 = c1.slice(-6, -1) as any[];
+          const lastNotional = Number(last.candle_acc_trade_volume ?? 0) * Number(last.trade_price ?? 0);
+          const prevAvg =
+            prev5.reduce((acc, r) => acc + Number(r.candle_acc_trade_volume ?? 0) * Number(r.trade_price ?? 0), 0) /
+            Math.max(1, prev5.length);
+          if (Number.isFinite(lastNotional) && Number.isFinite(prevAvg) && prevAvg > 0) {
+            volumeFadeTriggered = lastNotional / prevAvg < 0.65;
+          }
+        }
+      } catch {
+        // candle fetch failures shouldn't block entry evaluation; guard will fall back to null fields.
+      }
+
+      const gateTiming = opts.marketState.entryGate(sig.p, marketState);
+      const score = Number(gateTiming.score ?? 0);
+      const volumeRatio = Number(sig.p.volume_ratio ?? 0);
+      const btcTierNow = state.regime?.btc_filter_state ?? "neutral";
+
+      let lateEntryGuardTriggered = false;
+      let lateEntryGuardReason: string | null = null;
+      const staleLimit = btcTierNow === "weak" ? Math.min(LIVE_ENTRY_SIGNAL_STALE_SECONDS, 180) : LIVE_ENTRY_SIGNAL_STALE_SECONDS;
+      const chaseLimit = btcTierNow === "weak" ? LIVE_WEAK_MARKET_MAX_CHASE_PCT : LIVE_MAX_CHASE_FROM_SIGNAL_PCT;
+      if (secondsSinceSignal !== null && secondsSinceSignal > staleLimit) {
+        lateEntryGuardTriggered = true;
+        lateEntryGuardReason = `signal_stale:${secondsSinceSignal}s>${staleLimit}s`;
+      } else if (priceChangeSinceSignalPct !== null && priceChangeSinceSignalPct > chaseLimit) {
+        lateEntryGuardTriggered = true;
+        lateEntryGuardReason = `chase_from_signal:${priceChangeSinceSignalPct.toFixed(3)}pct>${chaseLimit}pct`;
+      } else if (distanceFromLocalHighPct !== null && distanceFromLocalHighPct < LIVE_MAX_ENTRY_NEAR_HIGH_PCT) {
+        lateEntryGuardTriggered = true;
+        lateEntryGuardReason = `too_near_local_high:${distanceFromLocalHighPct.toFixed(3)}pct<${LIVE_MAX_ENTRY_NEAR_HIGH_PCT}pct`;
+      } else if (volumeFadeTriggered) {
+        lateEntryGuardTriggered = true;
+        lateEntryGuardReason = "volume_fade_after_spike";
+      }
+
+      let entryAllowedByTiming = !lateEntryGuardTriggered;
+      if (btcTierNow === "weak") {
+        if (score < LIVE_WEAK_MARKET_MIN_SCORE) {
+          entryAllowedByTiming = false;
+          lateEntryGuardTriggered = true;
+          lateEntryGuardReason = `weak_market_min_score:${score.toFixed(2)}<${LIVE_WEAK_MARKET_MIN_SCORE}`;
+        } else if (volumeRatio > 0 && volumeRatio < LIVE_WEAK_MARKET_MIN_VOLUME_RATIO) {
+          entryAllowedByTiming = false;
+          lateEntryGuardTriggered = true;
+          lateEntryGuardReason = `weak_market_min_volume_ratio:${volumeRatio.toFixed(3)}<${LIVE_WEAK_MARKET_MIN_VOLUME_RATIO}`;
+        }
+      }
+
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_ENTRY_DECISION",
+          ts: new Date().toISOString(),
+          symbol: market,
+          market_state: marketState.market_state,
+          btc_tier: btcTierNow,
+          score,
+          entry_allowed: entryAllowedByTiming,
+          entry_block_reason: entryAllowedByTiming ? null : lateEntryGuardReason,
+          current_price: currentPrice,
+          signal_price: signalPriceApprox,
+          signal_ts: signalTs,
+          seconds_since_signal: secondsSinceSignal,
+          price_change_since_signal_pct: priceChangeSinceSignalPct,
+          recent_1m_return_pct: recent1mRet,
+          recent_3m_return_pct: recent3mRet,
+          recent_5m_return_pct: recent5mRet,
+          distance_from_recent_breakout_pct: null,
+          distance_from_local_high_pct: distanceFromLocalHighPct,
+          volume_ratio: volumeRatio,
+          late_entry_guard_triggered: lateEntryGuardTriggered,
+          late_entry_guard_reason: lateEntryGuardReason,
+        }),
+      );
+
+      if (!entryAllowedByTiming) {
+        console.info(
+          JSON.stringify({
+            tag: "DEBUG_LIVE_ENTRY_TIMING_GUARD",
+            ts: new Date().toISOString(),
+            symbol: market,
+            late_entry_guard_triggered: true,
+            late_entry_guard_reason: lateEntryGuardReason,
+            seconds_since_signal: secondsSinceSignal,
+            price_change_since_signal_pct: priceChangeSinceSignalPct,
+            distance_from_local_high_pct: distanceFromLocalHighPct,
+            volume_fade_triggered: volumeFadeTriggered,
+            btc_tier: btcTierNow,
+          }),
+        );
+        bumpSkip("late_entry_guard");
         continue;
       }
       const sigTypeUpper = (sig.p.signal_type ?? "").toUpperCase();
