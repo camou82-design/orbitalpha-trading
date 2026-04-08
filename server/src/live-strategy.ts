@@ -1424,11 +1424,24 @@ export function createLiveDataStrategy(opts: {
         ts: new Date().toISOString(),
         stage: "after_base_entry_universe",
         base_input_symbols: baseEntryUniverse.slice(0, 20),
+        held_extra_symbols: heldExtraSymbols.slice(0, 20),
         ticker_requested_symbols: tickerRequestedSymbols.slice(0, 20),
         symbols_match_boolean:
           baseEntryUniverse.length === tickerRequestedSymbols.length &&
           baseEntryUniverse.every((m) => tickerRequestedSymbols.includes(m)),
         ticker_is_superset_of_base: baseEntryUniverse.every((m) => tickerRequestedSymbols.includes(m)),
+        base_only_symbols: baseEntryUniverse.filter((m) => !tickerRequestedSymbols.includes(m)).slice(0, 20),
+        ticker_extra_symbols: tickerRequestedSymbols.filter((m) => !baseEntryUniverse.includes(m)).slice(0, 20),
+        match_interpretation: (() => {
+          const baseOnly = baseEntryUniverse.filter((m) => !tickerRequestedSymbols.includes(m));
+          const tickerSuperset = baseOnly.length === 0;
+          const exact =
+            baseEntryUniverse.length === tickerRequestedSymbols.length &&
+            tickerRequestedSymbols.every((m) => baseEntryUniverse.includes(m));
+          if (exact) return "exact_match";
+          if (tickerSuperset) return "superset_with_held_extra";
+          return "mismatch_missing_base_symbol";
+        })(),
       }),
     );
     console.info(
