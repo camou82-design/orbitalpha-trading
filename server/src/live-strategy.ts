@@ -740,22 +740,28 @@ export function createLiveDataStrategy(opts: {
       }),
     );
 
-    // ticker 요청 입력 소스는 baseEntryUniverseInput과 동일하게 정렬한다.
+    // 진입 후보 집합(base/precheck)과 ticker fetch 집합(보유/기준가 보강)을 개념적으로 분리한다.
     const fallbackUsedForPrimary = filterPassCandidates.length === 0;
     const tickerRequestSourceKind = fallbackUsedForPrimary ? "fallback" : "filter_pass_primary";
-    const primaryForUniverseAndTicker = fallbackUsedForPrimary ? watchMarkets : filterPassCandidates;
-    const tickerRequestedSymbols = Array.from(
-      new Set(["KRW-BTC", ...primaryForUniverseAndTicker, ...(exceptionSlotMarket ? [exceptionSlotMarket] : []), ...debugUniverseExtra]),
+    const primaryForUniverse = fallbackUsedForPrimary ? watchMarkets : filterPassCandidates;
+    const baseInputSymbols = Array.from(
+      new Set([...primaryForUniverse, ...(exceptionSlotMarket ? [exceptionSlotMarket] : []), ...debugUniverseExtra]),
     );
+    // 보유 포지션 평가/표시 보강 + BTC 기준가 보강(레짐/스케일 계산용)
+    const heldExtraSymbols = Array.from(new Set(["KRW-BTC", ...Object.keys(state.positions)])).filter((m) => m.startsWith("KRW-"));
+    const tickerRequestedSymbols = Array.from(new Set([...baseInputSymbols, ...heldExtraSymbols]));
     console.info(
       JSON.stringify({
         tag: "DEBUG_TICKER_REQUEST_SOURCE",
         ts: new Date().toISOString(),
         stage: "after_scanner_before_tickers",
         source_kind: tickerRequestSourceKind,
-        requested_symbols: tickerRequestedSymbols.slice(0, 20),
+        base_input_symbols: baseInputSymbols.slice(0, 20),
+        held_extra_symbols: heldExtraSymbols.slice(0, 20),
+        ticker_requested_symbols: tickerRequestedSymbols.slice(0, 20),
         filter_pass_symbols: filterPassCandidates.slice(0, 20),
         watch_markets_symbols: watchMarkets.slice(0, 20),
+        open_position_symbols: Object.keys(state.positions),
       }),
     );
     console.info(
@@ -1395,9 +1401,7 @@ export function createLiveDataStrategy(opts: {
     const fallbackUsed = filterPassCandidates.length === 0;
     const inputSourceKind = fallbackUsed ? "legacy_fallback" : "filter_pass_primary";
     const primary = fallbackUsed ? watchMarkets : filterPassCandidates;
-    const baseEntryUniverseInput = Array.from(
-      new Set([...primary, ...(exceptionSlot ? [exceptionSlot] : []), ...debugUniverseExtra]),
-    );
+    const baseEntryUniverseInput = Array.from(new Set([...primary, ...(exceptionSlot ? [exceptionSlot] : []), ...debugUniverseExtra]));
     console.info(
       JSON.stringify({
         tag: "DEBUG_ENTRY_INPUT_SOURCE",
@@ -1424,6 +1428,7 @@ export function createLiveDataStrategy(opts: {
         symbols_match_boolean:
           baseEntryUniverse.length === tickerRequestedSymbols.length &&
           baseEntryUniverse.every((m) => tickerRequestedSymbols.includes(m)),
+        ticker_is_superset_of_base: baseEntryUniverse.every((m) => tickerRequestedSymbols.includes(m)),
       }),
     );
     console.info(
