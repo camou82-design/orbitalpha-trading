@@ -45,6 +45,8 @@ export type FetchTickersOptions = {
   batchDelayMs?: number;
   /** 동시에 요청할 배치 수(1=기존 순차). 2~4 권장, 429 시 1로 낮춤. */
   parallelTickerBatches?: number;
+  /** DEBUG_LIVE_DATA_SOURCE / DEBUG_TICKER_RATE_LIMIT 로깅용 호출자 라벨. */
+  debugCaller?: string;
 };
 
 function sleep(ms: number): Promise<void> {
@@ -377,8 +379,41 @@ function numTradePrice(v: unknown): number {
 const TICKER_MAX_MARKETS_PER_TICK = Number(process.env.UPBIT_TICKER_MAX_MARKETS_PER_TICK ?? 15);
 const TICKER_BATCH_SIZE = Number(process.env.UPBIT_TICKER_BATCH_SIZE ?? 5);
 const TICKER_BATCH_DELAY_MS = Number(process.env.UPBIT_TICKER_BATCH_DELAY_MS ?? 1_800); // 배치 간 간격
-const TICKER_429_MAX_ATTEMPTS = Number(process.env.UPBIT_TICKER_429_MAX_ATTEMPTS ?? 2); // 최초 + 1회 재시도
-const TICKER_429_RETRY_DELAY_MS = Number(process.env.UPBIT_TICKER_429_RETRY_DELAY_MS ?? 2_000); // 최소 1~2초
+const TICKER_429_MAX_ATTEMPTS = Number(process.env.UPBIT_TICKER_429_MAX_ATTEMPTS ?? 1); // 기본: 재시도 없음(429 과호출 방지)
+const TICKER_429_RETRY_DELAY_MS = Number(process.env.UPBIT_TICKER_429_RETRY_DELAY_MS ?? 5_000); // 재시도 시 최소 대기
+
+// ticker REST 과호출/429 완화를 위한 공용 캐시/쿨다운 (프로세스 내).
+const TICKER_CACHE_TTL_MS = Number(process.env.UPBIT_TICKER_CACHE_TTL_MS ?? 12_000); // 8~15s 권장
+const TICKER_CACHE_STALE_GRACE_MS = Number(process.env.UPBIT_TICKER_CACHE_STALE_GRACE_MS ?? 30_000); // 429 시 마지막 값 서빙
+const TICKER_429_COOLDOWN_MS = Number(process.env.UPBIT_TICKER_429_COOLDOWN_MS ?? 20_000); // 10~30s 권장
+const TICKER_429_LOG_INTERVAL_MS = Number(process.env.UPBIT_TICKER_429_LOG_INTERVAL_MS ?? 60_000);
+
+type TickerCacheEntry = {
+  value: UpbitTicker;
+  fetchedAtMs: number;
+  expiresAtMs: number;
+  staleUntilMs: number;
+};
+
+const tickerCache = new Map<string, TickerCacheEntry>();
+const tickerCooldownUntilMs = new Map<string, number>();
+const ticker429LastLogAtMs = new Map<string, number>();
+
+function tickerDebugEnabled(): boolean {
+  return (
+    process.env.UPBIT_TICKER_DEBUG === "1" ||
+    (process.env.DEBUG_LOG_ENABLED ?? "").toLowerCase() === "true" ||
+    (process.env.ORBITALPHA_TRADING_DEBUG_LOG_ENABLED ?? "").toLowerCase() === "true"
+  );
+}
+
+function maybeLogTicker429(nowMs: number, payload: Record<string, unknown>) {
+  const key = String(payload["cooldown_key"] ?? "global");
+  const last = ticker429LastLogAtMs.get(key) ?? 0;
+  if (nowMs - last < TICKER_429_LOG_INTERVAL_MS) return;
+  ticker429LastLogAtMs.set(key, nowMs);
+  console.info(JSON.stringify({ tag: "DEBUG_TICKER_RATE_LIMIT", ts: new Date().toISOString(), ...payload }));
+}
 
 const ticker24hVolumeHintByMarket = new Map<string, number>();
 
@@ -425,6 +460,23 @@ async function fetchTickerBatchGroup(group: string[]): Promise<UpbitTicker[]> {
     } catch (e) {
       const status = e instanceof UpbitHttpError ? e.status : undefined;
       const is429 = status === 429 || (e instanceof Error && e.message.includes("429"));
+      if (is429) {
+        const now = Date.now();
+        for (const m of group) tickerCooldownUntilMs.set(m, now + TICKER_429_COOLDOWN_MS);
+        if (tickerDebugEnabled()) {
+          maybeLogTicker429(now, {
+            cooldown_key: `batch:${group.length}`,
+            markets: group,
+            status: status ?? 429,
+            retry_count: attempt,
+            cooldown_ms: TICKER_429_COOLDOWN_MS,
+            cache_fallback_used: group.some((m) => {
+              const c = tickerCache.get(m);
+              return Boolean(c && now <= c.staleUntilMs);
+            }),
+          });
+        }
+      }
       if (!is429 || attempt >= Math.max(1, TICKER_429_MAX_ATTEMPTS)) {
         console.warn(
           `[upbit-ticker] batch_failed markets=${group.length} attempt=${attempt} status=${status ?? "unknown"} error=${e instanceof Error ? e.message : String(e)}`,
@@ -442,6 +494,10 @@ export async function fetchTickers(markets: string[], opts?: FetchTickersOptions
   if (markets.length === 0) return [];
   const sanitized = await sanitizeKrwMarkets(markets);
   if (sanitized.length === 0) return [];
+  const now0 = Date.now();
+  const dbgOn = tickerDebugEnabled();
+  const sourceByMarket = new Map<string, "live" | "cache" | "fallback" | "cooldown_skip">();
+  const ageByMarketMs = new Map<string, number>();
   const maxCap = opts?.maxMarkets ?? TICKER_MAX_MARKETS_PER_TICK;
   const ordered =
     opts?.sortByCached24hVolume === false
@@ -449,18 +505,76 @@ export async function fetchTickers(markets: string[], opts?: FetchTickersOptions
       : [...sanitized].sort((a, b) => (ticker24hVolumeHintByMarket.get(b) ?? 0) - (ticker24hVolumeHintByMarket.get(a) ?? 0));
   const limited =
     maxCap >= ordered.length ? ordered : ordered.slice(0, Math.max(1, maxCap));
+
+  // 1) TTL 캐시 먼저 반영 → TTL 내 중복 호출 제거.
+  const needFetch: string[] = [];
+  const cachedOut: UpbitTicker[] = [];
+  for (const m of limited) {
+    const c = tickerCache.get(m);
+    if (c && now0 <= c.expiresAtMs) {
+      cachedOut.push(c.value);
+      sourceByMarket.set(m, "cache");
+      ageByMarketMs.set(m, now0 - c.fetchedAtMs);
+      continue;
+    }
+    // 2) 429 쿨다운 중이면, stale grace 내 캐시가 있으면 fallback, 없으면 스킵(호출 억제)
+    const cd = tickerCooldownUntilMs.get(m) ?? 0;
+    if (cd > now0) {
+      if (c && now0 <= c.staleUntilMs) {
+        cachedOut.push(c.value);
+        sourceByMarket.set(m, "fallback");
+        ageByMarketMs.set(m, now0 - c.fetchedAtMs);
+      } else {
+        sourceByMarket.set(m, "cooldown_skip");
+      }
+      continue;
+    }
+    needFetch.push(m);
+  }
   const batchSize = Math.max(1, opts?.batchSize ?? TICKER_BATCH_SIZE);
   const batchDelayMs = opts?.batchDelayMs ?? TICKER_BATCH_DELAY_MS;
   const parallelTickerBatches = Math.max(1, Math.min(20, opts?.parallelTickerBatches ?? 1));
-  const batches = chunk(limited, batchSize);
+  const batches = chunk(needFetch, batchSize);
 
-  const out: UpbitTicker[] = [];
+  const out: UpbitTicker[] = [...cachedOut];
   for (let i = 0; i < batches.length; i += parallelTickerBatches) {
     const slice = batches.slice(i, i + parallelTickerBatches);
     const results = await Promise.all(slice.map((g) => fetchTickerBatchGroup(g)));
-    for (const r of results) out.push(...r);
+    for (const r of results) {
+      for (const t of r) {
+        const now = Date.now();
+        tickerCache.set(t.market, {
+          value: t,
+          fetchedAtMs: now,
+          expiresAtMs: now + TICKER_CACHE_TTL_MS,
+          staleUntilMs: now + TICKER_CACHE_TTL_MS + TICKER_CACHE_STALE_GRACE_MS,
+        });
+        sourceByMarket.set(t.market, "live");
+        ageByMarketMs.set(t.market, 0);
+      }
+      out.push(...r);
+    }
     if (i + parallelTickerBatches < batches.length) {
       await sleep(Math.max(0, batchDelayMs));
+    }
+  }
+
+  if (dbgOn) {
+    // 호출자가 live-strategy인 경우, 심볼별 데이터 소스/age를 남겨 “429로 미평가 vs 신호부족”을 구분 가능하게 함.
+    for (const m of limited) {
+      const src = sourceByMarket.get(m);
+      if (!src) continue;
+      const age = ageByMarketMs.get(m) ?? null;
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_DATA_SOURCE",
+          ts: new Date().toISOString(),
+          symbol: m,
+          ticker_source: src,
+          ticker_age_ms: age,
+          caller: opts?.debugCaller ?? null,
+        }),
+      );
     }
   }
   return out;
