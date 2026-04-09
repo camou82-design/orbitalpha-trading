@@ -28,7 +28,7 @@ export type TradingContext = z.infer<typeof tradingContextSchema>;
 export const signalLogEntrySchema = z.object({
   ...tradingContextSchema.shape,
   ts: z.string().min(1),
-  kind: z.enum(["signal", "system", "upbit"]),
+  kind: z.enum(["signal", "system", "upbit", "paper"]),
   message: z.string(),
   payload: z.record(z.unknown()).optional(),
 });

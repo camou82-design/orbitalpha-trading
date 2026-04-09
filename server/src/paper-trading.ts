@@ -121,8 +121,8 @@ const PAPER_EARLY_ENTRY_MAX_SIGNAL_SECONDS = (() => {
 })();
 const PAPER_EARLY_ENTRY_FAIL_SECONDS = (() => {
   const raw = process.env.PAPER_EARLY_ENTRY_FAIL_SECONDS;
-  const n = raw === undefined || raw === "" ? 45 : Number(raw);
-  return Number.isFinite(n) ? Math.max(10, Math.min(300, Math.floor(n))) : 45;
+  const n = raw === undefined || raw === "" ? 180 : Number(raw);
+  return Number.isFinite(n) ? Math.max(10, Math.min(600, Math.floor(n))) : 180;
 })();
 const PAPER_EARLY_ENTRY_FAIL_LOSS_PCT = (() => {
   const raw = process.env.PAPER_EARLY_ENTRY_FAIL_LOSS_PCT;
@@ -163,7 +163,7 @@ const PAPER_SURGE_SCANNER_TIMEOUT_MS = (() => {
 })();
 const CANDIDATE_KEEP_MS = 3 * 60_000;
 const CANDIDATE_MAX_TRACKED = 8;
-const PAPER_HISTORY_MAX = 200;
+const PAPER_HISTORY_MAX = 1000;
 const PAPER_SEEN_SIGNAL_MAX = 500;
 const PAPER_BTC_NEUTRAL_ENTRY_SCALE = 0.75;
 const PAPER_BTC_WEAK_ENTRY_SCALE = 0.5;
@@ -195,7 +195,7 @@ function logPumpScannerDebug(payload: Record<string, unknown>) {
 }
 
 function emitPaper(tag: string, payload: Record<string, unknown> = {}) {
-  console.info(JSON.stringify({ tag, ts: new Date().toISOString(), ...payload }));
+  console.info(JSON.stringify({ kind: "paper", tag, ts: new Date().toISOString(), ...payload }));
 }
 
 function countPaperSlots(positions: Record<string, PaperPosition>): {

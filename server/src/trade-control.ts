@@ -77,7 +77,11 @@ const TEST_ORDER_KRW = 5000;
 const COOLDOWN_MS = 20_000;
 const ALLOWED_MARKETS = new Set(["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX"]);
 const MANAGED_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX"] as const;
-const MAX_CONCURRENT_STRATEGY_POSITIONS = 2;
+const MAX_CONCURRENT_STRATEGY_POSITIONS = (() => {
+  const raw = process.env.LIVE_MAX_POSITIONS_CAP;
+  const n = raw === undefined || raw === "" ? 6 : Number(raw);
+  return Number.isFinite(n) ? Math.max(1, Math.min(12, Math.floor(n))) : 6;
+})();
 const STRATEGY_RULES = {
   tp1_pct: 2.5,
   tp2_pct: 5.0,

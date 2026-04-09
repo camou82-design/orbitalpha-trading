@@ -2285,6 +2285,47 @@ export function createLiveDataStrategy(opts: {
             prior_exit_reason: null,
           }),
         );
+        if (LIVE_EARLY_ENTRY_ENABLED) {
+          const scoreCd = gatePre ? Number(gatePre.score ?? 0) : null;
+          const vrCd = sigPre ? Number(sigPre.p.volume_ratio ?? 0) : null;
+          const momCd = sigPre
+            ? Number((sigPre.p as any).momentum_3m_pct ?? (sigPre.p as any).price_change_3m_pct ?? 0)
+            : null;
+          console.info(
+            JSON.stringify({
+              tag: "DEBUG_LIVE_EARLY_CANDIDATE",
+              ts: new Date().toISOString(),
+              symbol: market,
+              score: scoreCd,
+              volume_ratio: vrCd,
+              price_position: null,
+              ema_gap: null,
+              momentum: momCd,
+              market_state: marketState.market_state,
+            }),
+          );
+          console.info(
+            JSON.stringify({
+              tag: "DEBUG_LIVE_EARLY_ENTRY_DECISION",
+              ts: new Date().toISOString(),
+              symbol: market,
+              decision: "block",
+              block_reason: "cooldown_active",
+              block_reason_detail: `cooldown_until:${cool}`,
+              timing_state: "late",
+              volume_state: "alive",
+              position_state: state.positions[market] ? "holding" : "empty",
+            }),
+          );
+          console.info(
+            JSON.stringify({
+              tag: "DEBUG_LIVE_ENTRY_SUMMARY",
+              ts: new Date().toISOString(),
+              symbol: market,
+              line: `${market} | early_candidate=yes | decision=block | reason=cooldown_active | score=${scoreCd === null ? "na" : Math.round(scoreCd)} | vr=${vrCd === null ? "na" : Number(vrCd).toFixed(2)}`,
+            }),
+          );
+        }
         bumpSkip("cooldown_active");
         continue;
       }
@@ -2419,6 +2460,46 @@ export function createLiveDataStrategy(opts: {
       const volumeRatio = Number(sig.p.volume_ratio ?? 0);
       const btcTierNow = state.regime?.btc_filter_state ?? "neutral";
 
+      const stdBlockReason = (raw: string | null): string => {
+        if (!raw) return "base_gate_failed";
+        const s = raw.toLowerCase();
+        if (s === "cooldown_active" || s.includes("cooldown")) return "cooldown_active";
+        if (s.includes("volume_fade")) return "volume_faded";
+        if (s.includes("too_near_local_high") || s.includes("near_high")) return "near_high_entry";
+        if (s.includes("signal_stale") || s.includes("stale") || s.includes("timing")) return "timing_late";
+        if (s.includes("risk_off")) return "market_risk_off";
+        if (s.includes("duplicate_symbol") || s.includes("position") || s.includes("already")) return "position_exists";
+        if (s.includes("signal_missing")) return "signal_missing";
+        if (s.includes("gate")) return "base_gate_failed";
+        return "base_gate_failed";
+      };
+
+      const timingState: "early" | "mid" | "late" =
+        secondsSinceSignal === null
+          ? "late"
+          : secondsSinceSignal <= LIVE_EARLY_ENTRY_MAX_SIGNAL_SECONDS
+            ? "early"
+            : secondsSinceSignal <= (btcTierNow === "weak" ? Math.min(LIVE_ENTRY_SIGNAL_STALE_SECONDS, 180) : LIVE_ENTRY_SIGNAL_STALE_SECONDS)
+              ? "mid"
+              : "late";
+      const volumeState: "alive" | "faded" = volumeFadeTriggered || (volumeRatio1m5 !== null && volumeRatio1m5 < 0.65) ? "faded" : "alive";
+      const positionState: "empty" | "holding" = state.positions[market] ? "holding" : "empty";
+
+      // ① EARLY 후보 포착 — “초입 후보까지는 왔다” 확인용 (candidate → decision → summary 연결의 시작점)
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_EARLY_CANDIDATE",
+          ts: new Date().toISOString(),
+          symbol: market,
+          score,
+          volume_ratio: volumeRatio1m5 ?? volumeRatio,
+          price_position: distanceFromLocalHighPct,
+          ema_gap: null,
+          momentum: Number((sig.p as any).momentum_3m_pct ?? (sig.p as any).price_change_3m_pct ?? 0),
+          market_state: marketState.market_state,
+        }),
+      );
+
       let lateEntryGuardTriggered = false;
       let lateEntryGuardReason: string | null = null;
       const staleLimit = btcTierNow === "weak" ? Math.min(LIVE_ENTRY_SIGNAL_STALE_SECONDS, 180) : LIVE_ENTRY_SIGNAL_STALE_SECONDS;
@@ -2497,36 +2578,50 @@ export function createLiveDataStrategy(opts: {
 
         const earlyAllowed =
           notAlready && earlySlotOk && weakOk && secondsFreshOk && nearHighOk && volOk && scoreOk && currentPrice > 0 && localHigh !== null;
-        const earlyReason = !notAlready
-          ? "duplicate_symbol"
+        const rawEarlyReason = !notAlready
+          ? "position_exists"
           : !earlySlotOk
-            ? "early_slot_full"
+            ? "base_gate_failed"
             : !weakOk
-              ? "weak_market_guard"
+              ? "market_risk_off"
               : !secondsFreshOk
-                ? "signal_not_fresh"
+                ? "timing_late"
                 : !nearHighOk
-                  ? "not_near_high"
+                  ? "near_high_entry"
                   : !volOk
-                    ? "volume_not_strong"
+                    ? "volume_faded"
                     : !scoreOk
-                      ? "score_too_low"
+                      ? "base_gate_failed"
                       : currentPrice <= 0
-                        ? "invalid_price"
-                        : "ok";
+                        ? "base_gate_failed"
+                        : "none";
+        const earlyDecision = earlyAllowed ? "enter" : "block";
+        const earlyBlockReason = earlyAllowed ? null : stdBlockReason(rawEarlyReason);
 
+        // ② 최종 진입 직전 상태 (early)
         console.info(
           JSON.stringify({
             tag: "DEBUG_LIVE_EARLY_ENTRY_DECISION",
             ts: new Date().toISOString(),
             symbol: market,
-            near_high_pct: distanceFromLocalHighPct,
-            volume_ratio: volumeRatio1m5,
-            seconds_since_signal: secondsSinceSignal,
-            early_entry_allowed: earlyAllowed,
-            early_entry_reason: earlyReason,
-            size_ratio: LIVE_EARLY_ENTRY_SIZE_RATIO,
-            early_entry_fail_triggered: false,
+            decision: earlyDecision,
+            block_reason: earlyBlockReason,
+            block_reason_detail: earlyAllowed ? null : rawEarlyReason,
+            timing_state: timingState,
+            volume_state: volumeState,
+            position_state: positionState,
+          }),
+        );
+
+        // ③ 최종 요약(한 줄)
+        console.info(
+          JSON.stringify({
+            tag: "DEBUG_LIVE_ENTRY_SUMMARY",
+            ts: new Date().toISOString(),
+            symbol: market,
+            line: `${market} | early_candidate=yes | decision=${earlyDecision} | reason=${earlyAllowed ? "none" : earlyBlockReason} | score=${Math.round(
+              score,
+            )} | vr=${Number((volumeRatio1m5 ?? volumeRatio) || 0).toFixed(2)}`,
           }),
         );
 
@@ -2580,11 +2675,23 @@ export function createLiveDataStrategy(opts: {
       }
 
       if (!entryAllowedByTiming) {
+        const reasonStd = stdBlockReason(lateEntryGuardReason);
+        console.info(
+          JSON.stringify({
+            tag: "DEBUG_LIVE_ENTRY_SUMMARY",
+            ts: new Date().toISOString(),
+            symbol: market,
+            line: `${market} | early_candidate=yes | decision=block | reason=${reasonStd} | score=${Math.round(score)} | vr=${Number(
+              (volumeRatio1m5 ?? volumeRatio) || 0,
+            ).toFixed(2)}`,
+          }),
+        );
         console.info(
           JSON.stringify({
             tag: "DEBUG_LIVE_ENTRY_TIMING_GUARD",
             ts: new Date().toISOString(),
             symbol: market,
+            block_reason: reasonStd,
             late_entry_guard_triggered: true,
             late_entry_guard_reason: lateEntryGuardReason,
             seconds_since_signal: secondsSinceSignal,
