@@ -142,80 +142,63 @@ function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btc
   const vNow = last.candle_acc_trade_volume * last.trade_price;
   const vAvg = avg(prev20.map((c) => c.candle_acc_trade_volume * c.trade_price));
   const volumeMultiple = vAvg > 0 ? vNow / vAvg : 0;
-  const scoreVol = clamp((volumeMultiple - 1) * 12, 0, 30);
 
   const high20 = Math.max(...prev20.map((c) => c.high_price));
   const breakout = last.trade_price >= high20;
-  const scoreBreak = breakout ? 20 : clamp(((last.trade_price / high20) - 0.98) * 1000, 0, 20);
 
   const range = Math.max(1e-9, last.high_price - last.low_price);
   const closeTopRatio = (last.trade_price - last.low_price) / range;
   const closeUpperHold = closeTopRatio >= 0.65;
-  const scoreCloseTop = clamp((closeTopRatio - 0.35) * 50, 0, 15);
 
   const recent3 = c1.slice(-3);
   const rise3mPct = recent3.length >= 3 ? (recent3[2]!.trade_price / recent3[0]!.trade_price - 1) * 100 : 0;
   const bullishCnt = recent3.filter((c) => c.trade_price > c.opening_price).length;
   const accel = recent3.length >= 3 && recent3[2]!.trade_price > recent3[1]!.trade_price && recent3[1]!.trade_price > recent3[0]!.trade_price;
-  const scoreAccel = clamp((bullishCnt - 1) * 7 + (accel ? 4 : 0), 0, 15);
-
-  const scoreSpeed = clamp((volumeMultiple - 1) * 4, 0, 10);
 
   const upperWickRatio = (last.high_price - last.trade_price) / range;
-  const scoreStability = upperWickRatio <= 0.35 ? 10 : clamp((0.6 - upperWickRatio) * 40, 0, 10);
-
-  let penalty = 0;
-  if (upperWickRatio > 0.55) penalty += 8;
   const oneMinPump = prev20.length > 0 ? (last.trade_price / prev20[prev20.length - 1]!.trade_price - 1) * 100 : 0;
-  if (oneMinPump > 4.5) penalty += 6;
-  if (volumeMultiple < 0.95) penalty += 10;
-  penalty += btcDropPenalty;
-
   const liquidity24h = Number(ticker.acc_trade_price_24h ?? 0);
+
+  // --- FATAL FLAW CHECK (Strict Exclusion) ---
+  const exclude_reasons: string[] = [];
   const liquidityBad = liquidity24h < LIQUIDITY_EXCLUDE_MIN_24H_KRW;
-  if (liquidityBad) penalty += 100;
+  if (liquidityBad) exclude_reasons.push("유동성 부족");
+  if (upperWickRatio > 0.55) exclude_reasons.push("윗꼬리 과다");
+  if (oneMinPump > 4.5) exclude_reasons.push("과열 (추격주의)");
+  if (volumeMultiple < 0.95) exclude_reasons.push("거래대금 부족");
+  if (btcDropPenalty > 0) exclude_reasons.push("BTC 역풍");
 
-  // Strong candidates: breakout + upper hold + clear volume surge.
-  const hasOnAltAltPattern = breakout && closeUpperHold && volumeMultiple >= 1.3;
+  const isFatal = exclude_reasons.length > 0;
 
-  // Re-weighting for "real alt breakout" detection.
+  // --- SCORING ---
   const scoreVolStrong = clamp((volumeMultiple - 1) * 18, 0, 45);
   const scoreBreakStrong = breakout ? 30 : clamp(((last.trade_price / high20) - 0.985) * 900, 0, 20);
   const scoreCloseTopStrong = closeUpperHold ? 18 : clamp((closeTopRatio - 0.35) * 60, 0, 16);
+  const accelBonus = clamp((bullishCnt - 1) * 7 + (accel ? 4 : 0), 0, 15);
   const scoreSpeedStrong = clamp((volumeMultiple - 1) * 6, 0, 18);
+  const scoreStability = upperWickRatio <= 0.35 ? 10 : clamp((0.6 - upperWickRatio) * 40, 0, 10);
   const scoreRise3m = clamp((rise3mPct - 1) * 0.9, 0, 25);
+
+  const hasOnAltAltPattern = !isFatal && breakout && closeUpperHold && volumeMultiple >= 1.3;
   const scoreOnPattern = hasOnAltAltPattern ? 15 : 0;
 
-  const scoreRaw = scoreVolStrong + scoreBreakStrong + scoreCloseTopStrong + scoreAccel + scoreSpeedStrong + scoreStability + scoreRise3m + scoreOnPattern - penalty;
+  let scoreRaw = scoreVolStrong + scoreBreakStrong + scoreCloseTopStrong + accelBonus + scoreSpeedStrong + scoreStability + scoreRise3m + scoreOnPattern - (isFatal ? 100 : 0);
   let score = clamp(scoreRaw, 0, 100);
 
-  // If liquidity is insufficient, always keep it excluded (so that reasons can be shown).
-  if (liquidityBad) score = Math.min(score, 49);
-
-  // Ensure ONT-like breakouts don't get stuck as "제외".
-  if (!liquidityBad && hasOnAltAltPattern) score = Math.max(score, 65);
-
+  // --- ELIGIBILITY (Only for non-fatal) ---
   const completedBeforeLast = c1.slice(-(PUMP_BOX_LOOKBACK_BARS + 1), -1);
-  const boxTop =
-    completedBeforeLast.length >= 5 ? Math.max(...completedBeforeLast.map((c) => c.high_price)) : high20;
+  const boxTop = completedBeforeLast.length >= 5 ? Math.max(...completedBeforeLast.map((c) => c.high_price)) : high20;
   const boxTopBreakout = completedBeforeLast.length >= 5 && last.trade_price > boxTop;
-  const initialRiseSignal =
-    rise3mPct >= PUMP_EARLY_RISE_3M_MIN_PCT ||
-    (recent3.length >= 2 && recent3[recent3.length - 1]!.trade_price > recent3[0]!.trade_price * 1.0015);
-  const earlyEntryEligible =
-    !liquidityBad && volumeMultiple > PUMP_EARLY_VOLUME_RATIO_MIN && initialRiseSignal;
-  const addEntryEligible = !liquidityBad && (breakout || boxTopBreakout);
+  const initialRiseSignal = rise3mPct >= PUMP_EARLY_RISE_3M_MIN_PCT || (recent3.length >= 2 && recent3[recent3.length - 1]!.trade_price > recent3[0]!.trade_price * 1.0015);
+
+  const earlyEntryEligible = !isFatal && volumeMultiple > PUMP_EARLY_VOLUME_RATIO_MIN && initialRiseSignal;
+  const addEntryEligible = !isFatal && (breakout || boxTopBreakout);
 
   if (earlyEntryEligible) score = Math.max(score, 54);
   if (addEntryEligible) score = Math.max(score, 56);
 
-  const status = toStatus(score);
-  const exclude_reasons: string[] = [];
-  if (liquidityBad) exclude_reasons.push("유동성 부족");
-  if (btcDropPenalty > 0) exclude_reasons.push("BTC 역풍");
-  if (upperWickRatio > 0.55) exclude_reasons.push("윗꼬리 과다");
-  if (oneMinPump > 4.5) exclude_reasons.push("과열");
-  if (volumeMultiple < 0.95) exclude_reasons.push("거래대금 부족");
+  // --- STATUS ---
+  const status = isFatal ? "제외" : toStatus(score);
 
   return {
     score: Number(score.toFixed(1)),
@@ -229,14 +212,7 @@ function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btc
     boxTop,
     boxTopBreakout,
     price: ticker.trade_price,
-    exclude_reasons:
-      status === "제외"
-        ? Array.from(
-            new Set(
-              exclude_reasons.length > 0 ? exclude_reasons : ["거래대금 부족"], // always show something
-            ),
-          )
-        : undefined,
+    exclude_reasons: status === "제외" ? Array.from(new Set(exclude_reasons.length > 0 ? exclude_reasons : ["기타 필터 탈락"])) : undefined,
   };
 }
 
@@ -435,250 +411,288 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
 
   const tick = async () => {
     try {
-    const tickT0 = Date.now();
-    const heldMarkets = Array.from(new Set(getHeldMarkets().filter((m) => typeof m === "string" && m.length > 0)));
+      const tickT0 = Date.now();
+      const heldMarkets = Array.from(new Set(getHeldMarkets().filter((m) => typeof m === "string" && m.length > 0)));
 
-    const is429Excluded = (market: string) => {
-      const until = market429CooldownUntilMs.get(market) ?? 0;
-      return until > 0 && Date.now() < until;
-    };
+      const is429Excluded = (market: string) => {
+        const until = market429CooldownUntilMs.get(market) ?? 0;
+        return until > 0 && Date.now() < until;
+      };
 
-    const baseTickers = await fetchTickers([...BASE_MARKETS]);
-    const tAfterBaseTickers = Date.now();
-    const btc = baseTickers.find((t) => t.market === "KRW-BTC");
-    const btcDropPenalty = btc && (btc.signed_change_rate ?? 0) < -0.01 ? 8 : 0;
+      const baseTickers = await fetchTickers([...BASE_MARKETS]);
+      const tAfterBaseTickers = Date.now();
+      const btc = baseTickers.find((t) => t.market === "KRW-BTC");
+      const btcDropPenalty = btc && (btc.signed_change_rate ?? 0) < -0.01 ? 8 : 0;
 
-    let krwMarkets: string[];
-    if (cachedKrwMarkets && Date.now() - cachedKrwMarketsAtMs < MARKET_LIST_CACHE_TTL_MS) {
-      krwMarkets = cachedKrwMarkets;
-    } else {
-      try {
-        const marketRows = await fetch("https://api.upbit.com/v1/market/all?isDetails=false").then((r) => r.json() as Promise<Array<{ market: string }>>);
-        krwMarkets = marketRows.map((m) => m.market).filter((m) => m.startsWith("KRW-"));
-        cachedKrwMarkets = krwMarkets;
-        cachedKrwMarketsAtMs = Date.now();
-      } catch {
-        krwMarkets = cachedKrwMarkets ?? [...BASE_MARKETS];
+      let krwMarkets: string[];
+      if (cachedKrwMarkets && Date.now() - cachedKrwMarketsAtMs < MARKET_LIST_CACHE_TTL_MS) {
+        krwMarkets = cachedKrwMarkets;
+      } else {
+        try {
+          const marketRows = await fetch("https://api.upbit.com/v1/market/all?isDetails=false").then((r) => r.json() as Promise<Array<{ market: string }>>);
+          krwMarkets = marketRows.map((m) => m.market).filter((m) => m.startsWith("KRW-"));
+          cachedKrwMarkets = krwMarkets;
+          cachedKrwMarketsAtMs = Date.now();
+        } catch {
+          krwMarkets = cachedKrwMarkets ?? [...BASE_MARKETS];
+        }
       }
-    }
-    let altMarkets = krwMarkets.filter((m) => !BASE_MARKET_SET.has(m));
-    const altValidity = await partitionKrwMarketsByUpbitValidity(altMarkets);
-    if (!altValidity.skippedBecauseUnknown) {
-      if (altValidity.rejected.length > 0) {
+      let altMarkets = krwMarkets.filter((m) => !BASE_MARKET_SET.has(m));
+      const altValidity = await partitionKrwMarketsByUpbitValidity(altMarkets);
+      if (!altValidity.skippedBecauseUnknown) {
+        if (altValidity.rejected.length > 0) {
+          console.info(
+            JSON.stringify({
+              tag: "DEBUG_PUMP_SCANNER_ALT_MARKETS_PRUNED",
+              rejected_sample: altValidity.rejected.slice(0, 12),
+              rejected_count: altValidity.rejected.length,
+            }),
+          );
+        }
+        altMarkets = altValidity.accepted;
+      }
+      const tickers = await fetchTickers(altMarkets, {
+        ...pumpAltTickerOptsBase,
+        maxMarkets: altMarkets.length,
+      });
+      const tAfterAltTickers = Date.now();
+      const fetchedAltSet = new Set(tickers.map((t) => t.market));
+      const heldMissingFromTicker = heldMarkets.filter((m) => !BASE_MARKET_SET.has(m) && !fetchedAltSet.has(m) && !is429Excluded(m));
+      const heldExtraTickers = await fetchTickers(heldMissingFromTicker);
+      const tAfterHeldExtraTickers = Date.now();
+
+      const momSel = selectMomentumTopM(tickers, {
+        is429Excluded,
+        lookbackMin: MOMENTUM_LOOKBACK_MIN,
+        topM: MOMENTUM_TOP_M,
+        useVolumeWeight: USE_VOLUME_WEIGHT,
+        snapshot: momentumSnapshot,
+        prevRankByMarket: lastMomentumRankByMarket,
+      });
+      momentumSnapshot = momSel.nextSnapshot;
+      lastMomentumRankByMarket = momSel.nextRankByMarket;
+      const momentumCandidates = momSel.momentumTop;
+      const momentumScoreByMarket = momSel.momentumScoreByMarket;
+      const tAfterMomentum = Date.now();
+
+      if (universeDebugLog) {
         console.info(
           JSON.stringify({
-            tag: "DEBUG_PUMP_SCANNER_ALT_MARKETS_PRUNED",
-            rejected_sample: altValidity.rejected.slice(0, 12),
-            rejected_count: altValidity.rejected.length,
+            tag: "DEBUG_UNIVERSE_SELECTION",
+            totalSymbols: altMarkets.length,
+            tickerReturned: tickers.length,
+            selectedSymbols: momentumCandidates.length,
+            considered: momSel.totalConsidered,
+            topMomentumSample: momentumCandidates.slice(0, 12).map((t) => t.market),
+            기준: {
+              price_change: "signed_change_rate + short-term vs prev snapshot within lookback",
+              volume_change: "delta acc_trade_price_24h vs prev snapshot when USE_VOLUME_WEIGHT",
+            },
           }),
         );
       }
-      altMarkets = altValidity.accepted;
-    }
-    const tickers = await fetchTickers(altMarkets, {
-      ...pumpAltTickerOptsBase,
-      maxMarkets: altMarkets.length,
-    });
-    const tAfterAltTickers = Date.now();
-    const fetchedAltSet = new Set(tickers.map((t) => t.market));
-    const heldMissingFromTicker = heldMarkets.filter((m) => !BASE_MARKET_SET.has(m) && !fetchedAltSet.has(m) && !is429Excluded(m));
-    const heldExtraTickers = await fetchTickers(heldMissingFromTicker);
-    const tAfterHeldExtraTickers = Date.now();
 
-    const momSel = selectMomentumTopM(tickers, {
-      is429Excluded,
-      lookbackMin: MOMENTUM_LOOKBACK_MIN,
-      topM: MOMENTUM_TOP_M,
-      useVolumeWeight: USE_VOLUME_WEIGHT,
-      snapshot: momentumSnapshot,
-      prevRankByMarket: lastMomentumRankByMarket,
-    });
-    momentumSnapshot = momSel.nextSnapshot;
-    lastMomentumRankByMarket = momSel.nextRankByMarket;
-    const momentumCandidates = momSel.momentumTop;
-    const momentumScoreByMarket = momSel.momentumScoreByMarket;
-    const tAfterMomentum = Date.now();
+      const allTickers = [...baseTickers, ...tickers, ...heldExtraTickers];
+      const tByMarket = new Map(allTickers.map((t) => [t.market, t]));
 
-    if (universeDebugLog) {
-      console.info(
-        JSON.stringify({
-          tag: "DEBUG_UNIVERSE_SELECTION",
-          totalSymbols: altMarkets.length,
-          tickerReturned: tickers.length,
-          selectedSymbols: momentumCandidates.length,
-          considered: momSel.totalConsidered,
-          topMomentumSample: momentumCandidates.slice(0, 12).map((t) => t.market),
-          기준: {
-            price_change: "signed_change_rate + short-term vs prev snapshot within lookback",
-            volume_change: "delta acc_trade_price_24h vs prev snapshot when USE_VOLUME_WEIGHT",
-          },
-        }),
-      );
-    }
+      // 기본: 보유 종목은 항상 스캔 대상에 포함(단, 429 쿨다운이면 제외).
+      const heldTickers = heldMarkets
+        .map((m) => tByMarket.get(m))
+        .filter((t): t is UpbitTicker => Boolean(t))
+        .filter((t) => !is429Excluded(t.market));
 
-    const allTickers = [...baseTickers, ...tickers, ...heldExtraTickers];
-    const tByMarket = new Map(allTickers.map((t) => [t.market, t]));
+      const seen = new Set<string>();
+      const marketsToScore = [...heldTickers, ...momentumCandidates].filter((t) => {
+        if (seen.has(t.market)) return false;
+        seen.add(t.market);
+        return true;
+      });
 
-    // 기본: 보유 종목은 항상 스캔 대상에 포함(단, 429 쿨다운이면 제외).
-    const heldTickers = heldMarkets
-      .map((m) => tByMarket.get(m))
-      .filter((t): t is UpbitTicker => Boolean(t))
-      .filter((t) => !is429Excluded(t.market));
+      const rawDetected: ScannerRow[] = [];
+      const tradableCandidates: ScannerRow[] = [];
 
-    const seen = new Set<string>();
-    const marketsToScore = [...heldTickers, ...momentumCandidates].filter((t) => {
-      if (seen.has(t.market)) return false;
-      seen.add(t.market);
-      return true;
-    });
+      const heldSet = new Set(heldMarkets);
+      const marketsRanked = [...marketsToScore].sort((a, b) => {
+        const heldBiasA = heldSet.has(a.market) ? 1 : 0;
+        const heldBiasB = heldSet.has(b.market) ? 1 : 0;
+        if (heldBiasA !== heldBiasB) return heldBiasB - heldBiasA;
+        return (momentumScoreByMarket.get(b.market) ?? 0) - (momentumScoreByMarket.get(a.market) ?? 0);
+      });
+      const candleTargets = marketsRanked.slice(0, CANDLE_MAX_MARKETS_PER_TICK);
+      const tBeforeCandles = Date.now();
+      const batches = chunk(candleTargets, CANDLE_BATCH_SIZE);
 
-    const rows: ScannerRow[] = [];
-    const heldSet = new Set(heldMarkets);
-    const marketsRanked = [...marketsToScore].sort((a, b) => {
-      const heldBiasA = heldSet.has(a.market) ? 1 : 0;
-      const heldBiasB = heldSet.has(b.market) ? 1 : 0;
-      if (heldBiasA !== heldBiasB) return heldBiasB - heldBiasA;
-      return (momentumScoreByMarket.get(b.market) ?? 0) - (momentumScoreByMarket.get(a.market) ?? 0);
-    });
-    const candleTargets = marketsRanked.slice(0, CANDLE_MAX_MARKETS_PER_TICK);
-    const tBeforeCandles = Date.now();
-    const batches = chunk(candleTargets, CANDLE_BATCH_SIZE);
-    for (let bi = 0; bi < batches.length; bi++) {
-      const batch = batches[bi]!;
-      for (const t of batch) {
-        const candles = await getCandlesSafe(t.market);
-        if (!candles) {
-          market429CooldownUntilMs.set(t.market, Date.now() + MARKET_429_EXCLUDE_MS);
-          continue;
-        }
-        const s = scoreOne(candles.c1, candles.c5, t as UpbitTicker, btcDropPenalty);
-        if (!s) continue;
-        rows.push({
-          rank: 0,
-          market: t.market,
-          score: Number(s.score.toFixed(1)),
-          status: s.status,
-          volume_multiple: Number(s.volumeMultiple.toFixed(2)),
-          breakout: s.breakout,
-          close_upper_hold: s.closeUpperHold,
-          rise_3m_pct: Number(s.rise3mPct.toFixed(2)),
-          early_entry_eligible: s.earlyEntryEligible,
-          add_entry_eligible: s.addEntryEligible,
-          exclude_reasons: s.exclude_reasons,
-          updated_at: new Date().toISOString(),
-        });
-        if (s.earlyEntryEligible) {
-          dbg("early_entry_eligible", { market: t.market, volume_multiple: s.volumeMultiple, rise_3m_pct: s.rise3mPct });
-        }
-        if (s.addEntryEligible) {
-          dbg("add_entry_eligible", {
+      for (let bi = 0; bi < batches.length; bi++) {
+        const batch = batches[bi]!;
+        for (const t of batch) {
+          const candles = await getCandlesSafe(t.market);
+          if (!candles) {
+            market429CooldownUntilMs.set(t.market, Date.now() + MARKET_429_EXCLUDE_MS);
+            continue;
+          }
+          const s = scoreOne(candles.c1, candles.c5, t as UpbitTicker, btcDropPenalty);
+          if (!s) continue;
+
+          const row: ScannerRow = {
+            rank: 0,
             market: t.market,
+            score: Number(s.score.toFixed(1)),
+            status: s.status,
+            volume_multiple: Number(s.volumeMultiple.toFixed(2)),
             breakout: s.breakout,
-            box_top_breakout: s.boxTopBreakout,
-            volume_multiple: s.volumeMultiple,
-          });
+            close_upper_hold: s.closeUpperHold,
+            rise_3m_pct: Number(s.rise3mPct.toFixed(2)),
+            early_entry_eligible: s.earlyEntryEligible,
+            add_entry_eligible: s.addEntryEligible,
+            exclude_reasons: s.exclude_reasons,
+            updated_at: new Date().toISOString(),
+          };
+
+          // 1) RAW_DETECTED Log
+          console.info(JSON.stringify({
+            tag: "RAW_DETECTED",
+            ts: row.updated_at,
+            market: row.market,
+            score: row.score,
+            status: row.status,
+            volume_multiple: row.volume_multiple
+          }));
+          rawDetected.push(row);
+
+          // 2) Categorize: Tradable vs Rejected
+          if (row.status === "제외") {
+            console.info(JSON.stringify({
+              tag: "FILTER_REJECTED",
+              ts: row.updated_at,
+              market: row.market,
+              reasons: row.exclude_reasons ?? ["기타"]
+            }));
+          } else {
+            console.info(JSON.stringify({
+              tag: "TRADABLE_CONFIRMED",
+              ts: row.updated_at,
+              market: row.market,
+              score: row.score,
+              status: row.status
+            }));
+            tradableCandidates.push(row);
+          }
+
+          if (row.status !== "제외" && row.early_entry_eligible) {
+            dbg("early_entry_eligible", { market: t.market, volume_multiple: s.volumeMultiple, rise_3m_pct: s.rise3mPct });
+          }
+          if (row.status !== "제외" && row.add_entry_eligible) {
+            dbg("add_entry_eligible", {
+              market: t.market,
+              breakout: s.breakout,
+              box_top_breakout: s.boxTopBreakout,
+              volume_multiple: s.volumeMultiple,
+            });
+          }
+        }
+        if (bi < batches.length - 1) {
+          await sleep(CANDLE_BATCH_DELAY_MS);
         }
       }
-      if (bi < batches.length - 1) {
-        await sleep(CANDLE_BATCH_DELAY_MS);
+      const tAfterCandles = Date.now();
+
+      // UI/API Exposure: Only tradable candidates
+      tradableCandidates.sort((a, b) => b.score - a.score);
+      tradableCandidates.forEach((r, i) => {
+        r.rank = i + 1;
+      });
+      state.rows = tradableCandidates.slice(0, 15);
+      state.updatedAt = new Date().toISOString();
+
+      if (PUMP_TIMING_LOG) {
+        const tickerBatchesAlt = Math.ceil(altMarkets.length / PUMP_TICKER_BATCH_SIZE);
+        const tickTotalMs = Date.now() - tickT0;
+        console.info(
+          JSON.stringify({
+            tag: "DEBUG_PUMP_SCANNER_TICK_TIMING",
+            tick_total_ms: tickTotalMs,
+            ticker_base_ms: tAfterBaseTickers - tickT0,
+            ticker_alt_ms: tAfterAltTickers - tAfterBaseTickers,
+            ticker_held_extra_ms: tAfterHeldExtraTickers - tAfterAltTickers,
+            ticker_phase_ms: tAfterHeldExtraTickers - tickT0,
+            momentum_ms: tAfterMomentum - tAfterHeldExtraTickers,
+            post_momentum_prep_ms: tBeforeCandles - tAfterMomentum,
+            candle_ms: tAfterCandles - tBeforeCandles,
+            alt_market_count: altMarkets.length,
+            ticker_returned: tickers.length,
+            ticker_batches_alt: tickerBatchesAlt,
+            ticker_batch_size: PUMP_TICKER_BATCH_SIZE,
+            ticker_parallel: PUMP_TICKER_PARALLEL,
+            ticker_batch_delay_ms: PUMP_TICKER_BATCH_DELAY_MS,
+            momentum_considered: momSel.totalConsidered,
+            momentum_top_m: MOMENTUM_TOP_M,
+            markets_to_score: marketsToScore.length,
+            candle_targets: candleTargets.length,
+            raw_detected_count: rawDetected.length,
+            tradable_confirmed_count: tradableCandidates.length,
+          }),
+        );
       }
-    }
-    const tAfterCandles = Date.now();
 
-    rows.sort((a, b) => b.score - a.score);
-    rows.forEach((r, i) => {
-      r.rank = i + 1;
-    });
-    state.rows = rows.slice(0, 15);
-    state.updatedAt = new Date().toISOString();
+      const priceBy = new Map(allTickers.map((t) => [t.market, t.trade_price]));
+      for (const r of state.rows.slice(0, 8)) {
+        const ts = new Date().toISOString();
+        const exists = state.perf.find((x) => x.timestamp === ts && x.market === r.market);
+        if (exists) continue;
+        dbg("candidate_captured", {
+          market: r.market,
+          captured_at: ts,
+          score: r.score,
+          status: r.status,
+          volume_multiple: r.volume_multiple,
+          breakout: r.breakout,
+          close_upper_hold: r.close_upper_hold,
+          rise_3m_pct: r.rise_3m_pct,
+          early_entry_eligible: r.early_entry_eligible,
+          add_entry_eligible: r.add_entry_eligible,
+        });
+        state.perf.push({
+          timestamp: ts,
+          market: r.market,
+          score: r.score,
+          status: r.status,
+          volume_multiple: r.volume_multiple,
+          breakout: r.breakout,
+          early_entry_eligible: r.early_entry_eligible,
+          add_entry_eligible: r.add_entry_eligible,
+          captured_at: ts,
+          saved_3m: false,
+          saved_5m: false,
+          saved_10m: false,
+          return_3m_pct: null,
+          return_5m_pct: null,
+          return_10m_pct: null,
+        });
+        state.pending.push({
+          ts,
+          market: r.market,
+          score: r.score,
+          status: r.status,
+          volume_multiple: r.volume_multiple,
+          breakout: r.breakout,
+          early_entry_eligible: r.early_entry_eligible,
+          add_entry_eligible: r.add_entry_eligible,
+          entry_price: priceBy.get(r.market) ?? 0,
+          due3: Date.now() + 3 * 60_000,
+          due5: Date.now() + 5 * 60_000,
+          due10: Date.now() + 10 * 60_000,
+          done3: false,
+          done5: false,
+          done10: false,
+        });
+      }
 
-    if (PUMP_TIMING_LOG) {
-      const tickerBatchesAlt = Math.ceil(altMarkets.length / PUMP_TICKER_BATCH_SIZE);
-      const tickTotalMs = Date.now() - tickT0;
-      console.info(
-        JSON.stringify({
-          tag: "DEBUG_PUMP_SCANNER_TICK_TIMING",
-          tick_total_ms: tickTotalMs,
-          ticker_base_ms: tAfterBaseTickers - tickT0,
-          ticker_alt_ms: tAfterAltTickers - tAfterBaseTickers,
-          ticker_held_extra_ms: tAfterHeldExtraTickers - tAfterAltTickers,
-          ticker_phase_ms: tAfterHeldExtraTickers - tickT0,
-          momentum_ms: tAfterMomentum - tAfterHeldExtraTickers,
-          post_momentum_prep_ms: tBeforeCandles - tAfterMomentum,
-          candle_ms: tAfterCandles - tBeforeCandles,
-          alt_market_count: altMarkets.length,
-          ticker_returned: tickers.length,
-          ticker_batches_alt: tickerBatchesAlt,
-          ticker_batch_size: PUMP_TICKER_BATCH_SIZE,
-          ticker_parallel: PUMP_TICKER_PARALLEL,
-          ticker_batch_delay_ms: PUMP_TICKER_BATCH_DELAY_MS,
-          momentum_considered: momSel.totalConsidered,
-          momentum_top_m: MOMENTUM_TOP_M,
-          markets_to_score: marketsToScore.length,
-          candle_targets: candleTargets.length,
-        }),
-      );
-    }
-
-    const priceBy = new Map(allTickers.map((t) => [t.market, t.trade_price]));
-    for (const r of state.rows.slice(0, 8)) {
-      const ts = new Date().toISOString();
-      const exists = state.perf.find((x) => x.timestamp === ts && x.market === r.market);
-      if (exists) continue;
-      dbg("candidate_captured", {
-        market: r.market,
-        captured_at: ts,
-        score: r.score,
-        status: r.status,
-        volume_multiple: r.volume_multiple,
-        breakout: r.breakout,
-        close_upper_hold: r.close_upper_hold,
-        rise_3m_pct: r.rise_3m_pct,
-        early_entry_eligible: r.early_entry_eligible,
-        add_entry_eligible: r.add_entry_eligible,
-      });
-      state.perf.push({
-        timestamp: ts,
-        market: r.market,
-        score: r.score,
-        status: r.status,
-        volume_multiple: r.volume_multiple,
-        breakout: r.breakout,
-        early_entry_eligible: r.early_entry_eligible,
-        add_entry_eligible: r.add_entry_eligible,
-        captured_at: ts,
-        saved_3m: false,
-        saved_5m: false,
-        saved_10m: false,
-        return_3m_pct: null,
-        return_5m_pct: null,
-        return_10m_pct: null,
-      });
-      state.pending.push({
-        ts,
-        market: r.market,
-        score: r.score,
-        status: r.status,
-        volume_multiple: r.volume_multiple,
-        breakout: r.breakout,
-        early_entry_eligible: r.early_entry_eligible,
-        add_entry_eligible: r.add_entry_eligible,
-        entry_price: priceBy.get(r.market) ?? 0,
-        due3: Date.now() + 3 * 60_000,
-        due5: Date.now() + 5 * 60_000,
-        due10: Date.now() + 10 * 60_000,
-        done3: false,
-        done5: false,
-        done10: false,
-      });
-    }
-
-    updatePending(priceBy);
-    try {
-      await persist();
-    } catch {
-      // persistence failure should not fail scanner tick
-    }
+      updatePending(priceBy);
+      try {
+        await persist();
+      } catch {
+        // persistence failure should not fail scanner tick
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.warn("[pump-scanner] tick_partial_failure", { error: msg });

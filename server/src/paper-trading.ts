@@ -368,6 +368,18 @@ export function createPaperTradingEngine(opts: {
       pnl_krw: null,
       pnl_pct: null,
     });
+
+    // --- PAPER_ENTRY_SUBMITTED Log ---
+    console.info(JSON.stringify({
+      tag: "PAPER_ENTRY_SUBMITTED",
+      ts: new Date().toISOString(),
+      market,
+      side: "buy",
+      price: entryPrice,
+      amount_krw: orderKrw,
+      note
+    }));
+
     const c = state.preEntryWatch.get(market);
     if (c) {
       state.metrics.entryLatencyMs.push(Date.now() - c.detectedAt);
@@ -418,6 +430,18 @@ export function createPaperTradingEngine(opts: {
       pnl_krw: null,
       pnl_pct: null,
     });
+
+    // --- PAPER_ENTRY_SUBMITTED Log (Add-on) ---
+    console.info(JSON.stringify({
+      tag: "PAPER_ENTRY_SUBMITTED",
+      ts: new Date().toISOString(),
+      market,
+      side: "buy_add",
+      price: entryPrice,
+      amount_krw: orderKrw,
+      note
+    }));
+
     return { ok: true };
   };
 
@@ -674,6 +698,10 @@ export function createPaperTradingEngine(opts: {
     }
 
     for (const [market, sig] of orderedSignals) {
+      if (sig.status === "제외") {
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "strict_filter_rejected_status", stage: "ordered_signals_loop" });
+        continue;
+      }
       const px = priceByMarket[market] ?? 0;
       const slotSnap = countPaperSlots(state.positions);
       const posHere = state.positions[market];
