@@ -224,6 +224,7 @@ export function createPaperTradingEngine(opts: {
     volume_multiple?: number;
     early_entry_eligible?: boolean;
     add_entry_eligible?: boolean;
+    exclude_reasons?: string[];
   }>;
 }) {
   const baseDir = path.join(tradingDataRoot(), "paper", opts.companyId, opts.serviceId);
@@ -581,6 +582,7 @@ export function createPaperTradingEngine(opts: {
         volume_multiple: number;
         early_entry_eligible: boolean;
         add_entry_eligible: boolean;
+        exclude_reasons?: string[];
       }
     >();
     const watchMarkets = new Set<string>(Object.keys(state.positions));
@@ -606,6 +608,7 @@ export function createPaperTradingEngine(opts: {
           volume_multiple: toNum(sig.volume_multiple, 0),
           early_entry_eligible: sig.early_entry_eligible === true,
           add_entry_eligible: sig.add_entry_eligible === true,
+          exclude_reasons: sig.exclude_reasons,
         });
       }
       const life = getLifecycle(market);
@@ -699,7 +702,8 @@ export function createPaperTradingEngine(opts: {
 
     for (const [market, sig] of orderedSignals) {
       if (sig.status === "제외") {
-        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "strict_filter_rejected_status", stage: "ordered_signals_loop" });
+        const blockReason = (sig.exclude_reasons || []).join(",") || "strict_filter_rejected_status";
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: blockReason, stage: "ordered_signals_loop" });
         continue;
       }
       const px = priceByMarket[market] ?? 0;

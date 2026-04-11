@@ -267,7 +267,9 @@ async function main() {
   });
   await strategy.init();
   app.log.info({ tag: "DEBUG_LIVE_LOOP_STARTED", stage: "strategy_init_done" }, "DEBUG_LIVE_LOOP_STARTED");
-  const pumpScanner = createPumpScanner(() => Object.keys((strategy.status() as any).open_positions ?? {}));
+  const pumpScanner = createPumpScanner(() => Object.keys((strategy.status() as any).open_positions ?? {}), {
+    onEvent: (row) => opLog.event(row),
+  });
   const paper = createPaperTradingEngine({
     companyId: env.companyId,
     serviceId: env.serviceId,

@@ -35,6 +35,22 @@ type ScannerRow = {
   updated_at: string;
 };
 
+interface ScannerState {
+  rows: ScannerRow[];
+  allResults: ScannerRow[];
+  updatedAt: string | null;
+  perf: PerfRow[];
+  pending: PendingEval[];
+}
+
+interface FakeoutState {
+  peakVolumeMultiple: number;
+  peakPrice: number;
+  detectedAtMs: number;
+  rejectedUntilMs: number;
+  lastReason?: string;
+}
+
 type PendingEval = {
   ts: string;
   market: string;
@@ -134,7 +150,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btcDropPenalty: number) {
+function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btcDropPenalty: number, fState?: FakeoutState) {
   const last = c1[c1.length - 1];
   if (!last) return null;
   const prev20 = c1.slice(-21, -1);
@@ -167,6 +183,27 @@ function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btc
   if (oneMinPump > 4.5) exclude_reasons.push("과열 (추격주의)");
   if (volumeMultiple < 0.95) exclude_reasons.push("거래대금 부족");
   if (btcDropPenalty > 0) exclude_reasons.push("BTC 역풍");
+
+  // --- FAKEOUT PATTERN REJECTION ---
+  if (fState) {
+    const now = Date.now();
+    // 1) VOLUME_FADE: 50% drop from peak multiple
+    if (volumeMultiple < fState.peakVolumeMultiple * 0.5) {
+      exclude_reasons.push("VOLUME_FADE_REJECTED");
+    }
+    // 2) HIGH_REJECTED: failed to hold peak price
+    if (last.trade_price < fState.peakPrice * 0.993) {
+      exclude_reasons.push("HIGH_REJECTED");
+    }
+    // 3) RETEST_FAIL: failed to hold high20 after breakout
+    if (!breakout && last.trade_price < high20 * 0.995 && (now - fState.detectedAtMs < 300_000)) {
+      exclude_reasons.push("RETEST_FAIL_REJECTED");
+    }
+    // 4) Persistence Cooldown
+    if (now < fState.rejectedUntilMs) {
+      exclude_reasons.push(fState.lastReason || "FAKEOUT_COOLDOWN");
+    }
+  }
 
   const isFatal = exclude_reasons.length > 0;
 
@@ -216,10 +253,6 @@ function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btc
   };
 }
 
-/**
- * 전체 KRW 티커 배치 조회 후, 단기 가격·(선택)거래대금 증가·순위 상승으로 모멘텀 점수 → 상위 M만 캔들 후보로 넘김.
- * (캔들·scoreOne·모멘텀 선별 경로; paper surge 진입은 `paper-trading`에서 스캐너 피드 기준 처리.)
- */
 function selectMomentumTopM(
   tickers: UpbitTicker[],
   opts: {
@@ -311,9 +344,13 @@ function selectMomentumTopM(
   };
 }
 
-export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
-  const state = {
+export function createPumpScanner(
+  getHeldMarkets: () => string[] = () => [],
+  opts: { onEvent?: (row: any) => Promise<void> } = {}
+) {
+  const state: ScannerState = {
     rows: [] as ScannerRow[],
+    allResults: [] as ScannerRow[],
     updatedAt: null as string | null,
     pending: [] as PendingEval[],
     perf: [] as PerfRow[],
@@ -328,6 +365,9 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
   const candleSnapshotCache = new Map<string, { c1: UpbitCandle[]; c5: UpbitCandle[]; fetchedAtMs: number }>();
   let momentumSnapshot = new Map<string, { ts: number; trade_price: number; acc24: number }>();
   let lastMomentumRankByMarket = new Map<string, number>();
+
+  // Fakeout Management
+  const fakeoutStateMap = new Map<string, FakeoutState>();
 
   const debugEnabled =
     process.env.ORBITALPHA_TRADING_SCANNER_DEBUG === "1" ||
@@ -530,8 +570,38 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
             market429CooldownUntilMs.set(t.market, Date.now() + MARKET_429_EXCLUDE_MS);
             continue;
           }
-          const s = scoreOne(candles.c1, candles.c5, t as UpbitTicker, btcDropPenalty);
+
+          // Manage Fakeout State
+          let fState = fakeoutStateMap.get(t.market);
+          const s = scoreOne(candles.c1, candles.c5, t as UpbitTicker, btcDropPenalty, fState);
           if (!s) continue;
+
+          // Update Peaks if not currently rejected
+          if (s.status !== "제외") {
+            if (!fState) {
+              fState = {
+                peakVolumeMultiple: s.volumeMultiple,
+                peakPrice: t.trade_price,
+                detectedAtMs: Date.now(),
+                rejectedUntilMs: 0
+              };
+              fakeoutStateMap.set(t.market, fState);
+            } else {
+              fState.peakVolumeMultiple = Math.max(fState.peakVolumeMultiple, s.volumeMultiple);
+              fState.peakPrice = Math.max(fState.peakPrice, t.trade_price);
+            }
+          } else {
+            // If rejected by fakeout specifically, apply persistence
+            const fakeoutReasons = (s.exclude_reasons || []).filter(r =>
+              ["VOLUME_FADE_REJECTED", "HIGH_REJECTED", "RETEST_FAIL_REJECTED"].includes(r)
+            );
+            if (fakeoutReasons.length > 0) {
+              if (fState) {
+                fState.rejectedUntilMs = Date.now() + 10 * 60_000; // 10 min cooldown
+                fState.lastReason = fakeoutReasons[0];
+              }
+            }
+          }
 
           const row: ScannerRow = {
             rank: 0,
@@ -561,20 +631,27 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
 
           // 2) Categorize: Tradable vs Rejected
           if (row.status === "제외") {
-            console.info(JSON.stringify({
-              tag: "FILTER_REJECTED",
-              ts: row.updated_at,
-              market: row.market,
-              reasons: row.exclude_reasons ?? ["기타"]
-            }));
+            if (opts.onEvent) {
+              await opts.onEvent({
+                timestamp: row.updated_at,
+                event_type: "FILTER_REJECTED",
+                market: row.market,
+                strategy_type: "SURGE_SCANNER",
+                reason: (row.exclude_reasons ?? []).join(","),
+                note: `score: ${row.score}`
+              });
+            }
           } else {
-            console.info(JSON.stringify({
-              tag: "TRADABLE_CONFIRMED",
-              ts: row.updated_at,
-              market: row.market,
-              score: row.score,
-              status: row.status
-            }));
+            if (opts.onEvent) {
+              await opts.onEvent({
+                timestamp: row.updated_at,
+                event_type: "TRADABLE_CONFIRMED",
+                market: row.market,
+                strategy_type: "SURGE_SCANNER",
+                reason: row.status,
+                note: `score: ${row.score}`
+              });
+            }
             tradableCandidates.push(row);
           }
 
@@ -602,6 +679,7 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
         r.rank = i + 1;
       });
       state.rows = tradableCandidates.slice(0, 15);
+      state.allResults = rawDetected;
       state.updatedAt = new Date().toISOString();
 
       if (PUMP_TIMING_LOG) {
@@ -703,9 +781,7 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
     intervalMs: SCANNER_INTERVAL_MS,
     tick,
     signalFeed: () =>
-      state.rows
-        .filter((r) => r.status !== "제외")
-        .slice(0, 8)
+      state.allResults
         .map((r) => ({
           market: r.market,
           score: r.score,
@@ -720,6 +796,7 @@ export function createPumpScanner(getHeldMarkets: () => string[] = () => []) {
             : r.add_entry_eligible
               ? `surge_scanner:add_leg_ready:${r.breakout ? "high20" : "box_top"}:score_${r.score.toFixed(1)}`
               : `surge_scanner:pre_entry_watch:score_${r.score.toFixed(1)}`,
+          exclude_reasons: r.exclude_reasons,
         })),
     status: () => {
       // Latest perf per market for post verification columns.
