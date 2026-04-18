@@ -435,6 +435,12 @@ async function main() {
    * 대시보드 `fetch(/api/session)` 5~12초 타임아웃 → 인증 로딩 무한 대기로 이어짐.
    * 짧은 상한 후에는 degraded 응답으로 200을 유지하고 상세는 /api/status에서 재동기화.
    */
+  app.addHook("onRequest", async (req, reply) => {
+    if (req.url.startsWith("/api/api/")) {
+      app.log.warn({ url: req.url, method: req.method }, "CRITICAL: Path duplication detected (/api/api/...). Check Nginx proxy_pass or dashboard apiBase settings.");
+    }
+  });
+
   const SESSION_TRADE_STATUS_TIMEOUT_MS = Math.min(
     12_000,
     Math.max(1500, Number(process.env.ORBITALPHA_SESSION_TRADE_STATUS_TIMEOUT_MS ?? 2000)),
