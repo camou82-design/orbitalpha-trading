@@ -4,10 +4,7 @@ import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { fetchTradeStatusUntilSyncedWithLog } from "@/lib/trade-status-fetch";
 
-const apiBase =
-  process.env.NEXT_PUBLIC_ORBITALPHA_TRADING_API_BASE?.replace(/\/$/, "") ??
-  process.env.NEXT_PUBLIC_ORBITALPHA_API_BASE?.replace(/\/$/, "") ??
-  "";
+const apiBase = "";
 
 function LoginPageInner() {
   const router = useRouter();
@@ -22,10 +19,19 @@ function LoginPageInner() {
     let cancelled = false;
     async function checkSession() {
       try {
-        const res = await fetch(`${apiBase}/api/v1/auth/session`, { cache: "no-store", credentials: "include" });
+        const ctrl = new AbortController();
+        const tid = setTimeout(() => ctrl.abort(), 3000);
+        const res = await fetch(`/api/v1/auth/session`, {
+          cache: "no-store",
+          credentials: "include",
+          signal: ctrl.signal
+        });
+        clearTimeout(tid);
         const body = (await res.json().catch(() => ({}))) as { authenticated?: boolean };
-        if (!cancelled && res.ok && body.authenticated === true) router.replace("/trading?account_sync=1");
-      } catch {}
+        if (!cancelled && res.ok && body.authenticated === true) {
+          router.replace("/trading?account_sync=1");
+        }
+      } catch { }
     }
     const reason = params.get("reason");
     if (reason === "session_expired") {
@@ -47,7 +53,7 @@ function LoginPageInner() {
     setBusy(true);
     setMessage("");
     try {
-      const res = await fetch(`${apiBase}/api/v1/auth/login`, {
+      const res = await fetch(`/api/v1/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
@@ -56,32 +62,11 @@ function LoginPageInner() {
       const body = await res.json();
       if (!res.ok || body?.authenticated !== true) {
         setMessageTone("error");
-        setMessage("아이디 또는 비밀번호가 올바르지 않습니다");
+        setMessage(body?.message || "아이디 또는 비밀번호가 올바르지 않습니다");
         return;
       }
-      const loginSync = await fetchTradeStatusUntilSyncedWithLog(apiBase, {
-        maxAttempts: 12,
-        logContext: "login",
-      });
-      if (loginSync.payload && typeof loginSync.payload === "object") {
-        const p = loginSync.payload as { api_connected?: boolean; account_sync_failure_code?: string; api_reason?: string | null };
-        console.log("[orbitalpha-trading] login trade/status final snapshot", {
-          attempts: loginSync.attempts,
-          httpStatus: loginSync.lastFetch?.httpStatus,
-          api_connected: p.api_connected,
-          account_sync_failure_code: p.account_sync_failure_code,
-          api_reason: p.api_reason,
-        });
-      } else {
-        console.log("[orbitalpha-trading] login trade/status final (no valid payload)", {
-          attempts: loginSync.attempts,
-          lastHttpStatus: loginSync.lastFetch?.httpStatus,
-          failureCode: loginSync.lastFetch?.failureCode,
-          failureMessage: loginSync.lastFetch?.failureMessage,
-        });
-      }
       setMessageTone("success");
-      setMessage("인증 성공. 자동매매를 활성화하고 이동합니다.");
+      setMessage("인증 성공. 대시보드로 이동합니다.");
       router.replace("/trading?account_sync=1");
     } catch {
       setMessage("로그인 실패");

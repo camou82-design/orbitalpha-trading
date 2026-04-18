@@ -70,7 +70,13 @@ async function getEgressPublicIp(): Promise<string | null> {
   const now = Date.now();
   if (cachedEgressIp && now - cachedEgressIp.atMs < 60_000) return cachedEgressIp.ip;
   try {
-    const r = await fetch("https://api.ipify.org?format=json", { headers: { Accept: "application/json" } });
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 2000);
+    const r = await fetch("https://api.ipify.org?format=json", {
+      headers: { Accept: "application/json" },
+      signal: ctrl.signal,
+    });
+    clearTimeout(tid);
     const j = (await r.json()) as { ip?: string };
     const ip = typeof j.ip === "string" ? j.ip : null;
     if (ip) cachedEgressIp = { ip, atMs: now };
@@ -108,6 +114,11 @@ async function main() {
   const opLog = createOperationalLogger({ debugEnabled: env.debugLogEnabled });
   const SESSION_COOKIE = "orbitalpha_trading_session";
   const sessions = new Map<string, { user_id: string; created_at: string }>();
+
+  // Login rate limiting: IP -> { attempts: number, lastAttempt: number }
+  const loginAttempts = new Map<string, { count: number; lastMs: number }>();
+  const MAX_ATTEMPTS = 5;
+  const LOCKOUT_MS = 15 * 60 * 1000; // 15 mins
 
   const readSessionToken = (cookieHeader?: string) => {
     if (!cookieHeader) return null;
@@ -168,8 +179,21 @@ async function main() {
     "/api/v1/replay/",
     "/api/v1/debug/",
     "/api/v1/paper/",
+    "/api/status",
+    "/status",
   ];
-  const authAllowList = new Set(["/api/v1/auth/login", "/api/v1/auth/logout", "/api/v1/auth/session", "/api/v1/auth/me"]);
+  const authAllowList = new Set([
+    "/api/v1/auth/login",
+    "/api/v1/auth/logout",
+    "/api/v1/auth/session",
+    "/api/v1/auth/me",
+    "/api/session",
+    "/api/health",
+    "/api/logout",
+    "/session",
+    "/health",
+    "/logout",
+  ]);
 
   app.addHook("onRequest", async (req, reply) => {
     const url = req.url.split("?")[0] ?? req.url;
@@ -406,6 +430,105 @@ async function main() {
     volume_threshold_alt: { "095": 0.95, "075": 0.75 },
   }));
 
+  /**
+   * trade.status()는 Upbit 등으로 무거울 수 있음 — 세션 엔드포인트에서 무제한 대기하면
+   * 대시보드 `fetch(/api/session)` 5~12초 타임아웃 → 인증 로딩 무한 대기로 이어짐.
+   * 짧은 상한 후에는 degraded 응답으로 200을 유지하고 상세는 /api/status에서 재동기화.
+   */
+  const SESSION_TRADE_STATUS_TIMEOUT_MS = Math.min(
+    12_000,
+    Math.max(1500, Number(process.env.ORBITALPHA_SESSION_TRADE_STATUS_TIMEOUT_MS ?? 2000)),
+  );
+
+  const buildAuthSessionPayload = async (req: FastifyRequest) => {
+    const s = getSession(req.headers.cookie);
+    if (!s) {
+      return {
+        authenticated: false,
+        message: "세션 없음",
+        auto_trade_enabled: false,
+        recovery_ready: false,
+        safety_guard_state: "주의" as const,
+        can_enable_auto_trade: false,
+        cannot_enable_reason: "unauthenticated" as const,
+      };
+    }
+    const ss = strategy.status() as { safety_guard_state?: string };
+    let st: Awaited<ReturnType<typeof trade.status>>;
+    try {
+      st = (await Promise.race([
+        trade.status(),
+        new Promise<never>((_, rej) =>
+          setTimeout(() => rej(new Error("SESSION_TRADE_STATUS_TIMEOUT")), SESSION_TRADE_STATUS_TIMEOUT_MS),
+        ),
+      ])) as Awaited<ReturnType<typeof trade.status>>;
+    } catch {
+      req.log.warn(
+        { route: "session", ms: SESSION_TRADE_STATUS_TIMEOUT_MS },
+        "session_trade_status_timeout_or_error",
+      );
+      return {
+        authenticated: true,
+        user_id: s.user_id,
+        auto_trade_enabled: false,
+        auto_trade_changed_at: null,
+        live_enabled: true,
+        api_connected: false,
+        recovery_ready: false,
+        safety_guard_state: (ss.safety_guard_state ?? "주의") as "정상" | "주의" | "자동정지",
+        can_enable_auto_trade: false,
+        cannot_enable_reason: "trade_status_slow_or_timeout",
+        session_status_degraded: true,
+      };
+    }
+    const cannotEnableReason =
+      !st.api_connected
+        ? "api disconnected"
+        : !st.live_enabled
+          ? "live disabled"
+          : !st.recovery_ready
+            ? "recovery not ready"
+            : ss.safety_guard_state === "자동정지"
+              ? "safety guard stopped"
+              : null;
+    return {
+      authenticated: true,
+      user_id: s.user_id,
+      auto_trade_enabled: st.auto_trade_enabled,
+      auto_trade_changed_at: st.auto_trade_changed_at,
+      live_enabled: st.live_enabled,
+      api_connected: st.api_connected,
+      recovery_ready: st.recovery_ready === true,
+      safety_guard_state: (ss.safety_guard_state ?? "주의") as "정상" | "주의" | "자동정지",
+      can_enable_auto_trade: cannotEnableReason === null,
+      cannot_enable_reason: cannotEnableReason,
+    };
+  };
+
+  /** Alias routes — 본문은 `/api/v1/auth/session` 과 동일 필드로 맞춤 */
+  const sessionHandler = async (req: FastifyRequest) => buildAuthSessionPayload(req);
+
+  app.get("/api/session", sessionHandler);
+  app.get("/session", sessionHandler);
+
+  app.get("/api/status", async (req) => buildTradeStatusResponse(req, "GET /api/status"));
+  app.get("/status", async (req) => buildTradeStatusResponse(req, "GET /status"));
+
+  const healthHandler = async () => ({ ok: true, ...monitorSnap() });
+  app.get("/api/health", healthHandler);
+  // app.get("/health", ...) 는 이미 위에 있으므로 생략하거나 덮어쓰기.
+
+  const logoutHandler = async (req: FastifyRequest, reply: any) => {
+    const token = readSessionToken(req.headers.cookie);
+    if (token) sessions.delete(token);
+    clearSessionCookie(reply, req);
+    return { authenticated: false };
+  };
+
+  app.post("/api/logout", logoutHandler);
+  app.post("/logout", logoutHandler);
+
+
   app.get("/api/v1/logs", async (req) => {
     const q = req.query as { limit?: string };
     const limit = Math.min(500, Math.max(1, Number(q.limit ?? 100)));
@@ -414,11 +537,46 @@ async function main() {
   });
 
   app.post("/api/v1/auth/login", async (req, reply) => {
-    const body = (req.body ?? {}) as { id?: string; password?: string };
-    const id = (body.id ?? "").trim();
-    const password = body.password ?? "";
-    const ok = id === env.tradingLoginId && password === env.tradingLoginPassword;
-    app.log.info({ route: "auth_login", user_id: id, success: ok }, "Auth login attempt");
+    const ip = String(req.headers["x-forwarded-for"] ?? req.ip ?? "unknown");
+    const nowMs = Date.now();
+
+    // Check lockout
+    const attempt = loginAttempts.get(ip);
+    if (attempt && attempt.count >= MAX_ATTEMPTS && nowMs - attempt.lastMs < LOCKOUT_MS) {
+      reply.code(429);
+      return {
+        authenticated: false,
+        message: `Too many login attempts. Please try again in ${Math.ceil((LOCKOUT_MS - (nowMs - attempt.lastMs)) / 60000)} minutes.`
+      };
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const id = String(body.id ?? body.loginId ?? body.userId ?? "").trim();
+    const password = String(body.password ?? "").trim();
+
+    // Password verification (SHA256 hash comparison)
+    const submittedHash = crypto.createHash("sha256").update(password).digest("hex");
+    const idOk = id === env.adminLoginId;
+    const pwOk = crypto.timingSafeEqual(
+      Buffer.from(submittedHash),
+      Buffer.from(env.adminPasswordHash)
+    );
+    const ok = idOk && pwOk;
+
+    if (!ok) {
+      // Update attempts
+      const cur = loginAttempts.get(ip) ?? { count: 0, lastMs: 0 };
+      loginAttempts.set(ip, { count: cur.count + 1, lastMs: nowMs });
+
+      app.log.warn({ route: "auth_login", user_id: id, ip, success: false }, "Auth login failed");
+      reply.code(401);
+      return { authenticated: false, message: "아이디 또는 비밀번호가 올바르지 않습니다" };
+    }
+
+    // Success: Reset attempts
+    loginAttempts.delete(ip);
+
+    app.log.info({ route: "auth_login", user_id: id, ip, success: true }, "Auth login success");
     await opLog.event({
       timestamp: new Date().toISOString(),
       event_type: ok ? "auth_login_success" : "auth_login_failed",
@@ -477,44 +635,7 @@ async function main() {
     return { authenticated: false, auto_trade_enabled: false };
   });
 
-  app.get("/api/v1/auth/session", async (req) => {
-    const s = getSession(req.headers.cookie);
-    if (!s) {
-      return {
-        authenticated: false,
-        message: "세션 없음",
-        auto_trade_enabled: false,
-        recovery_ready: false,
-        safety_guard_state: "주의",
-        can_enable_auto_trade: false,
-        cannot_enable_reason: "unauthenticated",
-      };
-    }
-    const st = await trade.status();
-    const ss = strategy.status() as any;
-    const cannotEnableReason =
-      !st.api_connected
-        ? "api disconnected"
-        : !st.live_enabled
-          ? "live disabled"
-          : !st.recovery_ready
-            ? "recovery not ready"
-            : ss.safety_guard_state === "자동정지"
-              ? "safety guard stopped"
-              : null;
-    return {
-      authenticated: true,
-      user_id: s.user_id,
-      auto_trade_enabled: st.auto_trade_enabled,
-      auto_trade_changed_at: st.auto_trade_changed_at,
-      live_enabled: st.live_enabled,
-      api_connected: st.api_connected,
-      recovery_ready: st.recovery_ready === true,
-      safety_guard_state: ss.safety_guard_state ?? "주의",
-      can_enable_auto_trade: cannotEnableReason === null,
-      cannot_enable_reason: cannotEnableReason,
-    };
-  });
+  app.get("/api/v1/auth/session", async (req) => buildAuthSessionPayload(req));
 
   app.get("/api/v1/auth/me", async (req, reply) => {
     const s = getSession(req.headers.cookie);

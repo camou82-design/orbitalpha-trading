@@ -3,10 +3,7 @@
 import { useMemo, useRef, useState } from "react";
 import Link from "next/link";
 
-const apiBase =
-  process.env.NEXT_PUBLIC_ORBITALPHA_TRADING_API_BASE?.replace(/\/$/, "") ??
-  process.env.NEXT_PUBLIC_ORBITALPHA_API_BASE?.replace(/\/$/, "") ??
-  "";
+const apiBase = "";
 
 type ReplayEvent = {
   timestamp: string;
@@ -86,7 +83,7 @@ export default function ReplayPage() {
       const start = `${date}T${startTime}:00`;
       const end = `${date}T${endTime}:59`;
       const q = new URLSearchParams({ start, end, market });
-      const res = await fetch(`${apiBase}/api/v1/replay/query?${q.toString()}`, {
+      const res = await fetch(`/api/v1/replay/query?${q.toString()}`, {
         cache: "no-store",
         credentials: "include",
       });

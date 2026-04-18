@@ -297,11 +297,47 @@ export function createTradeControl(
     }
   };
 
+  /** 계좌 실물 수량(balance+locked)이 전략 장부보다 작거나 0이면 strategyPositions를 즉시 맞춘다(수동 청산·외부 매도 후 장부 유령 방지). */
+  const reconcileAuthoritativeStrategyBook = (balances: ConnectionBalances) => {
+    const zeroed: string[] = [];
+    const clamped: string[] = [];
+    for (const market of MANAGED_MARKETS) {
+      const currency = market.replace("KRW-", "");
+      const account = balances.find((b) => b.currency === currency);
+      const totalQty = Number(account?.balance ?? 0) + Number(account?.locked ?? 0);
+      const pos = state.strategyPositions[market];
+      const prevQty = Number(pos?.qty ?? 0);
+      if (prevQty <= 0) continue;
+      if (totalQty <= 0) {
+        pos.qty = 0;
+        pos.avg = 0;
+        pos.entries = 0;
+        pos.invested_krw_total = 0;
+        zeroed.push(market);
+        continue;
+      }
+      if (prevQty > totalQty + 1e-12) {
+        const nextQty = Math.max(0, totalQty);
+        const inv = Number(pos.invested_krw_total ?? 0);
+        pos.qty = nextQty;
+        if (nextQty <= 0) {
+          pos.avg = 0;
+          pos.entries = 0;
+          pos.invested_krw_total = 0;
+        } else if (prevQty > 0) {
+          pos.invested_krw_total = Math.max(0, inv * (nextQty / prevQty));
+        }
+        clamped.push(market);
+      }
+    }
+    return { zeroed, clamped };
+  };
+
   const syncLegacyBuckets = (balances: ConnectionBalances) => {
     for (const market of MANAGED_MARKETS) {
       const currency = market.replace("KRW-", "");
       const account = balances.find((b) => b.currency === currency);
-      const accountQty = Number(account?.balance ?? 0);
+      const accountQty = Number(account?.balance ?? 0) + Number(account?.locked ?? 0);
       const strategyQty = Number(state.strategyPositions[market].qty ?? 0);
       const legacyQty = Math.max(0, accountQty - strategyQty);
       const bucket = state.legacyBuckets[market];
@@ -350,6 +386,7 @@ export function createTradeControl(
     }
     const conn = await getConnectionStatus();
     if (!conn.connected) throw new Error(conn.reason ?? "Connection failed");
+    reconcileAuthoritativeStrategyBook(conn.balances);
     syncLegacyBuckets(conn.balances);
     return conn;
   };
@@ -616,9 +653,13 @@ export function createTradeControl(
 
   const status = async () => {
     const conn = await getConnectionStatus();
-      const strategyPositions = state.strategyPositions;
-      syncLegacyBuckets(conn.balances);
-      const funds = computeKrwFunds(conn);
+    const strategyPositions = state.strategyPositions;
+    let ledger_reconcile: { zeroed: string[]; clamped: string[] } | null = null;
+    if (conn.connected && Array.isArray(conn.balances) && conn.balances.length > 0) {
+      ledger_reconcile = reconcileAuthoritativeStrategyBook(conn.balances);
+    }
+    syncLegacyBuckets(conn.balances);
+    const funds = computeKrwFunds(conn);
 
       let account_portfolio: AccountPortfolioSnapshot | null = null;
       let mark_prices: Record<string, number> | null = null;
@@ -761,6 +802,7 @@ export function createTradeControl(
       },
       legacy_positions: legacyPositions,
       strategy_positions: strategyPositions,
+      ledger_reconcile,
       pnl_summary: {
         legacy_position_pnl: null,
         strategy_position_pnl: Object.values(strategyPositions).reduce((acc, p) => acc + p.realized_pnl, 0),

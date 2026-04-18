@@ -46,7 +46,14 @@ export async function fetchTradeStatusDetailed(apiBase: string): Promise<TradeSt
   let body: unknown | null = null;
   try {
     // 동일 본문(account_portfolio 포함): GET /api/v1/account/status
-    const r = await fetch(`${base}/api/v1/trade/status?_=${ts}`, { cache: "no-store", credentials: "include" });
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 5000);
+    const r = await fetch(`/api/v1/trade/status?_=${ts}`, {
+      cache: "no-store",
+      credentials: "include",
+      signal: ctrl.signal,
+    });
+    clearTimeout(tid);
     httpStatus = r.status;
     const text = await r.text();
     try {
@@ -106,6 +113,8 @@ function logTradeStatusAttempt(
 
 export type TradeStatusUntilSyncedOptions = {
   maxAttempts?: number;
+  /** 전체 재시도 상한(밀리초). 초과 시 마지막 유효 payload 또는 null 로 종료 — 무한 대기 방지 */
+  maxWallMs?: number;
   /** When set, each attempt and the final summary are logged to the console. */
   logContext?: "login" | "trading_page_initial";
 };
@@ -133,11 +142,24 @@ export async function fetchTradeStatusUntilSyncedWithLog(
   opts?: TradeStatusUntilSyncedOptions,
 ): Promise<TradeStatusUntilSyncedResult> {
   const maxAttempts = Math.max(1, opts?.maxAttempts ?? 15);
+  const maxWallMs = opts?.maxWallMs ?? 22_000;
+  const deadline = Date.now() + maxWallMs;
   const ctx = opts?.logContext ?? "trading_page_initial";
   let lastGood: unknown | null = null;
   let lastFetch: TradeStatusFetchResult | null = null;
 
   for (let i = 0; i < maxAttempts; i++) {
+    if (Date.now() > deadline) {
+      if (opts?.logContext) {
+        console.log("[orbitalpha-trading] trade/status sync wall clock exceeded", {
+          context: ctx,
+          maxWallMs,
+          attempts_done: i,
+          lastHttpStatus: lastFetch?.httpStatus,
+        });
+      }
+      return { payload: lastGood, attempts: i, lastFetch };
+    }
     const attempt = i + 1;
     const res = await fetchTradeStatusDetailed(apiBase);
     lastFetch = res;
@@ -179,9 +201,20 @@ export async function fetchTradeStatusUntilSyncedWithLog(
     }
 
     if (i < maxAttempts - 1) {
+      if (res.httpStatus === 404) {
+        if (opts?.logContext) {
+          console.log("[orbitalpha-trading] trade/status sync failed immediately (404)", {
+            context: ctx,
+            attempts: attempt,
+            httpStatus: 404,
+          });
+        }
+        return { payload: null, attempts: attempt, lastFetch: res };
+      }
       const delayMs = Math.min(150 + i * 95, 1500);
       await new Promise((r2) => setTimeout(r2, delayMs));
     }
+
   }
 
   if (opts?.logContext) {

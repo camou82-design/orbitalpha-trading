@@ -171,7 +171,7 @@ const DEBUG_FORCE_BASE_GATE = String(process.env.DEBUG_FORCE_BASE_GATE ?? "").to
 /** 운영에서 `DEBUG_LIVE_ENTRY_POLICY_SNAPSHOT`으로 dist 빌드 정합성 확인. 2=동일심볼은 same_symbol_open_continue_entry_eval 만(레거시 차단 문자열 없음). */
 const LIVE_PRECHECK_EMITTER_REVISION = 2;
 /** 운영에서 dist 실행 코드가 최신인지 확인용(로그에 항상 포함). */
-const LIVE_STRATEGY_TRACE_REVISION = 3;
+const LIVE_STRATEGY_TRACE_REVISION = 4;
 const LIVE_LEGACY_DCA_BUY_ENABLED = String(process.env.LIVE_LEGACY_DCA_BUY_ENABLED ?? "false").toLowerCase() === "true";
 const LIVE_ENTRY_UTILIZATION_TARGET = Math.max(0.05, Math.min(0.98, Number(process.env.LIVE_ENTRY_UTILIZATION_TARGET ?? 0.85)));
 const LIVE_MIN_ENTRY_KRW = Math.max(5_000, Number(process.env.LIVE_MIN_ENTRY_KRW ?? 50_000));
@@ -274,6 +274,66 @@ const LIVE_RUNNER_TRAIL_FROM_PEAK_PCT = (() => {
   const n = raw === undefined || raw === "" ? 1.2 : Number(raw);
   return Number.isFinite(n) ? Math.max(0.3, Math.min(6, n)) : 1.2;
 })();
+
+/** late_entry_guard: 고득점·신선 신호·저추격 구간에서만 near_high / vol_fade 를 축소진입으로 완화 (실거래 전용). */
+const LIVE_LATE_ENTRY_SOFT_MIN_SCORE = (() => {
+  const raw = process.env.LIVE_LATE_ENTRY_SOFT_MIN_SCORE;
+  const n = raw === undefined || raw === "" ? 90 : Number(raw);
+  return Number.isFinite(n) ? Math.max(80, Math.min(100, n)) : 90;
+})();
+const LIVE_LATE_ENTRY_SOFT_MAX_SIGNAL_SEC = (() => {
+  const raw = process.env.LIVE_LATE_ENTRY_SOFT_MAX_SIGNAL_SEC;
+  const n = raw === undefined || raw === "" ? 135 : Number(raw);
+  return Number.isFinite(n) ? Math.max(20, Math.min(600, Math.floor(n))) : 135;
+})();
+const LIVE_LATE_ENTRY_SOFT_CHASE_FRAC = (() => {
+  const raw = process.env.LIVE_LATE_ENTRY_SOFT_CHASE_FRAC;
+  const n = raw === undefined || raw === "" ? 0.55 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0.2, Math.min(0.95, n)) : 0.55;
+})();
+const LIVE_LATE_ENTRY_SOFT_SIZE_MULT_NEAR_HIGH = (() => {
+  const raw = process.env.LIVE_LATE_ENTRY_SOFT_SIZE_MULT_NEAR_HIGH;
+  const n = raw === undefined || raw === "" ? 0.62 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0.25, Math.min(1, n)) : 0.62;
+})();
+const LIVE_LATE_ENTRY_SOFT_SIZE_MULT_VOL_FADE = (() => {
+  const raw = process.env.LIVE_LATE_ENTRY_SOFT_SIZE_MULT_VOL_FADE;
+  const n = raw === undefined || raw === "" ? 0.68 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0.25, Math.min(1, n)) : 0.68;
+})();
+const LIVE_LATE_ENTRY_NEAR_HIGH_HARD_PCT = (() => {
+  const raw = process.env.LIVE_LATE_ENTRY_NEAR_HIGH_HARD_PCT;
+  const n = raw === undefined || raw === "" ? 0.12 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0.03, Math.min(LIVE_MAX_ENTRY_NEAR_HIGH_PCT, n)) : 0.12;
+})();
+const LIVE_LATE_ENTRY_VOLUME_HARD_RATIO = (() => {
+  const raw = process.env.LIVE_LATE_ENTRY_VOLUME_HARD_RATIO;
+  const n = raw === undefined || raw === "" ? 0.38 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0.15, Math.min(0.6, n)) : 0.38;
+})();
+
+/** partial TP 이후 잔존이 장기간 슬롯만 점유할 때 완전 청산으로 승격 (실거래 전용). */
+const LIVE_RESIDUAL_MIN_MINUTES_AFTER_PARTIAL = (() => {
+  const raw = process.env.LIVE_RESIDUAL_MIN_MINUTES_AFTER_PARTIAL;
+  const n = raw === undefined || raw === "" ? 36 * 60 : Number(raw);
+  return Number.isFinite(n) ? Math.max(120, Math.min(10 * 24 * 60, Math.floor(n))) : 36 * 60;
+})();
+const LIVE_RESIDUAL_PEAK_GIVEBACK_PCT = (() => {
+  const raw = process.env.LIVE_RESIDUAL_PEAK_GIVEBACK_PCT;
+  const n = raw === undefined || raw === "" ? 0.42 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0.15, Math.min(3, n)) : 0.42;
+})();
+const LIVE_RESIDUAL_STALL_PNL_CAP = (() => {
+  const raw = process.env.LIVE_RESIDUAL_STALL_PNL_CAP;
+  const n = raw === undefined || raw === "" ? 1.35 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0.3, Math.min(4, n)) : 1.35;
+})();
+const LIVE_RESIDUAL_MAX_HOLD_MINUTES = (() => {
+  const raw = process.env.LIVE_RESIDUAL_MAX_HOLD_MINUTES;
+  const n = raw === undefined || raw === "" ? 4.5 * 24 * 60 : Number(raw);
+  return Number.isFinite(n) ? Math.max(24 * 60, Math.min(14 * 24 * 60, Math.floor(n))) : 4.5 * 24 * 60;
+})();
+
 const LIVE_BREAK_EVEN_ARM_PCT = (() => {
   const raw = process.env.LIVE_BREAK_EVEN_ARM_PCT;
   const n = raw === undefined || raw === "" ? 1.0 : Number(raw);
@@ -490,6 +550,14 @@ function todayKst() {
 
 function minutesSince(ts: string) {
   return Math.max(0, (Date.now() - Date.parse(ts)) / 60_000);
+}
+
+function accountTotalSpotQtyForMarket(market: string, balances: unknown[] | undefined): number {
+  const cur = market.replace("KRW-", "").toUpperCase();
+  const row = Array.isArray(balances)
+    ? (balances as any[]).find((b) => String(b?.currency ?? "").toUpperCase() === cur)
+    : undefined;
+  return Number(row?.balance ?? 0) + Number(row?.locked ?? 0);
 }
 
 export function createLiveDataStrategy(opts: {
@@ -720,11 +788,61 @@ export function createLiveDataStrategy(opts: {
       return;
     }
 
+    // 계좌 실물 + trade-control ledger 기준으로 persisted 전략 상태를 정리 (수동 청산·외부 매도 후 유령 슬롯 방지).
+    const balArr = Array.isArray(tstatus.balances) ? tstatus.balances : [];
+    const lr = (tstatus as any).ledger_reconcile as { zeroed: string[]; clamped: string[] } | null | undefined;
+    const reconcileActions: string[] = [];
+    const strategyPosSnap = ((tstatus as any).strategy_positions ?? {}) as Record<string, { qty?: number }>;
+    for (const m of new Set([...Object.keys(state.positions), ...Object.keys(state.early_positions)])) {
+      const totalSpot = accountTotalSpotQtyForMarket(m, balArr);
+      const stratQty = Number(strategyPosSnap[m]?.qty ?? 0);
+      if (state.positions[m]) {
+        if (totalSpot <= 0 && stratQty <= 0) {
+          delete state.positions[m];
+          delete state.cooldown_until[m];
+          reconcileActions.push(`${m}:cleared_strategy_state_account_and_ledger_zero`);
+        } else if (stratQty <= 0 && totalSpot > 0) {
+          delete state.positions[m];
+          delete state.cooldown_until[m];
+          reconcileActions.push(`${m}:cleared_orphan_strategy_state_ledger_zero_nonzero_spot`);
+        } else if (stratQty > 0) {
+          const p = state.positions[m]!;
+          if (Math.abs(p.qty - stratQty) > 1e-10) {
+            p.qty = stratQty;
+            p.remaining_qty = stratQty;
+            reconcileActions.push(`${m}:synced_qty_to_ledger_qty=${stratQty}`);
+          }
+        }
+      }
+      if (state.early_positions[m] && totalSpot <= 0) {
+        delete state.early_positions[m];
+        delete state.cooldown_until[m];
+        reconcileActions.push(`${m}:cleared_early_state_zero_spot`);
+      }
+    }
+    if (lr?.zeroed?.length) {
+      for (const m of lr.zeroed) reconcileActions.push(`${m}:trade_control_strategy_qty_zeroed`);
+    }
+    if (lr?.clamped?.length) {
+      for (const m of lr.clamped) reconcileActions.push(`${m}:trade_control_strategy_qty_clamped`);
+    }
+    if (reconcileActions.length > 0) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_STATE_RECONCILE_RESULT",
+          ts: new Date().toISOString(),
+          actions: reconcileActions,
+          ledger_reconcile: lr ?? null,
+        }),
+      );
+      await persist();
+    }
+
     // holdings_universe: 현재 계좌 보유 종목(관리/청산/표시용). discovery/entry_universe/precheck 경로에서는 제외한다.
-    const heldSymbols = Array.from(Array.isArray(tstatus.balances) ? tstatus.balances : [])
+    const heldSymbols = Array.from(balArr)
       .map((b: any) => {
         const currency = String(b?.currency ?? "").toUpperCase();
-        const qty = Number(b?.balance ?? 0);
+        const qty = Number(b?.balance ?? 0) + Number(b?.locked ?? 0);
         if (!currency || currency === "KRW" || !(qty > 0)) return null;
         return `KRW-${currency}`;
       })
@@ -1175,7 +1293,9 @@ export function createLiveDataStrategy(opts: {
         // 승격: normal 포지션으로 이동 (기존 exit 로직 적용)
         const stNow = await opts.trade.status();
         const currency = market.replace("KRW-", "");
-        const qty = Number(stNow.balances?.find((b: any) => b.currency === currency)?.balance ?? ep.qty ?? 0);
+        const bNow = stNow.balances?.find((x: any) => x.currency === currency);
+        const qty =
+          bNow !== undefined ? Number(bNow.balance ?? 0) + Number(bNow.locked ?? 0) : Number(ep.qty ?? 0);
         state.positions[market] = {
           market,
           strategy_type: "momentum",
@@ -1428,6 +1548,35 @@ export function createLiveDataStrategy(opts: {
               stopTriggerKind = "time_stop";
             }
           }
+          if (!reasonExit && p.partial_tp_done && p.partial_tp_at) {
+            const minSincePartial = minutesSince(p.partial_tp_at);
+            const peakGiveback = p.max_pnl_pct - pnlGross;
+            const stalledFromPeak =
+              minSincePartial >= LIVE_RESIDUAL_MIN_MINUTES_AFTER_PARTIAL &&
+              peakGiveback >= LIVE_RESIDUAL_PEAK_GIVEBACK_PCT &&
+              pnlGross < LIVE_RESIDUAL_STALL_PNL_CAP;
+            const slotHog =
+              holdMin >= LIVE_RESIDUAL_MAX_HOLD_MINUTES && p.max_pnl_pct < 3.5 && pnlGross < 2.2;
+            if (stalledFromPeak || slotHog) {
+              reasonExit = "residual_full_exit_escalation";
+              ratio = 1;
+              stopTriggerKind = "time_stop";
+              console.info(
+                JSON.stringify({
+                  tag: "DEBUG_LIVE_RESIDUAL_EXIT_ESCALATION",
+                  ts: new Date().toISOString(),
+                  symbol: market,
+                  strategy_type: "stable",
+                  stalled_from_peak: stalledFromPeak,
+                  slot_hog: slotHog,
+                  minutes_since_partial: Math.round(minSincePartial),
+                  peak_giveback_pct: Number(peakGiveback.toFixed(4)),
+                  gross_pnl_pct: pnlGross,
+                  hold_minutes: holdMin,
+                }),
+              );
+            }
+          }
           if (!p.partial_tp_done && pnlGross >= s.partial_take_profit_pct) {
             reasonExit = p.strict_exit ? "partial_take_profit_1st_strict" : "partial_take_profit";
             ratio = s.partial_take_profit_ratio;
@@ -1530,6 +1679,35 @@ export function createLiveDataStrategy(opts: {
             });
           }
           p.trailing_stop_price = p.highest_price_after_entry * (1 - m.trailing_from_peak_pct / 100);
+          if (!reasonExit && p.partial_tp_done && p.partial_tp_at) {
+            const minSincePartial = minutesSince(p.partial_tp_at);
+            const peakGiveback = p.max_pnl_pct - pnlGross;
+            const stalledFromPeak =
+              minSincePartial >= LIVE_RESIDUAL_MIN_MINUTES_AFTER_PARTIAL &&
+              peakGiveback >= LIVE_RESIDUAL_PEAK_GIVEBACK_PCT &&
+              pnlGross < LIVE_RESIDUAL_STALL_PNL_CAP;
+            const slotHog =
+              holdMin >= LIVE_RESIDUAL_MAX_HOLD_MINUTES && p.max_pnl_pct < 3.5 && pnlGross < 2.2;
+            if (stalledFromPeak || slotHog) {
+              reasonExit = "residual_full_exit_escalation";
+              ratio = 1;
+              stopTriggerKind = "time_stop";
+              console.info(
+                JSON.stringify({
+                  tag: "DEBUG_LIVE_RESIDUAL_EXIT_ESCALATION",
+                  ts: new Date().toISOString(),
+                  symbol: market,
+                  strategy_type: "momentum",
+                  stalled_from_peak: stalledFromPeak,
+                  slot_hog: slotHog,
+                  minutes_since_partial: Math.round(minSincePartial),
+                  peak_giveback_pct: Number(peakGiveback.toFixed(4)),
+                  gross_pnl_pct: pnlGross,
+                  hold_minutes: holdMin,
+                }),
+              );
+            }
+          }
           if (!p.partial_tp_done && pnlGross >= m.partial_take_profit_pct) {
             reasonExit = p.strict_exit ? "partial_take_profit_1st_strict" : "partial_take_profit";
             ratio = m.partial_take_profit_ratio;
@@ -1576,7 +1754,7 @@ export function createLiveDataStrategy(opts: {
 
       // Early micro-loss guard: avoid selling on tiny negative noise immediately after entry.
       const isStopLike =
-        /stop|loss|catastrophic|time_stop_weak_rebound|momentum_time_stop/i.test(reasonExit) ||
+        /stop|loss|catastrophic|time_stop_weak_rebound|momentum_time_stop|residual_full_exit_escalation/i.test(reasonExit) ||
         stopTriggerKind === "price_stop";
       const withinEarlyLossGuard = heldMs < LIVE_EXIT_EARLY_LOSS_GUARD_SECONDS * 1000;
       const blockedByMicroLoss = withinEarlyLossGuard && isStopLike && netPnlPctEst > LIVE_MIN_EXIT_LOSS_PCT && reasonExit !== "emergency_stop_loss";
@@ -1762,7 +1940,9 @@ export function createLiveDataStrategy(opts: {
                 ? "breakeven_exit"
                 : reasonExit === "momentum_pattern_break"
                   ? "pattern_break_exit"
-                  : reasonExit === "momentum_time_stop" || reasonExit === "stable_time_stop_weak_rebound"
+                  : reasonExit === "momentum_time_stop" ||
+                      reasonExit === "stable_time_stop_weak_rebound" ||
+                      reasonExit === "residual_full_exit_escalation"
                     ? "time_stop_exit"
                     : "stop_loss",
         market,
@@ -1985,7 +2165,7 @@ export function createLiveDataStrategy(opts: {
         const currency = String((b as any).currency ?? "").toUpperCase();
         if (!currency || currency === "KRW") continue;
         const mk = `KRW-${currency}`;
-        const qty = Number((b as any).balance ?? 0);
+        const qty = Number((b as any).balance ?? 0) + Number((b as any).locked ?? 0);
         const px = Number(priceBy.get(mk) ?? (b as any).avg_buy_price ?? 0);
         const valueKrw = qty > 0 && px > 0 ? qty * px : 0;
         if (valueKrw >= EXISTING_POSITION_MIN_KRW) heldMeaningfulMarkets.add(mk);
@@ -2113,7 +2293,7 @@ export function createLiveDataStrategy(opts: {
       const currency = String((b as any).currency ?? "").toUpperCase();
       if (!currency || currency === "KRW") continue;
       const mk = `KRW-${currency}`;
-      const qty = Number((b as any).balance ?? 0);
+      const qty = Number((b as any).balance ?? 0) + Number((b as any).locked ?? 0);
       const px = Number(priceBy.get(mk) ?? (b as any).avg_buy_price ?? 0);
       const valueKrw = qty > 0 && px > 0 ? qty * px : 0;
       accountHoldSnapshot[mk] = {
@@ -2199,6 +2379,7 @@ export function createLiveDataStrategy(opts: {
         );
       }
       scannedCount += 1;
+      let lateEntrySizingMultiplier = 1;
       const emitEval = (tag: string, payload: Record<string, unknown>) => {
         console.info(
           JSON.stringify({
@@ -2502,20 +2683,62 @@ export function createLiveDataStrategy(opts: {
 
       let lateEntryGuardTriggered = false;
       let lateEntryGuardReason: string | null = null;
+      let lateTimingTier: "pass" | "hard_block" | "reduced_size_allowed" = "pass";
       const staleLimit = btcTierNow === "weak" ? Math.min(LIVE_ENTRY_SIGNAL_STALE_SECONDS, 180) : LIVE_ENTRY_SIGNAL_STALE_SECONDS;
       const chaseLimit = btcTierNow === "weak" ? LIVE_WEAK_MARKET_MAX_CHASE_PCT : LIVE_MAX_CHASE_FROM_SIGNAL_PCT;
+      const chaseSoftCap = chaseLimit * LIVE_LATE_ENTRY_SOFT_CHASE_FRAC;
+      // risk_off 는 위에서 continue 되어 이 지점에서는 market_state 가 risk_on | neutral 로 좁혀짐.
+      const softContextForMicroGuard =
+        score >= LIVE_LATE_ENTRY_SOFT_MIN_SCORE &&
+        secondsSinceSignal !== null &&
+        secondsSinceSignal <= LIVE_LATE_ENTRY_SOFT_MAX_SIGNAL_SEC &&
+        (priceChangeSinceSignalPct === null || priceChangeSinceSignalPct <= chaseSoftCap);
+
       if (secondsSinceSignal !== null && secondsSinceSignal > staleLimit) {
         lateEntryGuardTriggered = true;
+        lateTimingTier = "hard_block";
         lateEntryGuardReason = `signal_stale:${secondsSinceSignal}s>${staleLimit}s`;
       } else if (priceChangeSinceSignalPct !== null && priceChangeSinceSignalPct > chaseLimit) {
         lateEntryGuardTriggered = true;
+        lateTimingTier = "hard_block";
         lateEntryGuardReason = `chase_from_signal:${priceChangeSinceSignalPct.toFixed(3)}pct>${chaseLimit}pct`;
-      } else if (distanceFromLocalHighPct !== null && distanceFromLocalHighPct < LIVE_MAX_ENTRY_NEAR_HIGH_PCT) {
-        lateEntryGuardTriggered = true;
-        lateEntryGuardReason = `too_near_local_high:${distanceFromLocalHighPct.toFixed(3)}pct<${LIVE_MAX_ENTRY_NEAR_HIGH_PCT}pct`;
-      } else if (volumeFadeTriggered) {
-        lateEntryGuardTriggered = true;
-        lateEntryGuardReason = "volume_fade_after_spike";
+      } else {
+        const nearHighProblem =
+          distanceFromLocalHighPct !== null && distanceFromLocalHighPct < LIVE_MAX_ENTRY_NEAR_HIGH_PCT;
+        const volFadeProblem =
+          volumeFadeTriggered || (volumeRatio1m5 !== null && volumeRatio1m5 < 0.65);
+        if (nearHighProblem) {
+          const severeNearHigh =
+            distanceFromLocalHighPct !== null && distanceFromLocalHighPct < LIVE_LATE_ENTRY_NEAR_HIGH_HARD_PCT;
+          if (severeNearHigh || !softContextForMicroGuard) {
+            lateEntryGuardTriggered = true;
+            lateTimingTier = "hard_block";
+            lateEntryGuardReason = `too_near_local_high:${distanceFromLocalHighPct!.toFixed(3)}pct<${LIVE_MAX_ENTRY_NEAR_HIGH_PCT}pct`;
+          } else {
+            lateTimingTier = "reduced_size_allowed";
+            lateEntrySizingMultiplier *= LIVE_LATE_ENTRY_SOFT_SIZE_MULT_NEAR_HIGH;
+            lateEntryGuardReason = `too_near_local_high_soft:${distanceFromLocalHighPct!.toFixed(3)}pct<${LIVE_MAX_ENTRY_NEAR_HIGH_PCT}pct`;
+          }
+        }
+        if (!lateEntryGuardTriggered && volFadeProblem) {
+          const severeVol = volumeRatio1m5 !== null && volumeRatio1m5 < LIVE_LATE_ENTRY_VOLUME_HARD_RATIO;
+          if (severeVol || !softContextForMicroGuard) {
+            lateEntryGuardTriggered = true;
+            lateTimingTier = "hard_block";
+            lateEntryGuardReason =
+              volumeRatio1m5 !== null
+                ? `volume_fade_after_spike:${volumeRatio1m5.toFixed(3)}<0.65`
+                : "volume_fade_after_spike";
+          } else {
+            lateTimingTier = "reduced_size_allowed";
+            lateEntrySizingMultiplier *= LIVE_LATE_ENTRY_SOFT_SIZE_MULT_VOL_FADE;
+            const vr = volumeRatio1m5 !== null ? volumeRatio1m5.toFixed(3) : "na";
+            lateEntryGuardReason =
+              lateEntryGuardReason !== null
+                ? `${lateEntryGuardReason}|volume_fade_after_spike_soft:${vr}`
+                : `volume_fade_after_spike_soft:${vr}`;
+          }
+        }
       }
 
       let entryAllowedByTiming = !lateEntryGuardTriggered;
@@ -2523,13 +2746,34 @@ export function createLiveDataStrategy(opts: {
         if (score < LIVE_WEAK_MARKET_MIN_SCORE) {
           entryAllowedByTiming = false;
           lateEntryGuardTriggered = true;
+          lateTimingTier = "hard_block";
+          lateEntrySizingMultiplier = 1;
           lateEntryGuardReason = `weak_market_min_score:${score.toFixed(2)}<${LIVE_WEAK_MARKET_MIN_SCORE}`;
         } else if (volumeRatio > 0 && volumeRatio < LIVE_WEAK_MARKET_MIN_VOLUME_RATIO) {
           entryAllowedByTiming = false;
           lateEntryGuardTriggered = true;
+          lateTimingTier = "hard_block";
+          lateEntrySizingMultiplier = 1;
           lateEntryGuardReason = `weak_market_min_volume_ratio:${volumeRatio.toFixed(3)}<${LIVE_WEAK_MARKET_MIN_VOLUME_RATIO}`;
         }
       }
+
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_LATE_ENTRY_GUARD_RESULT",
+          ts: new Date().toISOString(),
+          symbol: market,
+          late_timing_tier: lateTimingTier,
+          late_entry_hard_block: lateEntryGuardTriggered,
+          late_entry_sizing_multiplier: Number(lateEntrySizingMultiplier.toFixed(4)),
+          late_entry_guard_reason: lateEntryGuardReason,
+          soft_context_ok: softContextForMicroGuard,
+          seconds_since_signal: secondsSinceSignal,
+          price_change_since_signal_pct: priceChangeSinceSignalPct,
+          distance_from_local_high_pct: distanceFromLocalHighPct,
+          volume_ratio_1m5: volumeRatio1m5,
+        }),
+      );
 
       console.info(
         JSON.stringify({
@@ -2541,6 +2785,8 @@ export function createLiveDataStrategy(opts: {
           score,
           entry_allowed: entryAllowedByTiming,
           entry_block_reason: entryAllowedByTiming ? null : lateEntryGuardReason,
+          late_timing_tier: lateTimingTier,
+          late_entry_sizing_multiplier: Number(lateEntrySizingMultiplier.toFixed(4)),
           current_price: currentPrice,
           signal_price: signalPriceApprox,
           signal_ts: signalTs,
@@ -2637,7 +2883,8 @@ export function createLiveDataStrategy(opts: {
             });
             const stEarly = await opts.trade.status();
             const currency = market.replace("KRW-", "");
-            const qtyEarly = Number(stEarly.balances?.find((b: any) => b.currency === currency)?.balance ?? 0);
+            const bEarly = stEarly.balances?.find((x: any) => x.currency === currency);
+            const qtyEarly = Number(bEarly?.balance ?? 0) + Number(bEarly?.locked ?? 0);
             state.early_positions[market] = {
               market,
               entry_ts: new Date().toISOString(),
@@ -2933,7 +3180,8 @@ export function createLiveDataStrategy(opts: {
 
       const st = await opts.trade.status();
       const currency = market.replace("KRW-", "");
-      const existingQty = Number(st.balances?.find((b: any) => b.currency === currency)?.balance ?? 0);
+      const bExist = st.balances?.find((x: any) => x.currency === currency);
+      const existingQty = Number(bExist?.balance ?? 0) + Number(bExist?.locked ?? 0);
       const markPrice = Number(priceBy.get(market) ?? 0);
       const existingValueKrw = existingQty > 0 && markPrice > 0 ? existingQty * markPrice : 0;
       const meaningfulExistingHold = existingValueKrw >= EXISTING_POSITION_MIN_KRW;
@@ -2954,6 +3202,9 @@ export function createLiveDataStrategy(opts: {
       const baseBudget = perPositionBudgetBySymbol.get(market) ?? minOrderKrw;
       let orderKrw = Math.max(minOrderKrw, Math.min(LIVE_MAX_ENTRY_KRW, baseBudget));
       if (isExceptionMarket) orderKrw = Math.floor(orderKrw * 0.9);
+      if (lateEntrySizingMultiplier < 1 - 1e-9) {
+        orderKrw = Math.max(minOrderKrw, Math.floor(orderKrw * lateEntrySizingMultiplier));
+      }
 
       const stPos = st.strategy_positions?.[market];
       const investedSoFar = Math.max(0, Number(stPos?.invested_krw_total ?? 0));
@@ -2965,6 +3216,7 @@ export function createLiveDataStrategy(opts: {
         available_krw: liveOrderAvailableKrw,
         max_alloc_krw: maxAllocKrw,
         planned_entry_krw: orderKrw,
+        late_entry_sizing_multiplier: lateEntrySizingMultiplier,
         min_entry_krw: minOrderKrw,
         max_entry_krw: LIVE_MAX_ENTRY_KRW,
         allocation_mode: "weighted",
@@ -3046,7 +3298,8 @@ export function createLiveDataStrategy(opts: {
       }
       const price = priceBy.get(market) ?? 0;
       const st2 = await opts.trade.status();
-      const qty = Number(st2.balances?.find((b: any) => b.currency === currency)?.balance ?? 0);
+      const bFill = st2.balances?.find((x: any) => x.currency === currency);
+      const qty = Number(bFill?.balance ?? 0) + Number(bFill?.locked ?? 0);
       const strategyPositionExistsBefore = Boolean(state.positions[market]);
       state.positions[market] = {
         market,

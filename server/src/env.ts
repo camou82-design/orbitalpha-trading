@@ -18,8 +18,8 @@ const envSchema = z.object({
   upbitSecretKey: z.string().optional(),
   tradingMode: z.enum(["paper", "live"]).default("paper"),
   liveOrderConfirm: z.boolean().default(false),
-  tradingLoginId: z.string().min(1).default("admin"),
-  tradingLoginPassword: z.string().min(1).default("955104"),
+  adminLoginId: z.string().min(1),
+  adminPasswordHash: z.string().min(1),
   dashboardOrigin: z.string().url().default("http://localhost:3010"),
   /**
    * Nginx 등 리버스 프록시 뒤에서 `X-Forwarded-Proto` 등을 신뢰한다.
@@ -79,17 +79,13 @@ export function loadEnv(): Env {
     process.env.ORBITALPHA_TRADING_LIVE_ORDER_CONFIRM,
     process.env.LIVE_ORDER_CONFIRM,
   );
-  const tradingLoginId = first(
-    process.env.TRADING_LOGIN_ID,
-    process.env.ORBITALPHA_TRADING_LOGIN_ID,
-    process.env.TRADING_ADMIN_ID,
+  const adminLoginId = first(
     process.env.ORBITALPHA_TRADING_ADMIN_ID,
+    process.env.ADMIN_LOGIN_ID,
   );
-  const tradingLoginPassword = first(
-    process.env.TRADING_LOGIN_PASSWORD,
-    process.env.ORBITALPHA_TRADING_LOGIN_PASSWORD,
-    process.env.TRADING_ADMIN_PASSWORD,
-    process.env.ORBITALPHA_TRADING_ADMIN_PASSWORD,
+  const adminPasswordHash = first(
+    process.env.ORBITALPHA_TRADING_ADMIN_PASSWORD_HASH,
+    process.env.ADMIN_PASSWORD_HASH,
   );
 
   const excludeMarketsRaw = first(process.env.ORBITALPHA_TRADING_EXCLUDE_MARKETS);
@@ -121,8 +117,8 @@ export function loadEnv(): Env {
     upbitSecretKey,
     tradingMode: tradingMode ?? "paper",
     liveOrderConfirm: (liveOrderConfirmRaw ?? "false").toLowerCase() === "true",
-    tradingLoginId: tradingLoginId ?? "admin",
-    tradingLoginPassword: tradingLoginPassword ?? "955104",
+    adminLoginId: adminLoginId,
+    adminPasswordHash: adminPasswordHash,
     dashboardOrigin: dashboardOrigin ?? "http://localhost:3010",
     trustProxy: (trustProxyRaw ?? "false").toLowerCase() === "true",
     sessionCookieSecure: (sessionCookieSecureRaw ?? "false").toLowerCase() === "true",
@@ -155,6 +151,12 @@ export function loadEnv(): Env {
       "ORBITALPHA_TRADING_UPBIT_ACCESS_KEY and ORBITALPHA_TRADING_UPBIT_SECRET_KEY must both be set or both omitted",
     );
   }
+
+  const placeholders = ["PLACEHOLDER", "CHANGE_ME", "ADMIN", "1234"];
+  if (placeholders.includes(e.adminLoginId.toUpperCase()) || e.adminPasswordHash.length < 32) {
+    throw new Error("CRITICAL: Insecure or placeholder ADMIN credentials detected. Server boot aborted for security.");
+  }
+
   return { ...e, corsAllowlist };
 }
 
