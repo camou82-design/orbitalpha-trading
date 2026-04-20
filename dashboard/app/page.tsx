@@ -18,6 +18,9 @@ import {
   fetchTradeStatusOnce,
   fetchTradeStatusUntilSyncedWithLog,
 } from "@/lib/trade-status-fetch";
+import { UI } from "@/app/trading/ui-constants";
+import { useTradingEngineInsights } from "@/app/trading/hooks/use-trading-engine-insights";
+import { SignalHistorySection } from "@/app/trading/sections/signal-history-section";
 
 const apiBase = "";
 
@@ -934,36 +937,6 @@ const FAIL_SUMMARY_IDS = [
   "volume_spike_close_fail",
 ] as const;
 
-const UI = {
-  accent: "#2563eb",
-  pageOuterBg: "radial-gradient(1200px 700px at 20% -10%, #1d4ed833 0%, #070d1b 48%, #02050d 100%)",
-  pageBg: "linear-gradient(180deg, #0b1428 0%, #081125 100%)",
-  panelBg: "linear-gradient(180deg, #10203d 0%, #0b1a33 100%)",
-  cardBg: "linear-gradient(180deg, #152a4f 0%, #102241 100%)",
-  cardSoftBg: "#0f2240",
-  border: "#2b4d7a",
-  borderSoft: "#1f3c63",
-  title: "#f1f7ff",
-  body: "#d6e7ff",
-  muted: "#8ea9d1",
-  mutedSoft: "#6781a9",
-  pass: "#2dd4bf",
-  passBg: "#052e2b",
-  watch: "#f59e0b",
-  watchBg: "#3a2a07",
-  fail: "#ef4444",
-  failBg: "#3a1014",
-  idle: "#60a5fa",
-  idleBg: "#0a2244",
-  error: "#ef4444",
-  warningChipBg: "#3b2306",
-  warningChipBorder: "#d97706",
-  errorChipBg: "#3a1014",
-  errorChipBorder: "#b91c1c",
-  panelInnerLine: "#3c66a3",
-  panelGlow: "0 10px 30px rgba(2, 6, 23, 0.45)",
-} as const;
-
 export default function HomePage() {
   const router = useRouter();
   const pathname = usePathname();
@@ -989,111 +962,30 @@ export default function HomePage() {
   const tradeInitialSyncDoneRef = useRef(false);
   const prevPathnameRef = useRef<string | null>(null);
 
-  const heldLiveSymbols = useMemo(() => {
-    const out = new Set<string>();
-    const DUST_NOTIONAL_KRW = 1000;
-    for (const b of trade?.balances ?? []) {
-      if (!b || typeof b !== "object") continue;
-      const o = b as Record<string, unknown>;
-      const currency = String(o.currency ?? "").toUpperCase();
-      if (!currency || currency === "KRW") continue;
-      const qtyRaw = Number(o.balance ?? 0) + Number(o.locked ?? 0);
-      const avg = Number(o.avg_buy_price ?? 0);
-      const notionalByCost = qtyRaw * avg;
-      if (Number.isFinite(qtyRaw) && qtyRaw > 0 && notionalByCost >= DUST_NOTIONAL_KRW) out.add(`KRW-${currency}`);
-    }
-    return [...out].sort();
-  }, [trade]);
-
-  const scannerItemsExcludingHeld = useMemo(() => {
-    const before = Array.isArray(scanner?.items) ? scanner!.items : [];
-    const held = new Set(heldLiveSymbols);
-    const after = before.filter((it) => !held.has(it.market));
-    const excluded = before.filter((it) => held.has(it.market)).map((it) => it.market);
-    return { before, after, excluded };
-  }, [scanner, heldLiveSymbols]);
-
-  const accountPositionsCount = heldLiveSymbols.length;
-  const ap = useMemo(() => accountPortfolioForKpi(trade?.account_portfolio ?? null), [trade]);
-  const accountTotalEquity = Number(ap?.krw_total_krw ?? trade?.total_krw ?? trade?.krw_available ?? 0);
-  const accountAvailableKrw = Number(ap?.krw_available_krw ?? trade?.krw_available ?? 0);
-  const accountPnlKrw = Number(ap?.net_pnl_krw ?? 0);
-  const accountPnlPct = Number(ap?.net_return_pct ?? 0);
-
-  const strategyOpenPositions = useMemo(() => {
-    const ops = strategy?.open_positions ?? {};
-    return Object.values(ops).filter((p) => Number((p as { remaining_qty?: unknown } | null | undefined)?.remaining_qty ?? 0) > 0).length;
-  }, [strategy]);
-  const strategyMaxPositions = Math.max(1, Math.floor(Number(strategy?.max_positions ?? 6)));
-  const strategyRemainingSlots = Math.max(0, strategyMaxPositions - strategyOpenPositions);
-  const strategyUsableKrw = Math.max(0, Number(strategy?.strategy_available_krw ?? 0));
-  const perPositionBudgetKrw = Math.floor((strategyUsableKrw * 0.9) / Math.max(1, strategyMaxPositions));
-  const strategyCurrentUsedKrw = strategyOpenPositions * perPositionBudgetKrw;
-  const strategyMaxNeededKrw = strategyMaxPositions * perPositionBudgetKrw;
-  const entryPossible = strategyRemainingSlots > 0 && strategyUsableKrw >= perPositionBudgetKrw && perPositionBudgetKrw > 0;
-  const blockReason: "slot" | "fund" | "condition" | "none" = (() => {
-    if (strategyRemainingSlots <= 0) return "slot";
-    if (!(strategyUsableKrw >= perPositionBudgetKrw) || perPositionBudgetKrw <= 0) return "fund";
-    if (scannerItemsExcludingHeld.after.length === 0) return "condition";
-    return "none";
-  })();
-  const engineStatusLine = (() => {
-    if (blockReason === "slot") return "슬롯 부족으로 신규 진입 차단";
-    if (blockReason === "fund") return "자금 부족으로 신규 진입 차단";
-    if (blockReason === "condition") return "진입 조건 미충족";
-    return "신규 진입 가능 상태";
-  })();
-
-  useEffect(() => {
-    if (!scanner?.items?.length) return;
-    try {
-      const beforeSymbols = scannerItemsExcludingHeld.before.map((x) => x.market).slice(0, 50);
-      const afterSymbols = scannerItemsExcludingHeld.after.map((x) => x.market).slice(0, 50);
-      const excludedSymbols = scannerItemsExcludingHeld.excluded.slice(0, 50);
-      console.info(
-        JSON.stringify({
-          tag: "DEBUG_SCANNER_EXCLUDING_HELD",
-          ts: new Date().toISOString(),
-          held_symbols: heldLiveSymbols,
-          scanner_symbols_before: beforeSymbols,
-          scanner_symbols_after: afterSymbols,
-          excluded_held_symbols: excludedSymbols,
-          before_count: scannerItemsExcludingHeld.before.length,
-          after_count: scannerItemsExcludingHeld.after.length,
-        }),
-      );
-    } catch {
-      // ignore logging failures
-    }
-  }, [scanner?.updated_at, heldLiveSymbols.join(","), scannerItemsExcludingHeld.before.length, scannerItemsExcludingHeld.after.length]);
-
-  useEffect(() => {
-    try {
-      console.info(
-        JSON.stringify({
-          tag: "DEBUG_UI_ACCOUNT_STRATEGY_SPLIT",
-          ts: new Date().toISOString(),
-          account_positions_count: accountPositionsCount,
-          strategy_open_positions: strategyOpenPositions,
-          strategy_max_positions: strategyMaxPositions,
-          available_krw: accountAvailableKrw,
-          per_position_budget_krw: perPositionBudgetKrw,
-          entry_possible: entryPossible,
-          block_reason: blockReason,
-        }),
-      );
-    } catch {
-      // ignore logging failures
-    }
-  }, [
+  const {
+    heldLiveSymbols,
+    scannerItemsExcludingHeld,
     accountPositionsCount,
+    accountTotalEquity,
+    accountAvailableKrw,
+    accountPnlKrw,
+    accountPnlPct,
     strategyOpenPositions,
     strategyMaxPositions,
-    accountAvailableKrw,
+    strategyRemainingSlots,
+    strategyUsableKrw,
     perPositionBudgetKrw,
+    strategyCurrentUsedKrw,
+    strategyMaxNeededKrw,
     entryPossible,
     blockReason,
-  ]);
+    engineStatusLine,
+  } = useTradingEngineInsights({
+    trade,
+    strategy,
+    scanner,
+    accountPortfolioForKpi: (v) => accountPortfolioForKpi(v as TradeStatus["account_portfolio"]),
+  });
 
   useEffect(() => {
     const prev = prevPathnameRef.current;
@@ -2388,108 +2280,15 @@ export default function HomePage() {
           })()}
         </section>
 
-        <section style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.8rem", marginBottom: "0.9rem" }}>
-          <article
-            style={{
-              background: UI.cardBg,
-              border: `1px solid ${UI.border}`,
-              borderRadius: 12,
-              padding: "0.8rem 1rem",
-              boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.32)",
-            }}
-          >
-            <div style={{ height: 1, marginBottom: "0.55rem", background: "linear-gradient(90deg, #38bdf8, transparent)" }} />
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.55rem" }}>
-              <div style={{ fontSize: "0.88rem", color: UI.title, fontWeight: 800, letterSpacing: "0.02em" }}>최근 통과 신호</div>
-              <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>통과 기준</div>
-            </div>
-            {recentFillRows.length === 0 ? (
-              <p style={{ color: "#94a3b8", margin: 0, fontSize: "0.84rem" }}>최근 통과 없음</p>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {recentFillRows.map((entry) => {
-                  const parsed = parseSignalPayload(entry);
-                  const pass = parsed ? isPass(parsed) : false;
-                  const near = parsed ? !pass && isNearMissFiveOfSix(parsed) : false;
-                  const status = pass ? "통과" : near ? "관찰" : "탈락";
-                  const statusColor = pass ? "#4ade80" : near ? "#facc15" : "#f87171";
-                  const market = parsed?.p?.market ? parsed.p.market.replace("KRW-", "") : "UNK";
-                  const reason = parsed ? (!pass ? getCardFailReason(parsed) : "정상") : "payload 파싱 실패";
-                  return (
-                    <div
-                      key={`${entry.ts}-${entry.message}-${market}`}
-                      style={{
-                        display: "flex",
-                        gap: 10,
-                        alignItems: "center",
-                        padding: "0.38rem 0.48rem",
-                        background: UI.cardSoftBg,
-                        borderRadius: 6,
-                        fontSize: "0.78rem",
-                        border: "1px solid #28456f",
-                      }}
-                    >
-                      <span style={{ color: UI.mutedSoft, minWidth: 142 }}>{formatTsLocal(entry.ts)}</span>
-                      <strong style={{ color: UI.title, fontWeight: 800, minWidth: 42 }}>{market}</strong>
-                      <span style={{ color: statusColor, fontWeight: 800, minWidth: 52 }}>{status}</span>
-                      <span style={{ color: UI.body, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{reason}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </article>
-
-          <article
-            style={{
-              background: UI.cardBg,
-              border: `1px solid ${UI.border}`,
-              borderRadius: 12,
-              padding: "0.8rem 1rem",
-              boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.32)",
-            }}
-          >
-            <div style={{ height: 1, marginBottom: "0.55rem", background: "linear-gradient(90deg, #60a5fa, transparent)" }} />
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.55rem" }}>
-              <div style={{ fontSize: "0.88rem", color: UI.title, fontWeight: 800, letterSpacing: "0.02em" }}>최근 전체 신호</div>
-              <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>최신순</div>
-            </div>
-            {latestCycleRows.length === 0 ? (
-              <p style={{ color: "#94a3b8", margin: 0, fontSize: "0.84rem" }}>신호 로그 없음</p>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {latestCycleRows.map(({ entry, parsed }) => {
-                  const pass = isPass(parsed);
-                  const near = !pass && isNearMissFiveOfSix(parsed);
-                  const status = pass ? "통과" : near ? "관찰" : "탈락";
-                  const statusColor = pass ? "#4ade80" : near ? "#facc15" : "#f87171";
-                  const market = parsed.p.market.replace("KRW-", "");
-                  const reason = !pass ? getCardFailReason(parsed) : "정상";
-                  return (
-                    <div
-                      key={`${entry.ts}-sig-${market}`}
-                      style={{
-                        display: "flex",
-                        gap: 10,
-                        alignItems: "center",
-                        padding: "0.34rem 0.46rem",
-                        background: UI.cardSoftBg,
-                        borderRadius: 6,
-                        fontSize: "0.76rem",
-                        border: "1px solid #28456f",
-                      }}
-                    >
-                      <span style={{ color: UI.mutedSoft, minWidth: 142 }}>{formatTsLocal(entry.ts)}</span>
-                      <strong style={{ color: UI.title, fontWeight: 800, minWidth: 42 }}>{market}</strong>
-                      <span style={{ color: statusColor, fontWeight: 800, minWidth: 52 }}>{status}</span>
-                      <span style={{ color: UI.body, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{reason}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </article>
-        </section>
+        <SignalHistorySection
+          recentFillRows={recentFillRows}
+          latestCycleRows={latestCycleRows}
+          parseSignalPayload={parseSignalPayload}
+          isPass={isPass}
+          isNearMissFiveOfSix={isNearMissFiveOfSix}
+          getCardFailReason={getCardFailReason}
+          formatTsLocal={formatTsLocal}
+        />
 
         {err ? (
           <p
