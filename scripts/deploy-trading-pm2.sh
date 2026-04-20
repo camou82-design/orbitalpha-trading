@@ -17,6 +17,9 @@ npm run build -w @orbitalpha/shared
 echo "[deploy] build server"
 npm run build -w @orbitalpha/server
 
+echo "[deploy] clean dashboard build artifacts"
+rm -rf dashboard/.next
+
 echo "[deploy] build dashboard"
 npm run build -w @orbitalpha/dashboard
 

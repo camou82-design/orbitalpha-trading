@@ -28,8 +28,8 @@ module.exports = {
         {
             name: "orbitalpha-trading-dashboard",
             cwd: "/home/admin/orbitalpha-trading/dashboard",
-            script: "npm",
-            args: "start -- -p 3010",
+            script: "/home/admin/orbitalpha-trading/node_modules/.bin/next",
+            args: "start -p 3010",
             exec_mode: "fork",
             instances: 1,
             autorestart: true,
