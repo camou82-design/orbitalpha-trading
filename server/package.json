@@ -7,8 +7,9 @@
     "prebuild": "npm run build -w @orbitalpha/shared",
     "build": "tsc -p tsconfig.build.json",
     "dev": "tsx watch src/index.ts",
-    "prestart": "npm run build",
-    "start": "node dist/index.js",
+    "start": "npm run start:build",
+    "start:build": "npm run build && npm run start:runtime",
+    "start:runtime": "node dist/index.js",
     "lint": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

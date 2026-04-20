@@ -11,6 +11,7 @@
   "scripts": {
     "postinstall": "npm run build -w @orbitalpha/shared",
     "build": "npm run build -w @orbitalpha/shared && npm run build -w @orbitalpha/server && npm run build -w @orbitalpha/dashboard",
+    "deploy:pm2": "bash ./scripts/deploy-trading-pm2.sh",
     "start": "node scripts/start-railway.mjs",
     "dev": "concurrently -n shared,server,dash -c blue,green,magenta \"npm run dev -w @orbitalpha/shared\" \"npm run dev -w @orbitalpha/server\" \"npm run dev -w @orbitalpha/dashboard\"",
     "dev:server": "npm run dev -w @orbitalpha/server",
