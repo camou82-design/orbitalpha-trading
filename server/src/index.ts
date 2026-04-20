@@ -607,12 +607,10 @@ async function main() {
     const now = new Date().toISOString();
     sessions.set(token, { user_id: id, created_at: now });
     setSessionCookie(reply, req, token);
-    const st = await trade.status();
+    /** 로그인 응답은 세션 확정만 즉시 반환. 거래/자동매매 상태는 `/api/v1/auth/session`·`/api/status`에서 조회. */
     return {
       authenticated: true,
       user_id: id,
-      auto_trade_enabled: st.auto_trade_enabled,
-      auto_trade_changed_at: st.auto_trade_changed_at,
     };
   });
 

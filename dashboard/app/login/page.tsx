@@ -2,14 +2,11 @@
 
 import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { fetchTradeStatusUntilSyncedWithLog } from "@/lib/trade-status-fetch";
-
-const apiBase = "";
 
 function LoginPageInner() {
   const router = useRouter();
   const params = useSearchParams();
-  const [id, setId] = useState("admin");
+  const [id, setId] = useState("");
   const [password, setPassword] = useState("");
   const [message, setMessage] = useState("");
   const [messageTone, setMessageTone] = useState<"error" | "success">("error");
@@ -52,12 +49,19 @@ function LoginPageInner() {
     e.preventDefault();
     setBusy(true);
     setMessage("");
+    const idTrim = id.trim();
+    if (!idTrim || !password) {
+      setBusy(false);
+      setMessageTone("error");
+      setMessage("아이디와 비밀번호를 모두 입력해 주세요.");
+      return;
+    }
     try {
       const res = await fetch(`/api/v1/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
-        body: JSON.stringify({ id, password }),
+        body: JSON.stringify({ id: idTrim, password }),
       });
       const body = await res.json();
       if (!res.ok || body?.authenticated !== true) {
