@@ -354,13 +354,22 @@ export function createTradeControl(
     }
   };
 
-  const ensureOrderAllowed = async (side: TradeOrderSide, market: string, confirm: boolean, bucket: PositionBucket = "strategy") => {
-    if (!state.autoTradeEnabled) throw new Error("Auto trade is disabled");
+  const ensureOrderCommonAllowed = async (market: string, confirm: boolean, bucket: PositionBucket = "strategy") => {
     if (bucket === "legacy" && !ALLOWED_MARKETS.has(market)) throw new Error("Legacy bucket market is not managed");
     if (bucket === "strategy" && !market.startsWith("KRW-")) throw new Error("Only KRW-* market is allowed");
     if (!confirm) throw new Error("confirm=true required");
     if (!isLiveEnabled()) throw new Error("Live trading is disabled by environment guards");
     if (state.inFlight) throw new Error("Another order is in progress");
+    const conn = await getConnectionStatus();
+    if (!conn.connected) throw new Error(conn.reason ?? "Connection failed");
+    reconcileAuthoritativeStrategyBook(conn.balances);
+    syncLegacyBuckets(conn.balances);
+    return conn;
+  };
+
+  const ensureEntryAllowed = async (side: TradeOrderSide, market: string, confirm: boolean, bucket: PositionBucket = "strategy") => {
+    if (!state.autoTradeEnabled) throw new Error("Auto trade is disabled");
+    const conn = await ensureOrderCommonAllowed(market, confirm, bucket);
     const now = Date.now();
     if (now - state.lastOrderAtMs < COOLDOWN_MS) throw new Error(`Cooldown active: wait ${COOLDOWN_MS}ms`);
     const key = `${side}:${market}:${Math.floor(now / 1000)}`;
@@ -384,10 +393,17 @@ export function createTradeControl(
         throw new Error(`Legacy DCA limit reached for ${market}`);
       }
     }
-    const conn = await getConnectionStatus();
-    if (!conn.connected) throw new Error(conn.reason ?? "Connection failed");
-    reconcileAuthoritativeStrategyBook(conn.balances);
-    syncLegacyBuckets(conn.balances);
+    return conn;
+  };
+
+  const ensureExitAllowed = async (side: TradeOrderSide, market: string, confirm: boolean, bucket: PositionBucket = "strategy") => {
+    const conn = await ensureOrderCommonAllowed(market, confirm, bucket);
+    const pos = state.strategyPositions[market as keyof typeof state.strategyPositions];
+    const legacyPos = state.legacyBuckets[market as ManagedMarket];
+    const baseQty = bucket === "legacy" ? legacyPos?.qty ?? 0 : pos?.qty ?? 0;
+    if (!Number.isFinite(baseQty) || baseQty <= 0) {
+      throw new Error(`No ${bucket} position to sell for ${market}`);
+    }
     return conn;
   };
 
@@ -458,7 +474,7 @@ export function createTradeControl(
         throw new Error(`Strategy invested KRW limit exceeded for ${market}`);
       }
     }
-    const conn = await ensureOrderAllowed("buy", market, confirm, bucket);
+    const conn = await ensureEntryAllowed("buy", market, confirm, bucket);
     const funds = computeKrwFunds(conn);
     if (funds.live_order_available_krw < 5000) throw new Error("Live order available KRW is below minimum order amount");
     if (funds.live_order_available_krw < amountKrw) throw new Error(`Not enough live-order KRW. available=${funds.live_order_available_krw}`);
@@ -574,7 +590,7 @@ export function createTradeControl(
   };
 
   const placeSell = async (market: string, confirm: boolean, ratio = 1, bucket: PositionBucket = "strategy") => {
-    const conn = await ensureOrderAllowed("sell", market, confirm, bucket);
+    const conn = await ensureExitAllowed("sell", market, confirm, bucket);
     state.inFlight = true;
     try {
       const pos = state.strategyPositions[market as keyof typeof state.strategyPositions];

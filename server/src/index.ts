@@ -383,20 +383,22 @@ async function main() {
     };
   };
 
-  const evaluateOrderGuard = async (market?: string) => {
+  const evaluateOrderGuard = async (side: "buy" | "sell", market?: string) => {
     const st = await trade.status();
     const ss = strategy.status() as any;
     if (!st.api_connected) return { ok: false, code: "manual_order_rejected_api", reason: "api disconnected" };
     if (!st.live_enabled) return { ok: false, code: "manual_order_rejected_guard", reason: "live disabled" };
     if (!st.recovery_ready) return { ok: false, code: "manual_order_rejected_recovery", reason: "recovery not ready" };
-    if (ss.safety_guard_state === "자동정지") return { ok: false, code: "manual_order_rejected_guard", reason: "safety guard stopped" };
-    if (market) {
-      const cool = (ss.reentry_cooldowns ?? {})[market] as string | undefined;
-      if (cool && Date.now() < Date.parse(cool)) return { ok: false, code: "manual_order_rejected_cooldown", reason: "reentry cooldown active" };
+    if (side === "buy") {
+      if (ss.safety_guard_state === "자동정지") return { ok: false, code: "manual_order_rejected_guard", reason: "safety guard stopped" };
+      if (market) {
+        const cool = (ss.reentry_cooldowns ?? {})[market] as string | undefined;
+        if (cool && Date.now() < Date.parse(cool)) return { ok: false, code: "manual_order_rejected_cooldown", reason: "reentry cooldown active" };
+      }
+      const openCount = Object.values(ss.open_positions ?? {}).filter((p: any) => Number(p?.qty ?? 0) > 0).length;
+      const maxPos = Number(ss.max_positions ?? 2);
+      if (openCount >= maxPos) return { ok: false, code: "manual_order_rejected_max_positions", reason: "max positions reached" };
     }
-    const openCount = Object.values(ss.open_positions ?? {}).filter((p: any) => Number(p?.qty ?? 0) > 0).length;
-    const maxPos = Number(ss.max_positions ?? 2);
-    if (openCount >= maxPos) return { ok: false, code: "manual_order_rejected_max_positions", reason: "max positions reached" };
     return { ok: true, st, ss };
   };
 
@@ -852,7 +854,7 @@ async function main() {
         pnl_net_pct: null,
         note: null,
       });
-      const guard = await evaluateOrderGuard(market);
+      const guard = await evaluateOrderGuard("buy", market);
       if (!guard.ok) {
         await opLog.event({
           timestamp: new Date().toISOString(),
@@ -963,7 +965,7 @@ async function main() {
         pnl_net_pct: null,
         note: null,
       });
-      const guard = await evaluateOrderGuard(market);
+      const guard = await evaluateOrderGuard("sell", market);
       if (!guard.ok) {
         await opLog.event({
           timestamp: new Date().toISOString(),

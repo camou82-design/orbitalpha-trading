@@ -759,7 +759,10 @@ export function createLiveDataStrategy(opts: {
     }
 
     const tstatus = await opts.trade.status();
-    if (!tstatus.auto_trade_enabled || !tstatus.api_connected || !tstatus.live_enabled) {
+    const hasOpenPositions = Object.keys(state.positions).length > 0 || Object.keys(state.early_positions).length > 0;
+    const tradeStatusEntryBlocked =
+      !tstatus.auto_trade_enabled || !tstatus.api_connected || !tstatus.live_enabled;
+    if (tradeStatusEntryBlocked) {
       console.info(
         JSON.stringify({
           tag: "DEBUG_LIVE_LOOP_SKIP",
@@ -772,20 +775,24 @@ export function createLiveDataStrategy(opts: {
       );
       console.info(
         JSON.stringify({
-          tag: "DEBUG_LIVE_EARLY_EXIT",
+          tag: "DEBUG_LIVE_EXIT_MANAGEMENT_CONTINUES",
           ts: new Date().toISOString(),
-          stage: "before_signal_load",
-          reason: "trade_status_guard",
+          stage: "before_signal_load_trade_status_guard",
+          reason: "entry_blocked_trade_status_guard",
+          entry_blocked: true,
+          exit_management_continues: hasOpenPositions,
+          message: "auto_trade_off_entry_disabled_exit_still_active",
+          open_positions: Object.keys(state.positions).length,
+          early_positions: Object.keys(state.early_positions).length,
           watch_markets_count: null,
           signal_map_count: null,
           markets_with_filter_pass_count: null,
           base_entry_universe_count: null,
           entry_universe_count: null,
           symbol: null,
-          note: "trade status guard return",
+          note: "entry blocked only; continue exit/position management flow",
         }),
       );
-      return;
     }
 
     // 계좌 실물 + trade-control ledger 기준으로 persisted 전략 상태를 정리 (수동 청산·외부 매도 후 유령 슬롯 방지).
@@ -860,20 +867,24 @@ export function createLiveDataStrategy(opts: {
       );
       console.info(
         JSON.stringify({
-          tag: "DEBUG_LIVE_EARLY_EXIT",
+          tag: "DEBUG_LIVE_EXIT_MANAGEMENT_CONTINUES",
           ts: new Date().toISOString(),
-          stage: "before_signal_load",
-          reason: "safety_guard_stopped",
+          stage: "before_signal_load_safety_guard",
+          reason: "entry_blocked_safety_guard_stopped",
+          entry_blocked: true,
+          exit_management_continues: hasOpenPositions,
+          message: "auto_trade_off_entry_disabled_exit_still_active",
+          open_positions: Object.keys(state.positions).length,
+          early_positions: Object.keys(state.early_positions).length,
           watch_markets_count: null,
           signal_map_count: null,
           markets_with_filter_pass_count: null,
           base_entry_universe_count: null,
           entry_universe_count: null,
           symbol: null,
-          note: String(state.safety_guard.reason ?? ""),
+          note: "entry blocked only; continue exit/position management flow",
         }),
       );
-      return;
     }
     const latestByMarket = new Map<string, any>();
     const latestAllSignals = new Map<string, any>();
@@ -2013,6 +2024,27 @@ export function createLiveDataStrategy(opts: {
         p.qty = qtyAfter;
         p.remaining_qty = qtyAfter;
       }
+    }
+
+    const entryBlockedBySafety = state.safety_guard.state === "자동정지";
+    const entryAllowed = !tradeStatusEntryBlocked && !entryBlockedBySafety;
+    if (!entryAllowed) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_ENTRY_BLOCKED",
+          ts: new Date().toISOString(),
+          reason: entryBlockedBySafety ? "entry_blocked_safety_guard_stopped" : "entry_blocked_trade_status_guard",
+          auto_trade_enabled: Boolean(tstatus.auto_trade_enabled),
+          api_connected: Boolean(tstatus.api_connected),
+          live_enabled: Boolean(tstatus.live_enabled),
+          safety_guard_state: state.safety_guard.state,
+          safety_guard_reason: state.safety_guard.reason,
+          exit_management_continues: hasOpenPositions,
+          message: "auto_trade_off_entry_disabled_exit_still_active",
+        }),
+      );
+      await persist();
+      return;
     }
 
     // entries
