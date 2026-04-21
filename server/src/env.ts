@@ -36,8 +36,6 @@ const envSchema = z.object({
   /** 콤마 구분 마켓 코드, 예: KRW-TRX — 해당 종목은 스캔·WS 구독에서 제외 */
   excludedMarkets: z.array(z.string()).default([]),
   debugLogEnabled: z.boolean().default(false),
-  futuresPaperApiUrl: z.string().optional(),
-  futuresPaperApiSecret: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema> & { corsAllowlist: string[] };
@@ -125,8 +123,6 @@ export function loadEnv(): Env {
     sessionCookieDomain: sessionCookieDomain?.trim() || undefined,
     excludedMarkets,
     debugLogEnabled: (debugLogEnabledRaw ?? "false").toLowerCase() === "true",
-    futuresPaperApiUrl: first(process.env.FUTURES_PAPER_API_URL, process.env.ORBITALPHA_FUTURES_PAPER_API_URL),
-    futuresPaperApiSecret: first(process.env.FUTURES_PAPER_API_SECRET, process.env.ORBITALPHA_FUTURES_PAPER_API_SECRET),
   });
 
   if (!parsed.success) {

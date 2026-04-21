@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { NextConfig } from "next";
+import { resolveDashboardApiUpstreamBase } from "./lib/api-upstream-base";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -13,7 +14,7 @@ const nextConfig: NextConfig = {
    * rewrites 만으로는 정적 배포/앞단 Nginx에서 404가 나기 쉬우므로 Route Handler를 단일 경로로 사용.
    */
   async rewrites() {
-    const api = process.env.ORBITALPHA_TRADING_DASHBOARD_API_PROXY?.replace(/\/$/, "") ?? "http://127.0.0.1:8787";
+    const api = resolveDashboardApiUpstreamBase();
     return [{ source: "/health", destination: `${api}/health` }];
   },
 };

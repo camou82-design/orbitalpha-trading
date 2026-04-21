@@ -13,7 +13,6 @@ import { loadEnv } from "./env.js";
 import { getMonitorInstanceSnapshot } from "./monitor-instance-meta.js";
 import { acquireSignalServerProcessLock } from "./monitor-process-lock.js";
 import { startSignalMonitor } from "./signal-monitor.js";
-import { transformFuturesBundleToPaperStatus } from "./paper-api-client.js";
 import { readRecentLogs } from "./log-store.js";
 import { resolveWatchMarkets } from "./upbit-public.js";
 import { VOLUME_THRESHOLD_BY_MARKET } from "./volume-thresholds.js";
@@ -723,38 +722,7 @@ async function main() {
     };
   });
   app.get("/api/v1/scanner/status", async () => pumpScanner.status());
-  app.get("/api/v1/paper/status", async (req) => {
-    const q = (req.query ?? {}) as { source?: string };
-    const wantFutures = q.source === "futures";
-    if (wantFutures && env.futuresPaperApiUrl) {
-      try {
-        const r = await fetch(env.futuresPaperApiUrl, {
-          headers: {
-            "x-orbitalpha-futures-paper-token": env.futuresPaperApiSecret ?? "",
-          },
-        });
-        if (r.ok) {
-          const bundle = (await r.json()) as any;
-          const out = transformFuturesBundleToPaperStatus(bundle) as any;
-          app.log.info(
-            {
-              tag: "DEBUG_PAPER_STATUS_API_SOURCE",
-              source_name: "futures_paper_api",
-              source_path: env.futuresPaperApiUrl,
-              positions_count: Array.isArray(out?.holdings) ? out.holdings.length : 0,
-              open_positions: Number(out?.counters?.open_positions ?? 0),
-              max_open: Number(out?.config?.max_open_positions ?? 0),
-              recent_history_count: Array.isArray(out?.recent_history) ? out.recent_history.length : 0,
-            },
-            "DEBUG_PAPER_STATUS_API_SOURCE",
-          );
-          return { ...out, source_name: "futures_paper_api", source_path: env.futuresPaperApiUrl };
-        }
-        app.log.error({ status: r.status, url: env.futuresPaperApiUrl }, "futures_paper_api_not_ok");
-      } catch (e) {
-        app.log.error({ err: String(e) }, "futures_paper_fetch_failed");
-      }
-    }
+  app.get("/api/v1/paper/status", async () => {
     const out = (await paper.status()) as any;
     app.log.info(
       {

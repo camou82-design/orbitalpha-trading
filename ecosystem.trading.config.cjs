@@ -1,5 +1,5 @@
 /**
- * PM2 Unified Trading Ecosystem (Standardized)
+ * PM2 split: API (8787) + dashboard (3010). 레거시 단일 앱 `orbitalpha-trading` 는 사용하지 않는다.
  * Start: pm2 start ecosystem.trading.config.cjs --env production
  */
 module.exports = {
@@ -36,7 +36,8 @@ module.exports = {
             max_memory_restart: "400M",
             env: {
                 NODE_ENV: "production",
-                PORT: 3010
+                PORT: 3010,
+                ORBITALPHA_TRADING_API_ORIGIN: "http://127.0.0.1:8787"
             },
             env_production: {
                 NODE_ENV: "production"

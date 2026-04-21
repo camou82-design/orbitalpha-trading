@@ -62,4 +62,33 @@ if [[ "$dashboard_ok" -ne 1 ]]; then
   exit 1
 fi
 
+echo "[deploy] verify session via dashboard proxy (expect 200 + authenticated field)"
+session_ok=0
+for i in {1..15}; do
+  if body=$(curl -fsS --max-time 8 http://127.0.0.1:3010/api/v1/auth/session 2>/dev/null) && echo "$body" | grep -q '"authenticated"'; then
+    session_ok=1
+    break
+  fi
+  sleep 2
+done
+if [[ "$session_ok" -ne 1 ]]; then
+  echo "[deploy] session proxy check failed (GET /api/v1/auth/session via 3010)"
+  exit 1
+fi
+
+echo "[deploy] verify protected route (unauthenticated -> redirect to /login)"
+protected_ok=0
+for i in {1..15}; do
+  hdrs=$(curl -sSI --max-time 8 http://127.0.0.1:3010/trading 2>/dev/null | tr -d '\r' || true)
+  if echo "$hdrs" | grep -qiE '^HTTP/[0-9.]+ 30[0-9] ' && echo "$hdrs" | awk 'tolower($1)=="location:"{print tolower($0)}' | grep -q "login"; then
+    protected_ok=1
+    break
+  fi
+  sleep 2
+done
+if [[ "$protected_ok" -ne 1 ]]; then
+  echo "[deploy] protected-route check failed (expected 3xx Location .../login for GET /trading without cookie)"
+  exit 1
+fi
+
 echo "[deploy] done"
