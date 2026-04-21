@@ -37,7 +37,7 @@ ss -ltnp | egrep ':8787|:3010'
 echo "[deploy] wait for api health"
 api_ok=0
 for i in {1..30}; do
-  if curl -fsS http://127.0.0.1:8787/health >/dev/null; then
+  if curl -fsS http://127.0.0.1:8787/api/health >/dev/null; then
     api_ok=1
     break
   fi
