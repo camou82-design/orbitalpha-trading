@@ -961,6 +961,7 @@ export default function HomePage() {
   const [lastClientTradeFailure, setLastClientTradeFailure] = useState<{ code: string; message: string } | null>(null);
   const tradeInitialSyncDoneRef = useRef(false);
   const prevPathnameRef = useRef<string | null>(null);
+  const loadInFlightRef = useRef(false);
 
   const {
     heldLiveSymbols,
@@ -1000,6 +1001,8 @@ export default function HomePage() {
   useEffect(() => {
     let cancelled = false;
     async function load() {
+      if (loadInFlightRef.current) return;
+      loadInFlightRef.current = true;
       setErr(null);
       try {
         if (typeof window !== "undefined") {
@@ -1022,27 +1025,23 @@ export default function HomePage() {
           clearTimeout(sessionTid);
         } catch (e) {
           if (!cancelled) {
-            setAuthState("error");
             setErr(e instanceof Error ? e.message : "session_fetch_failed");
-            setAccountSyncState("idle");
-          }
-          return;
-        }
-        if (sessionRes.status === 404) {
-          if (!cancelled) {
-            setAuthState("error");
-            setErr("api_session_404");
-            setAccountSyncState("idle");
           }
           return;
         }
         const session = (await sessionRes.json().catch(() => ({}))) as AuthSession;
-        if (!sessionRes.ok) {
+        if (sessionRes.status === 401) {
           if (!cancelled) {
             setAuthState("expired");
             setAccountSyncState("idle");
             tradeInitialSyncDoneRef.current = false;
             router.replace("/login?reason=session_expired");
+          }
+          return;
+        }
+        if (!sessionRes.ok) {
+          if (!cancelled) {
+            setErr(`session_http_${sessionRes.status}`);
           }
           return;
         }
@@ -1211,10 +1210,12 @@ export default function HomePage() {
           setErr(e instanceof Error ? e.message : "load failed");
           setAuthState((prev) => (prev === "loading" ? "error" : prev));
         }
+      } finally {
+        loadInFlightRef.current = false;
       }
     }
     void load();
-    const t = setInterval(load, 2_000);
+    const t = setInterval(load, 7_000);
     return () => {
       cancelled = true;
       clearInterval(t);
