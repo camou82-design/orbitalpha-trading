@@ -27,9 +27,9 @@ module.exports = {
         },
         {
             name: "orbitalpha-trading-dashboard",
-            cwd: "/home/admin/orbitalpha-trading/dashboard",
-            script: "/home/admin/orbitalpha-trading/node_modules/.bin/next",
-            args: "start -p 3010",
+            cwd: "/home/admin/orbitalpha-trading",
+            script: "npm",
+            args: "run start -w @orbitalpha/dashboard -- -p 3010",
             exec_mode: "fork",
             instances: 1,
             autorestart: true,
