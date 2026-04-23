@@ -27,6 +27,43 @@ type PaperPosition = {
   runner_trail_armed?: boolean;
   /** pump surge 2차(70%) 배분 완료 여부 */
   surge_add_leg_done?: boolean;
+  entry_profile_key?: string;
+  entry_profile_features?: EntryProfileFeatures;
+  realized_pnl_krw?: number;
+  initial_invested_krw?: number;
+};
+
+type EntryProfileFeatures = {
+  signal_strength: string;
+  position_stage: "early_active" | "normal_active";
+  btc_tier: "strong" | "neutral" | "weak";
+  score_bucket: "0-69" | "70-79" | "80-89" | "90+";
+  volume_ratio_bucket: "<1.2" | "1.2-1.49" | "1.5-1.99" | "2.0+";
+  signal_age_bucket: "<=10s" | "11-30s" | "31-60s" | ">60s";
+  chase_pct_bucket: "<=0.2" | "0.21-0.5" | "0.51-1.0" | ">1.0";
+  near_high_bucket: "<=0.1" | "0.11-0.25" | "0.26-0.5" | ">0.5";
+  breakout: boolean;
+  early_entry_eligible: boolean;
+};
+
+type EntryProfileStats = {
+  total_trades: number;
+  wins: number;
+  losses: number;
+  timeouts: number;
+  total_pnl_krw: number;
+  total_pnl_pct: number;
+  avg_pnl_pct: number;
+  win_rate: number;
+  last_updated_at: string;
+  recent_pnl_pct: number[];
+};
+
+type ProfileDecision = "allow" | "block" | "unknown";
+type ProfileDecisionResult = {
+  decision: ProfileDecision;
+  reason: string;
+  stats_snapshot: { total_trades: number; avg_pnl_pct: number; win_rate: number };
 };
 
 type PaperTradeEvent = {
@@ -40,6 +77,11 @@ type PaperTradeEvent = {
   qty: number | null;
   pnl_krw: number | null;
   pnl_pct: number | null;
+  entry_profile_key?: string;
+  entry_profile_features?: EntryProfileFeatures;
+  profile_decision?: ProfileDecision;
+  profile_reason?: string;
+  profile_stats?: { total_trades: number; avg_pnl_pct: number; win_rate: number };
 };
 
 type PaperStateFile = {
@@ -47,6 +89,7 @@ type PaperStateFile = {
   positions: Record<string, PaperPosition>;
   history: PaperTradeEvent[];
   seen_signal_keys: string[];
+  entry_profile_stats?: Record<string, EntryProfileStats>;
 };
 
 type LifecycleState = "idle" | "pre_entry" | "entered" | "cooldown";
@@ -173,6 +216,124 @@ function toNum(v: unknown, d = 0): number {
   return Number.isFinite(n) ? n : d;
 }
 
+function scoreBucket(score: number): EntryProfileFeatures["score_bucket"] {
+  if (score >= 90) return "90+";
+  if (score >= 80) return "80-89";
+  if (score >= 70) return "70-79";
+  return "0-69";
+}
+
+function volumeRatioBucket(v: number | null): EntryProfileFeatures["volume_ratio_bucket"] {
+  const n = toNum(v, 0);
+  if (n >= 2.0) return "2.0+";
+  if (n >= 1.5) return "1.5-1.99";
+  if (n >= 1.2) return "1.2-1.49";
+  return "<1.2";
+}
+
+function signalAgeBucket(sec: number | null): EntryProfileFeatures["signal_age_bucket"] {
+  const n = Math.max(0, toNum(sec, 9999));
+  if (n <= 10) return "<=10s";
+  if (n <= 30) return "11-30s";
+  if (n <= 60) return "31-60s";
+  return ">60s";
+}
+
+function chaseBucket(pct: number | null): EntryProfileFeatures["chase_pct_bucket"] {
+  const n = Math.max(0, toNum(pct, 999));
+  if (n <= 0.2) return "<=0.2";
+  if (n <= 0.5) return "0.21-0.5";
+  if (n <= 1.0) return "0.51-1.0";
+  return ">1.0";
+}
+
+function nearHighBucket(pct: number | null): EntryProfileFeatures["near_high_bucket"] {
+  const n = Math.max(0, toNum(pct, 999));
+  if (n <= 0.1) return "<=0.1";
+  if (n <= 0.25) return "0.11-0.25";
+  if (n <= 0.5) return "0.26-0.5";
+  return ">0.5";
+}
+
+function buildEntryProfileFeatures(params: {
+  signalStrength: string;
+  positionStage: "early_active" | "normal_active";
+  btcTier: "strong" | "neutral" | "weak";
+  score: number;
+  volumeRatio: number | null;
+  signalAgeSec: number | null;
+  chasePct: number | null;
+  nearHighPct: number | null;
+  breakout: boolean;
+  earlyEntryEligible: boolean;
+}): EntryProfileFeatures {
+  return {
+    signal_strength: params.signalStrength,
+    position_stage: params.positionStage,
+    btc_tier: params.btcTier,
+    score_bucket: scoreBucket(params.score),
+    volume_ratio_bucket: volumeRatioBucket(params.volumeRatio),
+    signal_age_bucket: signalAgeBucket(params.signalAgeSec),
+    chase_pct_bucket: chaseBucket(params.chasePct),
+    near_high_bucket: nearHighBucket(params.nearHighPct),
+    breakout: params.breakout,
+    early_entry_eligible: params.earlyEntryEligible,
+  };
+}
+
+function entryProfileKey(f: EntryProfileFeatures): string {
+  return [
+    `sig:${f.signal_strength}`,
+    `slot:${f.position_stage}`,
+    `btc:${f.btc_tier}`,
+    `score:${f.score_bucket}`,
+    `vr:${f.volume_ratio_bucket}`,
+    `age:${f.signal_age_bucket}`,
+    `chase:${f.chase_pct_bucket}`,
+    `near:${f.near_high_bucket}`,
+    `bo:${f.breakout ? "1" : "0"}`,
+    `early:${f.early_entry_eligible ? "1" : "0"}`,
+  ].join("|");
+}
+
+function evaluateProfileDecision(stats: EntryProfileStats | undefined): ProfileDecisionResult {
+  if (!stats || stats.total_trades < 3) {
+    return {
+      decision: "unknown",
+      reason: "profile_unknown_fallback_allow",
+      stats_snapshot: {
+        total_trades: stats?.total_trades ?? 0,
+        avg_pnl_pct: Number((stats?.avg_pnl_pct ?? 0).toFixed(4)),
+        win_rate: Number((stats?.win_rate ?? 0).toFixed(4)),
+      },
+    };
+  }
+  const timeoutRate = stats.total_trades > 0 ? stats.timeouts / stats.total_trades : 0;
+  const recent2 = stats.recent_pnl_pct.slice(-2);
+  if (stats.total_trades >= 3 && stats.avg_pnl_pct <= -0.25) {
+    return { decision: "block", reason: "profile_block_negative_expectancy", stats_snapshot: { total_trades: stats.total_trades, avg_pnl_pct: Number(stats.avg_pnl_pct.toFixed(4)), win_rate: Number(stats.win_rate.toFixed(4)) } };
+  }
+  if (stats.total_trades >= 3 && stats.win_rate < 0.34) {
+    return { decision: "block", reason: "profile_block_low_win_rate", stats_snapshot: { total_trades: stats.total_trades, avg_pnl_pct: Number(stats.avg_pnl_pct.toFixed(4)), win_rate: Number(stats.win_rate.toFixed(4)) } };
+  }
+  if (stats.total_trades >= 2 && recent2.length === 2 && recent2.every((x) => x <= -0.2)) {
+    return { decision: "block", reason: "profile_block_consecutive_losses", stats_snapshot: { total_trades: stats.total_trades, avg_pnl_pct: Number(stats.avg_pnl_pct.toFixed(4)), win_rate: Number(stats.win_rate.toFixed(4)) } };
+  }
+  if (stats.total_trades >= 3 && timeoutRate >= 0.5 && stats.avg_pnl_pct < 0) {
+    return { decision: "block", reason: "profile_block_timeout_negative", stats_snapshot: { total_trades: stats.total_trades, avg_pnl_pct: Number(stats.avg_pnl_pct.toFixed(4)), win_rate: Number(stats.win_rate.toFixed(4)) } };
+  }
+  if (stats.total_trades >= 3 && stats.avg_pnl_pct >= 0.25) {
+    return { decision: "allow", reason: "profile_allow_positive_expectancy", stats_snapshot: { total_trades: stats.total_trades, avg_pnl_pct: Number(stats.avg_pnl_pct.toFixed(4)), win_rate: Number(stats.win_rate.toFixed(4)) } };
+  }
+  if (stats.total_trades >= 3 && stats.win_rate >= 0.55) {
+    return { decision: "allow", reason: "profile_allow_high_win_rate", stats_snapshot: { total_trades: stats.total_trades, avg_pnl_pct: Number(stats.avg_pnl_pct.toFixed(4)), win_rate: Number(stats.win_rate.toFixed(4)) } };
+  }
+  if (stats.wins > stats.losses && stats.total_pnl_pct > 0) {
+    return { decision: "allow", reason: "profile_allow_net_positive", stats_snapshot: { total_trades: stats.total_trades, avg_pnl_pct: Number(stats.avg_pnl_pct.toFixed(4)), win_rate: Number(stats.win_rate.toFixed(4)) } };
+  }
+  return { decision: "unknown", reason: "profile_unknown_fallback_allow", stats_snapshot: { total_trades: stats.total_trades, avg_pnl_pct: Number(stats.avg_pnl_pct.toFixed(4)), win_rate: Number(stats.win_rate.toFixed(4)) } };
+}
+
 function paperTimeExitDeadlineMs(p: Pick<PaperPosition, "signal_strength">): number {
   return p.signal_strength === "SURGE_SCANNER" ? PAPER_SURGE_SCANNER_TIMEOUT_MS : PAPER_TIMEOUT_MS;
 }
@@ -244,6 +405,7 @@ export function createPaperTradingEngine(opts: {
       entryLatencyMs: number[];
       earlyExitCount: number;
     };
+    entryProfileStats: Record<string, EntryProfileStats>;
   } = {
     cashKrw: PAPER_START_KRW,
     positions: {},
@@ -257,6 +419,7 @@ export function createPaperTradingEngine(opts: {
       entryLatencyMs: [],
       earlyExitCount: 0,
     },
+    entryProfileStats: {},
   };
 
   const trimHistoryAndSignals = () => {
@@ -279,6 +442,7 @@ export function createPaperTradingEngine(opts: {
       positions: state.positions,
       history: state.history,
       seen_signal_keys: Array.from(state.seenSignalKeys),
+      entry_profile_stats: state.entryProfileStats,
     };
     await fs.writeFile(stateFile, JSON.stringify(filePayload, null, 2), "utf8");
   };
@@ -291,6 +455,10 @@ export function createPaperTradingEngine(opts: {
       state.positions = (raw.positions ?? {}) as Record<string, PaperPosition>;
       state.history = Array.isArray(raw.history) ? (raw.history as PaperTradeEvent[]) : [];
       state.seenSignalKeys = new Set(Array.isArray(raw.seen_signal_keys) ? raw.seen_signal_keys : []);
+      state.entryProfileStats =
+        raw.entry_profile_stats && typeof raw.entry_profile_stats === "object"
+          ? (raw.entry_profile_stats as Record<string, EntryProfileStats>)
+          : {};
       trimHistoryAndSignals();
       for (const p of Object.values(state.positions)) {
         if (p.signal_strength !== "SURGE_SCANNER") continue;
@@ -325,6 +493,13 @@ export function createPaperTradingEngine(opts: {
     note: string,
     amountKrw = PAPER_ENTRY_KRW_PER_TRADE,
     slot: "early" | "normal" = "normal",
+    profile?: {
+      key: string;
+      features: EntryProfileFeatures;
+      decision: ProfileDecision;
+      reason: string;
+      stats_snapshot: { total_trades: number; avg_pnl_pct: number; win_rate: number };
+    },
   ): { ok: boolean; reason?: string } => {
     if (state.positions[market]) return { ok: false, reason: "already_open" };
     const { early_open_positions, normal_open_positions } = countPaperSlots(state.positions);
@@ -355,6 +530,10 @@ export function createPaperTradingEngine(opts: {
       max_up_pct: 0,
       runner_trail_armed: false,
       position_stage: slot === "early" ? "early_active" : "normal_active",
+      entry_profile_key: profile?.key,
+      entry_profile_features: profile?.features,
+      realized_pnl_krw: 0,
+      initial_invested_krw: orderKrw,
       ...(signalStrength === "SURGE_SCANNER" ? { surge_add_leg_done: false } : {}),
     };
     appendHistory({
@@ -368,6 +547,11 @@ export function createPaperTradingEngine(opts: {
       qty,
       pnl_krw: null,
       pnl_pct: null,
+      entry_profile_key: profile?.key,
+      entry_profile_features: profile?.features,
+      profile_decision: profile?.decision,
+      profile_reason: profile?.reason,
+      profile_stats: profile?.stats_snapshot,
     });
 
     // --- PAPER_ENTRY_SUBMITTED Log ---
@@ -467,6 +651,7 @@ export function createPaperTradingEngine(opts: {
     const buyFeePart = p.buy_fee_krw * ratioClamped;
     const pnlKrw = netProceeds - investedPart - buyFeePart;
     const pnlPct = investedPart > 0 ? (pnlKrw / investedPart) * 100 : 0;
+    p.realized_pnl_krw = Number(p.realized_pnl_krw ?? 0) + pnlKrw;
 
     state.cashKrw += netProceeds;
     const remainQty = p.qty - sellQty;
@@ -489,7 +674,45 @@ export function createPaperTradingEngine(opts: {
       qty: sellQty,
       pnl_krw: pnlKrw,
       pnl_pct: pnlPct,
+      entry_profile_key: p.entry_profile_key,
+      entry_profile_features: p.entry_profile_features,
     });
+    if (ratioClamped >= 0.9999 || !state.positions[market]) {
+      const key = p.entry_profile_key;
+      if (key) {
+        const prev = state.entryProfileStats[key] ?? {
+          total_trades: 0,
+          wins: 0,
+          losses: 0,
+          timeouts: 0,
+          total_pnl_krw: 0,
+          total_pnl_pct: 0,
+          avg_pnl_pct: 0,
+          win_rate: 0,
+          last_updated_at: new Date().toISOString(),
+          recent_pnl_pct: [],
+        };
+        const totalPnlKrw = Number(p.realized_pnl_krw ?? pnlKrw);
+        const initialInvested = Math.max(1, Number(p.initial_invested_krw ?? p.invested_krw ?? 1));
+        const totalPnlPct = (totalPnlKrw / initialInvested) * 100;
+        const next: EntryProfileStats = {
+          ...prev,
+          total_trades: prev.total_trades + 1,
+          wins: prev.wins + (closeState === "CLOSED_WIN" ? 1 : 0),
+          losses: prev.losses + (closeState === "CLOSED_LOSS" ? 1 : 0),
+          timeouts: prev.timeouts + (closeState === "CLOSED_TIMEOUT" ? 1 : 0),
+          total_pnl_krw: prev.total_pnl_krw + totalPnlKrw,
+          total_pnl_pct: prev.total_pnl_pct + totalPnlPct,
+          avg_pnl_pct: 0,
+          win_rate: 0,
+          last_updated_at: new Date().toISOString(),
+          recent_pnl_pct: [...prev.recent_pnl_pct, totalPnlPct].slice(-8),
+        };
+        next.avg_pnl_pct = next.total_trades > 0 ? next.total_pnl_pct / next.total_trades : 0;
+        next.win_rate = next.total_trades > 0 ? next.wins / next.total_trades : 0;
+        state.entryProfileStats[key] = next;
+      }
+    }
     if (ratioClamped >= 0.9999 || !state.positions[market]) {
       const lossExit =
         closeState === "CLOSED_LOSS" ||
@@ -886,6 +1109,49 @@ export function createPaperTradingEngine(opts: {
         continue;
       }
 
+      const baseProfile = buildEntryProfileFeatures({
+        signalStrength: sig.signal_strength,
+        positionStage: "normal_active",
+        btcTier,
+        score: sig.score,
+        volumeRatio: volumeRatio1m5,
+        signalAgeSec: secondsSinceSignal,
+        chasePct: priceChangeSinceSignalPct,
+        nearHighPct: distanceFromLocalHighPct,
+        breakout: sig.breakout,
+        earlyEntryEligible: sig.early_entry_eligible,
+      });
+      const profileKey = entryProfileKey(baseProfile);
+      const profileDecision = evaluateProfileDecision(state.entryProfileStats[profileKey]);
+      emitPaper("DEBUG_PAPER_PROFILE_DECISION", {
+        market,
+        profile_key: profileKey,
+        profile_decision: profileDecision.decision,
+        profile_reason: profileDecision.reason,
+        profile_stats: profileDecision.stats_snapshot,
+      });
+      if (profileDecision.decision === "block") {
+        appendHistory({
+          ts: new Date().toISOString(),
+          market,
+          state: "SKIPPED",
+          note: profileDecision.reason,
+          signal_strength: sig.signal_strength,
+          entry_price: px,
+          exit_price: null,
+          qty: null,
+          pnl_krw: null,
+          pnl_pct: null,
+          entry_profile_key: profileKey,
+          entry_profile_features: baseProfile,
+          profile_decision: "block",
+          profile_reason: profileDecision.reason,
+          profile_stats: profileDecision.stats_snapshot,
+        });
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: profileDecision.reason, stage: "profile_gate", profile_key: profileKey });
+        continue;
+      }
+
       // 1) Early entry first (aggressive)
       const earlySlotsUsed = Object.values(state.positions).filter((p) => p.position_stage === "early_active").length;
       const earlySlotOk = earlySlotsUsed < PAPER_EARLY_ENTRY_MAX_OPEN;
@@ -931,8 +1197,54 @@ export function createPaperTradingEngine(opts: {
 
       if (earlyAllowed) {
         const earlyAmount = Math.max(5_000, Math.floor(PAPER_ENTRY_KRW_PER_TRADE * 0.4 * entryScale));
-        emitPaper("DEBUG_PAPER_ORDER_ATTEMPT", { market, order_krw: earlyAmount, stage: "paper_early_entry" });
-        const b = paperBuy(market, "SURGE_SCANNER", px, "paper_early_entry", earlyAmount, "early");
+        const earlyFeatures: EntryProfileFeatures = { ...baseProfile, position_stage: "early_active" };
+        const earlyKey = entryProfileKey(earlyFeatures);
+        const earlyDecision = evaluateProfileDecision(state.entryProfileStats[earlyKey]);
+        if (earlyDecision.decision === "block") {
+          appendHistory({
+            ts: new Date().toISOString(),
+            market,
+            state: "SKIPPED",
+            note: earlyDecision.reason,
+            signal_strength: sig.signal_strength,
+            entry_price: px,
+            exit_price: null,
+            qty: null,
+            pnl_krw: null,
+            pnl_pct: null,
+            entry_profile_key: earlyKey,
+            entry_profile_features: earlyFeatures,
+            profile_decision: "block",
+            profile_reason: earlyDecision.reason,
+            profile_stats: earlyDecision.stats_snapshot,
+          });
+          emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: earlyDecision.reason, stage: "profile_gate_early", profile_key: earlyKey });
+          continue;
+        }
+        emitPaper("DEBUG_PAPER_ORDER_ATTEMPT", {
+          market,
+          order_krw: earlyAmount,
+          stage: "paper_early_entry",
+          profile_key: earlyKey,
+          profile_decision: earlyDecision.decision,
+          profile_reason: earlyDecision.reason,
+          profile_stats: earlyDecision.stats_snapshot,
+        });
+        const b = paperBuy(
+          market,
+          "SURGE_SCANNER",
+          px,
+          `paper_early_entry|${earlyDecision.reason}`,
+          earlyAmount,
+          "early",
+          {
+            key: earlyKey,
+            features: earlyFeatures,
+            decision: earlyDecision.decision,
+            reason: earlyDecision.reason,
+            stats_snapshot: earlyDecision.stats_snapshot,
+          },
+        );
         if (b.ok) {
           const filled = (state.positions as any)[market] as any;
           if (filled) {
@@ -973,9 +1285,23 @@ export function createPaperTradingEngine(opts: {
       }
 
       const earlyAmount = Math.max(5_000, Math.floor(PAPER_ENTRY_KRW_PER_TRADE * SURGE_EARLY_ALLOC_RATIO * entryScale));
-      const earlyNote = `early_entry:surge_30pct|vr=${sig.volume_multiple.toFixed(3)}|score=${sig.score}|btc_scale=${entryScale}`;
-      emitPaper("DEBUG_PAPER_ORDER_ATTEMPT", { market, order_krw: earlyAmount, stage: "legacy_early_entry" });
-      const b = paperBuy(market, sig.signal_strength, px, earlyNote, earlyAmount, "normal");
+      const earlyNote = `early_entry:surge_30pct|vr=${sig.volume_multiple.toFixed(3)}|score=${sig.score}|btc_scale=${entryScale}|${profileDecision.reason}`;
+      emitPaper("DEBUG_PAPER_ORDER_ATTEMPT", {
+        market,
+        order_krw: earlyAmount,
+        stage: "legacy_early_entry",
+        profile_key: profileKey,
+        profile_decision: profileDecision.decision,
+        profile_reason: profileDecision.reason,
+        profile_stats: profileDecision.stats_snapshot,
+      });
+      const b = paperBuy(market, sig.signal_strength, px, earlyNote, earlyAmount, "normal", {
+        key: profileKey,
+        features: baseProfile,
+        decision: profileDecision.decision,
+        reason: profileDecision.reason,
+        stats_snapshot: profileDecision.stats_snapshot,
+      });
       if (b.ok) {
         const filled = (state.positions as any)[market] as any;
         emitPaper("DEBUG_PAPER_ORDER_FILLED", {
