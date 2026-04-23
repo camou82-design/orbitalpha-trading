@@ -165,6 +165,7 @@ type TradeStatus = {
   env_secret_key_present?: boolean;
   api_connected: boolean;
   api_reason: string | null;
+  recovery_ready?: boolean;
   account_sync_failure_code?: string | null;
   account_sync_failure_message?: string | null;
   krw_available: number;
@@ -298,6 +299,7 @@ type AuthSession = {
   safety_guard_state?: "정상" | "주의" | "자동정지";
   can_enable_auto_trade?: boolean;
   cannot_enable_reason?: string | null;
+  session_status_degraded?: boolean;
   auto_trade_changed_at?: string | null;
   message?: string;
 };
@@ -513,6 +515,28 @@ function formatTsLocal(ts: string): string {
 function safeNum(v: unknown): number {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
+}
+
+function resolveAutoTradeGate(params: {
+  session: AuthSession;
+  trade: TradeStatus | null;
+  strategy: StrategyStatus | null;
+}): { canEnable: boolean; reason: string | null; softDelay: boolean } {
+  const { session, trade, strategy } = params;
+  const rawReason = typeof session.cannot_enable_reason === "string" ? session.cannot_enable_reason : null;
+  const softDelay =
+    session.session_status_degraded === true ||
+    rawReason === "light_status_timeout" ||
+    rawReason === "session_status_delayed";
+  if (trade?.api_connected === false) return { canEnable: false, reason: "api disconnected", softDelay };
+  if (trade?.live_enabled === false) return { canEnable: false, reason: "live disabled", softDelay };
+  if (trade?.recovery_ready === false) return { canEnable: false, reason: "recovery not ready", softDelay };
+  if (strategy?.safety_guard_state === "자동정지") return { canEnable: false, reason: "safety guard stopped", softDelay };
+  if (rawReason === "unauthenticated") return { canEnable: false, reason: rawReason, softDelay };
+  if (softDelay) return { canEnable: true, reason: null, softDelay: true };
+  if (session.can_enable_auto_trade === true) return { canEnable: true, reason: null, softDelay };
+  if (rawReason) return { canEnable: false, reason: rawReason, softDelay };
+  return { canEnable: false, reason: "조건 미충족", softDelay };
 }
 
 function toPaperPanelSummary(raw: unknown): PaperPanelSummary {
@@ -946,6 +970,7 @@ export default function HomePage() {
   const [err, setErr] = useState<string | null>(null);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
   const [trade, setTrade] = useState<TradeStatus | null>(null);
+  const [currentSession, setCurrentSession] = useState<AuthSession | null>(null);
   const [sessionUserId, setSessionUserId] = useState<string | null>(null);
   const [autoTradeEnabled, setAutoTradeEnabled] = useState(false);
   const [autoTradeChangedAt, setAutoTradeChangedAt] = useState<string | null>(null);
@@ -1057,11 +1082,10 @@ export default function HomePage() {
         }
         if (!cancelled) {
           setAuthState("ok");
+          setCurrentSession(session);
           setSessionUserId(session.user_id ?? null);
           setAutoTradeEnabled(session.auto_trade_enabled === true);
           setAutoTradeChangedAt(typeof session.auto_trade_changed_at === "string" ? session.auto_trade_changed_at : null);
-          setCanEnableAutoTrade(session.can_enable_auto_trade === true);
-          setCannotEnableReason(typeof session.cannot_enable_reason === "string" ? session.cannot_enable_reason : null);
         }
 
         if (!tradeInitialSyncDoneRef.current) {
@@ -1228,6 +1252,13 @@ export default function HomePage() {
       clearInterval(t);
     };
   }, [router, pathname]);
+
+  useEffect(() => {
+    if (!currentSession) return;
+    const gate = resolveAutoTradeGate({ session: currentSession, trade, strategy });
+    setCanEnableAutoTrade(gate.canEnable);
+    setCannotEnableReason(gate.reason);
+  }, [currentSession, trade, strategy]);
 
   const activeMonitorInstanceId = useMemo(() => {
     const fromCtx = ctx?.monitor_instance_id;
@@ -1514,6 +1545,12 @@ export default function HomePage() {
     if (!isSoftTradeStatusFailureCode(lastClientTradeFailure.code)) return null;
     return `상태 갱신 지연: ${lastClientTradeFailure.code}${lastClientTradeFailure.message ? ` — ${lastClientTradeFailure.message}` : ""}`.slice(0, 220);
   }, [lastClientTradeFailure]);
+  const sessionDelayNotice = useMemo(() => {
+    const reason = currentSession?.cannot_enable_reason;
+    if (currentSession?.session_status_degraded === true) return "상태 갱신 지연";
+    if (reason === "light_status_timeout" || reason === "session_status_delayed") return "상태 갱신 지연";
+    return null;
+  }, [currentSession]);
 
   const onToggleAutoTrade = async (enabled: boolean) => {
     if (enabled) {
@@ -1807,6 +1844,9 @@ export default function HomePage() {
               </button>
               {!autoTradeEnabled && !canEnableAutoTrade ? (
                 <div style={{ fontSize: "0.7rem", color: UI.watch }}>ON 불가: {cannotEnableReason ?? "조건 미충족"}</div>
+              ) : null}
+              {!autoTradeEnabled && canEnableAutoTrade && sessionDelayNotice ? (
+                <div style={{ fontSize: "0.7rem", color: UI.mutedSoft }}>{sessionDelayNotice}</div>
               ) : null}
             </div>
           </section>

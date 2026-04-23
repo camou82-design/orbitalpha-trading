@@ -448,6 +448,7 @@ async function main() {
     8_000,
     Math.max(1200, Number(process.env.ORBITALPHA_SESSION_LIGHT_STATUS_TIMEOUT_MS ?? 2500)),
   );
+  let lastGoodSessionLightStatus: Awaited<ReturnType<typeof trade.statusLightweight>> | null = null;
 
   const buildAuthSessionPayload = async (req: FastifyRequest) => {
     const s = getSession(req.headers.cookie);
@@ -471,22 +472,36 @@ async function main() {
           setTimeout(() => rej(new Error("SESSION_LIGHT_STATUS_TIMEOUT")), SESSION_LIGHT_STATUS_TIMEOUT_MS),
         ),
       ])) as Awaited<ReturnType<typeof trade.statusLightweight>>;
+      lastGoodSessionLightStatus = st;
     } catch {
       req.log.warn(
         { route: "session", ms: SESSION_LIGHT_STATUS_TIMEOUT_MS },
         "session_light_status_timeout_or_error",
       );
+      const fallback = lastGoodSessionLightStatus;
+      const cannotEnableReason =
+        fallback == null
+          ? "session_status_delayed"
+          : !fallback.api_connected
+            ? "api disconnected"
+            : !fallback.live_enabled
+              ? "live disabled"
+              : !fallback.recovery_ready
+                ? "recovery not ready"
+                : ss.safety_guard_state === "자동정지"
+                  ? "safety guard stopped"
+                  : "session_status_delayed";
       return {
         authenticated: true,
         user_id: s.user_id,
-        auto_trade_enabled: false,
-        auto_trade_changed_at: null,
-        live_enabled: false,
-        api_connected: undefined,
-        recovery_ready: false,
+        auto_trade_enabled: fallback?.auto_trade_enabled ?? false,
+        auto_trade_changed_at: fallback?.auto_trade_changed_at ?? null,
+        live_enabled: fallback?.live_enabled,
+        api_connected: fallback?.api_connected,
+        recovery_ready: fallback?.recovery_ready === true,
         safety_guard_state: (ss.safety_guard_state ?? "주의") as "정상" | "주의" | "자동정지",
-        can_enable_auto_trade: false,
-        cannot_enable_reason: "light_status_timeout",
+        can_enable_auto_trade: cannotEnableReason === null,
+        cannot_enable_reason: cannotEnableReason,
         session_status_degraded: true,
       };
     }
