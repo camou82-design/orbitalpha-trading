@@ -8,17 +8,13 @@ export const dynamic = "force-dynamic";
  * 브라우저는 동일 출처로 `/api/*` 를 호출한다. 정적/Nginx만 있으면 `/api/session` 이 404가 되어
  * 인증 로딩이 끝나지 않는다. Next 서버가 있을 때는 여기서 trading API 로 프록시한다.
  *
- * 로컬: 기본 `http://127.0.0.1:8787`
- * 배포: `ORBITALPHA_TRADING_API_ORIGIN` (예: http://127.0.0.1:8787 또는 내부 주소; 끝에 `/api` 붙이지 말 것)
+ * Upstream URL is always `${bareOrigin}/api/${subpath}` (see `resolveDashboardApiUpstreamBase`).
  */
-function upstreamBase(): string {
-  return resolveDashboardApiUpstreamBase();
-}
-
 async function proxy(req: NextRequest, pathSegments: string[]): Promise<Response> {
   const sub = pathSegments.length ? pathSegments.join("/") : "";
   const src = new URL(req.url);
-  const target = `${upstreamBase()}/api/${sub}${src.search}`;
+  const base = resolveDashboardApiUpstreamBase();
+  const target = `${base}/api/${sub}${src.search}`;
 
   const headers = new Headers();
   const pass = ["cookie", "authorization", "content-type", "accept", "accept-language", "user-agent"];
@@ -49,7 +45,7 @@ async function proxy(req: NextRequest, pathSegments: string[]): Promise<Response
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return NextResponse.json(
-      { ok: false, error: "api_upstream_unreachable", message: msg.slice(0, 400), upstream: upstreamBase() },
+      { ok: false, error: "api_upstream_unreachable", message: msg.slice(0, 400), upstream: resolveDashboardApiUpstreamBase() },
       { status: 502 },
     );
   }

@@ -20,7 +20,7 @@ npm run build -w @orbitalpha/server
 echo "[deploy-api-only] restart api pm2 app"
 pm2 delete orbitalpha-trading || true
 pm2 delete orbitalpha-trading-api || true
-ORBITALPHA_TRADING_PORT=8787 pm2 start /usr/bin/node --name orbitalpha-trading-api --cwd /home/admin/orbitalpha-trading/server -- dist/index.js
+pm2 start ecosystem.trading.config.cjs --only orbitalpha-trading-api --env production
 pm2 save
 
 echo "[deploy-api-only] verify api process and port"
@@ -30,7 +30,7 @@ ss -ltnp | egrep ':8787'
 echo "[deploy-api-only] wait for api health"
 api_ok=0
 for i in {1..30}; do
-  if curl -fsS http://127.0.0.1:8787/health >/dev/null; then
+  if curl -fsS http://127.0.0.1:8787/api/health >/dev/null; then
     api_ok=1
     break
   fi

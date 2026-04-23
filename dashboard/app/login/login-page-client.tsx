@@ -3,6 +3,45 @@
 import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
+function resolvePostLoginPath(searchParams: Pick<URLSearchParams, "get">): string {
+  const raw = searchParams.get("next");
+  if (raw && raw.startsWith("/") && !raw.startsWith("//")) {
+    return raw;
+  }
+  return "/trading?account_sync=1";
+}
+
+async function fetchSessionAuthenticated(signal?: AbortSignal): Promise<boolean> {
+  const res = await fetch(`/api/v1/auth/session`, {
+    cache: "no-store",
+    credentials: "include",
+    signal,
+  });
+  const body = (await res.json().catch(() => ({}))) as { authenticated?: boolean };
+  return res.ok && body.authenticated === true;
+}
+
+/** Immediate check plus short retries so Set-Cookie is visible before navigation. */
+async function confirmSessionAfterLogin(): Promise<boolean> {
+  const maxAttempts = 5;
+  const delayMs = 250;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      const ctrl = new AbortController();
+      const tid = setTimeout(() => ctrl.abort(), 3000);
+      const ok = await fetchSessionAuthenticated(ctrl.signal);
+      clearTimeout(tid);
+      if (ok) return true;
+    } catch {
+      /* retry */
+    }
+    if (attempt < maxAttempts - 1) {
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  return false;
+}
+
 function LoginPageInner() {
   const router = useRouter();
   const params = useSearchParams();
@@ -18,15 +57,10 @@ function LoginPageInner() {
       try {
         const ctrl = new AbortController();
         const tid = setTimeout(() => ctrl.abort(), 3000);
-        const res = await fetch(`/api/v1/auth/session`, {
-          cache: "no-store",
-          credentials: "include",
-          signal: ctrl.signal
-        });
+        const ok = await fetchSessionAuthenticated(ctrl.signal);
         clearTimeout(tid);
-        const body = (await res.json().catch(() => ({}))) as { authenticated?: boolean };
-        if (!cancelled && res.ok && body.authenticated === true) {
-          router.replace("/trading?account_sync=1");
+        if (!cancelled && ok) {
+          router.replace(resolvePostLoginPath(params));
         }
       } catch { }
     }
@@ -47,6 +81,7 @@ function LoginPageInner() {
 
   const onLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (busy) return;
     setBusy(true);
     setMessage("");
     const idTrim = id.trim();
@@ -69,10 +104,17 @@ function LoginPageInner() {
         setMessage(body?.message || "아이디 또는 비밀번호가 올바르지 않습니다");
         return;
       }
+      const sessionOk = await confirmSessionAfterLogin();
+      if (!sessionOk) {
+        setMessageTone("error");
+        setMessage("로그인은 성공했지만 세션 확인에 실패했습니다. 다시 시도해 주세요.");
+        return;
+      }
       setMessageTone("success");
       setMessage("인증 성공. 대시보드로 이동합니다.");
-      router.replace("/trading?account_sync=1");
+      router.replace(resolvePostLoginPath(params));
     } catch {
+      setMessageTone("error");
       setMessage("로그인 실패");
     } finally {
       setBusy(false);

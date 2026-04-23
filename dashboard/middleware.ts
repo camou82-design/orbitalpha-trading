@@ -10,6 +10,8 @@ export function middleware(req: NextRequest) {
   if (token) return NextResponse.next();
   const url = req.nextUrl.clone();
   url.pathname = "/login";
+  const nextPath = `${pathname}${req.nextUrl.search}`;
+  url.searchParams.set("next", nextPath);
   return NextResponse.redirect(url);
 }
 

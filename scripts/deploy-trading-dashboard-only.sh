@@ -19,7 +19,7 @@ npm run build -w @orbitalpha/dashboard
 
 echo "[deploy-dashboard-only] restart dashboard pm2 app"
 pm2 delete orbitalpha-trading-dashboard || true
-pm2 start /home/admin/orbitalpha-trading/node_modules/.bin/next --name orbitalpha-trading-dashboard --cwd /home/admin/orbitalpha-trading/dashboard -- start -p 3010
+pm2 start ecosystem.trading.config.cjs --only orbitalpha-trading-dashboard --env production
 pm2 save
 
 echo "[deploy-dashboard-only] verify dashboard process and port"

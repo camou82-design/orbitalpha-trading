@@ -1,5 +1,5 @@
 /**
- * Fastify API 루트 (경로 접두사 `/api/...` 없음). `.../api` 로 끝나면 이중 `/api/api` 가 되므로 제거한다.
+ * Fastify upstream: bare origin only (no trailing slash). Trailing path segment `api` is stripped so the dashboard proxy can append `/api/...` once.
  */
 export function resolveDashboardApiUpstreamBase(): string {
   const raw =
@@ -9,6 +9,8 @@ export function resolveDashboardApiUpstreamBase(): string {
     "";
   let base = raw.replace(/\/$/, "");
   if (!base) base = "http://127.0.0.1:8787";
-  base = base.replace(/\/api$/i, "");
+  while (/\/api$/i.test(base)) {
+    base = base.replace(/\/api$/i, "");
+  }
   return base;
 }
