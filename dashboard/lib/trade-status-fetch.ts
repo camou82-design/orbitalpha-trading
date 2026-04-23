@@ -39,8 +39,20 @@ export type TradeStatusFetchResult = {
   failureMessage: string | null;
 };
 
+let lastGoodTradeStatusPayload: unknown | null = null;
+
+export function isSoftTradeStatusFailureCode(code: string | null | undefined): boolean {
+  if (!code) return false;
+  return (
+    code === "client_fetch_aborted" ||
+    code === "client_fetch_timeout" ||
+    code === "client_fetch_failed" ||
+    code === "soft_fetch_failed_with_last_good"
+  );
+}
+
 export async function fetchTradeStatusDetailed(apiBase: string): Promise<TradeStatusFetchResult> {
-  const base = apiBase.replace(/\/$/, "");
+  void apiBase;
   const ts = Date.now();
   let httpStatus = 0;
   let body: unknown | null = null;
@@ -67,6 +79,7 @@ export async function fetchTradeStatusDetailed(apiBase: string): Promise<TradeSt
       return { httpStatus, body, payload: null, failureCode: code, failureMessage: message };
     }
     if (body && isValidTradeStatusPayload(body)) {
+      lastGoodTradeStatusPayload = body;
       return { httpStatus, body, payload: body, failureCode: null, failureMessage: null };
     }
     return {
@@ -78,11 +91,27 @@ export async function fetchTradeStatusDetailed(apiBase: string): Promise<TradeSt
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    const lower = msg.toLowerCase();
+    const isAbort = e instanceof Error && e.name === "AbortError";
+    const failureCode = isAbort
+      ? "client_fetch_aborted"
+      : /timeout|timed out|etimedout|und_err_connect_timeout/.test(lower)
+        ? "client_fetch_timeout"
+        : "client_fetch_failed";
+    if (lastGoodTradeStatusPayload) {
+      return {
+        httpStatus,
+        body,
+        payload: lastGoodTradeStatusPayload,
+        failureCode: "soft_fetch_failed_with_last_good",
+        failureMessage: msg.slice(0, 400),
+      };
+    }
     return {
       httpStatus,
       body,
       payload: null,
-      failureCode: "client_fetch_failed",
+      failureCode,
       failureMessage: msg.slice(0, 400),
     };
   }
@@ -209,7 +238,7 @@ export async function fetchTradeStatusUntilSyncedWithLog(
             httpStatus: 404,
           });
         }
-        return { payload: null, attempts: attempt, lastFetch: res };
+        return { payload: lastGood, attempts: attempt, lastFetch: res };
       }
       const delayMs = Math.min(150 + i * 95, 1500);
       await new Promise((r2) => setTimeout(r2, delayMs));
@@ -230,5 +259,5 @@ export async function fetchTradeStatusUntilSyncedWithLog(
     });
   }
 
-  return { payload: lastGood, attempts: maxAttempts, lastFetch };
+  return { payload: lastGood ?? lastGoodTradeStatusPayload, attempts: maxAttempts, lastFetch };
 }

@@ -152,6 +152,21 @@ type ConnectionResult = {
   access_key_fingerprint: string | null;
 };
 
+type LightweightStatus = {
+  api_connected: boolean;
+  api_reason: string | null;
+  account_sync_failure_code: string | null;
+  account_sync_failure_message: string | null;
+  auto_trade_enabled: boolean;
+  auto_trade_changed_at: string | null;
+  live_enabled: boolean;
+  recovery_ready: boolean;
+  env_access_key_present: boolean;
+  env_secret_key_present: boolean;
+  krw_available: number;
+  balances: ConnectionBalances;
+};
+
 export function createTradeControl(
   env: Env,
   hooks?: {
@@ -295,6 +310,28 @@ export function createTradeControl(
         access_key_fingerprint: keyFingerprint(env.upbitAccessKey),
       };
     }
+  };
+
+  const statusLightweight = async (): Promise<LightweightStatus> => {
+    const conn = await getConnectionStatus();
+    if (conn.connected && Array.isArray(conn.balances) && conn.balances.length > 0) {
+      reconcileAuthoritativeStrategyBook(conn.balances);
+    }
+    syncLegacyBuckets(conn.balances);
+    return {
+      api_connected: conn.connected,
+      api_reason: conn.reason,
+      account_sync_failure_code: conn.connected ? null : conn.failure_code,
+      account_sync_failure_message: conn.connected ? null : conn.reason,
+      auto_trade_enabled: state.autoTradeEnabled,
+      auto_trade_changed_at: state.autoTradeChangedAt,
+      live_enabled: isLiveEnabled(),
+      recovery_ready: state.recoveryReady,
+      env_access_key_present: Boolean(env.upbitAccessKey),
+      env_secret_key_present: Boolean(env.upbitSecretKey),
+      krw_available: conn.krw_available,
+      balances: conn.balances,
+    };
   };
 
   /** 계좌 실물 수량(balance+locked)이 전략 장부보다 작거나 0이면 strategyPositions를 즉시 맞춘다(수동 청산·외부 매도 후 장부 유령 방지). */
@@ -695,6 +732,10 @@ export function createTradeControl(
       };
       let pricing_debug: Record<string, PricingDebugRow> | null = null;
       let mark_prices_stale = false;
+      let market_data_degraded = false;
+      let valuation_unavailable = false;
+      let market_data_failure_code: string | null = null;
+      let market_data_failure_message: string | null = null;
       if (conn.connected) {
         const rawBalances = Array.isArray(conn.balances) ? conn.balances : [];
         const balanceRows = rawBalances.map((b) => ({
@@ -704,7 +745,17 @@ export function createTradeControl(
           avg_buy_price: Number(b.avg_buy_price),
         }));
         try {
-          const { merged, rest_fresh_markets } = await resolveTickerPricesForBalances(balanceRows, state.lastGoodMarkPrices);
+          const marketDataTimeoutMs = Math.max(
+            600,
+            Math.min(2500, Number(process.env.ORBITALPHA_TRADE_STATUS_MARKET_DATA_TIMEOUT_MS ?? 1200)),
+          );
+          const timed = await Promise.race([
+            resolveTickerPricesForBalances(balanceRows, state.lastGoodMarkPrices),
+            new Promise<never>((_, rej) =>
+              setTimeout(() => rej(new Error("MARKET_DATA_TIMEOUT")), marketDataTimeoutMs),
+            ),
+          ]);
+          const { merged, rest_fresh_markets } = timed;
           state.lastGoodMarkPrices = merged;
           const effective = buildEffectiveValuationPriceMap(balanceRows, merged);
           const snap = computeAccountValuationFromPrices(balanceRows, effective, new Date().toISOString());
@@ -739,6 +790,14 @@ export function createTradeControl(
           pricing_debug = dbg;
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
+          market_data_degraded = true;
+          valuation_unavailable = true;
+          market_data_failure_code = /429|too_many_requests/i.test(msg)
+            ? "ticker_rate_limited"
+            : /timeout|aborted|MARKET_DATA_TIMEOUT/i.test(msg)
+              ? "ticker_timeout"
+              : "ticker_fetch_failed";
+          market_data_failure_message = msg.slice(0, 280);
           await log("account_valuation_error", { error: msg.slice(0, 400) });
           const effective = buildEffectiveValuationPriceMap(balanceRows, state.lastGoodMarkPrices ?? {});
           const snap = computeAccountValuationFromPrices(balanceRows, effective, new Date().toISOString());
@@ -827,12 +886,17 @@ export function createTradeControl(
       account_portfolio,
       mark_prices,
       mark_prices_stale,
+      market_data_degraded,
+      valuation_unavailable,
+      market_data_failure_code,
+      market_data_failure_message,
       pricing_debug,
     };
   };
 
   return {
     status,
+    statusLightweight,
     connectionCheck: getConnectionStatus,
     placeBuy,
     placeSell,

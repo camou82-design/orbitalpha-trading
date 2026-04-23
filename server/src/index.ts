@@ -432,9 +432,7 @@ async function main() {
   }));
 
   /**
-   * trade.status()는 Upbit 등으로 무거울 수 있음 — 세션 엔드포인트에서 무제한 대기하면
-   * 대시보드 `fetch(/api/session)` 5~12초 타임아웃 → 인증 로딩 무한 대기로 이어짐.
-   * 짧은 상한 후에는 degraded 응답으로 200을 유지하고 상세는 /api/status에서 재동기화.
+   * Session endpoint must stay lightweight: never wait for ticker-heavy valuation path.
    */
   app.addHook("onRequest", async (req, reply) => {
     const pathOnly = req.url.split("?", 1)[0] ?? req.url;
@@ -446,9 +444,9 @@ async function main() {
     }
   });
 
-  const SESSION_TRADE_STATUS_TIMEOUT_MS = Math.min(
-    12_000,
-    Math.max(1500, Number(process.env.ORBITALPHA_SESSION_TRADE_STATUS_TIMEOUT_MS ?? 2000)),
+  const SESSION_LIGHT_STATUS_TIMEOUT_MS = Math.min(
+    8_000,
+    Math.max(1200, Number(process.env.ORBITALPHA_SESSION_LIGHT_STATUS_TIMEOUT_MS ?? 2500)),
   );
 
   const buildAuthSessionPayload = async (req: FastifyRequest) => {
@@ -465,30 +463,30 @@ async function main() {
       };
     }
     const ss = strategy.status() as { safety_guard_state?: string };
-    let st: Awaited<ReturnType<typeof trade.status>>;
+    let st: Awaited<ReturnType<typeof trade.statusLightweight>>;
     try {
       st = (await Promise.race([
-        trade.status(),
+        trade.statusLightweight(),
         new Promise<never>((_, rej) =>
-          setTimeout(() => rej(new Error("SESSION_TRADE_STATUS_TIMEOUT")), SESSION_TRADE_STATUS_TIMEOUT_MS),
+          setTimeout(() => rej(new Error("SESSION_LIGHT_STATUS_TIMEOUT")), SESSION_LIGHT_STATUS_TIMEOUT_MS),
         ),
-      ])) as Awaited<ReturnType<typeof trade.status>>;
+      ])) as Awaited<ReturnType<typeof trade.statusLightweight>>;
     } catch {
       req.log.warn(
-        { route: "session", ms: SESSION_TRADE_STATUS_TIMEOUT_MS },
-        "session_trade_status_timeout_or_error",
+        { route: "session", ms: SESSION_LIGHT_STATUS_TIMEOUT_MS },
+        "session_light_status_timeout_or_error",
       );
       return {
         authenticated: true,
         user_id: s.user_id,
         auto_trade_enabled: false,
         auto_trade_changed_at: null,
-        live_enabled: true,
-        api_connected: false,
+        live_enabled: false,
+        api_connected: undefined,
         recovery_ready: false,
         safety_guard_state: (ss.safety_guard_state ?? "주의") as "정상" | "주의" | "자동정지",
         can_enable_auto_trade: false,
-        cannot_enable_reason: "trade_status_slow_or_timeout",
+        cannot_enable_reason: "light_status_timeout",
         session_status_degraded: true,
       };
     }

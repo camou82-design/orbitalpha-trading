@@ -17,6 +17,7 @@ import {
   fetchTradeStatusDetailed,
   fetchTradeStatusOnce,
   fetchTradeStatusUntilSyncedWithLog,
+  isSoftTradeStatusFailureCode,
 } from "@/lib/trade-status-fetch";
 import { UI } from "@/app/trading/ui-constants";
 import { useTradingEngineInsights } from "@/app/trading/hooks/use-trading-engine-insights";
@@ -1093,13 +1094,15 @@ export default function HomePage() {
               }
             }
           } else if (!cancelled) {
-            setAccountSyncState("error");
             const lf = syncResult.lastFetch;
             if (lf?.failureCode) {
               setLastClientTradeFailure({
                 code: lf.failureCode,
                 message: lf.failureMessage ?? "",
               });
+              if (!isSoftTradeStatusFailureCode(lf.failureCode)) {
+                setAccountSyncState("error");
+              }
               console.log("[orbitalpha-trading] /trading initial sync no valid payload", {
                 attempts: syncResult.attempts,
                 lastHttpStatus: lf.httpStatus,
@@ -1165,6 +1168,10 @@ export default function HomePage() {
             else setAccountSyncState("ok");
           }
         } else if (!cancelled && tradePollRes.failureCode) {
+          setLastClientTradeFailure({
+            code: tradePollRes.failureCode,
+            message: tradePollRes.failureMessage ?? "",
+          });
           console.log("[orbitalpha-trading] trade/status poll (invalid or error body)", {
             httpStatus: tradePollRes.httpStatus,
             failureCode: tradePollRes.failureCode,
@@ -1502,6 +1509,12 @@ export default function HomePage() {
     return null;
   }, [trade, lastClientTradeFailure]);
 
+  const statusRefreshDelayDisplay = useMemo(() => {
+    if (!lastClientTradeFailure) return null;
+    if (!isSoftTradeStatusFailureCode(lastClientTradeFailure.code)) return null;
+    return `상태 갱신 지연: ${lastClientTradeFailure.code}${lastClientTradeFailure.message ? ` — ${lastClientTradeFailure.message}` : ""}`.slice(0, 220);
+  }, [lastClientTradeFailure]);
+
   const onToggleAutoTrade = async (enabled: boolean) => {
     if (enabled) {
       const ok = window.confirm("자동매매를 활성화합니다. 실제 주문이 실행될 수 있습니다.");
@@ -1800,6 +1813,11 @@ export default function HomePage() {
           {accountSyncFailureDisplay ? (
             <div style={{ marginTop: "0.45rem", fontSize: "0.72rem", color: UI.watch }}>
               계좌 동기화 실패 사유: {accountSyncFailureDisplay}
+            </div>
+          ) : null}
+          {!accountSyncFailureDisplay && statusRefreshDelayDisplay ? (
+            <div style={{ marginTop: "0.45rem", fontSize: "0.72rem", color: UI.mutedSoft }}>
+              {statusRefreshDelayDisplay}
             </div>
           ) : null}
           <details style={{ marginTop: "0.55rem" }}>
