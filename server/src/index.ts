@@ -437,8 +437,12 @@ async function main() {
    * 짧은 상한 후에는 degraded 응답으로 200을 유지하고 상세는 /api/status에서 재동기화.
    */
   app.addHook("onRequest", async (req, reply) => {
-    if (req.url.startsWith("/api/api/")) {
-      app.log.warn({ url: req.url, method: req.method }, "CRITICAL: Path duplication detected (/api/api/...). Check Nginx proxy_pass or dashboard apiBase settings.");
+    const pathOnly = req.url.split("?", 1)[0] ?? req.url;
+    if (pathOnly.startsWith("/api/") && pathOnly.slice("/api/".length).startsWith("api/")) {
+      app.log.warn(
+        { url: req.url, method: req.method },
+        "CRITICAL: duplicated API path prefix detected. Check Nginx proxy_pass or dashboard upstream origin settings.",
+      );
     }
   });
 
