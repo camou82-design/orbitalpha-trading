@@ -18,7 +18,7 @@ module.exports = {
                 ORBITALPHA_TRADING_PORT: "8787",
                 PORT: 8787,
                 ORBITALPHA_TRADING_MODE: "live",
-                ORBITALPHA_TRADING_LIVE_ORDER_CONFIRM: "false"
+                ORBITALPHA_TRADING_LIVE_ORDER_CONFIRM: "true"
             },
             env_production: {
                 NODE_ENV: "production",
