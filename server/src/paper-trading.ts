@@ -402,12 +402,13 @@ function paperTimeExitDeadlineMsByContext(
   return weakBase;
 }
 
-function paperTimeExitNote(p: Pick<PaperPosition, "signal_strength">): string {
-  const ms = paperTimeExitDeadlineMs(p);
+function paperTimeExitNote(
+  p: Pick<PaperPosition, "signal_strength" | "entry_profile_features">,
+  coarseStats?: EntryProfileStats,
+): string {
+  const ms = paperTimeExitDeadlineMsByContext(p, coarseStats);
   const m = Math.round(ms / 60_000);
-  return p.signal_strength === "SURGE_SCANNER"
-    ? `time_exit_${m}m:surge_scanner`
-    : `time_exit_${m}m:paper`;
+  return p.signal_strength === "SURGE_SCANNER" ? `time_exit_${m}m:surge_scanner` : `time_exit_${m}m:paper`;
 }
 
 function logPumpScannerDebug(payload: Record<string, unknown>) {
@@ -1221,11 +1222,19 @@ export function createPaperTradingEngine(opts: {
       const fineKey = buildFineProfileKey(baseProfile);
       const coarseDecision = evaluateCoarseProfileDecision(state.coarseProfileStats[coarseKey]);
       const fineDecision = evaluateFineProfileDecision(state.fineProfileStats[fineKey]);
+
       let profileDecision: ProfileDecisionResult = coarseDecision;
-      if (coarseDecision.decision !== "block" && fineDecision.decision === "allow") {
+      // [HARDENED] Dual-stage gating: Coarse block always takes priority
+      if (coarseDecision.decision === "block") {
+        profileDecision = coarseDecision;
+      } else if (fineDecision.decision === "block") {
         profileDecision = fineDecision;
-      }
-      if (coarseDecision.decision === "unknown") {
+      } else if (fineDecision.decision === "allow") {
+        profileDecision = fineDecision;
+      } else if (coarseDecision.decision === "allow") {
+        profileDecision = coarseDecision;
+      } else {
+        // Unknown case handling
         if (btcTier === "weak") {
           profileDecision = {
             decision: "block",
@@ -1529,8 +1538,9 @@ export function createPaperTradingEngine(opts: {
         const coarseKey =
           p.entry_profile_features != null ? buildCoarseProfileKey(coarseFromFine(p.entry_profile_features)) : null;
         const coarseStats = coarseKey ? state.coarseProfileStats[coarseKey] : undefined;
-        if (heldMs >= paperTimeExitDeadlineMsByContext(p, coarseStats)) {
-          paperSell(p.market, px, "CLOSED_TIMEOUT", paperTimeExitNote(p));
+        const deadline = paperTimeExitDeadlineMsByContext(p, coarseStats);
+        if (heldMs >= deadline) {
+          paperSell(p.market, px, "CLOSED_TIMEOUT", paperTimeExitNote(p, coarseStats));
         }
         continue;
       }
@@ -1565,8 +1575,11 @@ export function createPaperTradingEngine(opts: {
           }
         }
       }
-      if (heldMs >= paperTimeExitDeadlineMsByContext(p, undefined)) {
-        paperSell(p.market, px, "CLOSED_TIMEOUT", paperTimeExitNote(p));
+      const cKey = p.entry_profile_features != null ? buildCoarseProfileKey(coarseFromFine(p.entry_profile_features)) : null;
+      const cStats = cKey ? state.coarseProfileStats[cKey] : undefined;
+      const dline = paperTimeExitDeadlineMsByContext(p, cStats);
+      if (heldMs >= dline) {
+        paperSell(p.market, px, "CLOSED_TIMEOUT", paperTimeExitNote(p, cStats));
       }
     }
 

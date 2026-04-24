@@ -101,6 +101,10 @@ type EarlyEntryPosition = {
   /** 승격 여부(정상 포지션으로 이동 완료) */
   promoted: boolean;
   position_stage?: "early_candidate" | "early_active" | "normal_active" | "scaled_out_partial" | "cooldown" | "closed";
+  /** 진입 시 설정된 전체 목표 예산 (normal 승격 시 이 금액까지 채움) */
+  target_budget_krw?: number;
+  /** 실제 체결된 금액 (수수료 제외 순수 매수액) */
+  filled_entry_krw?: number;
 };
 
 type StrategyTradeRow = {
@@ -222,6 +226,8 @@ type PersistedState = {
     last_updated_at: string;
   };
   entry_profile_stats?: Record<string, LiveEntryProfileStats>;
+  coarse_profile_stats?: Record<string, LiveEntryProfileStats>;
+  fine_profile_stats?: Record<string, LiveEntryProfileStats>;
 };
 
 const MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX"] as const;
@@ -622,20 +628,26 @@ function accountTotalSpotQtyForMarket(market: string, balances: unknown[] | unde
 }
 
 function classifyEntryQuality(params: {
+  market: string;
   score: number;
-  signalFresh: boolean;
-  nearHighOk: boolean;
-  volumeStrong: boolean;
-  weakMarketConstraintsPass: boolean;
+  secondsSinceSignal: number | null;
+  distanceFromLocalHighPct: number | null;
+  volumeRatio: number | null;
+  btcTier: "strong" | "neutral" | "weak";
 }): EntryQuality {
   const score = Number(params.score ?? 0);
   const tier: EntryQualityTier = score >= 90 ? "A" : score >= 82 ? "B" : "C";
-  const earlyEligible =
-    tier === "A" &&
-    params.signalFresh &&
-    params.nearHighOk &&
-    params.volumeStrong &&
-    params.weakMarketConstraintsPass;
+
+  // Real-time diagnostics-backed eligibility
+  const age = params.secondsSinceSignal ?? 999;
+  const dist = params.distanceFromLocalHighPct ?? 0;
+  const vol = params.volumeRatio ?? 0;
+
+  const isFresh = age <= 30; // Early entry needs very fresh signals
+  const isNearHighSafe = dist >= 0.35; // Don't chase too close to local high
+  const isVolumeStrong = vol >= 1.45; // Strong volume confirmation
+
+  const earlyEligible = tier === "A" && isFresh && isNearHighSafe && isVolumeStrong && params.btcTier !== "weak";
   return { tier, score, earlyEligible };
 }
 
@@ -1527,7 +1539,11 @@ export function createLiveDataStrategy(opts: {
       const promoteNow = breakoutNow || pnlGross >= LIVE_EARLY_PROMOTION_PCT || heldSec >= LIVE_EARLY_PROMOTION_MAX_SECONDS;
 
       if (promoteNow) {
-        const promoteFillKrw = Math.max(0, Math.floor(ep.order_krw * ((1 - LIVE_EARLY_ENTRY_SIZE_RATIO) / Math.max(0.01, LIVE_EARLY_ENTRY_SIZE_RATIO))));
+        // [HARDENED] budget-aware promotion calculation
+        const minOrderFallback = Math.max(UPBIT_MIN_ORDER_KRW, LIVE_MIN_ENTRY_KRW);
+        const targetBudget = ep.target_budget_krw ?? minOrderFallback;
+        const filledSoFar = ep.filled_entry_krw ?? (ep.qty * ep.entry_price);
+        const promoteFillKrw = Math.max(0, Math.floor(targetBudget - filledSoFar));
         if (promoteFillKrw >= UPBIT_MIN_ORDER_KRW) {
           try {
             await opts.trade.placeBuy(market, true, promoteFillKrw, "momentum", "strategy", {
@@ -2531,21 +2547,37 @@ export function createLiveDataStrategy(opts: {
       0,
       Number(tstatus.strategy_available_krw ?? tstatus.live_order_available_krw ?? tstatus.krw_available ?? 0),
     );
-    const candidateMeta = entryUniverse
-      .map((m) => {
+    const candidateMeta = (await Promise.all(entryUniverse
+      .map(async (m) => {
         const s = latestAllSignals.get(m);
         if (!s?.p) return null;
         const gate = opts.marketState.entryGate(s.p, marketState);
         const score = Number(gate.score ?? 0);
+        const currentPx = priceBy.get(m) ?? 0;
+        
+        // Calculate diagnostics for quality classification
+        const sTs = s.ts ?? null;
+        const ageSec = sTs ? Math.max(0, Math.floor((Date.now() - Date.parse(sTs)) / 1000)) : null;
+        
+        let lHigh: number | null = null;
+        let distHighPct: number | null = null;
+        try {
+          const c1 = await fetchMinuteCandlesCached(m, 1, 12);
+          const highs = c1.map((x: any) => Number(x.high_price ?? 0)).filter((n: number) => n > 0);
+          if (highs.length > 0) lHigh = Math.max(...highs);
+          if (lHigh && currentPx > 0) distHighPct = ((lHigh - currentPx) / lHigh) * 100;
+        } catch {}
+
         const eq = classifyEntryQuality({
+          market: m,
           score,
-          signalFresh: true,
-          nearHighOk: true,
-          volumeStrong: Number(s.p.volume_ratio ?? 0) >= 1.2,
-          weakMarketConstraintsPass: btcTier !== "weak" || (score >= LIVE_WEAK_MARKET_MIN_SCORE && Number(s.p.volume_ratio ?? 0) >= LIVE_WEAK_MARKET_MIN_VOLUME_RATIO),
+          secondsSinceSignal: ageSec,
+          distanceFromLocalHighPct: distHighPct,
+          volumeRatio: Number(s.p.volume_ratio ?? 0),
+          btcTier,
         });
         return { market: m, score, tier: eq.tier };
-      })
+      })))
       .filter((x): x is { market: string; score: number; tier: EntryQualityTier } => Boolean(x));
     const capPlan = computeTargetPositionBudget({
       strategyUsableKrw: strategyUsableKrwForAlloc,
@@ -3241,6 +3273,8 @@ export function createLiveDataStrategy(opts: {
               entry_recent_high: Number(localHigh ?? currentPrice),
               entry_volume_ratio_1m5: Number(volumeRatio1m5 ?? 0),
               promoted: false,
+              target_budget_krw: Math.floor(baseBudget),
+              filled_entry_krw: earlyOrderKrw,
             };
             console.info(
               JSON.stringify({
@@ -3358,13 +3392,12 @@ export function createLiveDataStrategy(opts: {
       const breakout = reasonText.includes("breakout") || breakoutRelaxed;
       const trendOk = reasonText.includes("breakout") || reasonText.includes("trend") || reasonText.includes("reclaim");
       const quality = classifyEntryQuality({
+        market,
         score: signalScore,
-        signalFresh: secondsSinceSignal !== null && secondsSinceSignal <= LIVE_ENTRY_SIGNAL_STALE_SECONDS,
-        nearHighOk: distanceFromLocalHighPct !== null && distanceFromLocalHighPct >= LIVE_MAX_ENTRY_NEAR_HIGH_PCT,
-        volumeStrong: (volumeRatio1m5 ?? vol) >= 1.2,
-        weakMarketConstraintsPass:
-          btcTierNow !== "weak" ||
-          (signalScore >= LIVE_WEAK_MARKET_MIN_SCORE && (volumeRatio1m5 ?? vol) >= LIVE_WEAK_MARKET_MIN_VOLUME_RATIO),
+        secondsSinceSignal,
+        distanceFromLocalHighPct,
+        volumeRatio: volumeRatio1m5 ?? vol,
+        btcTier: btcTierNow,
       });
       const entryProfileFeatures: LiveEntryProfileFeatures = {
         signal_type: String(sig.p.signal_type ?? "MID"),
