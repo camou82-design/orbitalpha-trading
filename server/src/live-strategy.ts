@@ -79,6 +79,11 @@ type StrategyPosition = {
   partial_tp_at: string | null;
   /** 복원 시 없으면 기존 보유 — 신규만 엄격 손익 곡선 */
   strict_exit?: boolean;
+  position_id?: string;
+  entry_profile_key?: string;
+  entry_profile_decision?: "allow" | "block" | "unknown";
+  target_budget_krw?: number;
+  filled_entry_krw?: number;
 };
 
 type EarlyEntryPosition = {
@@ -124,6 +129,61 @@ type StrategyTradeRow = {
   trailing_stop_price: number;
   breakeven_armed_at: string | null;
   partial_tp_at: string | null;
+  position_id?: string;
+  entry_profile_key?: string;
+  entry_profile_decision?: "allow" | "block" | "unknown";
+  target_budget_krw?: number;
+  filled_entry_krw?: number;
+  exit_reason_detail?: string;
+  exit_authority_class?: string;
+  partial_tp_done?: boolean;
+  breakeven_armed?: boolean;
+  runner_trail_active?: boolean;
+  realized_partial_profit?: number;
+  final_net_pnl_pct?: number;
+};
+
+type EntryQualityTier = "A" | "B" | "C";
+type EntryQuality = {
+  tier: EntryQualityTier;
+  score: number;
+  earlyEligible: boolean;
+};
+
+type LiveEntryProfileFeatures = {
+  signal_type: string;
+  position_stage: "early_active" | "normal_active";
+  btc_tier: "strong" | "neutral" | "weak";
+  score_bucket: "0-69" | "70-79" | "80-89" | "90+";
+  volume_ratio_bucket: "<1.2" | "1.2-1.49" | "1.5-1.99" | "2.0+";
+  signal_age_bucket: "<=10s" | "11-30s" | "31-60s" | ">60s";
+  chase_bucket: "<=0.2" | "0.21-0.5" | "0.51-1.0" | ">1.0";
+  near_high_bucket: "<=0.1" | "0.11-0.25" | "0.26-0.5" | ">0.5";
+  breakout: boolean;
+  early_entry_flag: boolean;
+};
+
+type LiveEntryProfileStats = {
+  total_trades: number;
+  wins: number;
+  losses: number;
+  weak_stops: number;
+  timeouts: number;
+  total_net_pnl_pct: number;
+  total_net_pnl_krw: number;
+  avg_net_pnl_pct: number;
+  win_rate: number;
+  recent_net_pnl_pct: number[];
+  last_updated_at: string;
+};
+
+type ExitAuthorityDecision = {
+  reasonExit: string | null;
+  ratio: number;
+  stopTriggerKind: StopTriggerKind | null;
+  authorityClass: "emergency_exit" | "hard_loss" | "partial_take_profit" | "breakeven_protect" | "runner_trail" | "weak_time_stop" | "micro_loss_guard" | "none";
+  reasonDetail: string;
+  runnerTrailActive: boolean;
 };
 
 type DailyStats = {
@@ -161,6 +221,7 @@ type PersistedState = {
     entry_size_pct: number;
     last_updated_at: string;
   };
+  entry_profile_stats?: Record<string, LiveEntryProfileStats>;
 };
 
 const MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX"] as const;
@@ -267,7 +328,7 @@ const LIVE_PARTIAL_TAKE_PROFIT_PCT = (() => {
 const LIVE_PARTIAL_TAKE_PROFIT_RATIO = (() => {
   const raw = process.env.LIVE_PARTIAL_TAKE_PROFIT_RATIO;
   const n = raw === undefined || raw === "" ? 0.4 : Number(raw);
-  return Number.isFinite(n) ? Math.max(0.1, Math.min(0.8, n)) : 0.4;
+  return Number.isFinite(n) ? Math.max(0.1, Math.min(0.8, n)) : 0.25;
 })();
 const LIVE_RUNNER_TRAIL_FROM_PEAK_PCT = (() => {
   const raw = process.env.LIVE_RUNNER_TRAIL_FROM_PEAK_PCT;
@@ -389,7 +450,7 @@ const LIVE_EARLY_ENTRY_MAX_SIGNAL_SECONDS = (() => {
 })();
 const LIVE_EARLY_ENTRY_SIZE_RATIO = (() => {
   const raw = process.env.LIVE_EARLY_ENTRY_SIZE_RATIO;
-  const n = raw === undefined || raw === "" ? 0.4 : Number(raw);
+  const n = raw === undefined || raw === "" ? 0.25 : Number(raw);
   return Number.isFinite(n) ? Math.max(0.1, Math.min(0.8, n)) : 0.4;
 })();
 const LIVE_EARLY_ENTRY_FAIL_SECONDS = (() => {
@@ -560,6 +621,153 @@ function accountTotalSpotQtyForMarket(market: string, balances: unknown[] | unde
   return Number(row?.balance ?? 0) + Number(row?.locked ?? 0);
 }
 
+function classifyEntryQuality(params: {
+  score: number;
+  signalFresh: boolean;
+  nearHighOk: boolean;
+  volumeStrong: boolean;
+  weakMarketConstraintsPass: boolean;
+}): EntryQuality {
+  const score = Number(params.score ?? 0);
+  const tier: EntryQualityTier = score >= 90 ? "A" : score >= 82 ? "B" : "C";
+  const earlyEligible =
+    tier === "A" &&
+    params.signalFresh &&
+    params.nearHighOk &&
+    params.volumeStrong &&
+    params.weakMarketConstraintsPass;
+  return { tier, score, earlyEligible };
+}
+
+function computeTargetPositionBudget(params: {
+  strategyUsableKrw: number;
+  regime: "strong" | "neutral" | "weak";
+  candidates: Array<{ market: string; tier: EntryQualityTier; score: number }>;
+}): {
+  deployableKrw: number;
+  deployableAfterBufferKrw: number;
+  bySymbol: Map<string, number>;
+} {
+  const regimeUtil = params.regime === "strong" ? 0.88 : params.regime === "neutral" ? 0.72 : 0.45;
+  const deployableKrw = Math.floor(Math.max(0, params.strategyUsableKrw) * regimeUtil);
+  const deployableAfterBufferKrw = Math.floor(deployableKrw * 0.95);
+  const targetRatioByTier: Record<EntryQualityTier, number> = { A: 0.4, B: 0.28, C: 0.18 };
+  const capRatioByTier: Record<EntryQualityTier, number> = { A: 0.45, B: 0.3, C: 0.2 };
+  const sorted = [...params.candidates].sort((a, b) => b.score - a.score);
+  const wanted = sorted.map((c) => ({
+    market: c.market,
+    tier: c.tier,
+    target: Math.floor(deployableAfterBufferKrw * targetRatioByTier[c.tier]),
+    cap: Math.floor(deployableAfterBufferKrw * capRatioByTier[c.tier]),
+  }));
+  const totalWanted = wanted.reduce((acc, x) => acc + x.target, 0);
+  const scale = totalWanted > deployableAfterBufferKrw && totalWanted > 0 ? deployableAfterBufferKrw / totalWanted : 1;
+  const bySymbol = new Map<string, number>();
+  for (const w of wanted) {
+    const scaled = Math.floor(w.target * scale);
+    bySymbol.set(w.market, Math.max(UPBIT_MIN_ORDER_KRW, Math.min(w.cap, scaled)));
+  }
+  return { deployableKrw, deployableAfterBufferKrw, bySymbol };
+}
+
+function bucketScore(score: number): LiveEntryProfileFeatures["score_bucket"] {
+  if (score >= 90) return "90+";
+  if (score >= 80) return "80-89";
+  if (score >= 70) return "70-79";
+  return "0-69";
+}
+function bucketVol(v: number): LiveEntryProfileFeatures["volume_ratio_bucket"] {
+  if (v >= 2.0) return "2.0+";
+  if (v >= 1.5) return "1.5-1.99";
+  if (v >= 1.2) return "1.2-1.49";
+  return "<1.2";
+}
+function bucketAge(sec: number | null): LiveEntryProfileFeatures["signal_age_bucket"] {
+  const s = Math.max(0, Number(sec ?? 9999));
+  if (s <= 10) return "<=10s";
+  if (s <= 30) return "11-30s";
+  if (s <= 60) return "31-60s";
+  return ">60s";
+}
+function bucketChase(v: number | null): LiveEntryProfileFeatures["chase_bucket"] {
+  const n = Math.max(0, Number(v ?? 999));
+  if (n <= 0.2) return "<=0.2";
+  if (n <= 0.5) return "0.21-0.5";
+  if (n <= 1.0) return "0.51-1.0";
+  return ">1.0";
+}
+function bucketNear(v: number | null): LiveEntryProfileFeatures["near_high_bucket"] {
+  const n = Math.max(0, Number(v ?? 999));
+  if (n <= 0.1) return "<=0.1";
+  if (n <= 0.25) return "0.11-0.25";
+  if (n <= 0.5) return "0.26-0.5";
+  return ">0.5";
+}
+function makeEntryProfileKey(f: LiveEntryProfileFeatures): string {
+  return [
+    `sig:${f.signal_type}`,
+    `stage:${f.position_stage}`,
+    `btc:${f.btc_tier}`,
+    `score:${f.score_bucket}`,
+    `vol:${f.volume_ratio_bucket}`,
+    `age:${f.signal_age_bucket}`,
+    `chase:${f.chase_bucket}`,
+    `near:${f.near_high_bucket}`,
+    `bo:${f.breakout ? "1" : "0"}`,
+    `early:${f.early_entry_flag ? "1" : "0"}`,
+  ].join("|");
+}
+function decideEntryProfile(stats?: LiveEntryProfileStats): { decision: "allow" | "block" | "unknown"; reason: string } {
+  if (!stats || stats.total_trades < 3) return { decision: "unknown", reason: "profile_unknown_fallback_allow" };
+  const recent2 = stats.recent_net_pnl_pct.slice(-2);
+  const timeoutWeakRate = stats.total_trades > 0 ? (stats.timeouts + stats.weak_stops) / stats.total_trades : 0;
+  if (stats.total_trades >= 3 && stats.avg_net_pnl_pct <= -0.2) return { decision: "block", reason: "profile_block_negative_expectancy" };
+  if (stats.total_trades >= 3 && stats.win_rate < 0.35) return { decision: "block", reason: "profile_block_low_win_rate" };
+  if (recent2.length === 2 && recent2.every((x) => x <= -0.2)) return { decision: "block", reason: "profile_block_recent_losses" };
+  if (timeoutWeakRate >= 0.5 && stats.avg_net_pnl_pct < 0) return { decision: "block", reason: "profile_block_timeout_weak_negative" };
+  if (stats.total_trades >= 3 && stats.avg_net_pnl_pct >= 0.4) return { decision: "allow", reason: "profile_allow_positive_expectancy" };
+  if (stats.total_trades >= 3 && stats.win_rate >= 0.58) return { decision: "allow", reason: "profile_allow_win_rate" };
+  if (stats.wins > stats.losses && stats.total_net_pnl_pct > 0) return { decision: "allow", reason: "profile_allow_net_positive" };
+  return { decision: "unknown", reason: "profile_unknown_fallback_allow" };
+}
+
+function evaluateExitAuthority(params: {
+  p: StrategyPosition;
+  pnlGross: number;
+  heldMs: number;
+  marketTier: "strong" | "neutral" | "weak";
+  weakReboundPoor: boolean;
+}): ExitAuthorityDecision {
+  const holdMin = params.heldMs / 60_000;
+  const p = params.p;
+  const emergencyStop = p.strategy_type === "stable" ? -1.45 : -1.75;
+  if (params.pnlGross <= emergencyStop) {
+    return { reasonExit: "emergency_stop_loss", ratio: 1, stopTriggerKind: "price_stop", authorityClass: "emergency_exit", reasonDetail: `gross<=${emergencyStop}`, runnerTrailActive: false };
+  }
+  const hardLoss = p.strategy_type === "stable" ? -2.0 : -3.0;
+  if (params.pnlGross <= hardLoss) {
+    return { reasonExit: "strict_hard_stop_loss", ratio: 1, stopTriggerKind: "price_stop", authorityClass: "hard_loss", reasonDetail: `gross<=${hardLoss}`, runnerTrailActive: false };
+  }
+  const partialReady = !p.partial_tp_done && params.pnlGross >= 3.0 && holdMin >= 3 && p.max_pnl_pct >= 3.2;
+  if (partialReady) {
+    return { reasonExit: "partial_take_profit", ratio: 0.25, stopTriggerKind: null, authorityClass: "partial_take_profit", reasonDetail: "gross>=3.0,held>=3,peak>=3.2", runnerTrailActive: false };
+  }
+  const breakevenArm = p.partial_tp_done || (params.pnlGross >= 2.2 && holdMin >= 4);
+  const breakevenFloor = 0.35;
+  const trailWidth = params.marketTier === "weak" ? 1.8 : 2.2;
+  const ddFromPeak = p.highest_price_after_entry > 0 ? ((p.highest_price_after_entry - (p.entry_price * (1 + params.pnlGross / 100))) / p.highest_price_after_entry) * 100 : 0;
+  if (breakevenArm && params.pnlGross <= breakevenFloor) {
+    return { reasonExit: "breakeven_exit", ratio: 1, stopTriggerKind: "breakeven_protect", authorityClass: "breakeven_protect", reasonDetail: "armed && pnl<=0.35", runnerTrailActive: true };
+  }
+  if (p.partial_tp_done && ddFromPeak >= trailWidth) {
+    return { reasonExit: "trailing_runner_exit", ratio: 1, stopTriggerKind: "time_stop", authorityClass: "runner_trail", reasonDetail: `dd>=${trailWidth}`, runnerTrailActive: true };
+  }
+  if (params.marketTier === "weak" && holdMin >= LIVE_STABLE_WEAK_REBOUND_TIME_STOP_MINUTES && p.max_pnl_pct < 0.6 && params.pnlGross < 0 && params.weakReboundPoor) {
+    return { reasonExit: "weak_market_time_stop", ratio: 1, stopTriggerKind: "time_stop", authorityClass: "weak_time_stop", reasonDetail: "weak market low rebound", runnerTrailActive: false };
+  }
+  return { reasonExit: null, ratio: 1, stopTriggerKind: null, authorityClass: "none", reasonDetail: "no_exit", runnerTrailActive: p.partial_tp_done };
+}
+
 export function createLiveDataStrategy(opts: {
   companyId: string;
   serviceId: string;
@@ -614,6 +822,7 @@ export function createLiveDataStrategy(opts: {
       entry_size_pct: 1,
       last_updated_at: new Date().toISOString(),
     },
+    entry_profile_stats: {},
   };
 
   const persist = async () => {
@@ -630,6 +839,7 @@ export function createLiveDataStrategy(opts: {
           safety_guard: state.safety_guard,
           legacy: state.legacy,
           regime: state.regime,
+          entry_profile_stats: state.entry_profile_stats,
         },
         null,
         2,
@@ -652,6 +862,7 @@ export function createLiveDataStrategy(opts: {
       state.safety_guard = d.safety_guard ?? state.safety_guard;
       state.legacy = d.legacy ?? state.legacy;
       state.regime = d.regime ?? state.regime;
+      state.entry_profile_stats = d.entry_profile_stats ?? state.entry_profile_stats ?? {};
     } catch {}
     state.safety_guard.state = "정상";
     state.safety_guard.reason = null;
@@ -1170,6 +1381,17 @@ export function createLiveDataStrategy(opts: {
     );
     const priceBy = new Map(tickerRows.map((r) => [r.market, r.trade_price]));
     const changeRateBy = new Map(tickerRows.map((r) => [r.market, Number(r.signed_change_rate ?? 0)]));
+    const minute1CandleCache = new Map<string, any[]>();
+    const minute5CandleCache = new Map<string, any[]>();
+    const fetchMinuteCandlesCached = async (market: string, unit: 1 | 5, count: number) => {
+      const cache = unit === 1 ? minute1CandleCache : minute5CandleCache;
+      const key = `${market}:${count}`;
+      const hit = cache.get(key);
+      if (hit) return hit;
+      const rows = await fetchMinuteCandles(market, unit, count);
+      cache.set(key, rows as any[]);
+      return rows as any[];
+    };
     const btcChange = Number(changeRateBy.get("KRW-BTC") ?? 0);
     const btcTier: "strong" | "neutral" | "weak" =
       conservativeMode || btcChange <= -0.004 ? "weak" : btcChange >= 0.002 ? "strong" : "neutral";
@@ -1301,6 +1523,17 @@ export function createLiveDataStrategy(opts: {
       const promoteNow = breakoutNow || pnlGross >= LIVE_EARLY_PROMOTION_PCT || heldSec >= LIVE_EARLY_PROMOTION_MAX_SECONDS;
 
       if (promoteNow) {
+        const promoteFillKrw = Math.max(0, Math.floor(ep.order_krw * ((1 - LIVE_EARLY_ENTRY_SIZE_RATIO) / Math.max(0.01, LIVE_EARLY_ENTRY_SIZE_RATIO))));
+        if (promoteFillKrw >= UPBIT_MIN_ORDER_KRW) {
+          try {
+            await opts.trade.placeBuy(market, true, promoteFillKrw, "momentum", "strategy", {
+              __early_promote_fill: true,
+              __early_promote_fill_krw: promoteFillKrw,
+            });
+          } catch {
+            // keep running with current size if promote fill fails
+          }
+        }
         // 승격: normal 포지션으로 이동 (기존 exit 로직 적용)
         const stNow = await opts.trade.status();
         const currency = market.replace("KRW-", "");
@@ -1433,15 +1666,44 @@ export function createLiveDataStrategy(opts: {
       let reasonExit = "";
       let stopTriggerKind: StopTriggerKind | null = null;
       let ratio = 1;
+      let exitAuthorityClass: ExitAuthorityDecision["authorityClass"] = "none";
+      let exitReasonDetail = "legacy_flow";
       const weakModeTighterStop = (state.regime?.btc_filter_state ?? "neutral") === "weak" ? LIVE_BTC_WEAK_TIGHT_STOP_PCT : null;
       if (weakModeTighterStop !== null && pnlGross <= weakModeTighterStop) {
         reasonExit = "weak_market_price_stop";
         stopTriggerKind = "price_stop";
+        exitAuthorityClass = "hard_loss";
+        exitReasonDetail = "weak_tight_stop";
       }
       // Emergency stop loss — always allowed even within grace period.
       if (!reasonExit && pnlGross <= LIVE_EMERGENCY_STOP_LOSS_PCT) {
         reasonExit = "emergency_stop_loss";
         stopTriggerKind = "price_stop";
+        exitAuthorityClass = "emergency_exit";
+        exitReasonDetail = "emergency_stop_loss_threshold";
+      }
+      if (!reasonExit) {
+        const auth = evaluateExitAuthority({
+          p,
+          pnlGross,
+          heldMs,
+          marketTier: state.regime?.btc_filter_state ?? "neutral",
+          weakReboundPoor: p.max_pnl_pct < 0.6,
+        });
+        if (auth.reasonExit) {
+          reasonExit = auth.reasonExit;
+          ratio = auth.ratio;
+          stopTriggerKind = auth.stopTriggerKind;
+          exitAuthorityClass = auth.authorityClass;
+          exitReasonDetail = auth.reasonDetail;
+          if (auth.authorityClass === "breakeven_protect" && !p.breakeven_armed) {
+            p.breakeven_armed = true;
+            p.breakeven_armed_at = new Date().toISOString();
+          }
+          if (auth.authorityClass === "runner_trail") {
+            p.trailing_stop_price = p.highest_price_after_entry * (1 - ((state.regime?.btc_filter_state ?? "neutral") === "weak" ? 1.8 : 2.2) / 100);
+          }
+        }
       }
       if (!reasonExit && p.strategy_type === "stable") {
         const xs = p.strict_exit ? STRICT_NEW_POSITION_EXIT.stable : null;
@@ -1737,7 +1999,7 @@ export function createLiveDataStrategy(opts: {
             stopTriggerKind = "price_stop";
           } else {
             try {
-              const c1 = await fetchMinuteCandles(market, 1, 8);
+              const c1 = await fetchMinuteCandlesCached(market, 1, 8);
               const last = c1[c1.length - 1];
               const prev = c1[c1.length - 2];
               if (last && prev) {
@@ -1802,8 +2064,11 @@ export function createLiveDataStrategy(opts: {
           net_pnl_pct: netPnlPctEst,
           market_state: state.regime?.btc_filter_state ?? null,
           exit_reason: exitBlockedByGrace ? "blocked_by_grace_period" : blockedByMicroLoss ? "blocked_by_micro_loss_guard" : reasonExit,
+          exit_authority_class: exitAuthorityClass,
           exit_reason_detail: {
             chosen_reason: reasonExit,
+            authority_class: exitAuthorityClass,
+            authority_detail: exitReasonDetail,
             stop_trigger_kind: stopTriggerKind,
             legacy_reason_alias:
               reasonExit === "weak_market_price_stop"
@@ -1923,6 +2188,18 @@ export function createLiveDataStrategy(opts: {
         trailing_stop_price: p.trailing_stop_price,
         breakeven_armed_at: p.breakeven_armed_at,
         partial_tp_at: p.partial_tp_at,
+        position_id: p.position_id ?? `${market}|${p.entry_ts}`,
+        entry_profile_key: p.entry_profile_key,
+        entry_profile_decision: p.entry_profile_decision,
+        target_budget_krw: p.target_budget_krw ?? p.order_krw,
+        filled_entry_krw: p.filled_entry_krw ?? p.order_krw,
+        exit_reason_detail: exitReasonDetail,
+        exit_authority_class: exitAuthorityClass,
+        partial_tp_done: p.partial_tp_done,
+        breakeven_armed: p.breakeven_armed,
+        runner_trail_active: p.partial_tp_done,
+        realized_partial_profit: p.realized_partial_profit,
+        final_net_pnl_pct: netPnlPctValue,
       };
       state.trades.push(row);
       console.info(
@@ -1977,6 +2254,41 @@ export function createLiveDataStrategy(opts: {
         state.safety_guard.consecutive_losses = 0;
       }
       if (qtyAfter <= 0) {
+        if (p.entry_profile_key) {
+          const prev = state.entry_profile_stats?.[p.entry_profile_key] ?? {
+            total_trades: 0,
+            wins: 0,
+            losses: 0,
+            weak_stops: 0,
+            timeouts: 0,
+            total_net_pnl_pct: 0,
+            total_net_pnl_krw: 0,
+            avg_net_pnl_pct: 0,
+            win_rate: 0,
+            recent_net_pnl_pct: [],
+            last_updated_at: new Date().toISOString(),
+          };
+          const timeoutLike = /time_stop|timeout/i.test(reasonExit);
+          const weakStopLike = /weak_market/i.test(reasonExit);
+          const next: LiveEntryProfileStats = {
+            ...prev,
+            total_trades: prev.total_trades + 1,
+            wins: prev.wins + (netPnlPctValue > 0 ? 1 : 0),
+            losses: prev.losses + (netPnlPctValue <= 0 ? 1 : 0),
+            weak_stops: prev.weak_stops + (weakStopLike ? 1 : 0),
+            timeouts: prev.timeouts + (timeoutLike ? 1 : 0),
+            total_net_pnl_pct: prev.total_net_pnl_pct + netPnlPctValue,
+            total_net_pnl_krw: prev.total_net_pnl_krw + netPnlKrw,
+            avg_net_pnl_pct: 0,
+            win_rate: 0,
+            recent_net_pnl_pct: [...prev.recent_net_pnl_pct, netPnlPctValue].slice(-8),
+            last_updated_at: new Date().toISOString(),
+          };
+          next.avg_net_pnl_pct = next.total_trades > 0 ? next.total_net_pnl_pct / next.total_trades : 0;
+          next.win_rate = next.total_trades > 0 ? next.wins / next.total_trades : 0;
+          state.entry_profile_stats = state.entry_profile_stats ?? {};
+          state.entry_profile_stats[p.entry_profile_key] = next;
+        }
         delete state.positions[market];
         const baseCdSec = LIVE_REENTRY_COOLDOWN_SECONDS;
         state.cooldown_until[market] = new Date(Date.now() + baseCdSec * 1000).toISOString();
@@ -2210,52 +2522,49 @@ export function createLiveDataStrategy(opts: {
       return true;
     });
 
-    // --- Capital allocation (weighted) ---
+    // --- Capital allocation (deployable once + conviction tiers) ---
     const strategyUsableKrwForAlloc = Math.max(
       0,
       Number(tstatus.strategy_available_krw ?? tstatus.live_order_available_krw ?? tstatus.krw_available ?? 0),
     );
-    const capitalForNewEntriesKrwBase = Math.floor(strategyUsableKrwForAlloc * (1 - LIVE_CAPITAL_BUFFER_RATIO));
-    const capitalForNewEntriesKrw = Math.floor(capitalForNewEntriesKrwBase * entrySizePct);
-    const maxSymbolCapRatio = 0.25;
-    const maxSymbolCapKrw = Math.floor(capitalForNewEntriesKrw * maxSymbolCapRatio);
-    const minOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, LIVE_MIN_ENTRY_KRW);
-
     const candidateMeta = entryUniverse
       .map((m) => {
         const s = latestAllSignals.get(m);
         if (!s?.p) return null;
         const gate = opts.marketState.entryGate(s.p, marketState);
         const score = Number(gate.score ?? 0);
-        const tier = score >= 90 ? "A" : score >= 80 ? "B" : "C";
-        const weight = tier === "A" ? 1.35 : tier === "B" ? 1.0 : 0.7;
-        return { symbol: m, score, tier, weight };
+        const eq = classifyEntryQuality({
+          score,
+          signalFresh: true,
+          nearHighOk: true,
+          volumeStrong: Number(s.p.volume_ratio ?? 0) >= 1.2,
+          weakMarketConstraintsPass: btcTier !== "weak" || (score >= LIVE_WEAK_MARKET_MIN_SCORE && Number(s.p.volume_ratio ?? 0) >= LIVE_WEAK_MARKET_MIN_VOLUME_RATIO),
+        });
+        return { market: m, score, tier: eq.tier };
       })
-      .filter((x): x is { symbol: string; score: number; tier: "A" | "B" | "C"; weight: number } => Boolean(x));
-    const totalWeight = candidateMeta.reduce((acc, x) => acc + x.weight, 0);
-    const perPositionBudgetBySymbol = new Map<string, number>();
-    if (totalWeight > 0 && capitalForNewEntriesKrw > 0) {
-      for (const c of candidateMeta) {
-        const raw = Math.floor(capitalForNewEntriesKrw * (c.weight / totalWeight));
-        const capped = Math.min(maxSymbolCapKrw > 0 ? maxSymbolCapKrw : raw, raw);
-        const clipped = Math.max(minOrderKrw, Math.min(LIVE_MAX_ENTRY_KRW, capped));
-        perPositionBudgetBySymbol.set(c.symbol, clipped);
-      }
-    }
+      .filter((x): x is { market: string; score: number; tier: EntryQualityTier } => Boolean(x));
+    const capPlan = computeTargetPositionBudget({
+      strategyUsableKrw: strategyUsableKrwForAlloc,
+      regime: btcTier,
+      candidates: candidateMeta,
+    });
+    const minOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, LIVE_MIN_ENTRY_KRW);
+    const perPositionBudgetBySymbol = capPlan.bySymbol;
     console.info(
       JSON.stringify({
         tag: "DEBUG_LIVE_CAPITAL_POLICY",
         ts: new Date().toISOString(),
         max_positions_cap: state.safety_guard.max_positions,
         strategy_usable_krw: strategyUsableKrwForAlloc,
-        capital_buffer_ratio: LIVE_CAPITAL_BUFFER_RATIO,
-        capital_for_new_entries_krw: capitalForNewEntriesKrw,
-        allocation_mode: "weighted",
-        max_symbol_cap_ratio: maxSymbolCapRatio,
+        regime_utilization_applied: btcTier === "strong" ? 0.88 : btcTier === "neutral" ? 0.72 : 0.45,
+        capital_buffer_ratio: 0.05,
+        deployable_krw: capPlan.deployableKrw,
+        capital_for_new_entries_krw: capPlan.deployableAfterBufferKrw,
+        allocation_mode: "conviction_target_budget",
         candidate_weights: candidateMeta
           .sort((a, b) => b.score - a.score)
           .slice(0, 12)
-          .map((x) => ({ symbol: x.symbol, entry_score: Number(x.score.toFixed(2)), tier: x.tier, weight: x.weight })),
+          .map((x) => ({ symbol: x.market, entry_score: Number(x.score.toFixed(2)), tier: x.tier })),
         per_position_budget_krw_by_symbol: Array.from(perPositionBudgetBySymbol.entries())
           .slice(0, 12)
           .map(([symbol, krw]) => ({ symbol, per_position_budget_krw: krw })),
@@ -2628,7 +2937,7 @@ export function createLiveDataStrategy(opts: {
       let volumeRatio1m5: number | null = null;
       try {
         // Small window; used for timing guard + high proximity.
-        const c1 = await fetchMinuteCandles(market, 1, 12);
+        const c1 = await fetchMinuteCandlesCached(market, 1, 12);
         const closes = c1.map((x: any) => Number(x.trade_price ?? 0)).filter((n: number) => Number.isFinite(n) && n > 0);
         const highs = c1.map((x: any) => Number(x.high_price ?? 0)).filter((n: number) => Number.isFinite(n) && n > 0);
         if (highs.length > 0) localHigh = Math.max(...highs);
@@ -2848,7 +3157,7 @@ export function createLiveDataStrategy(opts: {
           const n = raw === undefined || raw === "" ? earlyMinScoreDefault : Number(raw);
           return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : earlyMinScoreDefault;
         })();
-        const scoreOk = score >= earlyMinScore;
+        const scoreOk = score >= Math.max(90, earlyMinScore);
         const notAlready = !state.positions[market] && !state.early_positions[market];
         const earlySlotOk = earlySlotsUsed < LIVE_EARLY_ENTRY_MAX_OPEN;
         const weakTier = btcTierNow === "weak";
@@ -3044,6 +3353,47 @@ export function createLiveDataStrategy(opts: {
           Boolean(parsedV2.data.pair_pass_breakout_b_and_vol_close_a));
       const breakout = reasonText.includes("breakout") || breakoutRelaxed;
       const trendOk = reasonText.includes("breakout") || reasonText.includes("trend") || reasonText.includes("reclaim");
+      const quality = classifyEntryQuality({
+        score: signalScore,
+        signalFresh: secondsSinceSignal !== null && secondsSinceSignal <= LIVE_ENTRY_SIGNAL_STALE_SECONDS,
+        nearHighOk: distanceFromLocalHighPct !== null && distanceFromLocalHighPct >= LIVE_MAX_ENTRY_NEAR_HIGH_PCT,
+        volumeStrong: (volumeRatio1m5 ?? vol) >= 1.2,
+        weakMarketConstraintsPass:
+          btcTierNow !== "weak" ||
+          (signalScore >= LIVE_WEAK_MARKET_MIN_SCORE && (volumeRatio1m5 ?? vol) >= LIVE_WEAK_MARKET_MIN_VOLUME_RATIO),
+      });
+      const entryProfileFeatures: LiveEntryProfileFeatures = {
+        signal_type: String(sig.p.signal_type ?? "MID"),
+        position_stage: quality.earlyEligible ? "early_active" : "normal_active",
+        btc_tier: btcTierNow,
+        score_bucket: bucketScore(signalScore),
+        volume_ratio_bucket: bucketVol(volumeRatio1m5 ?? vol),
+        signal_age_bucket: bucketAge(secondsSinceSignal),
+        chase_bucket: bucketChase(priceChangeSinceSignalPct),
+        near_high_bucket: bucketNear(distanceFromLocalHighPct),
+        breakout,
+        early_entry_flag: quality.earlyEligible,
+      };
+      const entry_profile_key = makeEntryProfileKey(entryProfileFeatures);
+      const profileInfo = decideEntryProfile(state.entry_profile_stats?.[entry_profile_key]);
+      emitEval("DEBUG_LIVE_PROFILE_GATE", {
+        entry_profile_key,
+        profile_decision: profileInfo.decision,
+        profile_reason: profileInfo.reason,
+        profile_stats: state.entry_profile_stats?.[entry_profile_key] ?? null,
+      });
+      if (profileInfo.decision === "block") {
+        bumpSkip("profile_block");
+        await appendLog({
+          company_id: companyIdSchema.parse(opts.companyId),
+          service_id: serviceIdSchema.parse(opts.serviceId),
+          ts: new Date().toISOString(),
+          kind: "system",
+          message: profileInfo.reason,
+          payload: { symbol: market, entry_profile_key, profile_decision: "block" },
+        });
+        continue;
+      }
       const openForGate = Object.keys(state.positions).length;
       const minBaseScore = openForGate >= 1 ? 88 : 83;
       const minBaseVol = openForGate >= 1 ? 1.14 : 1.08;
@@ -3146,7 +3496,7 @@ export function createLiveDataStrategy(opts: {
 
       let entryPipelineDetail: Record<string, unknown> = {};
       try {
-        const candles5 = await fetchMinuteCandles(market, 5, 48);
+        const candles5 = await fetchMinuteCandlesCached(market, 5, 48);
         const pr = evaluateSpotLongEntryPipeline({
           market,
           payload: sig.p,
@@ -3230,7 +3580,6 @@ export function createLiveDataStrategy(opts: {
     const liveOrderAvailableKrw = Math.max(0, Number(st.live_order_available_krw ?? st.krw_available ?? 0));
       const openCountNow = Object.keys(state.positions).length;
       const remainingSlots = Math.max(0, state.safety_guard.max_positions - openCountNow);
-      const maxAllocKrw = Math.floor(liveOrderAvailableKrw * LIVE_ENTRY_UTILIZATION_TARGET * entrySizePct);
       const baseBudget = perPositionBudgetBySymbol.get(market) ?? minOrderKrw;
       let orderKrw = Math.max(minOrderKrw, Math.min(LIVE_MAX_ENTRY_KRW, baseBudget));
       if (isExceptionMarket) orderKrw = Math.floor(orderKrw * 0.9);
@@ -3246,16 +3595,15 @@ export function createLiveDataStrategy(opts: {
       const gateScore = Number(opts.marketState.entryGate(sig.p, marketState).score ?? 0);
       emitEval("DEBUG_LIVE_ORDER_SIZING", {
         available_krw: liveOrderAvailableKrw,
-        max_alloc_krw: maxAllocKrw,
+        max_alloc_krw: capPlan.deployableAfterBufferKrw,
         planned_entry_krw: orderKrw,
         late_entry_sizing_multiplier: lateEntrySizingMultiplier,
         min_entry_krw: minOrderKrw,
         max_entry_krw: LIVE_MAX_ENTRY_KRW,
         allocation_mode: "weighted",
-        allocation_weight: candidateMeta.find((c) => c.symbol === market)?.weight ?? null,
-        allocation_tier: candidateMeta.find((c) => c.symbol === market)?.tier ?? null,
+        allocation_tier: candidateMeta.find((c) => c.market === market)?.tier ?? null,
         per_position_budget_krw: baseBudget,
-        max_symbol_cap_ratio: 0.25,
+        max_symbol_cap_ratio: candidateMeta.find((c) => c.market === market)?.tier === "A" ? 0.45 : candidateMeta.find((c) => c.market === market)?.tier === "B" ? 0.3 : 0.2,
         per_market_cap_krw: ORDER_LIMITS.MAX_STRATEGY_INVESTED_KRW_PER_MARKET,
         per_market_remaining_krw: remainingPerMarket,
         entry_score: gateScore,
@@ -3297,6 +3645,9 @@ export function createLiveDataStrategy(opts: {
             order_krw: orderKrw,
             strategy_type: strategyType,
             entry_pipeline: entryPipelineDetail,
+            entry_profile_key,
+            profile_decision: profileInfo.decision,
+            profile_reason: profileInfo.reason,
           },
         });
         emitEval("entry_opened", { symbol: market, order_krw: orderKrw });
@@ -3344,7 +3695,7 @@ export function createLiveDataStrategy(opts: {
           ? `exception_slot_entry:${exception.reason}`
           : entrySizePct < 1
             ? `${sig.p.signal_reason ?? "signal_pass"}:btc_risk_scaled_${entrySizePct}`
-            : sig.p.signal_reason ?? "signal_pass",
+            : `${sig.p.signal_reason ?? "signal_pass"}|${profileInfo.reason}`,
         signal_strength: sig.p.signal_type ?? "MID",
         volume_ratio: Number(sig.p.volume_ratio ?? 0),
         position_stage: "normal_active",
@@ -3360,6 +3711,11 @@ export function createLiveDataStrategy(opts: {
         breakeven_armed_at: null,
         partial_tp_at: null,
         strict_exit: true,
+        position_id: `${market}|${new Date().toISOString()}`,
+        entry_profile_key,
+        entry_profile_decision: profileInfo.decision,
+        target_budget_krw: baseBudget,
+        filled_entry_krw: orderKrw,
       };
       state.daily.entry_count += 1;
       state.cooldown_until[market] = new Date(Date.now() + (isExceptionMarket ? 28 : 18) * 60_000).toISOString();
@@ -3402,6 +3758,18 @@ export function createLiveDataStrategy(opts: {
         trailing_stop_price: 0,
         breakeven_armed_at: null,
         partial_tp_at: null,
+        position_id: state.positions[market]?.position_id,
+        entry_profile_key,
+        entry_profile_decision: profileInfo.decision,
+        target_budget_krw: baseBudget,
+        filled_entry_krw: orderKrw,
+        exit_reason_detail: "",
+        exit_authority_class: "",
+        partial_tp_done: false,
+        breakeven_armed: false,
+        runner_trail_active: false,
+        realized_partial_profit: 0,
+        final_net_pnl_pct: 0,
       });
       await opts.onEvent?.({
         timestamp: new Date().toISOString(),
