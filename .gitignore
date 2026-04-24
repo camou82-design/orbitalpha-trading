@@ -11,3 +11,4 @@ auth_cookie*.txt
 data/
 coverage/
 .turbo/
+*.cookies

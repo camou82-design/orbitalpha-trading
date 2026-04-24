@@ -10,7 +10,7 @@ import {
 } from "@orbitalpha/shared";
 import { tradingDataRoot } from "./paths.js";
 import { appendLog } from "./log-store.js";
-import { fetchMinuteCandles, fetchTickers, partitionKrwMarketsByUpbitValidity } from "./upbit-public.js";
+import { fetchMinuteCandles, fetchTickers, partitionKrwMarketsByUpbitValidity, type UpbitCandle } from "./upbit-public.js";
 import {
   LIVE_ENTRY_SIGNAL_GATES,
   RECOVERY_EXIT_CONFIG,
@@ -1397,16 +1397,16 @@ export function createLiveDataStrategy(opts: {
     );
     const priceBy = new Map(tickerRows.map((r) => [r.market, r.trade_price]));
     const changeRateBy = new Map(tickerRows.map((r) => [r.market, Number(r.signed_change_rate ?? 0)]));
-    const minute1CandleCache = new Map<string, any[]>();
-    const minute5CandleCache = new Map<string, any[]>();
-    const fetchMinuteCandlesCached = async (market: string, unit: 1 | 5, count: number) => {
+    const minute1CandleCache = new Map<string, UpbitCandle[]>();
+    const minute5CandleCache = new Map<string, UpbitCandle[]>();
+    const fetchMinuteCandlesCached = async (market: string, unit: 1 | 5, count: number): Promise<UpbitCandle[]> => {
       const cache = unit === 1 ? minute1CandleCache : minute5CandleCache;
       const key = `${market}:${count}`;
       const hit = cache.get(key);
       if (hit) return hit;
       const rows = await fetchMinuteCandles(market, unit, count);
-      cache.set(key, rows as any[]);
-      return rows as any[];
+      cache.set(key, rows);
+      return rows;
     };
     const btcChange = Number(changeRateBy.get("KRW-BTC") ?? 0);
     const btcTier: "strong" | "neutral" | "weak" =
@@ -2563,7 +2563,7 @@ export function createLiveDataStrategy(opts: {
         let distHighPct: number | null = null;
         try {
           const c1 = await fetchMinuteCandlesCached(m, 1, 12);
-          const highs = c1.map((x: any) => Number(x.high_price ?? 0)).filter((n: number) => n > 0);
+          const highs = c1.map((x) => Number(x.high_price ?? 0)).filter((n) => n > 0);
           if (highs.length > 0) lHigh = Math.max(...highs);
           if (lHigh && currentPx > 0) distHighPct = ((lHigh - currentPx) / lHigh) * 100;
         } catch {}
@@ -2974,8 +2974,8 @@ export function createLiveDataStrategy(opts: {
       try {
         // Small window; used for timing guard + high proximity.
         const c1 = await fetchMinuteCandlesCached(market, 1, 12);
-        const closes = c1.map((x: any) => Number(x.trade_price ?? 0)).filter((n: number) => Number.isFinite(n) && n > 0);
-        const highs = c1.map((x: any) => Number(x.high_price ?? 0)).filter((n: number) => Number.isFinite(n) && n > 0);
+        const closes = c1.map((x) => Number(x.trade_price ?? 0)).filter((n: number) => Number.isFinite(n) && n > 0);
+        const highs = c1.map((x) => Number(x.high_price ?? 0)).filter((n: number) => Number.isFinite(n) && n > 0);
         if (highs.length > 0) localHigh = Math.max(...highs);
         if (localHigh && currentPrice > 0) distanceFromLocalHighPct = ((localHigh - currentPrice) / localHigh) * 100;
         if (closes.length >= 2) recent1mRet = ((closes[closes.length - 1] / closes[closes.length - 2]) - 1) * 100;
@@ -2985,10 +2985,10 @@ export function createLiveDataStrategy(opts: {
         if (Number.isFinite(signalTsMs)) {
           // candle timestamp is `candle_date_time_utc` in upbit response (string ISO-ish). fall back other keys.
           let best: { t: number; px: number } | null = null;
-          for (const x of c1 as any[]) {
-            const tRaw = String((x as any).candle_date_time_utc ?? (x as any).candle_date_time_kst ?? "");
+          for (const x of c1) {
+            const tRaw = String(x.candle_date_time_kst ?? "");
             const t = Date.parse(tRaw);
-            const px = Number((x as any).trade_price ?? 0);
+            const px = Number(x.trade_price ?? 0);
             if (!Number.isFinite(t) || !(px > 0)) continue;
             if (t <= signalTsMs && (!best || t > best.t)) best = { t, px };
           }
@@ -2998,8 +2998,8 @@ export function createLiveDataStrategy(opts: {
 
         // Volume fade heuristic: latest notional vs avg previous 5 notional.
         if (c1.length >= 7) {
-          const last = c1[c1.length - 1] as any;
-          const prev5 = c1.slice(-6, -1) as any[];
+          const last = c1[c1.length - 1];
+          const prev5 = c1.slice(-6, -1);
           const lastNotional = Number(last.candle_acc_trade_volume ?? 0) * Number(last.trade_price ?? 0);
           const prevAvg =
             prev5.reduce((acc, r) => acc + Number(r.candle_acc_trade_volume ?? 0) * Number(r.trade_price ?? 0), 0) /
