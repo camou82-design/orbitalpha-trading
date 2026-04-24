@@ -731,6 +731,10 @@ function decideEntryProfile(stats?: LiveEntryProfileStats): { decision: "allow" 
   return { decision: "unknown", reason: "profile_unknown_fallback_allow" };
 }
 
+function evaluateEntryProfileDecision(stats?: LiveEntryProfileStats): { decision: "allow" | "block" | "unknown"; reason: string } {
+  return decideEntryProfile(stats);
+}
+
 function evaluateExitAuthority(params: {
   p: StrategyPosition;
   pnlGross: number;
@@ -3375,7 +3379,7 @@ export function createLiveDataStrategy(opts: {
         early_entry_flag: quality.earlyEligible,
       };
       const entry_profile_key = makeEntryProfileKey(entryProfileFeatures);
-      const profileInfo = decideEntryProfile(state.entry_profile_stats?.[entry_profile_key]);
+      const profileInfo = evaluateEntryProfileDecision(state.entry_profile_stats?.[entry_profile_key]);
       emitEval("DEBUG_LIVE_PROFILE_GATE", {
         entry_profile_key,
         profile_decision: profileInfo.decision,

@@ -46,6 +46,15 @@ type EntryProfileFeatures = {
   early_entry_eligible: boolean;
 };
 
+type CoarseProfileFeatures = {
+  signal_strength: string;
+  position_stage: "early_active" | "normal_active";
+  btc_tier: "strong" | "neutral" | "weak";
+  score_bucket: "0-69" | "70-79" | "80-89" | "90+";
+  volume_ratio_bucket: "<1.2" | "1.2-1.49" | "1.5-1.99" | "2.0+";
+  breakout: boolean;
+};
+
 type EntryProfileStats = {
   total_trades: number;
   wins: number;
@@ -90,6 +99,8 @@ type PaperStateFile = {
   history: PaperTradeEvent[];
   seen_signal_keys: string[];
   entry_profile_stats?: Record<string, EntryProfileStats>;
+  coarse_profile_stats?: Record<string, EntryProfileStats>;
+  fine_profile_stats?: Record<string, EntryProfileStats>;
 };
 
 type LifecycleState = "idle" | "pre_entry" | "entered" | "cooldown";
@@ -183,8 +194,8 @@ const PAPER_EARLY_PROMOTION_MAX_SECONDS = (() => {
   return Number.isFinite(n) ? Math.max(10, Math.min(300, Math.floor(n))) : 60;
 })();
 /** pump 스캐너 1차 선진입 비중 · 2차 돌파 추격 비중 */
-const SURGE_EARLY_ALLOC_RATIO = 0.3;
-const SURGE_ADD_ALLOC_RATIO = 0.7;
+const SURGE_EARLY_ALLOC_RATIO = 0.5;
+const SURGE_ADD_ALLOC_RATIO = 0.5;
 /** 스캐너 피드와 동일: 1차는 거래량 배수 > 이 값 (기본 1.2) */
 const SURGE_EARLY_VOLUME_RATIO_MIN = Math.max(1.0, Number(process.env.PUMP_SCANNER_EARLY_VOLUME_RATIO_MIN ?? 1.2));
 /** 진입가 대비 손절(%) — -0.5 ~ -1 구간으로 clamp, 기본 -0.75 */
@@ -296,6 +307,32 @@ function entryProfileKey(f: EntryProfileFeatures): string {
   ].join("|");
 }
 
+function buildCoarseProfileKey(f: CoarseProfileFeatures): string {
+  return [
+    `sig:${f.signal_strength}`,
+    `slot:${f.position_stage}`,
+    `btc:${f.btc_tier}`,
+    `score:${f.score_bucket}`,
+    `vr:${f.volume_ratio_bucket}`,
+    `bo:${f.breakout ? "1" : "0"}`,
+  ].join("|");
+}
+
+function buildFineProfileKey(f: EntryProfileFeatures): string {
+  return entryProfileKey(f);
+}
+
+function coarseFromFine(f: EntryProfileFeatures): CoarseProfileFeatures {
+  return {
+    signal_strength: f.signal_strength,
+    position_stage: f.position_stage,
+    btc_tier: f.btc_tier,
+    score_bucket: f.score_bucket,
+    volume_ratio_bucket: f.volume_ratio_bucket,
+    breakout: f.breakout,
+  };
+}
+
 function evaluateProfileDecision(stats: EntryProfileStats | undefined): ProfileDecisionResult {
   if (!stats || stats.total_trades < 3) {
     return {
@@ -334,8 +371,35 @@ function evaluateProfileDecision(stats: EntryProfileStats | undefined): ProfileD
   return { decision: "unknown", reason: "profile_unknown_fallback_allow", stats_snapshot: { total_trades: stats.total_trades, avg_pnl_pct: Number(stats.avg_pnl_pct.toFixed(4)), win_rate: Number(stats.win_rate.toFixed(4)) } };
 }
 
+function evaluateCoarseProfileDecision(stats: EntryProfileStats | undefined): ProfileDecisionResult {
+  return evaluateProfileDecision(stats);
+}
+
+function evaluateFineProfileDecision(stats: EntryProfileStats | undefined): ProfileDecisionResult {
+  return evaluateProfileDecision(stats);
+}
+
 function paperTimeExitDeadlineMs(p: Pick<PaperPosition, "signal_strength">): number {
   return p.signal_strength === "SURGE_SCANNER" ? PAPER_SURGE_SCANNER_TIMEOUT_MS : PAPER_TIMEOUT_MS;
+}
+
+function paperTimeExitDeadlineMsByContext(
+  p: Pick<PaperPosition, "signal_strength" | "entry_profile_features">,
+  coarseStats?: EntryProfileStats,
+): number {
+  const base = paperTimeExitDeadlineMs(p);
+  if (p.signal_strength !== "SURGE_SCANNER") return base;
+  const tier = p.entry_profile_features?.btc_tier ?? "neutral";
+  if (tier === "strong") return base;
+  if (tier === "neutral") return Math.max(20 * 60_000, Math.floor(base * 0.75));
+  const weakBase = Math.max(15 * 60_000, Math.floor(base * 0.55));
+  if (coarseStats && coarseStats.total_trades >= 4) {
+    const timeoutRate = coarseStats.timeouts / Math.max(1, coarseStats.total_trades);
+    if (timeoutRate >= 0.5 && coarseStats.avg_pnl_pct < 0) {
+      return Math.max(12 * 60_000, Math.floor(weakBase * 0.8));
+    }
+  }
+  return weakBase;
 }
 
 function paperTimeExitNote(p: Pick<PaperPosition, "signal_strength">): string {
@@ -405,7 +469,8 @@ export function createPaperTradingEngine(opts: {
       entryLatencyMs: number[];
       earlyExitCount: number;
     };
-    entryProfileStats: Record<string, EntryProfileStats>;
+    coarseProfileStats: Record<string, EntryProfileStats>;
+    fineProfileStats: Record<string, EntryProfileStats>;
   } = {
     cashKrw: PAPER_START_KRW,
     positions: {},
@@ -419,7 +484,8 @@ export function createPaperTradingEngine(opts: {
       entryLatencyMs: [],
       earlyExitCount: 0,
     },
-    entryProfileStats: {},
+    coarseProfileStats: {},
+    fineProfileStats: {},
   };
 
   const trimHistoryAndSignals = () => {
@@ -442,7 +508,9 @@ export function createPaperTradingEngine(opts: {
       positions: state.positions,
       history: state.history,
       seen_signal_keys: Array.from(state.seenSignalKeys),
-      entry_profile_stats: state.entryProfileStats,
+      entry_profile_stats: state.fineProfileStats,
+      coarse_profile_stats: state.coarseProfileStats,
+      fine_profile_stats: state.fineProfileStats,
     };
     await fs.writeFile(stateFile, JSON.stringify(filePayload, null, 2), "utf8");
   };
@@ -455,10 +523,18 @@ export function createPaperTradingEngine(opts: {
       state.positions = (raw.positions ?? {}) as Record<string, PaperPosition>;
       state.history = Array.isArray(raw.history) ? (raw.history as PaperTradeEvent[]) : [];
       state.seenSignalKeys = new Set(Array.isArray(raw.seen_signal_keys) ? raw.seen_signal_keys : []);
-      state.entryProfileStats =
+      const legacyFine =
         raw.entry_profile_stats && typeof raw.entry_profile_stats === "object"
           ? (raw.entry_profile_stats as Record<string, EntryProfileStats>)
           : {};
+      state.coarseProfileStats =
+        raw.coarse_profile_stats && typeof raw.coarse_profile_stats === "object"
+          ? (raw.coarse_profile_stats as Record<string, EntryProfileStats>)
+          : {};
+      state.fineProfileStats =
+        raw.fine_profile_stats && typeof raw.fine_profile_stats === "object"
+          ? (raw.fine_profile_stats as Record<string, EntryProfileStats>)
+          : legacyFine;
       trimHistoryAndSignals();
       for (const p of Object.values(state.positions)) {
         if (p.signal_strength !== "SURGE_SCANNER") continue;
@@ -678,20 +754,10 @@ export function createPaperTradingEngine(opts: {
       entry_profile_features: p.entry_profile_features,
     });
     if (ratioClamped >= 0.9999 || !state.positions[market]) {
-      const key = p.entry_profile_key;
-      if (key) {
-        const prev = state.entryProfileStats[key] ?? {
-          total_trades: 0,
-          wins: 0,
-          losses: 0,
-          timeouts: 0,
-          total_pnl_krw: 0,
-          total_pnl_pct: 0,
-          avg_pnl_pct: 0,
-          win_rate: 0,
-          last_updated_at: new Date().toISOString(),
-          recent_pnl_pct: [],
-        };
+      const fineKey = p.entry_profile_key;
+      const coarseKey =
+        p.entry_profile_features != null ? buildCoarseProfileKey(coarseFromFine(p.entry_profile_features)) : null;
+      const applyStatsUpdate = (prev: EntryProfileStats): EntryProfileStats => {
         const totalPnlKrw = Number(p.realized_pnl_krw ?? pnlKrw);
         const initialInvested = Math.max(1, Number(p.initial_invested_krw ?? p.invested_krw ?? 1));
         const totalPnlPct = (totalPnlKrw / initialInvested) * 100;
@@ -710,7 +776,37 @@ export function createPaperTradingEngine(opts: {
         };
         next.avg_pnl_pct = next.total_trades > 0 ? next.total_pnl_pct / next.total_trades : 0;
         next.win_rate = next.total_trades > 0 ? next.wins / next.total_trades : 0;
-        state.entryProfileStats[key] = next;
+        return next;
+      };
+      if (fineKey) {
+        const prev = state.fineProfileStats[fineKey] ?? {
+          total_trades: 0,
+          wins: 0,
+          losses: 0,
+          timeouts: 0,
+          total_pnl_krw: 0,
+          total_pnl_pct: 0,
+          avg_pnl_pct: 0,
+          win_rate: 0,
+          last_updated_at: new Date().toISOString(),
+          recent_pnl_pct: [],
+        };
+        state.fineProfileStats[fineKey] = applyStatsUpdate(prev);
+      }
+      if (coarseKey) {
+        const prev = state.coarseProfileStats[coarseKey] ?? {
+          total_trades: 0,
+          wins: 0,
+          losses: 0,
+          timeouts: 0,
+          total_pnl_krw: 0,
+          total_pnl_pct: 0,
+          avg_pnl_pct: 0,
+          win_rate: 0,
+          last_updated_at: new Date().toISOString(),
+          recent_pnl_pct: [],
+        };
+        state.coarseProfileStats[coarseKey] = applyStatsUpdate(prev);
       }
     }
     if (ratioClamped >= 0.9999 || !state.positions[market]) {
@@ -1121,13 +1217,37 @@ export function createPaperTradingEngine(opts: {
         breakout: sig.breakout,
         earlyEntryEligible: sig.early_entry_eligible,
       });
-      const profileKey = entryProfileKey(baseProfile);
-      const profileDecision = evaluateProfileDecision(state.entryProfileStats[profileKey]);
+      const coarseKey = buildCoarseProfileKey(coarseFromFine(baseProfile));
+      const fineKey = buildFineProfileKey(baseProfile);
+      const coarseDecision = evaluateCoarseProfileDecision(state.coarseProfileStats[coarseKey]);
+      const fineDecision = evaluateFineProfileDecision(state.fineProfileStats[fineKey]);
+      let profileDecision: ProfileDecisionResult = coarseDecision;
+      if (coarseDecision.decision !== "block" && fineDecision.decision === "allow") {
+        profileDecision = fineDecision;
+      }
+      if (coarseDecision.decision === "unknown") {
+        if (btcTier === "weak") {
+          profileDecision = {
+            decision: "block",
+            reason: "coarse_profile_unknown_block_in_weak",
+            stats_snapshot: coarseDecision.stats_snapshot,
+          };
+        } else if (btcTier === "neutral" && (sig.score < 82 || (volumeRatio1m5 ?? 0) < 1.35)) {
+          profileDecision = {
+            decision: "block",
+            reason: "coarse_profile_unknown_block_neutral_quality",
+            stats_snapshot: coarseDecision.stats_snapshot,
+          };
+        }
+      }
       emitPaper("DEBUG_PAPER_PROFILE_DECISION", {
         market,
-        profile_key: profileKey,
+        coarse_profile_key: coarseKey,
+        fine_profile_key: fineKey,
         profile_decision: profileDecision.decision,
         profile_reason: profileDecision.reason,
+        coarse_profile_decision: coarseDecision.decision,
+        fine_profile_decision: fineDecision.decision,
         profile_stats: profileDecision.stats_snapshot,
       });
       if (profileDecision.decision === "block") {
@@ -1142,13 +1262,13 @@ export function createPaperTradingEngine(opts: {
           qty: null,
           pnl_krw: null,
           pnl_pct: null,
-          entry_profile_key: profileKey,
+          entry_profile_key: fineKey,
           entry_profile_features: baseProfile,
           profile_decision: "block",
           profile_reason: profileDecision.reason,
           profile_stats: profileDecision.stats_snapshot,
         });
-        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: profileDecision.reason, stage: "profile_gate", profile_key: profileKey });
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: profileDecision.reason, stage: "profile_gate", coarse_profile_key: coarseKey, fine_profile_key: fineKey });
         continue;
       }
 
@@ -1198,8 +1318,21 @@ export function createPaperTradingEngine(opts: {
       if (earlyAllowed) {
         const earlyAmount = Math.max(5_000, Math.floor(PAPER_ENTRY_KRW_PER_TRADE * 0.4 * entryScale));
         const earlyFeatures: EntryProfileFeatures = { ...baseProfile, position_stage: "early_active" };
-        const earlyKey = entryProfileKey(earlyFeatures);
-        const earlyDecision = evaluateProfileDecision(state.entryProfileStats[earlyKey]);
+        const earlyCoarseKey = buildCoarseProfileKey(coarseFromFine(earlyFeatures));
+        const earlyKey = buildFineProfileKey(earlyFeatures);
+        const earlyCoarseDecision = evaluateCoarseProfileDecision(state.coarseProfileStats[earlyCoarseKey]);
+        const earlyFineDecision = evaluateFineProfileDecision(state.fineProfileStats[earlyKey]);
+        let earlyDecision: ProfileDecisionResult = earlyCoarseDecision;
+        if (earlyCoarseDecision.decision !== "block" && earlyFineDecision.decision === "allow") {
+          earlyDecision = earlyFineDecision;
+        }
+        if (earlyCoarseDecision.decision === "unknown" && btcTier === "weak") {
+          earlyDecision = {
+            decision: "block",
+            reason: "coarse_profile_unknown_block_in_weak",
+            stats_snapshot: earlyCoarseDecision.stats_snapshot,
+          };
+        }
         if (earlyDecision.decision === "block") {
           appendHistory({
             ts: new Date().toISOString(),
@@ -1218,14 +1351,15 @@ export function createPaperTradingEngine(opts: {
             profile_reason: earlyDecision.reason,
             profile_stats: earlyDecision.stats_snapshot,
           });
-          emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: earlyDecision.reason, stage: "profile_gate_early", profile_key: earlyKey });
+          emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: earlyDecision.reason, stage: "profile_gate_early", coarse_profile_key: earlyCoarseKey, fine_profile_key: earlyKey });
           continue;
         }
         emitPaper("DEBUG_PAPER_ORDER_ATTEMPT", {
           market,
           order_krw: earlyAmount,
           stage: "paper_early_entry",
-          profile_key: earlyKey,
+          coarse_profile_key: earlyCoarseKey,
+          fine_profile_key: earlyKey,
           profile_decision: earlyDecision.decision,
           profile_reason: earlyDecision.reason,
           profile_stats: earlyDecision.stats_snapshot,
@@ -1285,18 +1419,19 @@ export function createPaperTradingEngine(opts: {
       }
 
       const earlyAmount = Math.max(5_000, Math.floor(PAPER_ENTRY_KRW_PER_TRADE * SURGE_EARLY_ALLOC_RATIO * entryScale));
-      const earlyNote = `early_entry:surge_30pct|vr=${sig.volume_multiple.toFixed(3)}|score=${sig.score}|btc_scale=${entryScale}|${profileDecision.reason}`;
+      const earlyNote = `early_entry:surge_50pct|vr=${sig.volume_multiple.toFixed(3)}|score=${sig.score}|btc_scale=${entryScale}|${profileDecision.reason}`;
       emitPaper("DEBUG_PAPER_ORDER_ATTEMPT", {
         market,
         order_krw: earlyAmount,
         stage: "legacy_early_entry",
-        profile_key: profileKey,
+        coarse_profile_key: coarseKey,
+        fine_profile_key: fineKey,
         profile_decision: profileDecision.decision,
         profile_reason: profileDecision.reason,
         profile_stats: profileDecision.stats_snapshot,
       });
       const b = paperBuy(market, sig.signal_strength, px, earlyNote, earlyAmount, "normal", {
-        key: profileKey,
+        key: fineKey,
         features: baseProfile,
         decision: profileDecision.decision,
         reason: profileDecision.reason,
@@ -1343,8 +1478,18 @@ export function createPaperTradingEngine(opts: {
         if (!sig?.add_entry_eligible) continue;
         const px = priceByMarket[p.market] ?? 0;
         if (!(px > 0)) continue;
+        const grossPct = ((px / p.entry_price) - 1) * 100;
+        const hasEdge = grossPct > 0;
+        const breakoutHeld = sig.breakout === true;
+        const volumeHeld = Number(sig.volume_multiple ?? 0) >= 1.2;
+        const qualityHeld = (() => {
+          const chase = p.signal_price && p.signal_price > 0 ? ((px / p.signal_price) - 1) * 100 : 0;
+          const near = p.entry_recent_high && p.entry_recent_high > 0 ? ((p.entry_recent_high - px) / p.entry_recent_high) * 100 : 0;
+          return chase <= 1.0 && near >= 0.05;
+        })();
+        if (!hasEdge || !breakoutHeld || !volumeHeld || !qualityHeld) continue;
         const addAmount = Math.max(5_000, Math.floor(PAPER_ENTRY_KRW_PER_TRADE * SURGE_ADD_ALLOC_RATIO * entryScale));
-        const addNote = `add_entry:surge_70pct|score=${sig.score}|btc_scale=${entryScale}|${sig.breakout ? "high20" : "box_top"}`;
+        const addNote = `add_entry:surge_50pct|score=${sig.score}|btc_scale=${entryScale}|winner_only_add`;
         const r = paperSurgeAddBuy(p.market, px, addNote, addAmount);
         if (r.ok) {
           logPumpScannerDebug({
@@ -1381,7 +1526,10 @@ export function createPaperTradingEngine(opts: {
           paperSell(p.market, px, "CLOSED_LOSS", `surge_stop_loss:${SURGE_STOP_LOSS_PCT}`);
           continue;
         }
-        if (heldMs >= paperTimeExitDeadlineMs(p)) {
+        const coarseKey =
+          p.entry_profile_features != null ? buildCoarseProfileKey(coarseFromFine(p.entry_profile_features)) : null;
+        const coarseStats = coarseKey ? state.coarseProfileStats[coarseKey] : undefined;
+        if (heldMs >= paperTimeExitDeadlineMsByContext(p, coarseStats)) {
           paperSell(p.market, px, "CLOSED_TIMEOUT", paperTimeExitNote(p));
         }
         continue;
@@ -1395,8 +1543,8 @@ export function createPaperTradingEngine(opts: {
         paperSell(p.market, px, "CLOSED_LOSS", "early_failure_cut");
         continue;
       }
-      if (!p.take_profit_partial_done && grossPct >= 1.5) {
-        const r = paperSell(p.market, px, "CLOSED_WIN", "partial_take_profit", 0.4);
+      if (!p.take_profit_partial_done && grossPct >= 3.0) {
+        const r = paperSell(p.market, px, "CLOSED_WIN", "partial_take_profit", 0.25);
         if (r.ok && state.positions[p.market]) {
           state.positions[p.market]!.take_profit_partial_done = true;
           state.positions[p.market]!.runner_trail_armed = false;
@@ -1404,19 +1552,20 @@ export function createPaperTradingEngine(opts: {
         continue;
       }
       if (p.take_profit_partial_done) {
-        if (grossPct >= 3.0) {
+        if (grossPct >= 3.2) {
           p.runner_trail_armed = true;
         }
         const peak = Number(p.peak_price ?? 0);
         if (p.runner_trail_armed && peak > 0) {
           const ddFromPeak = ((peak - px) / peak) * 100;
-          if (ddFromPeak >= 1.2) {
+          const trailNeed = (p.entry_profile_features?.btc_tier ?? "neutral") === "weak" ? 1.8 : 2.2;
+          if (ddFromPeak >= trailNeed) {
             paperSell(p.market, px, "CLOSED_WIN", "runner_trailing_exit");
             continue;
           }
         }
       }
-      if (heldMs >= paperTimeExitDeadlineMs(p)) {
+      if (heldMs >= paperTimeExitDeadlineMsByContext(p, undefined)) {
         paperSell(p.market, px, "CLOSED_TIMEOUT", paperTimeExitNote(p));
       }
     }
