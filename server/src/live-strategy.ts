@@ -44,8 +44,39 @@ function mean(values: number[]): number {
 }
 
 
+type UpbitBalance = {
+  currency: string;
+  balance: string;
+  locked: string;
+  avg_buy_price: string;
+};
+
+type TradeStatus = {
+  auto_trade_enabled: boolean;
+  api_connected: boolean;
+  live_enabled: boolean;
+  balances: UpbitBalance[];
+  ledger_reconcile?: { zeroed: string[]; clamped: string[] };
+  strategy_positions?: Record<string, { qty: number; invested_krw_total?: number }>;
+  legacy_positions?: { market: string; qty: number }[];
+  krw_available?: number;
+  live_order_available_krw?: number;
+  strategy_available_krw?: number;
+};
+
+type SignalPayloadV2 = {
+  market: string;
+  signal_type?: string;
+  signal_reason?: string;
+  volume_ratio?: number;
+  filters?: { id: string; passed: boolean }[];
+  momentum_3m_pct?: number;
+  price_change_3m_pct?: number;
+  [key: string]: unknown;
+};
+
 type TradeApi = {
-  status: () => Promise<any>;
+  status: () => Promise<TradeStatus>;
   placeBuy: (
     market: string,
     confirm: boolean,
@@ -53,10 +84,10 @@ type TradeApi = {
     strategyType?: StrategyType,
     bucket?: "strategy" | "legacy",
     signalPayload?: unknown,
-  ) => Promise<any>;
-  placeSell: (market: string, confirm: boolean, ratio?: number) => Promise<any>;
-  placeLegacyDcaBuy?: (market: string, confirm: boolean, amountKrw?: number, signalPayload?: unknown) => Promise<any>;
-  placeLegacyExitSell?: (market: string, confirm: boolean, ratio?: number) => Promise<any>;
+  ) => Promise<{ ok: boolean; reason?: string }>;
+  placeSell: (market: string, confirm: boolean, ratio?: number) => Promise<{ ok: boolean; reason?: string }>;
+  placeLegacyDcaBuy?: (market: string, confirm: boolean, amountKrw?: number, signalPayload?: unknown) => Promise<{ ok: boolean; reason?: string }>;
+  placeLegacyExitSell?: (market: string, confirm: boolean, ratio?: number) => Promise<{ ok: boolean; reason?: string }>;
   setAutoTradeEnabled?: (enabled: boolean) => Promise<void>;
 };
 
@@ -111,6 +142,12 @@ type StrategyPosition = {
   entry_risk_reward?: number;
   entry_candle_low?: number;
   previous_swing_low?: number;
+  ema50?: number;
+  ema200?: number;
+  rsi?: number;
+  stochK?: number;
+  stochD?: number;
+  volumeRatio?: number;
 };
 
 type EarlyEntryPosition = {
@@ -140,6 +177,12 @@ type EarlyEntryPosition = {
   entry_risk_reward?: number;
   entry_candle_low?: number;
   previous_swing_low?: number;
+  ema50?: number;
+  ema200?: number;
+  rsi?: number;
+  stochK?: number;
+  stochD?: number;
+  volumeRatio?: number;
 };
 
 type StrategyTradeRow = {
@@ -186,15 +229,31 @@ type StrategyTradeRow = {
   entry_stop_price?: number;
   entry_target_price?: number;
   entry_risk_reward?: number;
-  stoch_rsi_k?: number;
-  stoch_rsi_d?: number;
+  stochK?: number;
+  stochD?: number;
   rsi?: number;
   ema50?: number;
   ema200?: number;
-  volume_ratio_5?: number;
+  volumeRatio?: number;
 };
 
 type OriginalSetupMode = "safe" | "aggressive" | "none";
+type OriginalSpotSetupResult = {
+  ok: boolean;
+  mode: OriginalSetupMode;
+  reason: string;
+  stopPrice?: number;
+  targetPrice?: number;
+  riskReward?: number;
+  candleLow?: number;
+  swingLow?: number;
+  ema50?: number;
+  ema200?: number;
+  rsi?: number;
+  stochK?: number;
+  stochD?: number;
+  volumeRatio?: number;
+};
 
 type CandidateMeta = {
   market: string;
@@ -202,6 +261,18 @@ type CandidateMeta = {
   tier: EntryQualityTier;
   setupMode: OriginalSetupMode;
   riskReward: number;
+  setupReason: string;
+  stopPrice: number;
+  targetPrice: number;
+  candleLow: number;
+  swingLow: number;
+  ema50?: number;
+  ema200?: number;
+  rsi?: number;
+  stochK?: number;
+  stochD?: number;
+  volumeRatio?: number;
+  setup?: OriginalSpotSetupResult;
 };
 
 type EntryQualityTier = "A" | "B" | "C";
@@ -732,23 +803,6 @@ function calculateStochRsi(rsi: number[], period: number, kSmoothing: number, dS
   return { k, d };
 }
 
-type OriginalSpotSetupResult = {
-  ok: boolean;
-  mode: OriginalSetupMode;
-  reason: string;
-  ema50?: number;
-  ema200?: number;
-  rsi?: number;
-  stochK?: number;
-  stochD?: number;
-  volumeRatio?: number;
-  stopPrice?: number;
-  targetPrice?: number;
-  riskReward?: number;
-  candleLow?: number;
-  swingLow?: number;
-};
-
 function evaluateOriginalSpotScalpingSetup(
   market: string,
   candles1: UpbitCandle[],
@@ -791,12 +845,14 @@ function evaluateOriginalSpotScalpingSetup(
   const lastVol = volumes[lastIdx]!;
   const volRatio = avgVol5 > 0 ? lastVol / avgVol5 : 0;
 
+  const prevRsi = rsiValues[lastIdx - 1] ?? 0;
+
   // 1. 안전형 조건
   const safePriceAboveEma200 = currentPrice > ema200Last || Number(lastCandle.trade_price) > ema200Last;
   const pullbackToEma200 = lows.slice(-20).some(l => l <= ema200Last * 1.015);
-  const stochOverboughtCross = prevK <= 20 && prevD <= 20 && k > d && prevK <= prevD;
+  const stochOversoldBullishCross = prevK <= 20 && prevD <= 20 && k > d && prevK <= prevD;
   
-  if (safePriceAboveEma200 && pullbackToEma200 && stochOverboughtCross && isBullish) {
+  if (safePriceAboveEma200 && pullbackToEma200 && stochOversoldBullishCross && isBullish) {
     const stopPrice = swingLow * 0.998;
     const risk = currentPrice - stopPrice;
     if (risk > 0) {
@@ -818,7 +874,7 @@ function evaluateOriginalSpotScalpingSetup(
   const aggressiveEmaStack = ema50Last > ema200Last;
   const aggressivePriceAbove = currentPrice > ema50Last && currentPrice > ema200Last;
   const stochReversal = k > prevK && k > 20;
-  const rsiBullish = rsi > 50 || (rsi > prevK && prevK < 50); // Simplified RSI cross/up
+  const rsiBullish = rsi > 50 || (prevRsi <= 50 && rsi > 50) || rsi > prevRsi;
   const volSpike = volRatio > 1.0;
 
   if (aggressiveEmaStack && aggressivePriceAbove && stochReversal && rsiBullish && volSpike) {
@@ -856,10 +912,10 @@ function minutesSince(ts: string) {
   return Math.max(0, (Date.now() - Date.parse(ts)) / 60_000);
 }
 
-function accountTotalSpotQtyForMarket(market: string, balances: unknown[] | undefined): number {
+function accountTotalSpotQtyForMarket(market: string, balances: UpbitBalance[] | undefined): number {
   const cur = market.replace("KRW-", "").toUpperCase();
   const row = Array.isArray(balances)
-    ? (balances as any[]).find((b) => String(b?.currency ?? "").toUpperCase() === cur)
+    ? balances.find((b) => String(b?.currency ?? "").toUpperCase() === cur)
     : undefined;
   return Number(row?.balance ?? 0) + Number(row?.locked ?? 0);
 }
@@ -1188,12 +1244,12 @@ export function createLiveDataStrategy(opts: {
     };
   };
 
-  const legacySignalAllowsDca = (sig: any): boolean => {
+  const legacySignalAllowsDca = (sig: { p: SignalPayloadV2 }): boolean => {
     if (!sig?.p) return false;
     const p = sig.p;
     const volumeOkay = Number(p.volume_ratio ?? 0) >= 0.85;
-    const filters = Array.isArray(p.filters) ? p.filters : [];
-    const passed = new Set(filters.filter((f: any) => f?.passed === true).map((f: any) => String(f.id)));
+    const filters = Array.isArray(p.filters) ? (p.filters as { id: string; passed: boolean }[]) : [];
+    const passed = new Set(filters.filter((f) => f?.passed === true).map((f) => String(f.id)));
     const reboundPattern =
       passed.has("box_breakout") ||
       passed.has("pullback_reclaim") ||
@@ -1201,11 +1257,11 @@ export function createLiveDataStrategy(opts: {
     return volumeOkay && reboundPattern;
   };
 
-  const legacySignalWeakening = (sig: any): boolean => {
+  const legacySignalWeakening = (sig: { p: SignalPayloadV2 }): boolean => {
     if (!sig?.p) return false;
     const p = sig.p;
-    const filters = Array.isArray(p.filters) ? p.filters : [];
-    const closeHold = filters.find((f: any) => String(f?.id) === "volume_spike_close_fail");
+    const filters = Array.isArray(p.filters) ? (p.filters as { id: string; passed: boolean }[]) : [];
+    const closeHold = filters.find((f) => String(f?.id) === "volume_spike_close_fail");
     const volume = Number(p.volume_ratio ?? 0);
     return (closeHold && closeHold.passed === false) || volume < 0.75;
   };
@@ -1272,9 +1328,9 @@ export function createLiveDataStrategy(opts: {
 
     // 계좌 실물 + trade-control ledger 기준으로 persisted 전략 상태를 정리 (수동 청산·외부 매도 후 유령 슬롯 방지).
     const balArr = Array.isArray(tstatus.balances) ? tstatus.balances : [];
-    const lr = (tstatus as any).ledger_reconcile as { zeroed: string[]; clamped: string[] } | null | undefined;
+    const lr = tstatus.ledger_reconcile;
     const reconcileActions: string[] = [];
-    const strategyPosSnap = ((tstatus as any).strategy_positions ?? {}) as Record<string, { qty?: number }>;
+    const strategyPosSnap = tstatus.strategy_positions ?? {};
     for (const m of new Set([...Object.keys(state.positions), ...Object.keys(state.early_positions)])) {
       const totalSpot = accountTotalSpotQtyForMarket(m, balArr);
       const stratQty = Number(strategyPosSnap[m]?.qty ?? 0);
@@ -1321,14 +1377,14 @@ export function createLiveDataStrategy(opts: {
     }
 
     // holdings_universe: 현재 계좌 보유 종목(관리/청산/표시용). discovery/entry_universe/precheck 경로에서는 제외한다.
-    const heldSymbols = Array.from(balArr)
-      .map((b: any) => {
+    const heldSymbols = balArr
+      .map((b) => {
         const currency = String(b?.currency ?? "").toUpperCase();
         const qty = Number(b?.balance ?? 0) + Number(b?.locked ?? 0);
         if (!currency || currency === "KRW" || !(qty > 0)) return null;
         return `KRW-${currency}`;
       })
-      .filter((x: any): x is string => Boolean(x) && String(x).startsWith("KRW-"));
+      .filter((x): x is string => Boolean(x) && String(x).startsWith("KRW-"));
     const heldSymbolSet = new Set<string>([...heldSymbols, ...Object.keys(state.positions)]);
     if (state.safety_guard.state === "자동정지") {
       console.info(
@@ -1371,7 +1427,7 @@ export function createLiveDataStrategy(opts: {
       const p = mvpSignalPayloadV2Schema.safeParse(row.payload);
       if (!p.success) continue;
       if (!latestAllSignals.has(p.data.market)) latestAllSignals.set(p.data.market, { ts: row.ts, p: p.data });
-      if (!MARKETS.includes(p.data.market as any)) continue;
+      if (!MARKETS.includes(p.data.market as (typeof MARKETS)[number])) continue;
       if (!latestByMarket.has(p.data.market)) latestByMarket.set(p.data.market, { ts: row.ts, p: p.data });
     }
 
@@ -1558,7 +1614,7 @@ export function createLiveDataStrategy(opts: {
         const p = s?.p;
         const filters = Array.isArray(p?.filters) ? p.filters : [];
         if (filters.length === 0) continue;
-        const failed = filters.filter((f: any) => f && f.passed === false).map((f: any) => String(f.id));
+        const failed = filters.filter((f: { id: string; passed: boolean }) => f && f.passed === false).map((f: { id: string; passed: boolean }) => String(f.id));
         if (failed.length === 0) continue;
         for (const id of failed) {
           if (id.includes("volume_increase")) out.volume_failed_count += 1;
@@ -1805,7 +1861,7 @@ export function createLiveDataStrategy(opts: {
         // 승격: normal 포지션으로 이동 (기존 exit 로직 적용)
         const stNow = await opts.trade.status();
         const currency = market.replace("KRW-", "");
-        const bNow = stNow.balances?.find((x: any) => x.currency === currency);
+        const bNow = stNow.balances?.find((x) => x.currency === currency);
         const qty =
           bNow !== undefined ? Number(bNow.balance ?? 0) + Number(bNow.locked ?? 0) : Number(ep.qty ?? 0);
         state.positions[market] = {
@@ -2785,11 +2841,11 @@ export function createLiveDataStrategy(opts: {
     const heldMeaningfulMarkets = new Set<string>();
     if (EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE) {
       for (const b of Array.isArray(tstatus.balances) ? tstatus.balances : []) {
-        const currency = String((b as any).currency ?? "").toUpperCase();
+        const currency = String(b.currency ?? "").toUpperCase();
         if (!currency || currency === "KRW") continue;
         const mk = `KRW-${currency}`;
-        const qty = Number((b as any).balance ?? 0) + Number((b as any).locked ?? 0);
-        const px = Number(priceBy.get(mk) ?? (b as any).avg_buy_price ?? 0);
+        const qty = Number(b.balance ?? 0) + Number(b.locked ?? 0);
+        const px = Number(priceBy.get(mk) ?? b.avg_buy_price ?? 0);
         const valueKrw = qty > 0 && px > 0 ? qty * px : 0;
         if (valueKrw >= EXISTING_POSITION_MIN_KRW) heldMeaningfulMarkets.add(mk);
       }
@@ -2801,11 +2857,11 @@ export function createLiveDataStrategy(opts: {
       return true;
     });
 
-    // --- Capital allocation (deployable once + conviction tiers) ---
     const strategyUsableKrwForAlloc = Math.max(
       0,
       Number(tstatus.strategy_available_krw ?? tstatus.live_order_available_krw ?? tstatus.krw_available ?? 0),
     );
+    const candidateMetaMap = new Map<string, CandidateMeta>();
     const candidateMeta = (await Promise.all(entryUniverse
       .map(async (m) => {
         const s = latestAllSignals.get(m);
@@ -2846,25 +2902,30 @@ export function createLiveDataStrategy(opts: {
           btcTier,
         });
 
-        // Attach setup results to signal payload so finalEntryAuthorization can store them
-        (s.p as any).original_setup_mode = setup.mode;
-        (s.p as any).original_setup_reason = setup.reason;
-        (s.p as any).entry_stop_price = setup.stopPrice;
-        (s.p as any).entry_target_price = setup.targetPrice;
-        (s.p as any).entry_risk_reward = setup.riskReward;
-        (s.p as any).entry_candle_low = setup.candleLow;
-        (s.p as any).previous_swing_low = setup.swingLow;
-
         const riskReward = Number(setup.riskReward ?? 0);
         if (!(riskReward > 0)) return null;
 
-        return {
+        const meta: CandidateMeta = {
           market: m,
           score,
           tier: eq.tier,
           setupMode: setup.mode,
           riskReward,
+          setupReason: setup.reason,
+          stopPrice: setup.stopPrice ?? 0,
+          targetPrice: setup.targetPrice ?? 0,
+          candleLow: setup.candleLow ?? 0,
+          swingLow: setup.swingLow ?? 0,
+          ema50: setup.ema50,
+          ema200: setup.ema200,
+          rsi: setup.rsi,
+          stochK: setup.stochK,
+          stochD: setup.stochD,
+          volumeRatio: setup.volumeRatio,
+          setup,
         };
+        candidateMetaMap.set(m, meta);
+        return meta;
       }))
     ).filter((x): x is CandidateMeta => x !== null);
     const capPlan = computeTargetPositionBudget({
@@ -2955,11 +3016,11 @@ export function createLiveDataStrategy(opts: {
 
     const accountHoldSnapshot: Record<string, { qty: number; value_krw: number; meaningful: boolean }> = {};
     for (const b of Array.isArray(tstatus.balances) ? tstatus.balances : []) {
-      const currency = String((b as any).currency ?? "").toUpperCase();
+      const currency = String(b.currency ?? "").toUpperCase();
       if (!currency || currency === "KRW") continue;
       const mk = `KRW-${currency}`;
-      const qty = Number((b as any).balance ?? 0) + Number((b as any).locked ?? 0);
-      const px = Number(priceBy.get(mk) ?? (b as any).avg_buy_price ?? 0);
+      const qty = Number(b.balance ?? 0) + Number(b.locked ?? 0);
+      const px = Number(priceBy.get(mk) ?? b.avg_buy_price ?? 0);
       const valueKrw = qty > 0 && px > 0 ? qty * px : 0;
       accountHoldSnapshot[mk] = {
         qty,
@@ -3135,7 +3196,7 @@ export function createLiveDataStrategy(opts: {
           const scoreCd = gatePre ? Number(gatePre.score ?? 0) : null;
           const vrCd = sigPre ? Number(sigPre.p.volume_ratio ?? 0) : null;
           const momCd = sigPre
-            ? Number((sigPre.p as any).momentum_3m_pct ?? (sigPre.p as any).price_change_3m_pct ?? 0)
+            ? Number(sigPre.p.momentum_3m_pct ?? sigPre.p.price_change_3m_pct ?? 0)
             : null;
           console.info(
             JSON.stringify({
@@ -3341,7 +3402,7 @@ export function createLiveDataStrategy(opts: {
           volume_ratio: volumeRatio1m5 ?? volumeRatio,
           price_position: distanceFromLocalHighPct,
           ema_gap: null,
-          momentum: Number((sig.p as any).momentum_3m_pct ?? (sig.p as any).price_change_3m_pct ?? 0),
+          momentum: Number(sig.p.momentum_3m_pct ?? sig.p.price_change_3m_pct ?? 0),
           market_state: marketState.market_state,
         }),
       );
@@ -3548,7 +3609,7 @@ export function createLiveDataStrategy(opts: {
             });
             const stEarly = await opts.trade.status();
             const currency = market.replace("KRW-", "");
-            const bEarly = stEarly.balances?.find((x: any) => x.currency === currency);
+            const bEarly = stEarly.balances?.find((x) => x.currency === currency);
             const qtyEarly = Number(bEarly?.balance ?? 0) + Number(bEarly?.locked ?? 0);
             state.early_positions[market] = {
               market,
@@ -3887,7 +3948,7 @@ export function createLiveDataStrategy(opts: {
 
       const st = await opts.trade.status();
       const currency = market.replace("KRW-", "");
-      const bExist = st.balances?.find((x: any) => x.currency === currency);
+      const bExist = st.balances?.find((x) => x.currency === currency);
       const existingQty = Number(bExist?.balance ?? 0) + Number(bExist?.locked ?? 0);
       const markPrice = Number(priceBy.get(market) ?? 0);
       const existingValueKrw = existingQty > 0 && markPrice > 0 ? existingQty * markPrice : 0;
@@ -4006,9 +4067,10 @@ export function createLiveDataStrategy(opts: {
       }
       const price = priceBy.get(market) ?? 0;
       const st2 = await opts.trade.status();
-      const bFill = st2.balances?.find((x: any) => x.currency === currency);
+      const bFill = st2.balances?.find((x) => x.currency === currency);
       const qty = Number(bFill?.balance ?? 0) + Number(bFill?.locked ?? 0);
       const strategyPositionExistsBefore = Boolean(state.positions[market]);
+      const marketMeta = candidateMeta.find(x => x.market === market);
       state.positions[market] = {
         market,
         strategy_type: strategyType,
@@ -4041,6 +4103,16 @@ export function createLiveDataStrategy(opts: {
         entry_profile_decision: profileInfo.decision,
         target_budget_krw: baseBudget,
         filled_entry_krw: orderKrw,
+        original_setup_mode: marketMeta?.setupMode,
+        original_setup_reason: marketMeta?.setupReason,
+        entry_stop_price: marketMeta?.stopPrice,
+        entry_target_price: marketMeta?.targetPrice,
+        entry_risk_reward: marketMeta?.riskReward,
+        ema50: marketMeta?.ema50,
+        ema200: marketMeta?.ema200,
+        rsi: marketMeta?.rsi,
+        stochK: marketMeta?.stochK,
+        stochD: marketMeta?.stochD,
       };
       state.daily.entry_count += 1;
       state.cooldown_until[market] = new Date(Date.now() + (isExceptionMarket ? 28 : 18) * 60_000).toISOString();

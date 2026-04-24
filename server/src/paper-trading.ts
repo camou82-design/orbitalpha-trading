@@ -37,7 +37,15 @@ type PaperPosition = {
   entry_stop_price?: number;
   entry_target_price?: number;
   entry_risk_reward?: number;
+  ema50?: number;
+  ema200?: number;
+  rsi?: number;
+  stochK?: number;
+  stochD?: number;
+  volumeRatio?: number;
 };
+
+type OriginalSetupMode = "safe" | "aggressive" | "none";
 
 type EntryProfileFeatures = {
   signal_strength: string;
@@ -50,6 +58,17 @@ type EntryProfileFeatures = {
   near_high_bucket: "<=0.1" | "0.11-0.25" | "0.26-0.5" | ">0.5";
   breakout: boolean;
   early_entry_eligible: boolean;
+  original_setup_mode?: OriginalSetupMode;
+  original_setup_reason?: string;
+  entry_stop_price?: number;
+  entry_target_price?: number;
+  entry_risk_reward?: number;
+  ema50?: number;
+  ema200?: number;
+  rsi?: number;
+  stochK?: number;
+  stochD?: number;
+  volumeRatio?: number;
 };
 
 type CoarseProfileFeatures = {
@@ -283,6 +302,17 @@ function buildEntryProfileFeatures(params: {
   nearHighPct: number | null;
   breakout: boolean;
   earlyEntryEligible: boolean;
+  originalSetupMode?: OriginalSetupMode;
+  originalSetupReason?: string;
+  entryStopPrice?: number;
+  entryTargetPrice?: number;
+  entryRiskReward?: number;
+  ema50?: number;
+  ema200?: number;
+  rsi?: number;
+  stochK?: number;
+  stochD?: number;
+  volumeRatioVal?: number;
 }): EntryProfileFeatures {
   return {
     signal_strength: params.signalStrength,
@@ -295,6 +325,17 @@ function buildEntryProfileFeatures(params: {
     near_high_bucket: nearHighBucket(params.nearHighPct),
     breakout: params.breakout,
     early_entry_eligible: params.earlyEntryEligible,
+    original_setup_mode: params.originalSetupMode,
+    original_setup_reason: params.originalSetupReason,
+    entry_stop_price: params.entryStopPrice,
+    entry_target_price: params.entryTargetPrice,
+    entry_risk_reward: params.entryRiskReward,
+    ema50: params.ema50,
+    ema200: params.ema200,
+    rsi: params.rsi,
+    stochK: params.stochK,
+    stochD: params.stochD,
+    volumeRatio: params.volumeRatioVal,
   };
 }
 
@@ -617,11 +658,17 @@ export function createPaperTradingEngine(opts: {
       entry_profile_features: profile?.features,
       realized_pnl_krw: 0,
       initial_invested_krw: orderKrw,
-      original_setup_mode: profile?.features && (profile.features as any).original_setup_mode,
-      original_setup_reason: profile?.features && (profile.features as any).original_setup_reason,
-      entry_stop_price: profile?.features && (profile.features as any).entry_stop_price,
-      entry_target_price: profile?.features && (profile.features as any).entry_target_price,
-      entry_risk_reward: profile?.features && (profile.features as any).entry_risk_reward,
+      original_setup_mode: profile?.features?.original_setup_mode,
+      original_setup_reason: profile?.features?.original_setup_reason,
+      entry_stop_price: profile?.features?.entry_stop_price,
+      entry_target_price: profile?.features?.entry_target_price,
+      entry_risk_reward: profile?.features?.entry_risk_reward,
+      ema50: profile?.features?.ema50,
+      ema200: profile?.features?.ema200,
+      rsi: profile?.features?.rsi,
+      stochK: profile?.features?.stochK,
+      stochD: profile?.features?.stochD,
+      volumeRatio: profile?.features?.volumeRatio,
       ...(signalStrength === "SURGE_SCANNER" ? { surge_add_leg_done: false } : {}),
     };
     appendHistory({
@@ -957,11 +1004,28 @@ export function createPaperTradingEngine(opts: {
     return { k, d };
   }
 
+  type OriginalSpotSetupResult = {
+    ok: boolean;
+    mode: OriginalSetupMode;
+    reason: string;
+    stop: number;
+    target: number;
+    rr: number;
+    ema50?: number;
+    ema200?: number;
+    rsi?: number;
+    stochK?: number;
+    stochD?: number;
+    candleLow?: number;
+    swingLow?: number;
+    volumeRatio?: number;
+  };
+
   const tick = async () => {
     const scannerSignals = opts.getScannerSignals();
     emitPaper("DEBUG_PAPER_SIGNAL_HANDOFF", {
       scanner_signals_length: scannerSignals.length,
-      markets: scannerSignals.map((s) => String((s as any)?.market ?? "")).filter((m) => m).slice(0, 50),
+      markets: scannerSignals.map((s) => String(s?.market ?? "")).filter((m) => m).slice(0, 50),
     });
     const latestSignalByMarket = new Map<
       string,
@@ -1098,14 +1162,12 @@ export function createPaperTradingEngine(opts: {
       if (!(px > 0)) continue;
 
       // [ORIGINAL SETUP] Primary Filter for Paper Trading
-      let setupOk = false;
-      let setupResult: any = null;
+      let setupResult: OriginalSpotSetupResult | null = null;
       try {
         const c250 = await fetchMinuteCandles(market, 1, 250);
         if (c250.length >= 250) {
           const completed = c250.slice(0, -1);
           const closes = completed.map(c => Number(c.trade_price));
-          const highs = completed.map(c => Number(c.high_price));
           const lows = completed.map(c => Number(c.low_price));
           const volumes = completed.map(c => Number(c.candle_acc_trade_volume));
 
@@ -1116,6 +1178,7 @@ export function createPaperTradingEngine(opts: {
           
           const lastIdx = closes.length - 1;
           const rsi = rsiValues[lastIdx] ?? 0;
+          const prevRsi = rsiValues[lastIdx - 1] ?? 0;
           const k = stoch.k[lastIdx] ?? 0;
           const d = stoch.d[lastIdx] ?? 0;
           const prevK = stoch.k[lastIdx - 1] ?? 0;
@@ -1128,37 +1191,35 @@ export function createPaperTradingEngine(opts: {
           const avgVol5 = volumes.slice(-6, -1).reduce((a,b) => a+b, 0) / 5;
           const volRatio = avgVol5 > 0 ? volumes[lastIdx]! / avgVol5 : 0;
 
-          // Safe Mode
+          // 1. 안전형 조건
           const safePriceAboveEma200 = px > (ema200 ?? 0);
           const pullbackToEma200 = lows.slice(-20).some(l => l <= (ema200 ?? 0) * 1.015);
-          const stochCross = prevK <= 20 && prevD <= 20 && k > d && prevK <= prevD;
+          const stochOversoldBullishCross = prevK <= 20 && prevD <= 20 && k > d && prevK <= prevD;
           
-          if (safePriceAboveEma200 && pullbackToEma200 && stochCross && isBullish) {
+          if (safePriceAboveEma200 && pullbackToEma200 && stochOversoldBullishCross && isBullish) {
             const stop = swingLow * 0.998;
             const target = px + (px - stop) * 1.5;
-            setupResult = { ok: true, mode: "safe", stop, target, rr: 1.5, reason: "safe_pullback_ema200" };
-            setupOk = true;
+            setupResult = { ok: true, mode: "safe", stop, target, rr: 1.5, reason: "safe_pullback_ema200", ema50: ema50 ?? 0, ema200: ema200 ?? 0, rsi, stochK: k, stochD: d, swingLow, volumeRatio: volRatio };
           } else {
             // Aggressive Mode
             const emaStack = (ema50 ?? 0) > (ema200 ?? 0);
             const priceAbove = px > (ema50 ?? 0) && px > (ema200 ?? 0);
-            const stochRev = k > prevK && k > 20;
-            const rsiBull = rsi > 50 || (rsi > prevK && prevK < 50);
-            if (emaStack && priceAbove && stochRev && rsiBull && volRatio > 1.0) {
+            const stochReversal = k > prevK && k > 20;
+            const rsiBullish = rsi > 50 || (prevRsi <= 50 && rsi > 50) || rsi > prevRsi;
+            if (emaStack && priceAbove && stochReversal && rsiBullish && volRatio > 1.0) {
               const stop = Math.min(Number(lastCandle.low_price), swingLow) * 0.998;
               const target = px + (px - stop) * 2.0;
-              setupResult = { ok: true, mode: "aggressive", stop, target, rr: 2.0, reason: "aggressive_trend" };
-              setupOk = true;
+              setupResult = { ok: true, mode: "aggressive", stop, target, rr: 2.0, reason: "aggressive_trend", ema50: ema50 ?? 0, ema200: ema200 ?? 0, rsi, stochK: k, stochD: d, swingLow, volumeRatio: volRatio };
             }
           }
         }
       } catch (err) {}
 
-      if (!setupOk) {
-        emitPaper("DEBUG_ORIGINAL_SPOT_SETUP_BLOCK", { market, ok: false, reason: "setup_conditions_not_met" });
+      if (!setupResult || !setupResult.ok) {
+        emitPaper("DEBUG_ORIGINAL_SPOT_SETUP_BLOCK", { market, ok: false, reason: setupResult?.reason ?? "setup_conditions_not_met" });
         continue; 
       }
-      emitPaper("DEBUG_ORIGINAL_SPOT_SETUP_PASS", { market, mode: setupResult.mode, rr: setupResult.rr });
+      emitPaper("DEBUG_ORIGINAL_SPOT_SETUP_PASS", { market, mode: setupResult.mode, reason: setupResult.reason });
 
       if (sig.status === "제외") {
         const blockReason = (sig.exclude_reasons || []).join(",") || "strict_filter_rejected_status";
@@ -1241,13 +1302,13 @@ export function createPaperTradingEngine(opts: {
       let volumeRatio1m5: number | null = null;
       try {
         const c1 = await fetchMinuteCandles(market, 1, 12);
-        const highs = c1.map((x: any) => Number(x.high_price ?? 0)).filter((n: number) => Number.isFinite(n) && n > 0);
+        const highs = c1.map(x => Number(x.high_price ?? 0)).filter(n => Number.isFinite(n) && n > 0);
         if (highs.length > 0) localHigh = Math.max(...highs);
         if (localHigh > 0) distanceFromLocalHighPct = ((localHigh - px) / localHigh) * 100;
         if (signalPrice > 0) priceChangeSinceSignalPct = ((px / signalPrice) - 1) * 100;
         if (c1.length >= 7) {
-          const last = c1[c1.length - 1] as any;
-          const prev5 = c1.slice(-6, -1) as any[];
+          const last = c1[c1.length - 1];
+          const prev5 = c1.slice(-6, -1);
           const lastNotional = Number(last.candle_acc_trade_volume ?? 0) * Number(last.trade_price ?? 0);
           const prevAvg =
             prev5.reduce((acc, r) => acc + Number(r.candle_acc_trade_volume ?? 0) * Number(r.trade_price ?? 0), 0) /
@@ -1344,6 +1405,7 @@ export function createPaperTradingEngine(opts: {
         continue;
       }
 
+      // Attach Original Setup fields to profile for handoff
       const baseProfile = buildEntryProfileFeatures({
         signalStrength: sig.signal_strength,
         positionStage: "normal_active",
@@ -1355,14 +1417,12 @@ export function createPaperTradingEngine(opts: {
         nearHighPct: distanceFromLocalHighPct,
         breakout: sig.breakout,
         earlyEntryEligible: sig.early_entry_eligible,
+        originalSetupMode: setupResult?.mode,
+        originalSetupReason: setupResult?.reason,
+        entryStopPrice: setupResult?.stop,
+        entryTargetPrice: setupResult?.target,
+        entryRiskReward: setupResult?.rr,
       });
-
-      // Attach Original Setup fields to profile for handoff
-      (baseProfile as any).original_setup_mode = setupResult.mode;
-      (baseProfile as any).original_setup_reason = setupResult.reason;
-      (baseProfile as any).entry_stop_price = setupResult.stop;
-      (baseProfile as any).entry_target_price = setupResult.target;
-      (baseProfile as any).entry_risk_reward = setupResult.rr;
 
 
       const coarseKey = buildCoarseProfileKey(coarseFromFine(baseProfile));
@@ -1536,7 +1596,7 @@ export function createPaperTradingEngine(opts: {
           },
         );
         if (b.ok) {
-          const filled = (state.positions as any)[market] as any;
+          const filled = state.positions[market] as PaperPosition | undefined;
           if (filled) {
             filled.signal_ts = signalTs;
             filled.signal_price = signalPrice;
@@ -1594,7 +1654,7 @@ export function createPaperTradingEngine(opts: {
         stats_snapshot: profileDecision.stats_snapshot,
       });
       if (b.ok) {
-        const filled = (state.positions as any)[market] as any;
+        const filled = state.positions[market] as PaperPosition | undefined;
         emitPaper("DEBUG_PAPER_ORDER_FILLED", {
           market,
           qty: Number(filled?.qty ?? 0),
