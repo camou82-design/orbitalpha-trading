@@ -31,6 +31,12 @@ type PaperPosition = {
   entry_profile_features?: EntryProfileFeatures;
   realized_pnl_krw?: number;
   initial_invested_krw?: number;
+  /** Original Setup fields */
+  original_setup_mode?: "safe" | "aggressive" | "none";
+  original_setup_reason?: string;
+  entry_stop_price?: number;
+  entry_target_price?: number;
+  entry_risk_reward?: number;
 };
 
 type EntryProfileFeatures = {
@@ -611,6 +617,11 @@ export function createPaperTradingEngine(opts: {
       entry_profile_features: profile?.features,
       realized_pnl_krw: 0,
       initial_invested_krw: orderKrw,
+      original_setup_mode: profile?.features && (profile.features as any).original_setup_mode,
+      original_setup_reason: profile?.features && (profile.features as any).original_setup_reason,
+      entry_stop_price: profile?.features && (profile.features as any).entry_stop_price,
+      entry_target_price: profile?.features && (profile.features as any).entry_target_price,
+      entry_risk_reward: profile?.features && (profile.features as any).entry_risk_reward,
       ...(signalStrength === "SURGE_SCANNER" ? { surge_add_leg_done: false } : {}),
     };
     appendHistory({
@@ -884,6 +895,68 @@ export function createPaperTradingEngine(opts: {
     };
   };
 
+  function emaLast(values: number[], period: number): number | null {
+    if (values.length < period) return null;
+    let ema = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+    const k = 2 / (period + 1);
+    for (let i = period; i < values.length; i++) {
+      ema = (values[i]! - ema) * k + ema;
+    }
+    return ema;
+  }
+
+  function calculateRsi(closes: number[], period: number): number[] {
+    if (closes.length <= period) return [];
+    const rsi: number[] = [];
+    let gains = 0;
+    let losses = 0;
+    for (let i = 1; i <= period; i++) {
+      const diff = closes[i]! - closes[i - 1]!;
+      if (diff >= 0) gains += diff;
+      else losses -= diff;
+    }
+    let avgGain = gains / period;
+    let avgLoss = losses / period;
+    rsi[period] = 100 - 100 / (1 + avgGain / (avgLoss || 1e-9));
+    for (let i = period + 1; i < closes.length; i++) {
+      const diff = closes[i]! - closes[i - 1]!;
+      const gain = diff >= 0 ? diff : 0;
+      const loss = diff < 0 ? -diff : 0;
+      avgGain = (avgGain * (period - 1) + gain) / period;
+      avgLoss = (avgLoss * (period - 1) + loss) / period;
+      rsi[i] = 100 - 100 / (1 + avgGain / (avgLoss || 1e-9));
+    }
+    return rsi;
+  }
+
+  function calculateStochRsi(rsi: number[], period: number, kSmoothing: number, dSmoothing: number): { k: number[]; d: number[] } {
+    if (rsi.length < period + kSmoothing + dSmoothing) return { k: [], d: [] };
+    const stochRsi: (number | null)[] = rsi.map((_, i) => {
+      if (i < period) return null;
+      const window = rsi.slice(i - period + 1, i + 1).filter(v => v !== undefined);
+      const min = Math.min(...window);
+      const max = Math.max(...window);
+      return max === min ? 0 : (rsi[i]! - min) / (max - min);
+    });
+    const k: number[] = [];
+    for (let i = 0; i < stochRsi.length; i++) {
+      if (i < period + kSmoothing - 1) continue;
+      const window = stochRsi.slice(i - kSmoothing + 1, i + 1).filter((v): v is number => v !== null);
+      if (window.length === kSmoothing) {
+        k[i] = (window.reduce((a, b) => a + b, 0) / kSmoothing) * 100;
+      }
+    }
+    const d: number[] = [];
+    for (let i = 0; i < k.length; i++) {
+      if (i < period + kSmoothing + dSmoothing - 2 || k[i] === undefined) continue;
+      const window = k.slice(i - dSmoothing + 1, i + 1).filter(v => v !== undefined);
+      if (window.length === dSmoothing) {
+        d[i] = window.reduce((a, b) => a + b, 0) / dSmoothing;
+      }
+    }
+    return { k, d };
+  }
+
   const tick = async () => {
     const scannerSignals = opts.getScannerSignals();
     emitPaper("DEBUG_PAPER_SIGNAL_HANDOFF", {
@@ -1021,12 +1094,77 @@ export function createPaperTradingEngine(opts: {
     }
 
     for (const [market, sig] of orderedSignals) {
+      const px = priceByMarket[market] ?? 0;
+      if (!(px > 0)) continue;
+
+      // [ORIGINAL SETUP] Primary Filter for Paper Trading
+      let setupOk = false;
+      let setupResult: any = null;
+      try {
+        const c250 = await fetchMinuteCandles(market, 1, 250);
+        if (c250.length >= 250) {
+          const completed = c250.slice(0, -1);
+          const closes = completed.map(c => Number(c.trade_price));
+          const highs = completed.map(c => Number(c.high_price));
+          const lows = completed.map(c => Number(c.low_price));
+          const volumes = completed.map(c => Number(c.candle_acc_trade_volume));
+
+          const ema50 = emaLast(closes, 50);
+          const ema200 = emaLast(closes, 200);
+          const rsiValues = calculateRsi(closes, 14);
+          const stoch = calculateStochRsi(rsiValues, 14, 3, 3);
+          
+          const lastIdx = closes.length - 1;
+          const rsi = rsiValues[lastIdx] ?? 0;
+          const k = stoch.k[lastIdx] ?? 0;
+          const d = stoch.d[lastIdx] ?? 0;
+          const prevK = stoch.k[lastIdx - 1] ?? 0;
+          const prevD = stoch.d[lastIdx - 1] ?? 0;
+
+          const lastCandle = completed[lastIdx]!;
+          const isBullish = Number(lastCandle.trade_price) > Number(lastCandle.opening_price);
+          const recentLows = lows.slice(-10);
+          const swingLow = Math.min(...recentLows);
+          const avgVol5 = volumes.slice(-6, -1).reduce((a,b) => a+b, 0) / 5;
+          const volRatio = avgVol5 > 0 ? volumes[lastIdx]! / avgVol5 : 0;
+
+          // Safe Mode
+          const safePriceAboveEma200 = px > (ema200 ?? 0);
+          const pullbackToEma200 = lows.slice(-20).some(l => l <= (ema200 ?? 0) * 1.015);
+          const stochCross = prevK <= 20 && prevD <= 20 && k > d && prevK <= prevD;
+          
+          if (safePriceAboveEma200 && pullbackToEma200 && stochCross && isBullish) {
+            const stop = swingLow * 0.998;
+            const target = px + (px - stop) * 1.5;
+            setupResult = { ok: true, mode: "safe", stop, target, rr: 1.5, reason: "safe_pullback_ema200" };
+            setupOk = true;
+          } else {
+            // Aggressive Mode
+            const emaStack = (ema50 ?? 0) > (ema200 ?? 0);
+            const priceAbove = px > (ema50 ?? 0) && px > (ema200 ?? 0);
+            const stochRev = k > prevK && k > 20;
+            const rsiBull = rsi > 50 || (rsi > prevK && prevK < 50);
+            if (emaStack && priceAbove && stochRev && rsiBull && volRatio > 1.0) {
+              const stop = Math.min(Number(lastCandle.low_price), swingLow) * 0.998;
+              const target = px + (px - stop) * 2.0;
+              setupResult = { ok: true, mode: "aggressive", stop, target, rr: 2.0, reason: "aggressive_trend" };
+              setupOk = true;
+            }
+          }
+        }
+      } catch (err) {}
+
+      if (!setupOk) {
+        emitPaper("DEBUG_ORIGINAL_SPOT_SETUP_BLOCK", { market, ok: false, reason: "setup_conditions_not_met" });
+        continue; 
+      }
+      emitPaper("DEBUG_ORIGINAL_SPOT_SETUP_PASS", { market, mode: setupResult.mode, rr: setupResult.rr });
+
       if (sig.status === "제외") {
         const blockReason = (sig.exclude_reasons || []).join(",") || "strict_filter_rejected_status";
         emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: blockReason, stage: "ordered_signals_loop" });
         continue;
       }
-      const px = priceByMarket[market] ?? 0;
       const slotSnap = countPaperSlots(state.positions);
       const posHere = state.positions[market];
       emitPaper("DEBUG_PAPER_PRECHECK_ENTER", {
@@ -1218,6 +1356,15 @@ export function createPaperTradingEngine(opts: {
         breakout: sig.breakout,
         earlyEntryEligible: sig.early_entry_eligible,
       });
+
+      // Attach Original Setup fields to profile for handoff
+      (baseProfile as any).original_setup_mode = setupResult.mode;
+      (baseProfile as any).original_setup_reason = setupResult.reason;
+      (baseProfile as any).entry_stop_price = setupResult.stop;
+      (baseProfile as any).entry_target_price = setupResult.target;
+      (baseProfile as any).entry_risk_reward = setupResult.rr;
+
+
       const coarseKey = buildCoarseProfileKey(coarseFromFine(baseProfile));
       const fineKey = buildFineProfileKey(baseProfile);
       const coarseDecision = evaluateCoarseProfileDecision(state.coarseProfileStats[coarseKey]);
@@ -1521,6 +1668,15 @@ export function createPaperTradingEngine(opts: {
       const heldMs = Date.now() - Date.parse(p.entry_ts);
       p.peak_price = Math.max(Number(p.peak_price ?? p.entry_price), px);
       p.max_up_pct = Math.max(p.max_up_pct ?? grossPct, grossPct);
+
+      // [ORIGINAL SETUP] Priority Exit Guard for Paper
+      if (p.entry_stop_price && px <= p.entry_stop_price) {
+        paperSell(p.market, px, "CLOSED_LOSS", "original_setup_stop_loss");
+        continue;
+      } else if (p.entry_target_price && px >= p.entry_target_price) {
+        paperSell(p.market, px, "CLOSED_WIN", "original_setup_target_tp");
+        continue;
+      }
 
       if (p.signal_strength === "SURGE_SCANNER") {
         if (grossPct <= SURGE_STOP_LOSS_PCT) {

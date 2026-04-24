@@ -25,6 +25,25 @@ import {
 } from "./strategy-risk-config.js";
 import { ENTRY_PIPELINE_MID_SCORE_FLOOR, evaluateSpotLongEntryPipeline } from "./live-entry-pipeline.js";
 
+function num(x: unknown): number {
+  return typeof x === "number" ? x : Number(x);
+}
+
+function emaLast(closes: readonly number[], period: number): number | null {
+  if (closes.length < period) return null;
+  const k = 2 / (period + 1);
+  let e = closes[0]!;
+  for (let i = 1; i < closes.length; i++) e = closes[i]! * k + e * (1 - k);
+  return e;
+}
+
+function mean(values: number[]): number {
+  const xs = values.filter((n) => Number.isFinite(n));
+  if (xs.length === 0) return 0;
+  return xs.reduce((a, b) => a + b, 0) / xs.length;
+}
+
+
 type TradeApi = {
   status: () => Promise<any>;
   placeBuy: (
@@ -84,6 +103,14 @@ type StrategyPosition = {
   entry_profile_decision?: "allow" | "block" | "unknown";
   target_budget_krw?: number;
   filled_entry_krw?: number;
+  /** Original Setup fields */
+  original_setup_mode?: "safe" | "aggressive" | "none";
+  original_setup_reason?: string;
+  entry_stop_price?: number;
+  entry_target_price?: number;
+  entry_risk_reward?: number;
+  entry_candle_low?: number;
+  previous_swing_low?: number;
 };
 
 type EarlyEntryPosition = {
@@ -105,6 +132,14 @@ type EarlyEntryPosition = {
   target_budget_krw?: number;
   /** 실제 체결된 금액 (수수료 제외 순수 매수액) */
   filled_entry_krw?: number;
+  /** Original Setup fields */
+  original_setup_mode?: "safe" | "aggressive" | "none";
+  original_setup_reason?: string;
+  entry_stop_price?: number;
+  entry_target_price?: number;
+  entry_risk_reward?: number;
+  entry_candle_low?: number;
+  previous_swing_low?: number;
 };
 
 type StrategyTradeRow = {
@@ -145,6 +180,28 @@ type StrategyTradeRow = {
   runner_trail_active?: boolean;
   realized_partial_profit?: number;
   final_net_pnl_pct?: number;
+  /** Original Setup fields */
+  original_setup_mode?: "safe" | "aggressive" | "none";
+  original_setup_reason?: string;
+  entry_stop_price?: number;
+  entry_target_price?: number;
+  entry_risk_reward?: number;
+  stoch_rsi_k?: number;
+  stoch_rsi_d?: number;
+  rsi?: number;
+  ema50?: number;
+  ema200?: number;
+  volume_ratio_5?: number;
+};
+
+type OriginalSetupMode = "safe" | "aggressive" | "none";
+
+type CandidateMeta = {
+  market: string;
+  score: number;
+  tier: EntryQualityTier;
+  setupMode: OriginalSetupMode;
+  riskReward: number;
 };
 
 type EntryQualityTier = "A" | "B" | "C";
@@ -615,6 +672,186 @@ function todayKst() {
   return new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" });
 }
 
+/**
+ * 원형 매매법 1차 필터 (Original Spot Scalping Setup)
+ */
+function calculateRsi(closes: number[], period: number): number[] {
+  if (closes.length <= period) return [];
+  const rsi: number[] = [];
+  let gains = 0;
+  let losses = 0;
+
+  for (let i = 1; i <= period; i++) {
+    const diff = closes[i]! - closes[i - 1]!;
+    if (diff >= 0) gains += diff;
+    else losses -= diff;
+  }
+
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+  rsi[period] = 100 - 100 / (1 + avgGain / (avgLoss || 1e-9));
+
+  for (let i = period + 1; i < closes.length; i++) {
+    const diff = closes[i]! - closes[i - 1]!;
+    const gain = diff >= 0 ? diff : 0;
+    const loss = diff < 0 ? -diff : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    rsi[i] = 100 - 100 / (1 + avgGain / (avgLoss || 1e-9));
+  }
+  return rsi;
+}
+
+function calculateStochRsi(rsi: number[], period: number, kSmoothing: number, dSmoothing: number): { k: number[]; d: number[] } {
+  if (rsi.length < period + kSmoothing + dSmoothing) return { k: [], d: [] };
+  const stochRsi: (number | null)[] = rsi.map((_, i) => {
+    if (i < period) return null;
+    const window = rsi.slice(i - period + 1, i + 1).filter(v => v !== undefined);
+    const min = Math.min(...window);
+    const max = Math.max(...window);
+    return max === min ? 0 : (rsi[i]! - min) / (max - min);
+  });
+
+  const k: number[] = [];
+  for (let i = 0; i < stochRsi.length; i++) {
+    if (i < period + kSmoothing - 1) continue;
+    const window = stochRsi.slice(i - kSmoothing + 1, i + 1).filter((v): v is number => v !== null);
+    if (window.length === kSmoothing) {
+      k[i] = (window.reduce((a, b) => a + b, 0) / kSmoothing) * 100;
+    }
+  }
+
+  const d: number[] = [];
+  for (let i = 0; i < k.length; i++) {
+    if (i < period + kSmoothing + dSmoothing - 2 || k[i] === undefined) continue;
+    const window = k.slice(i - dSmoothing + 1, i + 1).filter(v => v !== undefined);
+    if (window.length === dSmoothing) {
+      d[i] = window.reduce((a, b) => a + b, 0) / dSmoothing;
+    }
+  }
+  return { k, d };
+}
+
+type OriginalSpotSetupResult = {
+  ok: boolean;
+  mode: OriginalSetupMode;
+  reason: string;
+  ema50?: number;
+  ema200?: number;
+  rsi?: number;
+  stochK?: number;
+  stochD?: number;
+  volumeRatio?: number;
+  stopPrice?: number;
+  targetPrice?: number;
+  riskReward?: number;
+  candleLow?: number;
+  swingLow?: number;
+};
+
+function evaluateOriginalSpotScalpingSetup(
+  market: string,
+  candles1: UpbitCandle[],
+  currentPrice: number,
+): OriginalSpotSetupResult {
+  if (candles1.length < 250) {
+    return { ok: false, mode: "none", reason: `insufficient_candles:${candles1.length}<250` };
+  }
+
+  const completed = candles1.slice(0, -1);
+  const closes = completed.map(c => Number(c.trade_price));
+  const highs = completed.map(c => Number(c.high_price));
+  const lows = completed.map(c => Number(c.low_price));
+  const volumes = completed.map(c => Number(c.candle_acc_trade_volume));
+
+  const ema50Last = emaLast(closes, 50);
+  const ema200Last = emaLast(closes, 200);
+  if (ema50Last === null || ema200Last === null) {
+    return { ok: false, mode: "none", reason: "ema_not_ready" };
+  }
+
+  const rsiValues = calculateRsi(closes, 14);
+  const stoch = calculateStochRsi(rsiValues, 14, 3, 3);
+  
+  const lastIdx = closes.length - 1;
+  const rsi = rsiValues[lastIdx] ?? 0;
+  const k = stoch.k[lastIdx] ?? 0;
+  const d = stoch.d[lastIdx] ?? 0;
+  const prevK = stoch.k[lastIdx - 1] ?? 0;
+  const prevD = stoch.d[lastIdx - 1] ?? 0;
+
+  const lastCandle = completed[lastIdx]!;
+  const isBullish = Number(lastCandle.trade_price) > Number(lastCandle.opening_price);
+  const candleLow = Number(lastCandle.low_price);
+  
+  const recentLows = lows.slice(-10);
+  const swingLow = Math.min(...recentLows);
+  
+  const avgVol5 = mean(volumes.slice(-6, -1));
+  const lastVol = volumes[lastIdx]!;
+  const volRatio = avgVol5 > 0 ? lastVol / avgVol5 : 0;
+
+  // 1. 안전형 조건
+  const safePriceAboveEma200 = currentPrice > ema200Last || Number(lastCandle.trade_price) > ema200Last;
+  const pullbackToEma200 = lows.slice(-20).some(l => l <= ema200Last * 1.015);
+  const stochOverboughtCross = prevK <= 20 && prevD <= 20 && k > d && prevK <= prevD;
+  
+  if (safePriceAboveEma200 && pullbackToEma200 && stochOverboughtCross && isBullish) {
+    const stopPrice = swingLow * 0.998;
+    const risk = currentPrice - stopPrice;
+    if (risk > 0) {
+      const targetPrice = currentPrice + risk * 1.5;
+      const rr = 1.5;
+      return {
+        ok: true,
+        mode: "safe",
+        reason: "safe_pullback_ema200_stoch_cross",
+        ema50: ema50Last, ema200: ema200Last, rsi, stochK: k, stochD: d,
+        volumeRatio: volRatio,
+        stopPrice, targetPrice, riskReward: rr,
+        candleLow, swingLow
+      };
+    }
+  }
+
+  // 2. 공격형 조건
+  const aggressiveEmaStack = ema50Last > ema200Last;
+  const aggressivePriceAbove = currentPrice > ema50Last && currentPrice > ema200Last;
+  const stochReversal = k > prevK && k > 20;
+  const rsiBullish = rsi > 50 || (rsi > prevK && prevK < 50); // Simplified RSI cross/up
+  const volSpike = volRatio > 1.0;
+
+  if (aggressiveEmaStack && aggressivePriceAbove && stochReversal && rsiBullish && volSpike) {
+    const stopPrice = Math.min(candleLow, swingLow) * 0.998;
+    const risk = currentPrice - stopPrice;
+    if (risk > 0) {
+      const targetPrice = currentPrice + risk * 2.0;
+      const rr = 2.0;
+      return {
+        ok: true,
+        mode: "aggressive",
+        reason: "aggressive_trend_volume_spike",
+        ema50: ema50Last, ema200: ema200Last, rsi, stochK: k, stochD: d,
+        volumeRatio: volRatio,
+        stopPrice, targetPrice, riskReward: rr,
+        candleLow, swingLow
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    mode: "none",
+    reason: "setup_conditions_not_met",
+    ema50: ema50Last,
+    ema200: ema200Last,
+    rsi,
+    stochK: k,
+    stochD: d,
+    volumeRatio: volRatio,
+  };
+}
+
 function minutesSince(ts: string) {
   return Math.max(0, (Date.now() - Date.parse(ts)) / 60_000);
 }
@@ -654,7 +891,7 @@ function classifyEntryQuality(params: {
 function computeTargetPositionBudget(params: {
   strategyUsableKrw: number;
   regime: "strong" | "neutral" | "weak";
-  candidates: Array<{ market: string; tier: EntryQualityTier; score: number }>;
+  candidates: CandidateMeta[];
 }): {
   deployableKrw: number;
   deployableAfterBufferKrw: number;
@@ -666,12 +903,23 @@ function computeTargetPositionBudget(params: {
   const targetRatioByTier: Record<EntryQualityTier, number> = { A: 0.4, B: 0.28, C: 0.18 };
   const capRatioByTier: Record<EntryQualityTier, number> = { A: 0.45, B: 0.3, C: 0.2 };
   const sorted = [...params.candidates].sort((a, b) => b.score - a.score);
-  const wanted = sorted.map((c) => ({
-    market: c.market,
-    tier: c.tier,
-    target: Math.floor(deployableAfterBufferKrw * targetRatioByTier[c.tier]),
-    cap: Math.floor(deployableAfterBufferKrw * capRatioByTier[c.tier]),
-  }));
+  const wanted = sorted.map((c) => {
+    const baseTarget = Math.floor(deployableAfterBufferKrw * targetRatioByTier[c.tier]);
+    const baseCap = Math.floor(deployableAfterBufferKrw * capRatioByTier[c.tier]);
+    // 원형 셋업 퀄리티에 따른 보너스/페널티 배율
+    let setupMultiplier = 1.0;
+    if (c.setupMode === "safe") setupMultiplier = 1.5;
+    else if (c.setupMode === "aggressive") setupMultiplier = 1.25;
+    
+    if (c.riskReward && c.riskReward < 1.4) setupMultiplier *= 0.7;
+
+    return {
+      market: c.market,
+      tier: c.tier,
+      target: Math.floor(baseTarget * setupMultiplier),
+      cap: Math.floor(baseCap * setupMultiplier),
+    };
+  });
   const totalWanted = wanted.reduce((acc, x) => acc + x.target, 0);
   const scale = totalWanted > deployableAfterBufferKrw && totalWanted > 0 ? deployableAfterBufferKrw / totalWanted : 1;
   const bySymbol = new Map<string, number>();
@@ -1652,6 +1900,22 @@ export function createLiveDataStrategy(opts: {
       p.max_pnl_pct = Math.max(p.max_pnl_pct, pnlGross);
       p.min_pnl_pct = Math.min(Number(p.min_pnl_pct ?? 0), pnlGross);
       p.current_net_pnl_pct = pnlGross;
+
+      let reasonExit = "";
+      let stopTriggerKind: StopTriggerKind | null = null;
+      let ratio = 1;
+      let exitAuthorityClass: ExitAuthorityDecision["authorityClass"] = "none";
+      let exitReasonDetail = "legacy_flow";
+
+      // [ORIGINAL SETUP] Primary Exit Authority Enforcement
+      if (p.entry_stop_price && now <= p.entry_stop_price) {
+        reasonExit = "original_setup_stop_loss";
+        stopTriggerKind = "price_stop";
+      } else if (p.entry_target_price && now >= p.entry_target_price) {
+        reasonExit = "original_setup_target_tp";
+        stopTriggerKind = "price_stop";
+      }
+
       if (now > p.highest_price_after_entry) {
         p.highest_price_after_entry = now;
         state.trades.push({
@@ -1683,11 +1947,6 @@ export function createLiveDataStrategy(opts: {
         });
       }
       const holdMin = minutesSince(p.entry_ts);
-      let reasonExit = "";
-      let stopTriggerKind: StopTriggerKind | null = null;
-      let ratio = 1;
-      let exitAuthorityClass: ExitAuthorityDecision["authorityClass"] = "none";
-      let exitReasonDetail = "legacy_flow";
       const weakModeTighterStop = (state.regime?.btc_filter_state ?? "neutral") === "weak" ? LIVE_BTC_WEAK_TIGHT_STOP_PCT : null;
       if (weakModeTighterStop !== null && pnlGross <= weakModeTighterStop) {
         reasonExit = "weak_market_price_stop";
@@ -2551,9 +2810,20 @@ export function createLiveDataStrategy(opts: {
       .map(async (m) => {
         const s = latestAllSignals.get(m);
         if (!s?.p) return null;
+        const currentPx = priceBy.get(m) ?? 0;
+        if (!(currentPx > 0)) return null;
+
+        // [ORIGINAL SETUP] Primary Gate Enforcement
+        const candles1 = await fetchMinuteCandlesCached(m, 1, 250);
+        const setup = evaluateOriginalSpotScalpingSetup(m, candles1, currentPx);
+        if (!setup.ok) {
+          console.info(JSON.stringify({ tag: "DEBUG_ORIGINAL_SPOT_SETUP_BLOCK", market: m, reason: setup.reason }));
+          return null;
+        }
+        console.info(JSON.stringify({ tag: "DEBUG_ORIGINAL_SPOT_SETUP_PASS", market: m, mode: setup.mode, rr: setup.riskReward }));
+
         const gate = opts.marketState.entryGate(s.p, marketState);
         const score = Number(gate.score ?? 0);
-        const currentPx = priceBy.get(m) ?? 0;
         
         // Calculate diagnostics for quality classification
         const sTs = s.ts ?? null;
@@ -2562,8 +2832,7 @@ export function createLiveDataStrategy(opts: {
         let lHigh: number | null = null;
         let distHighPct: number | null = null;
         try {
-          const c1 = await fetchMinuteCandlesCached(m, 1, 12);
-          const highs = c1.map((x) => Number(x.high_price ?? 0)).filter((n) => n > 0);
+          const highs = candles1.slice(-12).map((x) => Number(x.high_price ?? 0)).filter((n) => n > 0);
           if (highs.length > 0) lHigh = Math.max(...highs);
           if (lHigh && currentPx > 0) distHighPct = ((lHigh - currentPx) / lHigh) * 100;
         } catch {}
@@ -2576,9 +2845,28 @@ export function createLiveDataStrategy(opts: {
           volumeRatio: Number(s.p.volume_ratio ?? 0),
           btcTier,
         });
-        return { market: m, score, tier: eq.tier };
-      })))
-      .filter((x): x is { market: string; score: number; tier: EntryQualityTier } => Boolean(x));
+
+        // Attach setup results to signal payload so finalEntryAuthorization can store them
+        (s.p as any).original_setup_mode = setup.mode;
+        (s.p as any).original_setup_reason = setup.reason;
+        (s.p as any).entry_stop_price = setup.stopPrice;
+        (s.p as any).entry_target_price = setup.targetPrice;
+        (s.p as any).entry_risk_reward = setup.riskReward;
+        (s.p as any).entry_candle_low = setup.candleLow;
+        (s.p as any).previous_swing_low = setup.swingLow;
+
+        const riskReward = Number(setup.riskReward ?? 0);
+        if (!(riskReward > 0)) return null;
+
+        return {
+          market: m,
+          score,
+          tier: eq.tier,
+          setupMode: setup.mode,
+          riskReward,
+        };
+      }))
+    ).filter((x): x is CandidateMeta => x !== null);
     const capPlan = computeTargetPositionBudget({
       strategyUsableKrw: strategyUsableKrwForAlloc,
       regime: btcTier,
