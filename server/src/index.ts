@@ -448,7 +448,7 @@ async function main() {
     8_000,
     Math.max(1200, Number(process.env.ORBITALPHA_SESSION_LIGHT_STATUS_TIMEOUT_MS ?? 2500)),
   );
-  let lastGoodSessionLightStatus: Awaited<ReturnType<typeof trade.statusLightweight>> | null = null;
+  let lastGoodSessionLightStatus: { value: Awaited<ReturnType<typeof trade.statusLightweight>>; atMs: number } | null = null;
 
   const buildAuthSessionPayload = async (req: FastifyRequest) => {
     const s = getSession(req.headers.cookie);
@@ -473,6 +473,7 @@ async function main() {
     );
     const ss = strategy.status() as { safety_guard_state?: string };
     let st: Awaited<ReturnType<typeof trade.statusLightweight>>;
+    const startedAtMs = Date.now();
     try {
       st = (await Promise.race([
         trade.statusLightweight(),
@@ -480,8 +481,26 @@ async function main() {
           setTimeout(() => rej(new Error("SESSION_LIGHT_STATUS_TIMEOUT")), SESSION_LIGHT_STATUS_TIMEOUT_MS),
         ),
       ])) as Awaited<ReturnType<typeof trade.statusLightweight>>;
-      lastGoodSessionLightStatus = st;
+      lastGoodSessionLightStatus = { value: st, atMs: Date.now() };
+      req.log.info(
+        {
+          route: "session",
+          authenticated: true,
+          trade_status_available: true,
+          auto_trade_enabled: st.auto_trade_enabled,
+          live_enabled: st.live_enabled,
+          api_connected: st.api_connected,
+          recovery_ready: st.recovery_ready === true,
+          ms: Date.now() - startedAtMs,
+          user_id: s.user_id,
+        },
+        "DEBUG_SESSION_TRADE_STATUS_OK",
+      );
     } catch {
+      const fallback = lastGoodSessionLightStatus;
+      const fallbackUsed = fallback != null;
+      const fallbackAgeMs = fallback ? Math.max(0, Date.now() - fallback.atMs) : null;
+      const fallbackValue = fallback?.value ?? null;
       req.log.warn(
         {
           route: "session",
@@ -500,17 +519,18 @@ async function main() {
         },
         "session_light_status_timeout_or_error",
       );
-      const fallback = lastGoodSessionLightStatus;
       const degraded = {
         authenticated: true,
         user_id: s.user_id,
         trade_status_available: false,
         trade_status_error: "timeout" as const,
-        auto_trade_enabled: fallback?.auto_trade_enabled ?? false,
-        auto_trade_changed_at: fallback?.auto_trade_changed_at ?? null,
-        live_enabled: fallback?.live_enabled ?? false,
-        api_connected: fallback?.api_connected ?? false,
-        recovery_ready: fallback?.recovery_ready === true ? true : false,
+        trade_status_fallback_used: fallbackUsed,
+        trade_status_fallback_age_ms: fallbackAgeMs,
+        auto_trade_enabled: fallbackValue?.auto_trade_enabled ?? false,
+        auto_trade_changed_at: fallbackValue?.auto_trade_changed_at ?? null,
+        live_enabled: fallbackValue?.live_enabled ?? false,
+        api_connected: fallbackValue?.api_connected ?? false,
+        recovery_ready: fallbackValue?.recovery_ready === true ? true : false,
         safety_guard_state: (ss.safety_guard_state ?? "주의") as "정상" | "주의" | "자동정지",
         can_enable_auto_trade: false,
         cannot_enable_reason: "trade_status_timeout" as const,
@@ -524,6 +544,12 @@ async function main() {
           reason: "trade_status_timeout",
           user_id: s.user_id,
           ms: SESSION_LIGHT_STATUS_TIMEOUT_MS,
+          fallback_used: fallbackUsed,
+          fallback_age_ms: fallbackAgeMs,
+          fallback_auto_trade_enabled: fallbackValue?.auto_trade_enabled ?? null,
+          fallback_live_enabled: fallbackValue?.live_enabled ?? null,
+          fallback_api_connected: fallbackValue?.api_connected ?? null,
+          fallback_recovery_ready: fallbackValue?.recovery_ready ?? null,
         },
         "DEBUG_AUTH_SESSION_RESPONSE_DEGRADED",
       );
@@ -544,6 +570,8 @@ async function main() {
       user_id: s.user_id,
       trade_status_available: true,
       trade_status_error: null,
+      trade_status_fallback_used: false,
+      trade_status_fallback_age_ms: null,
       auto_trade_enabled: st.auto_trade_enabled,
       auto_trade_changed_at: st.auto_trade_changed_at,
       live_enabled: st.live_enabled,
