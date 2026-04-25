@@ -284,16 +284,44 @@ type CandidateMeta = {
 type PaperSurgePatternStats = {
   profile_key: string;
   sample_count: number;
+  profit_count?: number;
   win_count: number;
   loss_count: number;
+  fast_profit_count?: number;
+  target_tp_count?: number;
+  partial_tp_count?: number;
+  runner_profit_count?: number;
+  volume_hold_profit_count?: number;
+  clean_candle_profit_count?: number;
+  profile_unknown_profit_count?: number;
+  early_entry_profit_count?: number;
+  avg_profit_pnl_pct?: number;
+  avg_profit_holding_minutes?: number;
+  stop_loss_count?: number;
+  surge_stop_loss_count?: number;
+  timeout_loss_count?: number;
+  failed_spike_count?: number;
+  volume_fade_loss_count?: number;
+  high_rejected_loss_count?: number;
+  profile_unknown_loss_count?: number;
+  early_entry_loss_count?: number;
+  chase_loss_count?: number;
+  avg_loss_pnl_pct?: number;
+  avg_loss_holding_minutes?: number;
   win_rate: number;
   avg_pnl_pct: number;
   avg_3m_pnl_pct?: number;
   avg_5m_pnl_pct?: number;
   fast_profit_rate?: number;
+  target_tp_rate?: number;
+  surge_stop_loss_rate?: number;
+  timeout_loss_rate?: number;
   failed_spike_rate?: number;
   volume_fade_loss_rate?: number;
   high_rejected_loss_rate?: number;
+  profile_unknown_loss_rate?: number;
+  early_entry_loss_rate?: number;
+  chase_loss_rate?: number;
   suggested_size_multiplier: number;
   suggested_entry_speed?: "fast" | "normal" | "slow" | "avoid";
   confidence: "low" | "medium" | "high";
@@ -3070,41 +3098,106 @@ export function createLiveDataStrategy(opts: {
         const stats = paperStatsMap[profileKey];
 
         let paperMultiplier = 1.0;
-        let riskTagMultiplier = 1.0;
+        let experienceBonusMultiplier = 1.0;
+        let experiencePenaltyMultiplier = 1.0;
         let paperConfidence: "low" | "medium" | "high" = "low";
+        let experienceBlockReason: string | null = null;
         if (stats) {
           paperConfidence = stats.confidence;
           if (stats.confidence === "low") paperMultiplier = 1.0;
           else if (stats.confidence === "medium" && stats.avg_pnl_pct > 0) paperMultiplier = 1.2;
           else if (stats.confidence === "high" && stats.win_rate > 0.6) paperMultiplier = 1.5;
 
-          if ((stats.failed_spike_rate ?? 0) > 0.3) riskTagMultiplier *= 0.7;
-          if ((stats.volume_fade_loss_rate ?? 0) > 0.3) riskTagMultiplier *= 0.6;
-          if ((stats.high_rejected_loss_rate ?? 0) > 0.3) riskTagMultiplier *= 0.6;
+          if ((stats.fast_profit_rate ?? 0) >= 0.35) experienceBonusMultiplier *= 1.1;
+          if ((stats.target_tp_rate ?? 0) >= 0.25) experienceBonusMultiplier *= 1.1;
+          if ((stats.avg_profit_pnl_pct ?? 0) > 0) experienceBonusMultiplier *= 1.08;
+          if ((stats.volume_hold_profit_count ?? 0) >= 3) experienceBonusMultiplier *= 1.08;
+          if ((stats.clean_candle_profit_count ?? 0) >= 3) experienceBonusMultiplier *= 1.05;
+
+          if ((stats.surge_stop_loss_rate ?? 0) > 0.35) experiencePenaltyMultiplier *= 0.55;
+          if ((stats.profile_unknown_loss_rate ?? 0) > 0.35) experiencePenaltyMultiplier *= 0.55;
+          if ((stats.early_entry_loss_rate ?? 0) > 0.3) experiencePenaltyMultiplier *= 0.7;
+          if ((stats.volume_fade_loss_rate ?? 0) > 0.3) experiencePenaltyMultiplier *= 0.6;
+          if ((stats.high_rejected_loss_rate ?? 0) > 0.3) experiencePenaltyMultiplier *= 0.6;
+          if ((stats.chase_loss_rate ?? 0) > 0.3) experiencePenaltyMultiplier *= 0.65;
+          if ((stats.avg_loss_pnl_pct ?? 0) < -1.0) experiencePenaltyMultiplier *= 0.8;
+
+          if ((stats.sample_count ?? 0) >= 10 && (stats.avg_pnl_pct ?? 0) < 0) {
+            experienceBlockReason = "negative_expectancy_with_enough_samples";
+          } else if ((stats.surge_stop_loss_rate ?? 0) > 0.45) {
+            experienceBlockReason = "surge_stop_loss_rate_too_high";
+          } else if ((stats.profile_unknown_loss_rate ?? 0) > 0.45) {
+            experienceBlockReason = "profile_unknown_loss_rate_too_high";
+          } else if ((stats.volume_fade_loss_rate ?? 0) > 0.35 && (stats.high_rejected_loss_rate ?? 0) > 0.35) {
+            experienceBlockReason = "volume_fade_and_high_rejected_loss_rates_high";
+          } else if ((stats.early_entry_loss_rate ?? 0) > 0.35 && (stats.fast_profit_rate ?? 0) < 0.1) {
+            experienceBlockReason = "early_entry_loss_high_fast_profit_low";
+          }
         }
-        meta.paper_pattern_multiplier = paperMultiplier;
-        meta.risk_tag_multiplier = riskTagMultiplier;
+        const profileUnknown = profileKey.includes("early:0") && paperConfidence === "low";
+        if (profileUnknown && !stats) experiencePenaltyMultiplier *= 0.5;
+        if (profileUnknown && (stats?.profile_unknown_loss_rate ?? 0) > 0.35) {
+          experienceBlockReason = "profile_unknown_with_loss_experience";
+        }
+        if (profileUnknown && (stats?.profile_unknown_profit_count ?? 0) > 0 && (stats?.sample_count ?? 0) >= 6) {
+          experienceBonusMultiplier *= 1.02;
+        }
+
+        const finalMultiplier = paperMultiplier * experienceBonusMultiplier * experiencePenaltyMultiplier;
+        meta.paper_pattern_multiplier = paperMultiplier * experienceBonusMultiplier;
+        meta.risk_tag_multiplier = experiencePenaltyMultiplier;
 
         console.info(JSON.stringify({
-          tag: "DEBUG_LIVE_PAPER_PATTERN_REFERENCE",
+          tag: "DEBUG_LIVE_EXPERIENCE_REFERENCE",
           ts: new Date().toISOString(),
           market,
-          paperProfileKey: profileKey,
+          profile_key: profileKey,
           paperStatsFound: Boolean(stats),
           paperStatsSource: stats ? "entry_profile_key" : "missing",
-          paperConfidence,
-          paperPatternMultiplier: paperMultiplier,
-          riskTagMultiplier,
-          winRate: stats?.win_rate,
-          avgPnlPct: stats?.avg_pnl_pct,
+          sample_count: stats?.sample_count ?? 0,
+          win_rate: stats?.win_rate ?? 0,
+          avg_pnl_pct: stats?.avg_pnl_pct ?? 0,
+          fast_profit_rate: stats?.fast_profit_rate ?? 0,
+          surge_stop_loss_rate: stats?.surge_stop_loss_rate ?? 0,
+          profile_unknown_loss_rate: stats?.profile_unknown_loss_rate ?? 0,
+          early_entry_loss_rate: stats?.early_entry_loss_rate ?? 0,
+          volume_fade_loss_rate: stats?.volume_fade_loss_rate ?? 0,
+          high_rejected_loss_rate: stats?.high_rejected_loss_rate ?? 0,
+          experience_bonus_multiplier: experienceBonusMultiplier,
+          experience_penalty_multiplier: experiencePenaltyMultiplier,
+          final_multiplier: finalMultiplier,
+          block_reason: experienceBlockReason,
         }));
+        if (experienceBlockReason) {
+          console.info(JSON.stringify({
+            tag: "DEBUG_LIVE_EXPERIENCE_BLOCK",
+            ts: new Date().toISOString(),
+            market,
+            profile_key: profileKey,
+            sample_count: stats?.sample_count ?? 0,
+            win_rate: stats?.win_rate ?? 0,
+            avg_pnl_pct: stats?.avg_pnl_pct ?? 0,
+            fast_profit_rate: stats?.fast_profit_rate ?? 0,
+            surge_stop_loss_rate: stats?.surge_stop_loss_rate ?? 0,
+            profile_unknown_loss_rate: stats?.profile_unknown_loss_rate ?? 0,
+            early_entry_loss_rate: stats?.early_entry_loss_rate ?? 0,
+            volume_fade_loss_rate: stats?.volume_fade_loss_rate ?? 0,
+            high_rejected_loss_rate: stats?.high_rejected_loss_rate ?? 0,
+            experience_bonus_multiplier: experienceBonusMultiplier,
+            experience_penalty_multiplier: experiencePenaltyMultiplier,
+            final_multiplier: finalMultiplier,
+            block_reason: experienceBlockReason,
+          }));
+          perPositionBudgetBySymbol.set(market, 0);
+          continue;
+        }
 
         const baseBudgetKrw = perPositionBudgetBySymbol.get(market) ?? 0;
         const surgeMinOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(surgeCapitalLimitKrw * SURGE_MIN_ORDER_RATIO));
         const surgeNormalOrderKrw = Math.floor(surgeCapitalLimitKrw * SURGE_NORMAL_ORDER_RATIO);
         const surgeHighConfidenceOrderKrw = Math.floor(surgeCapitalLimitKrw * SURGE_HIGH_CONFIDENCE_ORDER_RATIO);
 
-        let finalOrderKrw = Math.floor(baseBudgetKrw * paperMultiplier * riskTagMultiplier);
+        let finalOrderKrw = Math.floor(baseBudgetKrw * finalMultiplier);
         const highConfidenceSurgeSetup = paperConfidence === "high" && (stats?.win_rate ?? 0) >= 0.55;
         if (highConfidenceSurgeSetup) {
           finalOrderKrw = Math.max(finalOrderKrw, surgeHighConfidenceOrderKrw);
@@ -3144,17 +3237,29 @@ export function createLiveDataStrategy(opts: {
         }
 
         console.info(JSON.stringify({
-          tag: "DEBUG_LIVE_SURGE_ORDER_SIZE_DECISION",
+          tag: "DEBUG_LIVE_EXPERIENCE_SIZE_ADJUST",
           ts: new Date().toISOString(),
           market,
+          profile_key: profileKey,
+          sample_count: stats?.sample_count ?? 0,
+          win_rate: stats?.win_rate ?? 0,
+          avg_pnl_pct: stats?.avg_pnl_pct ?? 0,
+          fast_profit_rate: stats?.fast_profit_rate ?? 0,
+          surge_stop_loss_rate: stats?.surge_stop_loss_rate ?? 0,
+          profile_unknown_loss_rate: stats?.profile_unknown_loss_rate ?? 0,
+          early_entry_loss_rate: stats?.early_entry_loss_rate ?? 0,
+          volume_fade_loss_rate: stats?.volume_fade_loss_rate ?? 0,
+          high_rejected_loss_rate: stats?.high_rejected_loss_rate ?? 0,
           baseBudgetKrw,
           surgeMinOrderKrw,
           surgeNormalOrderKrw,
           surgeHighConfidenceOrderKrw,
-          paperPatternMultiplier: paperMultiplier,
-          riskTagMultiplier,
+          experience_bonus_multiplier: experienceBonusMultiplier,
+          experience_penalty_multiplier: experiencePenaltyMultiplier,
+          final_multiplier: finalMultiplier,
           finalOrderKrw,
           surgeCapitalRemainingKrw: surgeRemainingForTickKrw,
+          block_reason: experienceBlockReason,
         }));
 
         perPositionBudgetBySymbol.set(market, finalOrderKrw);

@@ -9,16 +9,44 @@ type PaperStateValue = "SIGNAL" | "OPEN" | "PARTIAL_EXIT" | "CLOSED_WIN" | "CLOS
 type PaperSurgePatternStats = {
   profile_key: string;
   sample_count: number;
+  profit_count: number;
   win_count: number;
   loss_count: number;
+  fast_profit_count: number;
+  target_tp_count: number;
+  partial_tp_count: number;
+  runner_profit_count: number;
+  volume_hold_profit_count: number;
+  clean_candle_profit_count: number;
+  profile_unknown_profit_count: number;
+  early_entry_profit_count: number;
+  avg_profit_pnl_pct: number;
+  avg_profit_holding_minutes: number;
+  stop_loss_count: number;
+  surge_stop_loss_count: number;
+  timeout_loss_count: number;
+  failed_spike_count: number;
+  volume_fade_loss_count: number;
+  high_rejected_loss_count: number;
+  profile_unknown_loss_count: number;
+  early_entry_loss_count: number;
+  chase_loss_count: number;
+  avg_loss_pnl_pct: number;
+  avg_loss_holding_minutes: number;
   win_rate: number;
   avg_pnl_pct: number;
   avg_3m_pnl_pct: number;
   avg_5m_pnl_pct: number;
   fast_profit_rate: number;
+  target_tp_rate: number;
+  surge_stop_loss_rate: number;
+  timeout_loss_rate: number;
   failed_spike_rate: number;
   volume_fade_loss_rate: number;
   high_rejected_loss_rate: number;
+  profile_unknown_loss_rate: number;
+  early_entry_loss_rate: number;
+  chase_loss_rate: number;
   suggested_size_multiplier: number;
   suggested_entry_speed: "fast" | "normal" | "slow" | "avoid";
   confidence: "low" | "medium" | "high";
@@ -610,29 +638,113 @@ export function createPaperTradingEngine(opts: {
   const createEmptySurgePatternStat = (profileKey: string): PaperSurgePatternStats => ({
     profile_key: profileKey,
     sample_count: 0,
+    profit_count: 0,
     win_count: 0,
     loss_count: 0,
+    fast_profit_count: 0,
+    target_tp_count: 0,
+    partial_tp_count: 0,
+    runner_profit_count: 0,
+    volume_hold_profit_count: 0,
+    clean_candle_profit_count: 0,
+    profile_unknown_profit_count: 0,
+    early_entry_profit_count: 0,
+    avg_profit_pnl_pct: 0,
+    avg_profit_holding_minutes: 0,
+    stop_loss_count: 0,
+    surge_stop_loss_count: 0,
+    timeout_loss_count: 0,
+    failed_spike_count: 0,
+    volume_fade_loss_count: 0,
+    high_rejected_loss_count: 0,
+    profile_unknown_loss_count: 0,
+    early_entry_loss_count: 0,
+    chase_loss_count: 0,
+    avg_loss_pnl_pct: 0,
+    avg_loss_holding_minutes: 0,
     win_rate: 0,
     avg_pnl_pct: 0,
     avg_3m_pnl_pct: 0,
     avg_5m_pnl_pct: 0,
     fast_profit_rate: 0,
+    target_tp_rate: 0,
+    surge_stop_loss_rate: 0,
+    timeout_loss_rate: 0,
     failed_spike_rate: 0,
     volume_fade_loss_rate: 0,
     high_rejected_loss_rate: 0,
+    profile_unknown_loss_rate: 0,
+    early_entry_loss_rate: 0,
+    chase_loss_rate: 0,
     suggested_size_multiplier: 1.0,
     suggested_entry_speed: "normal",
     confidence: "low",
     updated_at: new Date().toISOString(),
   });
 
-  const finalizeSurgePatternStat = (s: PaperSurgePatternStats, marker: { fastWins: number; failedSpike: number; volumeFade: number; highRejected: number }) => {
+  const classifyExperience = (row: {
+    state: PaperStateValue;
+    note: string;
+    profile_reason?: string;
+    profile_reference_reason?: string;
+    paper_risk_tags?: string[];
+    holding_minutes?: number;
+    pnl_pct?: number | null;
+  }) => {
+    const note = String(row.note ?? "").toLowerCase();
+    const profileReason = String(row.profile_reason ?? row.profile_reference_reason ?? "").toLowerCase();
+    const tags = Array.isArray(row.paper_risk_tags) ? row.paper_risk_tags.map((x) => String(x).toLowerCase()) : [];
+    const isProfit = row.state === "CLOSED_WIN";
+    const isLoss = row.state === "CLOSED_LOSS";
+    const isTimeout = row.state === "CLOSED_TIMEOUT";
+    const fastProfit = isProfit && ((row.holding_minutes ?? 999) <= 8 || note.includes("partial_take_profit") || note.includes("target_tp"));
+    const targetTp = isProfit && (note.includes("target_tp") || note.includes("tp"));
+    const partialTp = isProfit && note.includes("partial_take_profit");
+    const runnerProfit = isProfit && note.includes("runner_trailing_exit");
+    const volumeHoldProfit = isProfit && (note.includes("volume_hold") || !tags.includes("volume_fade"));
+    const cleanCandleProfit = isProfit && (note.includes("clean_candle") || (!tags.includes("high_rejected") && !tags.includes("failed_spike")));
+    const profileUnknown = profileReason.includes("profile_unknown_fallback_allow") || tags.includes("profile_unknown");
+    const earlyEntry = note.includes("paper_early_entry") || tags.includes("early_entry");
+    const surgeStopLoss = isLoss && note.includes("surge_stop_loss");
+    const stopLoss = isLoss && (note.includes("stop_loss") || note.includes("hard_stop_loss"));
+    const volumeFadeLoss = isLoss && (note.includes("volume_fade") || tags.includes("volume_fade") || tags.includes("volume_fade_rejected"));
+    const highRejectedLoss = isLoss && (note.includes("high_rejected") || tags.includes("high_rejected") || tags.includes("윗꼬리"));
+    const failedSpikeLoss = isLoss && (note.includes("failed_spike") || tags.includes("failed_spike") || surgeStopLoss);
+    const chaseLoss = isLoss && (note.includes("near_high") || note.includes("chase") || tags.includes("near_high") || tags.includes("chase"));
+    return {
+      isProfit,
+      isLoss,
+      isTimeout,
+      fastProfit,
+      targetTp,
+      partialTp,
+      runnerProfit,
+      volumeHoldProfit,
+      cleanCandleProfit,
+      profileUnknown,
+      earlyEntry,
+      surgeStopLoss,
+      stopLoss,
+      failedSpikeLoss,
+      volumeFadeLoss,
+      highRejectedLoss,
+      chaseLoss,
+    };
+  };
+
+  const finalizeSurgePatternStat = (s: PaperSurgePatternStats) => {
     const sample = Math.max(1, s.sample_count);
     s.win_rate = s.win_count / sample;
-    s.fast_profit_rate = marker.fastWins / sample;
-    s.failed_spike_rate = marker.failedSpike / sample;
-    s.volume_fade_loss_rate = marker.volumeFade / sample;
-    s.high_rejected_loss_rate = marker.highRejected / sample;
+    s.fast_profit_rate = s.fast_profit_count / sample;
+    s.target_tp_rate = s.target_tp_count / sample;
+    s.surge_stop_loss_rate = s.surge_stop_loss_count / sample;
+    s.timeout_loss_rate = s.timeout_loss_count / sample;
+    s.failed_spike_rate = s.failed_spike_count / sample;
+    s.volume_fade_loss_rate = s.volume_fade_loss_count / sample;
+    s.high_rejected_loss_rate = s.high_rejected_loss_count / sample;
+    s.profile_unknown_loss_rate = s.profile_unknown_loss_count / sample;
+    s.early_entry_loss_rate = s.early_entry_loss_count / sample;
+    s.chase_loss_rate = s.chase_loss_count / sample;
     s.avg_3m_pnl_pct = s.avg_pnl_pct;
     s.avg_5m_pnl_pct = s.avg_pnl_pct;
     if (s.sample_count >= 12 && s.win_rate >= 0.58 && s.avg_pnl_pct > 0.15) s.confidence = "high";
@@ -648,14 +760,12 @@ export function createPaperTradingEngine(opts: {
     fineProfileStats: Record<string, EntryProfileStats>,
   ): Record<string, PaperSurgePatternStats> => {
     const byKey = new Map<string, PaperSurgePatternStats>();
-    const markerByKey = new Map<string, { fastWins: number; failedSpike: number; volumeFade: number; highRejected: number }>();
 
     const ensure = (key: string) => {
       let s = byKey.get(key);
       if (!s) {
         s = createEmptySurgePatternStat(key);
         byKey.set(key, s);
-        markerByKey.set(key, { fastWins: 0, failedSpike: 0, volumeFade: 0, highRejected: 0 });
       }
       return s;
     };
@@ -664,37 +774,57 @@ export function createPaperTradingEngine(opts: {
       if (row.state !== "CLOSED_WIN" && row.state !== "CLOSED_LOSS" && row.state !== "CLOSED_TIMEOUT") continue;
       const key = row.entry_profile_key && row.entry_profile_key.trim() ? row.entry_profile_key.trim() : deriveFallbackProfileKey(row);
       const s = ensure(key);
-      const marker = markerByKey.get(key)!;
       const pnlPct = Number(row.pnl_pct ?? 0);
       const prevCount = s.sample_count;
       s.sample_count += 1;
-      if (row.state === "CLOSED_WIN") s.win_count += 1;
-      if (row.state === "CLOSED_LOSS") s.loss_count += 1;
+      const holdingMinutes = 0;
+      const c = classifyExperience({
+        state: row.state,
+        note: row.note,
+        profile_reason: row.profile_reason,
+        profile_reference_reason: row.profile_reference_reason,
+        paper_risk_tags: row.paper_risk_tags,
+        pnl_pct: row.pnl_pct,
+        holding_minutes: holdingMinutes,
+      });
+      if (c.isProfit) {
+        s.profit_count += 1;
+        s.win_count += 1;
+        s.avg_profit_pnl_pct = (s.avg_profit_pnl_pct * Math.max(0, s.profit_count - 1) + pnlPct) / Math.max(1, s.profit_count);
+        s.avg_profit_holding_minutes =
+          (s.avg_profit_holding_minutes * Math.max(0, s.profit_count - 1) + holdingMinutes) / Math.max(1, s.profit_count);
+      }
+      if (c.isLoss) {
+        s.loss_count += 1;
+        s.avg_loss_pnl_pct = (s.avg_loss_pnl_pct * Math.max(0, s.loss_count - 1) + pnlPct) / Math.max(1, s.loss_count);
+        s.avg_loss_holding_minutes =
+          (s.avg_loss_holding_minutes * Math.max(0, s.loss_count - 1) + holdingMinutes) / Math.max(1, s.loss_count);
+      }
+      if (c.isTimeout) s.timeout_loss_count += 1;
       s.avg_pnl_pct = (s.avg_pnl_pct * prevCount + pnlPct) / Math.max(1, s.sample_count);
-
-      const note = String(row.note ?? "").toLowerCase();
-      const tags = Array.isArray(row.paper_risk_tags) ? row.paper_risk_tags.map((x) => String(x).toLowerCase()) : [];
-      const profileReason = String(row.profile_reason ?? row.profile_reference_reason ?? "").toLowerCase();
-      if (row.state === "CLOSED_WIN") {
-        if (note.includes("partial_take_profit") || note.includes("target_tp") || note.includes("runner_trailing_exit")) {
-          marker.fastWins += 1;
-        }
-      }
-      if (
-        row.state === "CLOSED_LOSS" &&
-        (note.includes("surge_stop_loss") ||
-          note.includes("failed_spike") ||
-          profileReason.includes("profile_unknown_fallback_allow") ||
-          tags.includes("failed_spike"))
-      ) {
-        marker.failedSpike += 1;
-      }
-      if (row.state === "CLOSED_LOSS" && (note.includes("volume_fade") || tags.includes("volume_fade"))) {
-        marker.volumeFade += 1;
-      }
-      if (row.state === "CLOSED_LOSS" && (note.includes("high_rejected") || tags.includes("high_rejected"))) {
-        marker.highRejected += 1;
-      }
+      if (c.fastProfit) s.fast_profit_count += 1;
+      if (c.targetTp) s.target_tp_count += 1;
+      if (c.partialTp) s.partial_tp_count += 1;
+      if (c.runnerProfit) s.runner_profit_count += 1;
+      if (c.volumeHoldProfit) s.volume_hold_profit_count += 1;
+      if (c.cleanCandleProfit) s.clean_candle_profit_count += 1;
+      if (c.profileUnknown && c.isProfit) s.profile_unknown_profit_count += 1;
+      if (c.profileUnknown && c.isLoss) s.profile_unknown_loss_count += 1;
+      if (c.earlyEntry && c.isProfit) s.early_entry_profit_count += 1;
+      if (c.earlyEntry && c.isLoss) s.early_entry_loss_count += 1;
+      if (c.stopLoss) s.stop_loss_count += 1;
+      if (c.surgeStopLoss) s.surge_stop_loss_count += 1;
+      if (c.failedSpikeLoss) s.failed_spike_count += 1;
+      if (c.volumeFadeLoss) s.volume_fade_loss_count += 1;
+      if (c.highRejectedLoss) s.high_rejected_loss_count += 1;
+      if (c.chaseLoss) s.chase_loss_count += 1;
+      emitPaper("DEBUG_PAPER_EXPERIENCE_CLASSIFIED", {
+        market: row.market,
+        profile_key: key,
+        state: row.state,
+        pnl_pct: pnlPct,
+        note: row.note,
+      });
     }
 
     for (const [key, pStats] of Object.entries(fineProfileStats)) {
@@ -703,27 +833,35 @@ export function createPaperTradingEngine(opts: {
       seeded.sample_count = Math.max(0, Math.floor(Number(pStats.total_trades ?? 0)));
       seeded.win_count = Math.max(0, Math.floor(Number(pStats.wins ?? 0)));
       seeded.loss_count = Math.max(0, Math.floor(Number(pStats.losses ?? 0)));
+      seeded.profit_count = seeded.win_count;
       seeded.avg_pnl_pct = Number(pStats.avg_pnl_pct ?? 0);
       byKey.set(key, seeded);
-      markerByKey.set(key, { fastWins: 0, failedSpike: 0, volumeFade: 0, highRejected: 0 });
     }
 
     for (const [key, stat] of byKey.entries()) {
-      finalizeSurgePatternStat(stat, markerByKey.get(key)!);
+      finalizeSurgePatternStat(stat);
     }
 
-    let winCountTotal = 0;
-    let lossCountTotal = 0;
+    let totalProfitCount = 0;
+    let totalLossCount = 0;
+    let totalSurgeStopLossCount = 0;
+    let totalProfileUnknownLossCount = 0;
+    let totalEarlyEntryLossCount = 0;
     for (const s of byKey.values()) {
-      winCountTotal += s.win_count;
-      lossCountTotal += s.loss_count;
+      totalProfitCount += s.profit_count;
+      totalLossCount += s.loss_count;
+      totalSurgeStopLossCount += s.surge_stop_loss_count;
+      totalProfileUnknownLossCount += s.profile_unknown_loss_count;
+      totalEarlyEntryLossCount += s.early_entry_loss_count;
     }
     emitPaper("DEBUG_PAPER_SURGE_PATTERN_STATS_BOOTSTRAP", {
       history_count: historyRows.length,
-      profile_stats_count: Object.keys(fineProfileStats).length,
       generated_stats_count: byKey.size,
-      win_count_total: winCountTotal,
-      loss_count_total: lossCountTotal,
+      total_profit_count: totalProfitCount,
+      total_loss_count: totalLossCount,
+      total_surge_stop_loss_count: totalSurgeStopLossCount,
+      total_profile_unknown_loss_count: totalProfileUnknownLossCount,
+      total_early_entry_loss_count: totalEarlyEntryLossCount,
       source: "bootstrap_from_existing_paper_history",
     });
 
@@ -737,30 +875,69 @@ export function createPaperTradingEngine(opts: {
       const s: PaperSurgePatternStats = existing ?? createEmptySurgePatternStat(key);
       const prevCount = s.sample_count;
       const pnlPct = Number.isFinite(exitPnlPct) ? exitPnlPct : 0;
+      const heldMinutes = Math.max(0, (Date.now() - Date.parse(p.entry_ts)) / 60_000);
       s.sample_count += 1;
-      if (pnlPct > 0) s.win_count += 1;
-      else if (closeState !== "CLOSED_TIMEOUT") s.loss_count += 1;
-      s.win_rate = s.sample_count > 0 ? s.win_count / s.sample_count : 0;
+      const c = classifyExperience({
+        state: closeState,
+        note: p.profile_reference_reason ?? "",
+        profile_reference_reason: p.profile_reference_reason,
+        paper_risk_tags: p.paper_risk_tags,
+        holding_minutes: heldMinutes,
+        pnl_pct: pnlPct,
+      });
+      if (c.isProfit) {
+        s.profit_count += 1;
+        s.win_count += 1;
+        s.avg_profit_pnl_pct = (s.avg_profit_pnl_pct * Math.max(0, s.profit_count - 1) + pnlPct) / Math.max(1, s.profit_count);
+        s.avg_profit_holding_minutes =
+          (s.avg_profit_holding_minutes * Math.max(0, s.profit_count - 1) + heldMinutes) / Math.max(1, s.profit_count);
+      }
+      if (c.isLoss) {
+        s.loss_count += 1;
+        s.avg_loss_pnl_pct = (s.avg_loss_pnl_pct * Math.max(0, s.loss_count - 1) + pnlPct) / Math.max(1, s.loss_count);
+        s.avg_loss_holding_minutes =
+          (s.avg_loss_holding_minutes * Math.max(0, s.loss_count - 1) + heldMinutes) / Math.max(1, s.loss_count);
+      }
+      if (c.isTimeout) s.timeout_loss_count += 1;
       s.avg_pnl_pct = (s.avg_pnl_pct * prevCount + pnlPct) / Math.max(1, s.sample_count);
       s.avg_3m_pnl_pct = s.avg_pnl_pct;
       s.avg_5m_pnl_pct = s.avg_pnl_pct;
-      const tags = Array.isArray(p.paper_risk_tags) ? p.paper_risk_tags : [];
-      const hadFailedSpike = tags.includes("failed_spike") ? 1 : 0;
-      const hadVolumeFade = tags.includes("volume_fade") ? 1 : 0;
-      const hadHighRejected = tags.includes("high_rejected") ? 1 : 0;
-      const marker = {
-        fastWins: s.fast_profit_rate * prevCount + (closeState === "CLOSED_WIN" ? 1 : 0),
-        failedSpike: s.failed_spike_rate * prevCount + hadFailedSpike,
-        volumeFade: s.volume_fade_loss_rate * prevCount + hadVolumeFade,
-        highRejected: s.high_rejected_loss_rate * prevCount + hadHighRejected,
-      };
-      finalizeSurgePatternStat(s, marker);
+      if (c.fastProfit) s.fast_profit_count += 1;
+      if (c.targetTp) s.target_tp_count += 1;
+      if (c.partialTp) s.partial_tp_count += 1;
+      if (c.runnerProfit) s.runner_profit_count += 1;
+      if (c.volumeHoldProfit) s.volume_hold_profit_count += 1;
+      if (c.cleanCandleProfit) s.clean_candle_profit_count += 1;
+      if (c.profileUnknown && c.isProfit) s.profile_unknown_profit_count += 1;
+      if (c.profileUnknown && c.isLoss) s.profile_unknown_loss_count += 1;
+      if (c.earlyEntry && c.isProfit) s.early_entry_profit_count += 1;
+      if (c.earlyEntry && c.isLoss) s.early_entry_loss_count += 1;
+      if (c.stopLoss) s.stop_loss_count += 1;
+      if (c.surgeStopLoss) s.surge_stop_loss_count += 1;
+      if (c.failedSpikeLoss) s.failed_spike_count += 1;
+      if (c.volumeFadeLoss) s.volume_fade_loss_count += 1;
+      if (c.highRejectedLoss) s.high_rejected_loss_count += 1;
+      if (c.chaseLoss) s.chase_loss_count += 1;
+      finalizeSurgePatternStat(s);
       state.surgePatternStats[key] = s;
+      emitPaper("DEBUG_PAPER_EXPERIENCE_CLASSIFIED", {
+        market: p.market,
+        profile_key: key,
+        sample_count: s.sample_count,
+        win_rate: Number(s.win_rate.toFixed(4)),
+        avg_pnl_pct: Number(s.avg_pnl_pct.toFixed(4)),
+      });
       emitPaper("DEBUG_PAPER_SURGE_PATTERN_STATS_UPDATE", {
         profile_key: key,
         sample_count: s.sample_count,
         win_rate: Number(s.win_rate.toFixed(4)),
         avg_pnl_pct: Number(s.avg_pnl_pct.toFixed(4)),
+        fast_profit_rate: Number(s.fast_profit_rate.toFixed(4)),
+        surge_stop_loss_rate: Number(s.surge_stop_loss_rate.toFixed(4)),
+        profile_unknown_loss_rate: Number(s.profile_unknown_loss_rate.toFixed(4)),
+        early_entry_loss_rate: Number(s.early_entry_loss_rate.toFixed(4)),
+        volume_fade_loss_rate: Number(s.volume_fade_loss_rate.toFixed(4)),
+        high_rejected_loss_rate: Number(s.high_rejected_loss_rate.toFixed(4)),
         confidence: s.confidence,
       });
     } catch (err) {
