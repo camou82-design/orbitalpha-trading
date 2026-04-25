@@ -6,6 +6,25 @@ import { fetchMinuteCandles, fetchTickers } from "./upbit-public.js";
 
 type PaperStateValue = "SIGNAL" | "OPEN" | "PARTIAL_EXIT" | "CLOSED_WIN" | "CLOSED_LOSS" | "CLOSED_TIMEOUT" | "SKIPPED";
 
+type PaperSurgePatternStats = {
+  profile_key: string;
+  sample_count: number;
+  win_count: number;
+  loss_count: number;
+  win_rate: number;
+  avg_pnl_pct: number;
+  avg_3m_pnl_pct: number;
+  avg_5m_pnl_pct: number;
+  fast_profit_rate: number;
+  failed_spike_rate: number;
+  volume_fade_loss_rate: number;
+  high_rejected_loss_rate: number;
+  suggested_size_multiplier: number;
+  suggested_entry_speed: "fast" | "normal" | "slow" | "avoid";
+  confidence: "low" | "medium" | "high";
+  updated_at: string;
+};
+
 type PaperPosition = {
   market: string;
   entry_ts: string;
@@ -43,6 +62,10 @@ type PaperPosition = {
   stochK?: number;
   stochD?: number;
   volumeRatio?: number;
+  paper_risk_tags?: string[];
+  original_block_reasons?: string[];
+  paper_size_multiplier?: number;
+  profile_reference_reason?: string;
 };
 
 type OriginalSetupMode = "safe" | "aggressive" | "none";
@@ -116,6 +139,17 @@ type PaperTradeEvent = {
   profile_decision?: ProfileDecision;
   profile_reason?: string;
   profile_stats?: { total_trades: number; avg_pnl_pct: number; win_rate: number };
+  paper_risk_tags?: string[];
+  original_block_reasons?: string[];
+  paper_size_multiplier?: number;
+  profile_reference_reason?: string;
+  entry_score?: number;
+  signal_strength_bucket?: string;
+  volume_ratio?: number;
+  volume_ratio_1m5?: number | null;
+  near_high_bucket?: string;
+  chase_bucket?: string;
+  entry_speed_bucket?: "fast" | "normal" | "slow";
 };
 
 type PaperStateFile = {
@@ -126,6 +160,7 @@ type PaperStateFile = {
   entry_profile_stats?: Record<string, EntryProfileStats>;
   coarse_profile_stats?: Record<string, EntryProfileStats>;
   fine_profile_stats?: Record<string, EntryProfileStats>;
+  paper_surge_pattern_stats?: PaperSurgePatternStats[];
 };
 
 type LifecycleState = "idle" | "pre_entry" | "entered" | "cooldown";
@@ -471,6 +506,18 @@ function emitPaper(tag: string, payload: Record<string, unknown> = {}) {
   console.info(JSON.stringify({ kind: "paper", tag, ts: new Date().toISOString(), ...payload }));
 }
 
+const PAPER_HARD_BLOCK_REASONS = new Set<string>([
+  "PRICE_ZERO",
+  "VOLUME_ZERO",
+  "DATA_MISSING",
+  "EXTREME_LIQUIDITY_LOW",
+  "invalid_or_missing_price",
+]);
+
+function isPaperHardBlockReason(reason: string): boolean {
+  return PAPER_HARD_BLOCK_REASONS.has(reason);
+}
+
 function countPaperSlots(positions: Record<string, PaperPosition>): {
   early_open_positions: number;
   normal_open_positions: number;
@@ -519,6 +566,7 @@ export function createPaperTradingEngine(opts: {
     };
     coarseProfileStats: Record<string, EntryProfileStats>;
     fineProfileStats: Record<string, EntryProfileStats>;
+    surgePatternStats: Record<string, PaperSurgePatternStats>;
   } = {
     cashKrw: PAPER_START_KRW,
     positions: {},
@@ -534,6 +582,7 @@ export function createPaperTradingEngine(opts: {
     },
     coarseProfileStats: {},
     fineProfileStats: {},
+    surgePatternStats: {},
   };
 
   const trimHistoryAndSignals = () => {
@@ -541,6 +590,64 @@ export function createPaperTradingEngine(opts: {
     if (state.seenSignalKeys.size > PAPER_SEEN_SIGNAL_MAX) {
       const arr = Array.from(state.seenSignalKeys);
       state.seenSignalKeys = new Set(arr.slice(arr.length - PAPER_SEEN_SIGNAL_MAX));
+    }
+  };
+
+  const updatePaperSurgePatternStats = (p: PaperPosition, exitPnlPct: number, closeState: "CLOSED_WIN" | "CLOSED_LOSS" | "CLOSED_TIMEOUT") => {
+    try {
+      const key = p.entry_profile_key || "default";
+      const existing = state.surgePatternStats[key];
+      const s: PaperSurgePatternStats = existing ?? {
+        profile_key: key,
+        sample_count: 0,
+        win_count: 0,
+        loss_count: 0,
+        win_rate: 0,
+        avg_pnl_pct: 0,
+        avg_3m_pnl_pct: 0,
+        avg_5m_pnl_pct: 0,
+        fast_profit_rate: 0,
+        failed_spike_rate: 0,
+        volume_fade_loss_rate: 0,
+        high_rejected_loss_rate: 0,
+        suggested_size_multiplier: 1.0,
+        suggested_entry_speed: "normal",
+        confidence: "low",
+        updated_at: new Date().toISOString(),
+      };
+      const prevCount = s.sample_count;
+      const pnlPct = Number.isFinite(exitPnlPct) ? exitPnlPct : 0;
+      s.sample_count += 1;
+      if (pnlPct > 0) s.win_count += 1;
+      else if (closeState !== "CLOSED_TIMEOUT") s.loss_count += 1;
+      s.win_rate = s.sample_count > 0 ? s.win_count / s.sample_count : 0;
+      s.avg_pnl_pct = (s.avg_pnl_pct * prevCount + pnlPct) / Math.max(1, s.sample_count);
+      s.avg_3m_pnl_pct = s.avg_pnl_pct;
+      s.avg_5m_pnl_pct = s.avg_pnl_pct;
+      const tags = Array.isArray(p.paper_risk_tags) ? p.paper_risk_tags : [];
+      const hadFailedSpike = tags.includes("failed_spike") ? 1 : 0;
+      const hadVolumeFade = tags.includes("volume_fade") ? 1 : 0;
+      const hadHighRejected = tags.includes("high_rejected") ? 1 : 0;
+      s.failed_spike_rate = (s.failed_spike_rate * prevCount + hadFailedSpike) / Math.max(1, s.sample_count);
+      s.volume_fade_loss_rate = (s.volume_fade_loss_rate * prevCount + hadVolumeFade) / Math.max(1, s.sample_count);
+      s.high_rejected_loss_rate = (s.high_rejected_loss_rate * prevCount + hadHighRejected) / Math.max(1, s.sample_count);
+      s.fast_profit_rate = s.win_rate;
+      if (s.sample_count >= 12 && s.win_rate >= 0.58 && s.avg_pnl_pct > 0.15) s.confidence = "high";
+      else if (s.sample_count >= 6) s.confidence = "medium";
+      else s.confidence = "low";
+      s.suggested_size_multiplier = s.confidence === "high" ? 1.3 : s.confidence === "medium" ? 1.1 : 1.0;
+      s.suggested_entry_speed = s.confidence === "high" ? "fast" : s.confidence === "low" ? "slow" : "normal";
+      s.updated_at = new Date().toISOString();
+      state.surgePatternStats[key] = s;
+      emitPaper("DEBUG_PAPER_SURGE_PATTERN_STATS_UPDATE", {
+        profile_key: key,
+        sample_count: s.sample_count,
+        win_rate: Number(s.win_rate.toFixed(4)),
+        avg_pnl_pct: Number(s.avg_pnl_pct.toFixed(4)),
+        confidence: s.confidence,
+      });
+    } catch (err) {
+      console.error("Failed to update paper stats:", err);
     }
   };
 
@@ -559,6 +666,7 @@ export function createPaperTradingEngine(opts: {
       entry_profile_stats: state.fineProfileStats,
       coarse_profile_stats: state.coarseProfileStats,
       fine_profile_stats: state.fineProfileStats,
+      paper_surge_pattern_stats: Object.values(state.surgePatternStats),
     };
     await fs.writeFile(stateFile, JSON.stringify(filePayload, null, 2), "utf8");
   };
@@ -583,6 +691,12 @@ export function createPaperTradingEngine(opts: {
         raw.fine_profile_stats && typeof raw.fine_profile_stats === "object"
           ? (raw.fine_profile_stats as Record<string, EntryProfileStats>)
           : legacyFine;
+      const surgeRows = Array.isArray(raw.paper_surge_pattern_stats) ? raw.paper_surge_pattern_stats : [];
+      state.surgePatternStats = {};
+      for (const row of surgeRows) {
+        if (!row?.profile_key) continue;
+        state.surgePatternStats[row.profile_key] = row;
+      }
       trimHistoryAndSignals();
       for (const p of Object.values(state.positions)) {
         if (p.signal_strength !== "SURGE_SCANNER") continue;
@@ -623,6 +737,10 @@ export function createPaperTradingEngine(opts: {
       decision: ProfileDecision;
       reason: string;
       stats_snapshot: { total_trades: number; avg_pnl_pct: number; win_rate: number };
+      paper_risk_tags?: string[];
+      original_block_reasons?: string[];
+      paper_size_multiplier?: number;
+      profile_reference_reason?: string;
     },
   ): { ok: boolean; reason?: string } => {
     if (state.positions[market]) return { ok: false, reason: "already_open" };
@@ -669,6 +787,10 @@ export function createPaperTradingEngine(opts: {
       stochK: profile?.features?.stochK,
       stochD: profile?.features?.stochD,
       volumeRatio: profile?.features?.volumeRatio,
+      paper_risk_tags: profile?.paper_risk_tags,
+      original_block_reasons: profile?.original_block_reasons,
+      paper_size_multiplier: profile?.paper_size_multiplier,
+      profile_reference_reason: profile?.profile_reference_reason,
       ...(signalStrength === "SURGE_SCANNER" ? { surge_add_leg_done: false } : {}),
     };
     appendHistory({
@@ -687,6 +809,10 @@ export function createPaperTradingEngine(opts: {
       profile_decision: profile?.decision,
       profile_reason: profile?.reason,
       profile_stats: profile?.stats_snapshot,
+      paper_risk_tags: profile?.paper_risk_tags,
+      original_block_reasons: profile?.original_block_reasons,
+      paper_size_multiplier: profile?.paper_size_multiplier,
+      profile_reference_reason: profile?.profile_reference_reason,
     });
 
     // --- PAPER_ENTRY_SUBMITTED Log ---
@@ -813,6 +939,14 @@ export function createPaperTradingEngine(opts: {
       entry_profile_features: p.entry_profile_features,
     });
     if (ratioClamped >= 0.9999 || !state.positions[market]) {
+      updatePaperSurgePatternStats(p, pnlPct, closeState);
+      emitPaper("DEBUG_PAPER_PATTERN_RESULT", {
+        market,
+        profile_key: p.entry_profile_key ?? "default",
+        close_state: closeState,
+        pnl_pct: Number(pnlPct.toFixed(4)),
+        paper_risk_tags: p.paper_risk_tags ?? [],
+      });
       const fineKey = p.entry_profile_key;
       const coarseKey =
         p.entry_profile_features != null ? buildCoarseProfileKey(coarseFromFine(p.entry_profile_features)) : null;
@@ -1466,7 +1600,21 @@ export function createPaperTradingEngine(opts: {
         fine_profile_decision: fineDecision.decision,
         profile_stats: profileDecision.stats_snapshot,
       });
+      const sharedPaperRiskTags: string[] = [];
+      const originalBlockReasons: string[] = [];
       if (profileDecision.decision === "block") {
+        originalBlockReasons.push(profileDecision.reason);
+        if (!isPaperHardBlockReason(profileDecision.reason)) {
+          sharedPaperRiskTags.push(profileDecision.reason);
+          emitPaper("DEBUG_PAPER_RISK_TAGGED_ENTRY", {
+            market,
+            paper_risk_tags: sharedPaperRiskTags,
+            original_block_reasons: originalBlockReasons,
+            profile_reason: profileDecision.reason,
+          });
+        }
+      }
+      if (profileDecision.decision === "block" && isPaperHardBlockReason(profileDecision.reason)) {
         appendHistory({
           ts: new Date().toISOString(),
           market,
@@ -1483,6 +1631,8 @@ export function createPaperTradingEngine(opts: {
           profile_decision: "block",
           profile_reason: profileDecision.reason,
           profile_stats: profileDecision.stats_snapshot,
+          paper_risk_tags: sharedPaperRiskTags,
+          original_block_reasons: originalBlockReasons,
         });
         emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: profileDecision.reason, stage: "profile_gate", coarse_profile_key: coarseKey, fine_profile_key: fineKey });
         continue;
@@ -1549,27 +1699,18 @@ export function createPaperTradingEngine(opts: {
             stats_snapshot: earlyCoarseDecision.stats_snapshot,
           };
         }
+        // Paper Risk Tagging instead of hard block
+        const paperRiskTags: string[] = [...sharedPaperRiskTags];
         if (earlyDecision.decision === "block") {
-          appendHistory({
-            ts: new Date().toISOString(),
-            market,
-            state: "SKIPPED",
-            note: earlyDecision.reason,
-            signal_strength: sig.signal_strength,
-            entry_price: px,
-            exit_price: null,
-            qty: null,
-            pnl_krw: null,
-            pnl_pct: null,
-            entry_profile_key: earlyKey,
-            entry_profile_features: earlyFeatures,
-            profile_decision: "block",
-            profile_reason: earlyDecision.reason,
-            profile_stats: earlyDecision.stats_snapshot,
-          });
-          emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: earlyDecision.reason, stage: "profile_gate_early", coarse_profile_key: earlyCoarseKey, fine_profile_key: earlyKey });
-          continue;
+          paperRiskTags.push(earlyDecision.reason || "unknown_block");
+          // Re-evaluate: Only hard block for critical issues
+          const criticalReasons = ["PRICE_ZERO", "VOLUME_ZERO", "DATA_MISSING", "EXTREME_LIQUIDITY_LOW"];
+          if (criticalReasons.includes(earlyDecision.reason || "")) {
+            emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: earlyDecision.reason, stage: "profile_gate_early_critical" });
+            continue;
+          }
         }
+
         emitPaper("DEBUG_PAPER_ORDER_ATTEMPT", {
           market,
           order_krw: earlyAmount,
@@ -1578,7 +1719,7 @@ export function createPaperTradingEngine(opts: {
           fine_profile_key: earlyKey,
           profile_decision: earlyDecision.decision,
           profile_reason: earlyDecision.reason,
-          profile_stats: earlyDecision.stats_snapshot,
+          paper_risk_tags: paperRiskTags,
         });
         const b = paperBuy(
           market,
@@ -1593,6 +1734,10 @@ export function createPaperTradingEngine(opts: {
             decision: earlyDecision.decision,
             reason: earlyDecision.reason,
             stats_snapshot: earlyDecision.stats_snapshot,
+            paper_risk_tags: paperRiskTags,
+            original_block_reasons: originalBlockReasons,
+            paper_size_multiplier: Math.max(0.5, 1 - paperRiskTags.length * 0.15),
+            profile_reference_reason: earlyDecision.reason,
           },
         );
         if (b.ok) {
@@ -1652,6 +1797,10 @@ export function createPaperTradingEngine(opts: {
         decision: profileDecision.decision,
         reason: profileDecision.reason,
         stats_snapshot: profileDecision.stats_snapshot,
+        paper_risk_tags: sharedPaperRiskTags,
+        original_block_reasons: originalBlockReasons,
+        paper_size_multiplier: Math.max(0.5, 1 - sharedPaperRiskTags.length * 0.15),
+        profile_reference_reason: profileDecision.reason,
       });
       if (b.ok) {
         const filled = state.positions[market] as PaperPosition | undefined;
