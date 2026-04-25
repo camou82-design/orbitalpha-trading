@@ -2321,6 +2321,7 @@ export function createPaperTradingEngine(opts: {
         };
       }),
       recent_history: state.history.slice(-40).reverse(),
+      paper_surge_pattern_stats: Object.values(state.surgePatternStats),
       files: { state: stateFile },
     };
   };

@@ -384,6 +384,29 @@ type PumpScannerStatus = {
   }>;
 };
 
+type PaperSurgePatternStats = {
+  profile_key: string;
+  sample_count: number;
+  profit_count: number;
+  win_count: number;
+  loss_count: number;
+  win_rate: number;
+  fast_profit_rate: number;
+  target_tp_rate: number;
+  surge_stop_loss_rate: number;
+  volume_fade_loss_rate: number;
+  high_rejected_loss_rate: number;
+  profile_unknown_loss_rate: number;
+  early_entry_loss_rate: number;
+  chase_loss_rate: number;
+  volume_hold_profit_count: number;
+  clean_candle_profit_count: number;
+  avg_pnl_pct: number;
+  confidence: "low" | "medium" | "high";
+  suggested_size_multiplier: number;
+  updated_at: string;
+};
+
 type PaperStatus = {
   mode: string;
   updated_at: string;
@@ -432,7 +455,12 @@ type PaperStatus = {
     qty: number | null;
     pnl_krw: number | null;
     pnl_pct: number | null;
+    paper_risk_tags?: string[];
+    profile_reason?: string;
+    profile_reference_reason?: string;
+    entry_profile_key?: string;
   }>;
+  paper_surge_pattern_stats?: PaperSurgePatternStats[];
 };
 
 type PaperPanelSummary = {
@@ -453,6 +481,9 @@ type PaperPanelSummary = {
     state: string;
     note: string;
     pnlPct: number | null;
+    paperRiskTags: string[];
+    profileReason: string;
+    entryProfileKey: string;
   }>;
   maxOpenPositions: number;
   startKrw: number;
@@ -461,6 +492,7 @@ type PaperPanelSummary = {
   stopLossPct: number;
   timeoutMinutes: number;
   updatedAt: string | null;
+  experienceStats: PaperSurgePatternStats[];
 };
 
 type MarketStateStatus = {
@@ -545,6 +577,7 @@ function toPaperPanelSummary(raw: unknown): PaperPanelSummary {
   const config = (r.config && typeof r.config === "object" && r.config !== null ? r.config : {}) as Record<string, unknown>;
   const holdingsRaw = Array.isArray(r.holdings) ? r.holdings : [];
   const historyRaw = Array.isArray(r.recent_history) ? r.recent_history : [];
+  const statsRaw = Array.isArray(r.paper_surge_pattern_stats) ? r.paper_surge_pattern_stats : [];
 
   const openPositions = holdingsRaw.map((h: unknown) => {
     const o = h && typeof h === "object" ? (h as Record<string, unknown>) : {};
@@ -564,6 +597,9 @@ function toPaperPanelSummary(raw: unknown): PaperPanelSummary {
       state: typeof o.state === "string" ? o.state : "UNKNOWN",
       note: typeof o.note === "string" ? o.note : "-",
       pnlPct: o.pnl_pct == null ? null : safeNum(o.pnl_pct),
+      paperRiskTags: Array.isArray(o.paper_risk_tags) ? o.paper_risk_tags.map(String) : [],
+      profileReason: String(o.profile_reason ?? o.profile_reference_reason ?? "-"),
+      entryProfileKey: String(o.entry_profile_key ?? "-"),
     };
   });
 
@@ -582,6 +618,7 @@ function toPaperPanelSummary(raw: unknown): PaperPanelSummary {
     stopLossPct: safeNum(config.stop_loss_pct),
     timeoutMinutes: safeNum(config.timeout_minutes),
     updatedAt: typeof r.updated_at === "string" ? r.updated_at : null,
+    experienceStats: statsRaw as PaperSurgePatternStats[],
   };
 }
 
@@ -2162,6 +2199,9 @@ export default function HomePage() {
               갱신 {scanner?.updated_at ? formatTsLocal(scanner.updated_at) : "-"}
             </div>
           </div>
+          <div style={{ fontSize: "0.72rem", color: UI.mutedSoft, marginTop: -4, marginBottom: 12, lineHeight: 1.4 }}>
+            스캐너 신호는 즉시 진입이 아니라, 원형 매매법 + paper 경험치 + live 리스크 게이트를 통과해야 실거래 후보가 됩니다.
+          </div>
           {scannerItemsExcludingHeld.after.length ? (
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               <div
@@ -2238,7 +2278,7 @@ export default function HomePage() {
               })}
             </div>
           ) : (
-            <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>급등 후보 데이터 수집 중...</p>
+            <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>급등 후보 수집 및 경험치 대조 중...</p>
           )}
         </section>
 
@@ -2247,94 +2287,219 @@ export default function HomePage() {
             background: UI.cardBg,
             border: `1px solid ${UI.border}`,
             borderRadius: 12,
-            padding: "0.8rem 1rem",
+            padding: "1rem",
             marginBottom: "0.9rem",
             boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.32)",
           }}
         >
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.55rem" }}>
-            <div style={{ fontSize: "0.9rem", color: UI.title, fontWeight: 800, letterSpacing: "0.02em" }}>모의매매 (Paper)</div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "0.55rem" }}>
+            <div>
+              <div style={{ fontSize: "0.95rem", color: UI.title, fontWeight: 900, letterSpacing: "0.02em" }}>급등주 경험치 엔진 (Paper → Live 학습)</div>
+              <div style={{ fontSize: "0.72rem", color: UI.mutedSoft, marginTop: 2 }}>모의매매 결과를 원인별 경험치로 분석해 실거래 진입금액/차단 판단에 반영합니다.</div>
+            </div>
             <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>
               갱신 {paperSummary.updatedAt ? formatTsLocal(paperSummary.updatedAt) : "-"}
             </div>
           </div>
+
           {(() => {
             try {
               if (paperPanelError) {
-                return <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>모의매매 데이터를 불러오지 못했습니다</p>;
+                return <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>데이터를 불러오지 못했습니다</p>;
               }
               if (!paper) {
-                return <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>모의매매 데이터 수집 중...</p>;
+                return <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>아직 표시할 경험치 표본이 없습니다. 서버가 기존 paper history를 bootstrap하면 profile별 경험치가 표시됩니다.</p>;
               }
+
+              const stats = paperSummary.experienceStats ?? [];
+              const totalSamples = stats.reduce((acc, s) => acc + s.sample_count, 0);
+              const totalWins = stats.reduce((acc, s) => acc + s.win_count, 0);
+              const totalLosses = stats.reduce((acc, s) => acc + s.loss_count, 0);
+              const avgPnl = totalSamples > 0 ? stats.reduce((acc, s) => acc + s.avg_pnl_pct * s.sample_count, 0) / totalSamples : 0;
+
+              const totalFastProfit = stats.reduce((acc, s) => acc + s.fast_profit_rate * s.sample_count, 0);
+              const totalTargetTp = stats.reduce((acc, s) => acc + s.target_tp_rate * s.sample_count, 0);
+              const totalVolHold = stats.reduce((acc, s) => acc + s.volume_hold_profit_count, 0);
+              const totalCleanCandle = stats.reduce((acc, s) => acc + s.clean_candle_profit_count, 0);
+
+              const totalSurgeSL = stats.reduce((acc, s) => acc + s.surge_stop_loss_rate * s.sample_count, 0);
+              const totalVolFade = stats.reduce((acc, s) => acc + s.volume_fade_loss_rate * s.sample_count, 0);
+              const totalHighRej = stats.reduce((acc, s) => acc + s.high_rejected_loss_rate * s.sample_count, 0);
+              const totalUnknown = stats.reduce((acc, s) => acc + s.profile_unknown_loss_rate * s.sample_count, 0);
+              const totalEarly = stats.reduce((acc, s) => acc + s.early_entry_loss_rate * s.sample_count, 0);
+              const totalChase = stats.reduce((acc, s) => acc + s.chase_loss_rate * s.sample_count, 0);
+
+              const liveReflection = autoTradeEnabled ? "ON" : "대기";
+
               return (
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.85rem" }}>
-                  <div style={{ border: "1px solid #28456f", borderRadius: 8, padding: "0.6rem", background: UI.cardSoftBg }}>
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, fontSize: "0.78rem", color: UI.body }}>
-                      <div>총자산: <strong>{Math.round(Number(paperSummary.totalEquity ?? 0)).toLocaleString()}</strong></div>
-                      <div>보유 KRW: <strong>{Math.round(Number(paperSummary.cashKrw ?? 0)).toLocaleString()}</strong></div>
-                      <div>평가손익: <strong style={{ color: Number(paperSummary.realizedPnl ?? 0) >= 0 ? UI.pass : UI.fail }}>{Math.round(Number(paperSummary.realizedPnl ?? 0)).toLocaleString()}</strong></div>
-                      <div>수익률: <strong style={{ color: Number(paperSummary.returnPct ?? 0) >= 0 ? UI.pass : UI.fail }}>{Number(paperSummary.returnPct ?? 0).toFixed(2)}%</strong></div>
-                      <div>미실현 손익: <strong style={{ color: Number(paperSummary.unrealizedPnl ?? 0) >= 0 ? UI.pass : UI.fail }}>{Math.round(Number(paperSummary.unrealizedPnl ?? 0)).toLocaleString()}</strong></div>
-                      <div>오픈/최대: <strong>{(paperSummary.openPositions ?? []).length}/{Math.round(Number(paperSummary.maxOpenPositions ?? 0))}</strong></div>
-                    </div>
-                    <div style={{ marginTop: 8, fontSize: "0.72rem", color: UI.mutedSoft }}>
-                      시작 {Math.round(Number(paperSummary.startKrw ?? 0)).toLocaleString()} / 종목당 {Math.round(Number(paperSummary.entryPerTradeKrw ?? 0)).toLocaleString()} / TP {Number(paperSummary.takeProfitPct ?? 0)}% / SL {Number(paperSummary.stopLossPct ?? 0)}% / T/O {Number(paperSummary.timeoutMinutes ?? 0)}분
-                    </div>
-                  </div>
-                  <div style={{ border: "1px solid #28456f", borderRadius: 8, padding: "0.6rem", background: UI.cardSoftBg }}>
-                    <div style={{ fontSize: "0.78rem", color: UI.title, fontWeight: 800, marginBottom: 6 }}>모의 보유 종목</div>
-                    {(paperSummary.openPositions ?? []).length === 0 ? (
-                      <div style={{ fontSize: "0.76rem", color: UI.mutedSoft }}>보유 없음</div>
-                    ) : (
-                      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                        {(paperSummary.openPositions ?? []).slice(0, 6).map((h) => (
-                          <div key={`${h.market}-${h.entryTs}`} style={{ display: "flex", justifyContent: "space-between", fontSize: "0.74rem", color: UI.body }}>
-                            <span>{h.market.replace("KRW-", "")} · {h.signalStrength}</span>
-                            <span style={{ color: Number(h.unrealizedPnlPct ?? 0) >= 0 ? UI.pass : UI.fail }}>{Number(h.unrealizedPnlPct ?? 0).toFixed(2)}%</span>
-                          </div>
-                        ))}
+                <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
+                  {/* 1단: 요약 카드 */}
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: "0.5rem" }}>
+                    {[
+                      { label: "경험치 프로필", value: `${stats.length}개` },
+                      { label: "총 표본", value: `${totalSamples}건` },
+                      { label: "수익 표본", value: `${totalWins}건`, color: UI.pass },
+                      { label: "손실 표본", value: `${totalLosses}건`, color: UI.fail },
+                      { label: "평균 손익", value: `${avgPnl.toFixed(2)}%`, color: avgPnl >= 0 ? UI.pass : UI.fail },
+                      { label: "실거래 반영", value: liveReflection, color: autoTradeEnabled ? UI.pass : UI.watch },
+                    ].map((c, i) => (
+                      <div key={i} style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 8, padding: "0.6rem", textAlign: "center" }}>
+                        <div style={{ fontSize: "0.68rem", color: UI.mutedSoft, marginBottom: 4 }}>{c.label}</div>
+                        <div style={{ fontSize: "1.1rem", fontWeight: 900, color: c.color ?? UI.title }}>{c.value}</div>
                       </div>
-                    )}
+                    ))}
                   </div>
-                  <div style={{ gridColumn: "1 / -1", border: "1px solid #28456f", borderRadius: 8, padding: "0.6rem", background: UI.cardSoftBg }}>
-                    <div style={{ fontSize: "0.78rem", color: UI.title, fontWeight: 800, marginBottom: 6 }}>최근 모의매매 내역</div>
-                    <div style={{ fontSize: "0.7rem", color: UI.mutedSoft, marginBottom: 6 }}>
-                      <code style={{ fontSize: "0.68rem" }}>/api/v1/paper/status</code> · recent_history (최신순)
+
+                  {/* 2단: 이익/손실 원인 */}
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1rem" }}>
+                    <div style={{ background: "#061a12", border: "1px solid #14532d", borderRadius: 10, padding: "0.8rem" }}>
+                      <div style={{ fontSize: "0.85rem", color: "#4ade80", fontWeight: 900, marginBottom: 10 }}>이익 원인 분석</div>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.6rem 1rem", fontSize: "0.78rem" }}>
+                        <div style={{ color: UI.mutedSoft }}>빠른 수익 전환</div><strong style={{ textAlign: "right" }}>{(totalSamples > 0 ? (totalFastProfit / totalSamples * 100).toFixed(1) : "0.0")}%</strong>
+                        <div style={{ color: UI.mutedSoft }}>목표가 도달</div><strong style={{ textAlign: "right" }}>{(totalSamples > 0 ? (totalTargetTp / totalSamples * 100).toFixed(1) : "0.0")}%</strong>
+                        <div style={{ color: UI.mutedSoft }}>거래량 유지</div><strong style={{ textAlign: "right" }}>{totalVolHold}건</strong>
+                        <div style={{ color: UI.mutedSoft }}>깨끗한 캔들</div><strong style={{ textAlign: "right" }}>{totalCleanCandle}건</strong>
+                      </div>
                     </div>
+                    <div style={{ background: "#1a0b0b", border: "1px solid #7f1d1d", borderRadius: 10, padding: "0.8rem" }}>
+                      <div style={{ fontSize: "0.85rem", color: "#f87171", fontWeight: 900, marginBottom: 10 }}>손실 원인 분석</div>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.4rem 1rem", fontSize: "0.74rem" }}>
+                        <div style={{ color: UI.mutedSoft }}>급등 손절</div><strong style={{ textAlign: "right", color: "#fca5a5" }}>{(totalSamples > 0 ? (totalSurgeSL / totalSamples * 100).toFixed(1) : "0.0")}%</strong>
+                        <div style={{ color: UI.mutedSoft }}>거래량 꺼짐</div><strong style={{ textAlign: "right" }}>{(totalSamples > 0 ? (totalVolFade / totalSamples * 100).toFixed(1) : "0.0")}%</strong>
+                        <div style={{ color: UI.mutedSoft }}>윗꼬리/거절</div><strong style={{ textAlign: "right" }}>{(totalSamples > 0 ? (totalHighRej / totalSamples * 100).toFixed(1) : "0.0")}%</strong>
+                        <div style={{ color: UI.mutedSoft }}>Unknown 진입</div><strong style={{ textAlign: "right" }}>{(totalSamples > 0 ? (totalUnknown / totalSamples * 100).toFixed(1) : "0.0")}%</strong>
+                        <div style={{ color: UI.mutedSoft }}>빠른진입(초입실패)</div><strong style={{ textAlign: "right" }}>{(totalSamples > 0 ? (totalEarly / totalSamples * 100).toFixed(1) : "0.0")}%</strong>
+                        <div style={{ color: UI.mutedSoft }}>추격진입</div><strong style={{ textAlign: "right" }}>{(totalSamples > 0 ? (totalChase / totalSamples * 100).toFixed(1) : "0.0")}%</strong>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 3단: 실거래 자금 상태 */}
+                  <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
+                    <div style={{ fontSize: "0.85rem", color: UI.title, fontWeight: 900, marginBottom: 8 }}>실거래 급등주 자금 상태</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "1rem", fontSize: "0.8rem" }}>
+                      <div>
+                        <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", marginBottom: 2 }}>급등주 실거래 한도 (50%)</div>
+                        <strong>{assetSummary.kpi === "ready" ? Math.round(assetSummary.totalAssets * 0.5).toLocaleString() : "수집 대기"}원</strong>
+                      </div>
+                      <div>
+                        <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", marginBottom: 2 }}>현재 사용 중 / 남은 자금</div>
+                        <strong>{Math.round(trade?.pump_paper_allocated_krw ?? 0).toLocaleString()} / {assetSummary.kpi === "ready" ? Math.round(assetSummary.totalAssets * 0.5 - (trade?.pump_paper_allocated_krw ?? 0)).toLocaleString() : "-"}</strong>
+                      </div>
+                      <div>
+                        <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", marginBottom: 2 }}>동시 보유 / 모드</div>
+                        <strong>{(strategy?.open_positions ? Object.keys(strategy.open_positions).length : 0)} / 3 (실거래 ON 시 적용)</strong>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 4단: 경험치 프로필 테이블 */}
+                  <div style={{ border: `1px solid ${UI.borderSoft}`, borderRadius: 10, overflow: "hidden" }}>
+                    <div style={{ background: UI.cardSoftBg, padding: "0.6rem 0.8rem", fontSize: "0.82rem", fontWeight: 900, borderBottom: `1px solid ${UI.borderSoft}` }}>경험치 프로필 (Profiles)</div>
+                    <div style={{ overflowX: "auto" }}>
+                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.72rem", textAlign: "left" }}>
+                        <thead>
+                          <tr style={{ background: "#0f172a", color: UI.mutedSoft }}>
+                            <th style={{ padding: "0.6rem 0.8rem" }}>profile_key</th>
+                            <th style={{ padding: "0.6rem 0.8rem" }}>표본</th>
+                            <th style={{ padding: "0.6rem 0.8rem" }}>승률</th>
+                            <th style={{ padding: "0.6rem 0.8rem" }}>평균손익</th>
+                            <th style={{ padding: "0.6rem 0.8rem" }}>신뢰도</th>
+                            <th style={{ padding: "0.6rem 0.8rem" }}>Sizing</th>
+                            <th style={{ padding: "0.6rem 0.8rem" }}>Fast%</th>
+                            <th style={{ padding: "0.6rem 0.8rem" }}>SurgeSL%</th>
+                            <th style={{ padding: "0.6rem 0.8rem" }}>Unk%</th>
+                            <th style={{ padding: "0.6rem 0.8rem" }}>Live 판단</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {stats.map((s, i) => {
+                            let liveLabel = "관찰";
+                            let liveColor: string = UI.muted;
+                            if (s.confidence === "high" && s.avg_pnl_pct > 0 && s.fast_profit_rate > 0.4) { liveLabel = "확대"; liveColor = UI.pass; }
+                            else if (s.avg_pnl_pct < 0 || s.surge_stop_loss_rate > 0.3) { liveLabel = "감액"; liveColor = UI.watch; }
+                            else if (s.profile_unknown_loss_rate > 0.4) { liveLabel = "차단후보"; liveColor = UI.fail; }
+                            else if (s.sample_count < 5) { liveLabel = "관찰"; liveColor = UI.muted; }
+
+                            return (
+                              <tr key={i} style={{ borderBottom: `1px solid ${UI.borderSoft}`, background: i % 2 === 0 ? "transparent" : "#0a101f" }}>
+                                <td style={{ padding: "0.5rem 0.8rem", color: UI.mutedSoft, fontSize: "0.65rem", maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={s.profile_key}>{s.profile_key}</td>
+                                <td style={{ padding: "0.5rem 0.8rem" }}>{s.sample_count}</td>
+                                <td style={{ padding: "0.5rem 0.8rem", color: s.win_rate >= 0.5 ? UI.pass : UI.fail }}>{(s.win_rate * 100).toFixed(1)}%</td>
+                                <td style={{ padding: "0.5rem 0.8rem", color: s.avg_pnl_pct >= 0 ? UI.pass : UI.fail }}>{s.avg_pnl_pct.toFixed(2)}%</td>
+                                <td style={{ padding: "0.5rem 0.8rem" }}>{s.confidence}</td>
+                                <td style={{ padding: "0.5rem 0.8rem" }}>x{s.suggested_size_multiplier.toFixed(1)}</td>
+                                <td style={{ padding: "0.5rem 0.8rem" }}>{(s.fast_profit_rate * 100).toFixed(0)}%</td>
+                                <td style={{ padding: "0.5rem 0.8rem" }}>{(s.surge_stop_loss_rate * 100).toFixed(0)}%</td>
+                                <td style={{ padding: "0.5rem 0.8rem" }}>{(s.profile_unknown_loss_rate * 100).toFixed(0)}%</td>
+                                <td style={{ padding: "0.5rem 0.8rem" }}><span style={{ color: liveColor, fontWeight: 900 }}>{liveLabel}</span></td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  {/* 5단: 최근 모의매매 내역 */}
+                  <div style={{ border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem", background: UI.cardSoftBg }}>
+                    <div style={{ fontSize: "0.85rem", color: UI.title, fontWeight: 900, marginBottom: 10 }}>최근 모의매매 (Experience Samples)</div>
                     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                       {(paperSummary.recentTrades ?? []).length > 0 ? (
-                        (paperSummary.recentTrades ?? []).slice(0, 10).map((row, idx) => (
-                          <div
-                            key={`${row.ts ?? idx}-${row.market}-${row.state}-${idx}`}
-                            style={{
-                              display: "grid",
-                              gridTemplateColumns: "132px 56px 96px 1fr 72px",
-                              gap: 6,
-                              fontSize: "0.72rem",
-                              color: UI.body,
-                              alignItems: "center",
-                            }}
-                          >
-                            <span style={{ color: UI.mutedSoft }}>{row.ts ? formatTsLocal(row.ts) : "-"}</span>
-                            <strong>{(row.market ?? "").replace("KRW-", "")}</strong>
-                            <span style={{ color: UI.mutedSoft }}>{row.state ?? "-"}</span>
-                            <span style={{ color: UI.mutedSoft, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={row.note}>
-                              {row.note ?? "—"}
-                            </span>
-                            <span style={{ color: Number(row.pnlPct ?? 0) >= 0 ? UI.pass : UI.fail }}>
-                              {row.pnlPct == null ? "-" : `${Number(row.pnlPct).toFixed(2)}%`}
-                            </span>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                          <div style={{ display: "grid", gridTemplateColumns: "85px 75px 85px 120px 140px 100px 1fr", gap: 8, fontSize: "0.65rem", color: UI.mutedSoft, padding: "0 4px", borderBottom: "1px solid #1e293b", paddingBottom: 4 }}>
+                            <span>시간</span><span>종목</span><span>상태</span><span>진입사유</span><span>경험치분류</span><span>RiskTags</span><span>반영결과</span>
                           </div>
-                        ))
+                          {paperSummary.recentTrades.slice(0, 15).map((row, idx) => {
+                            let expLabel = "관찰 표본 수집";
+                            let reflection = "-";
+                            if (row.state === "CLOSED_WIN") { expLabel = "이익 / 패턴 적중"; reflection = "Live 유지/확대"; }
+                            if (row.state === "CLOSED_LOSS") { 
+                              expLabel = row.note.includes("surge_stop_loss") ? "손실 / 급등 손절" : "손실 / 흐름 이탈";
+                              reflection = "다음 유사 패턴 감액";
+                            }
+                            if (row.note.includes("unknown")) { expLabel = "unknown 표본 수집"; reflection = "Live 고신뢰 아님"; }
+                            if (row.state === "OPEN") { expLabel = "진입 / 추적 중"; reflection = "진행 중"; }
+
+                            return (
+                              <div
+                                key={idx}
+                                style={{
+                                  display: "grid",
+                                  gridTemplateColumns: "85px 75px 85px 120px 140px 100px 1fr",
+                                  gap: 8,
+                                  fontSize: "0.72rem",
+                                  color: UI.body,
+                                  alignItems: "center",
+                                  padding: "4px",
+                                  borderBottom: "1px solid #1e293b44"
+                                }}
+                              >
+                                <span style={{ color: UI.mutedSoft, fontSize: "0.65rem" }}>{row.ts ? row.ts.slice(11, 19) : "-"}</span>
+                                <strong>{row.market.replace("KRW-", "")}</strong>
+                                <span style={{ 
+                                  color: row.state.includes("WIN") ? UI.pass : row.state.includes("LOSS") ? UI.fail : UI.body,
+                                  fontSize: "0.68rem"
+                                }}>
+                                  {row.state} {row.pnlPct != null ? `(${row.pnlPct.toFixed(2)}%)` : ""}
+                                </span>
+                                <span style={{ fontSize: "0.68rem", color: UI.mutedSoft, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={row.profileReason}>{row.profileReason}</span>
+                                <span style={{ fontSize: "0.68rem" }}>{expLabel}</span>
+                                <span style={{ fontSize: "0.65rem", color: "#f59e0b" }}>{row.paperRiskTags.slice(0, 1).join(", ")}</span>
+                                <span style={{ fontSize: "0.68rem", color: UI.mutedSoft }}>{reflection}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
                       ) : (
-                        <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>체결 내역 없음 또는 로딩 중</div>
+                        <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>표시할 경험치 표본이 없습니다.</div>
                       )}
                     </div>
                   </div>
                 </div>
               );
-            } catch {
-              return <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>모의매매 데이터를 불러오지 못했습니다</p>;
+            } catch (err) {
+              return <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>UI 렌더링 중 오류가 발생했습니다: {String(err)}</p>;
             }
           })()}
         </section>
