@@ -156,6 +156,7 @@ type PaperStateFile = {
   cash_krw: number;
   positions: Record<string, PaperPosition>;
   history: PaperTradeEvent[];
+  recent_history?: PaperTradeEvent[];
   seen_signal_keys: string[];
   entry_profile_stats?: Record<string, EntryProfileStats>;
   coarse_profile_stats?: Record<string, EntryProfileStats>;
@@ -593,28 +594,147 @@ export function createPaperTradingEngine(opts: {
     }
   };
 
+  const deriveFallbackProfileKey = (row: PaperTradeEvent): string => {
+    const signal = String(row.signal_strength ?? "unknown").trim() || "unknown";
+    const reason = String(row.profile_reason ?? row.profile_reference_reason ?? row.note ?? "unknown")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "_")
+      .slice(0, 80);
+    const tags = Array.isArray(row.paper_risk_tags) && row.paper_risk_tags.length > 0
+      ? row.paper_risk_tags.join("+")
+      : "none";
+    return `fallback|sig:${signal}|reason:${reason}|tags:${tags}`;
+  };
+
+  const createEmptySurgePatternStat = (profileKey: string): PaperSurgePatternStats => ({
+    profile_key: profileKey,
+    sample_count: 0,
+    win_count: 0,
+    loss_count: 0,
+    win_rate: 0,
+    avg_pnl_pct: 0,
+    avg_3m_pnl_pct: 0,
+    avg_5m_pnl_pct: 0,
+    fast_profit_rate: 0,
+    failed_spike_rate: 0,
+    volume_fade_loss_rate: 0,
+    high_rejected_loss_rate: 0,
+    suggested_size_multiplier: 1.0,
+    suggested_entry_speed: "normal",
+    confidence: "low",
+    updated_at: new Date().toISOString(),
+  });
+
+  const finalizeSurgePatternStat = (s: PaperSurgePatternStats, marker: { fastWins: number; failedSpike: number; volumeFade: number; highRejected: number }) => {
+    const sample = Math.max(1, s.sample_count);
+    s.win_rate = s.win_count / sample;
+    s.fast_profit_rate = marker.fastWins / sample;
+    s.failed_spike_rate = marker.failedSpike / sample;
+    s.volume_fade_loss_rate = marker.volumeFade / sample;
+    s.high_rejected_loss_rate = marker.highRejected / sample;
+    s.avg_3m_pnl_pct = s.avg_pnl_pct;
+    s.avg_5m_pnl_pct = s.avg_pnl_pct;
+    if (s.sample_count >= 12 && s.win_rate >= 0.58 && s.avg_pnl_pct > 0.15) s.confidence = "high";
+    else if (s.sample_count >= 6) s.confidence = "medium";
+    else s.confidence = "low";
+    s.suggested_size_multiplier = s.confidence === "high" ? 1.3 : s.confidence === "medium" ? 1.1 : 1.0;
+    s.suggested_entry_speed = s.confidence === "high" ? "fast" : s.confidence === "low" ? "slow" : "normal";
+    s.updated_at = new Date().toISOString();
+  };
+
+  const rebuildPaperSurgePatternStatsFromHistory = (
+    historyRows: PaperTradeEvent[],
+    fineProfileStats: Record<string, EntryProfileStats>,
+  ): Record<string, PaperSurgePatternStats> => {
+    const byKey = new Map<string, PaperSurgePatternStats>();
+    const markerByKey = new Map<string, { fastWins: number; failedSpike: number; volumeFade: number; highRejected: number }>();
+
+    const ensure = (key: string) => {
+      let s = byKey.get(key);
+      if (!s) {
+        s = createEmptySurgePatternStat(key);
+        byKey.set(key, s);
+        markerByKey.set(key, { fastWins: 0, failedSpike: 0, volumeFade: 0, highRejected: 0 });
+      }
+      return s;
+    };
+
+    for (const row of historyRows) {
+      if (row.state !== "CLOSED_WIN" && row.state !== "CLOSED_LOSS" && row.state !== "CLOSED_TIMEOUT") continue;
+      const key = row.entry_profile_key && row.entry_profile_key.trim() ? row.entry_profile_key.trim() : deriveFallbackProfileKey(row);
+      const s = ensure(key);
+      const marker = markerByKey.get(key)!;
+      const pnlPct = Number(row.pnl_pct ?? 0);
+      const prevCount = s.sample_count;
+      s.sample_count += 1;
+      if (row.state === "CLOSED_WIN") s.win_count += 1;
+      if (row.state === "CLOSED_LOSS") s.loss_count += 1;
+      s.avg_pnl_pct = (s.avg_pnl_pct * prevCount + pnlPct) / Math.max(1, s.sample_count);
+
+      const note = String(row.note ?? "").toLowerCase();
+      const tags = Array.isArray(row.paper_risk_tags) ? row.paper_risk_tags.map((x) => String(x).toLowerCase()) : [];
+      const profileReason = String(row.profile_reason ?? row.profile_reference_reason ?? "").toLowerCase();
+      if (row.state === "CLOSED_WIN") {
+        if (note.includes("partial_take_profit") || note.includes("target_tp") || note.includes("runner_trailing_exit")) {
+          marker.fastWins += 1;
+        }
+      }
+      if (
+        row.state === "CLOSED_LOSS" &&
+        (note.includes("surge_stop_loss") ||
+          note.includes("failed_spike") ||
+          profileReason.includes("profile_unknown_fallback_allow") ||
+          tags.includes("failed_spike"))
+      ) {
+        marker.failedSpike += 1;
+      }
+      if (row.state === "CLOSED_LOSS" && (note.includes("volume_fade") || tags.includes("volume_fade"))) {
+        marker.volumeFade += 1;
+      }
+      if (row.state === "CLOSED_LOSS" && (note.includes("high_rejected") || tags.includes("high_rejected"))) {
+        marker.highRejected += 1;
+      }
+    }
+
+    for (const [key, pStats] of Object.entries(fineProfileStats)) {
+      if (byKey.has(key)) continue;
+      const seeded = createEmptySurgePatternStat(key);
+      seeded.sample_count = Math.max(0, Math.floor(Number(pStats.total_trades ?? 0)));
+      seeded.win_count = Math.max(0, Math.floor(Number(pStats.wins ?? 0)));
+      seeded.loss_count = Math.max(0, Math.floor(Number(pStats.losses ?? 0)));
+      seeded.avg_pnl_pct = Number(pStats.avg_pnl_pct ?? 0);
+      byKey.set(key, seeded);
+      markerByKey.set(key, { fastWins: 0, failedSpike: 0, volumeFade: 0, highRejected: 0 });
+    }
+
+    for (const [key, stat] of byKey.entries()) {
+      finalizeSurgePatternStat(stat, markerByKey.get(key)!);
+    }
+
+    let winCountTotal = 0;
+    let lossCountTotal = 0;
+    for (const s of byKey.values()) {
+      winCountTotal += s.win_count;
+      lossCountTotal += s.loss_count;
+    }
+    emitPaper("DEBUG_PAPER_SURGE_PATTERN_STATS_BOOTSTRAP", {
+      history_count: historyRows.length,
+      profile_stats_count: Object.keys(fineProfileStats).length,
+      generated_stats_count: byKey.size,
+      win_count_total: winCountTotal,
+      loss_count_total: lossCountTotal,
+      source: "bootstrap_from_existing_paper_history",
+    });
+
+    return Object.fromEntries(byKey.entries());
+  };
+
   const updatePaperSurgePatternStats = (p: PaperPosition, exitPnlPct: number, closeState: "CLOSED_WIN" | "CLOSED_LOSS" | "CLOSED_TIMEOUT") => {
     try {
-      const key = p.entry_profile_key || "default";
+      const key = p.entry_profile_key && p.entry_profile_key.trim() ? p.entry_profile_key.trim() : `fallback|sig:${p.signal_strength}|reason:${p.profile_reference_reason ?? "none"}|tags:${(p.paper_risk_tags ?? []).join("+") || "none"}`;
       const existing = state.surgePatternStats[key];
-      const s: PaperSurgePatternStats = existing ?? {
-        profile_key: key,
-        sample_count: 0,
-        win_count: 0,
-        loss_count: 0,
-        win_rate: 0,
-        avg_pnl_pct: 0,
-        avg_3m_pnl_pct: 0,
-        avg_5m_pnl_pct: 0,
-        fast_profit_rate: 0,
-        failed_spike_rate: 0,
-        volume_fade_loss_rate: 0,
-        high_rejected_loss_rate: 0,
-        suggested_size_multiplier: 1.0,
-        suggested_entry_speed: "normal",
-        confidence: "low",
-        updated_at: new Date().toISOString(),
-      };
+      const s: PaperSurgePatternStats = existing ?? createEmptySurgePatternStat(key);
       const prevCount = s.sample_count;
       const pnlPct = Number.isFinite(exitPnlPct) ? exitPnlPct : 0;
       s.sample_count += 1;
@@ -628,16 +748,13 @@ export function createPaperTradingEngine(opts: {
       const hadFailedSpike = tags.includes("failed_spike") ? 1 : 0;
       const hadVolumeFade = tags.includes("volume_fade") ? 1 : 0;
       const hadHighRejected = tags.includes("high_rejected") ? 1 : 0;
-      s.failed_spike_rate = (s.failed_spike_rate * prevCount + hadFailedSpike) / Math.max(1, s.sample_count);
-      s.volume_fade_loss_rate = (s.volume_fade_loss_rate * prevCount + hadVolumeFade) / Math.max(1, s.sample_count);
-      s.high_rejected_loss_rate = (s.high_rejected_loss_rate * prevCount + hadHighRejected) / Math.max(1, s.sample_count);
-      s.fast_profit_rate = s.win_rate;
-      if (s.sample_count >= 12 && s.win_rate >= 0.58 && s.avg_pnl_pct > 0.15) s.confidence = "high";
-      else if (s.sample_count >= 6) s.confidence = "medium";
-      else s.confidence = "low";
-      s.suggested_size_multiplier = s.confidence === "high" ? 1.3 : s.confidence === "medium" ? 1.1 : 1.0;
-      s.suggested_entry_speed = s.confidence === "high" ? "fast" : s.confidence === "low" ? "slow" : "normal";
-      s.updated_at = new Date().toISOString();
+      const marker = {
+        fastWins: s.fast_profit_rate * prevCount + (closeState === "CLOSED_WIN" ? 1 : 0),
+        failedSpike: s.failed_spike_rate * prevCount + hadFailedSpike,
+        volumeFade: s.volume_fade_loss_rate * prevCount + hadVolumeFade,
+        highRejected: s.high_rejected_loss_rate * prevCount + hadHighRejected,
+      };
+      finalizeSurgePatternStat(s, marker);
       state.surgePatternStats[key] = s;
       emitPaper("DEBUG_PAPER_SURGE_PATTERN_STATS_UPDATE", {
         profile_key: key,
@@ -696,6 +813,24 @@ export function createPaperTradingEngine(opts: {
       for (const row of surgeRows) {
         if (!row?.profile_key) continue;
         state.surgePatternStats[row.profile_key] = row;
+      }
+      const recentHistoryRows = Array.isArray(raw.recent_history) ? raw.recent_history : [];
+      const mergedHistoryRows = [...state.history, ...recentHistoryRows];
+      const dedupedHistoryRows: PaperTradeEvent[] = [];
+      const seenHistoryKey = new Set<string>();
+      for (const row of mergedHistoryRows) {
+        const hk = `${row.ts}|${row.market}|${row.state}|${row.note}`;
+        if (seenHistoryKey.has(hk)) continue;
+        seenHistoryKey.add(hk);
+        dedupedHistoryRows.push(row);
+      }
+      state.history = dedupedHistoryRows;
+      const currentSampleCount = Object.values(state.surgePatternStats).reduce((acc, s) => acc + Number(s.sample_count ?? 0), 0);
+      const closedCountFromHistory = state.history.filter(
+        (h) => h.state === "CLOSED_WIN" || h.state === "CLOSED_LOSS" || h.state === "CLOSED_TIMEOUT",
+      ).length;
+      if (currentSampleCount === 0 || closedCountFromHistory > currentSampleCount) {
+        state.surgePatternStats = rebuildPaperSurgePatternStatsFromHistory(state.history, state.fineProfileStats);
       }
       trimHistoryAndSignals();
       for (const p of Object.values(state.positions)) {
@@ -942,7 +1077,10 @@ export function createPaperTradingEngine(opts: {
       updatePaperSurgePatternStats(p, pnlPct, closeState);
       emitPaper("DEBUG_PAPER_PATTERN_RESULT", {
         market,
-        profile_key: p.entry_profile_key ?? "default",
+        profile_key:
+          p.entry_profile_key && p.entry_profile_key.trim()
+            ? p.entry_profile_key
+            : `fallback|sig:${p.signal_strength}|reason:${p.profile_reference_reason ?? "none"}|tags:${(p.paper_risk_tags ?? []).join("+") || "none"}`,
         close_state: closeState,
         pnl_pct: Number(pnlPct.toFixed(4)),
         paper_risk_tags: p.paper_risk_tags ?? [],
