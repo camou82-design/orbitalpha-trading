@@ -463,6 +463,14 @@ async function main() {
         cannot_enable_reason: "unauthenticated" as const,
       };
     }
+    req.log.info(
+      {
+        route: "session",
+        authenticated: true,
+        user_id: s.user_id,
+      },
+      "DEBUG_AUTH_SESSION_VERIFIED",
+    );
     const ss = strategy.status() as { safety_guard_state?: string };
     let st: Awaited<ReturnType<typeof trade.statusLightweight>>;
     try {
@@ -475,35 +483,51 @@ async function main() {
       lastGoodSessionLightStatus = st;
     } catch {
       req.log.warn(
-        { route: "session", ms: SESSION_LIGHT_STATUS_TIMEOUT_MS },
+        {
+          route: "session",
+          authenticated: true,
+          trade_status_available: false,
+          ms: SESSION_LIGHT_STATUS_TIMEOUT_MS,
+          reason: "trade_status_timeout",
+          user_id: s.user_id,
+        },
+        "DEBUG_SESSION_TRADE_STATUS_TIMEOUT",
+      );
+      req.log.warn(
+        {
+          route: "session",
+          ms: SESSION_LIGHT_STATUS_TIMEOUT_MS,
+        },
         "session_light_status_timeout_or_error",
       );
       const fallback = lastGoodSessionLightStatus;
-      const cannotEnableReason =
-        fallback == null
-          ? "session_status_delayed"
-          : !fallback.api_connected
-            ? "api disconnected"
-            : !fallback.live_enabled
-              ? "live disabled"
-              : !fallback.recovery_ready
-                ? "recovery not ready"
-                : ss.safety_guard_state === "자동정지"
-                  ? "safety guard stopped"
-                  : "session_status_delayed";
-      return {
+      const degraded = {
         authenticated: true,
         user_id: s.user_id,
+        trade_status_available: false,
+        trade_status_error: "timeout" as const,
         auto_trade_enabled: fallback?.auto_trade_enabled ?? false,
         auto_trade_changed_at: fallback?.auto_trade_changed_at ?? null,
-        live_enabled: fallback?.live_enabled,
-        api_connected: fallback?.api_connected,
-        recovery_ready: fallback?.recovery_ready === true,
+        live_enabled: fallback?.live_enabled ?? false,
+        api_connected: fallback?.api_connected ?? false,
+        recovery_ready: fallback?.recovery_ready === true ? true : false,
         safety_guard_state: (ss.safety_guard_state ?? "주의") as "정상" | "주의" | "자동정지",
-        can_enable_auto_trade: cannotEnableReason === null,
-        cannot_enable_reason: cannotEnableReason,
+        can_enable_auto_trade: false,
+        cannot_enable_reason: "trade_status_timeout" as const,
         session_status_degraded: true,
       };
+      req.log.warn(
+        {
+          route: "session",
+          authenticated: true,
+          trade_status_available: false,
+          reason: "trade_status_timeout",
+          user_id: s.user_id,
+          ms: SESSION_LIGHT_STATUS_TIMEOUT_MS,
+        },
+        "DEBUG_AUTH_SESSION_RESPONSE_DEGRADED",
+      );
+      return degraded;
     }
     const cannotEnableReason =
       !st.api_connected
@@ -515,9 +539,11 @@ async function main() {
             : ss.safety_guard_state === "자동정지"
               ? "safety guard stopped"
               : null;
-    return {
+    const response = {
       authenticated: true,
       user_id: s.user_id,
+      trade_status_available: true,
+      trade_status_error: null,
       auto_trade_enabled: st.auto_trade_enabled,
       auto_trade_changed_at: st.auto_trade_changed_at,
       live_enabled: st.live_enabled,
@@ -527,6 +553,7 @@ async function main() {
       can_enable_auto_trade: cannotEnableReason === null,
       cannot_enable_reason: cannotEnableReason,
     };
+    return response;
   };
 
   /** Alias routes — 본문은 `/api/v1/auth/session` 과 동일 필드로 맞춤 */
