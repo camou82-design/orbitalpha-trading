@@ -275,6 +275,7 @@ type CandidateMeta = {
   stochD?: number;
   volumeRatio?: number;
   setup?: OriginalSpotSetupResult;
+  paper_profile_key?: string;
   paper_pattern_multiplier?: number;
   risk_tag_multiplier?: number;
   engine_bucket?: "surge" | "other";
@@ -384,7 +385,10 @@ type PersistedState = {
 
 const MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX"] as const;
 const LEADER_MARKETS = new Set<string>(MARKETS as unknown as string[]);
-const EXISTING_POSITION_MIN_KRW = 5_000;
+const EXISTING_POSITION_MIN_KRW = Math.max(
+  1000,
+  Number(process.env.LIVE_EXISTING_POSITION_MIN_KRW ?? 5000),
+);
 const SURGE_LIVE_CAPITAL_RATIO = 0.5;
 const SURGE_MAX_OPEN_POSITIONS = 3;
 const SURGE_MIN_ORDER_RATIO = 0.08;
@@ -1337,9 +1341,12 @@ export function createLiveDataStrategy(opts: {
     }
 
     const tstatus = await opts.trade.status();
+    const liveTradingOn =
+      tstatus.auto_trade_enabled === true &&
+      tstatus.live_enabled === true &&
+      tstatus.api_connected === true;
     const hasOpenPositions = Object.keys(state.positions).length > 0 || Object.keys(state.early_positions).length > 0;
-    const tradeStatusEntryBlocked =
-      !tstatus.auto_trade_enabled || !tstatus.api_connected || !tstatus.live_enabled;
+    const tradeStatusEntryBlocked = !liveTradingOn;
     if (tradeStatusEntryBlocked) {
       console.info(
         JSON.stringify({
@@ -2725,6 +2732,16 @@ export function createLiveDataStrategy(opts: {
     if (!entryAllowed) {
       console.info(
         JSON.stringify({
+          tag: "DEBUG_LIVE_SURGE_DISABLED_BY_LIVE_MODE",
+          ts: new Date().toISOString(),
+          auto_trade_enabled: Boolean(tstatus.auto_trade_enabled),
+          live_enabled: Boolean(tstatus.live_enabled),
+          api_connected: Boolean(tstatus.api_connected),
+          reason: "live_trading_off",
+        }),
+      );
+      console.info(
+        JSON.stringify({
           tag: "DEBUG_LIVE_ENTRY_BLOCKED",
           ts: new Date().toISOString(),
           reason: entryBlockedBySafety ? "entry_blocked_safety_guard_stopped" : "entry_blocked_trade_status_guard",
@@ -2909,13 +2926,14 @@ export function createLiveDataStrategy(opts: {
       Number(tstatus.strategy_available_krw ?? tstatus.live_order_available_krw ?? tstatus.krw_available ?? 0),
     );
 
-    let strategyPortfolioValueKrw = 0;
+    let liveOpenPositionValueKrw = 0;
+    let earlyOpenPositionValueKrw = 0;
     let surgeUsedCapitalKrw = 0;
     for (const p of Object.values(state.positions)) {
       const mk = p.market;
       const px = priceBy.get(mk) ?? p.entry_price;
       const val = p.qty * px;
-      strategyPortfolioValueKrw += val;
+      liveOpenPositionValueKrw += val;
       if (p.engine_bucket === "surge") {
         surgeUsedCapitalKrw += Math.max(val, Number(p.filled_entry_krw ?? p.order_krw ?? 0));
       }
@@ -2925,14 +2943,16 @@ export function createLiveDataStrategy(opts: {
       const mk = p.market;
       const px = priceBy.get(mk) ?? p.entry_price;
       const markValue = p.qty * px;
+      earlyOpenPositionValueKrw += markValue;
       if (p.engine_bucket === "surge") {
         surgeUsedCapitalKrw += Math.max(markValue, Number(p.filled_entry_krw ?? p.order_krw ?? 0));
       }
     }
 
-    const totalLiveCapitalKrw = Math.floor(strategyUsableKrwForAlloc + strategyPortfolioValueKrw + surgeUsedCapitalKrw);
+    const totalLiveCapitalKrw = Math.floor(strategyUsableKrwForAlloc + liveOpenPositionValueKrw + earlyOpenPositionValueKrw);
     const surgeCapitalLimitKrw = Math.floor(totalLiveCapitalKrw * SURGE_LIVE_CAPITAL_RATIO);
     const surgeCapitalRemainingKrw = Math.max(0, surgeCapitalLimitKrw - surgeUsedCapitalKrw);
+    let surgeRemainingForTickKrw = surgeCapitalRemainingKrw;
 
     console.info(
       JSON.stringify({
@@ -2943,7 +2963,8 @@ export function createLiveDataStrategy(opts: {
         surgeUsedCapitalKrw,
         surgeCapitalRemainingKrw,
         strategyUsableKrwForAlloc,
-        strategyPortfolioValueKrw,
+        liveOpenPositionValueKrw,
+        earlyOpenPositionValueKrw,
       })
     );
 
@@ -3027,88 +3048,117 @@ export function createLiveDataStrategy(opts: {
     const perPositionBudgetBySymbol = capPlan.bySymbol;
 
     // Apply Paper Stats and Surge Limits to each candidate
-    for (const meta of candidateMeta) {
-      const market = meta.market;
-      const profileKey = meta.setupReason || "default";
-      const stats = paperStatsMap[profileKey];
+    if (liveTradingOn) {
+      for (const meta of candidateMeta) {
+        const market = meta.market;
+        const signal = latestAllSignals.get(market);
+        const signalPayload = signal?.p;
+        if (!signalPayload) continue;
+        const profileKey = makeEntryProfileKey({
+          signal_type: String(signalPayload.signal_type ?? "MID"),
+          position_stage: meta.tier === "A" ? "early_active" : "normal_active",
+          btc_tier: btcTier,
+          score_bucket: bucketScore(meta.score),
+          volume_ratio_bucket: bucketVol(Number(signalPayload.volume_ratio ?? 0)),
+          signal_age_bucket: bucketAge(signal?.ts ? Math.max(0, Math.floor((Date.now() - Date.parse(signal.ts)) / 1000)) : null),
+          chase_bucket: bucketChase(null),
+          near_high_bucket: bucketNear(null),
+          breakout: String(signalPayload.signal_reason ?? "").toLowerCase().includes("breakout"),
+          early_entry_flag: meta.tier === "A",
+        });
+        meta.paper_profile_key = profileKey;
+        const stats = paperStatsMap[profileKey];
 
-      let paperMultiplier = 1.0;
-      let riskTagMultiplier = 1.0;
-      let paperConfidence: "low" | "medium" | "high" = "low";
-      if (stats) {
-        paperConfidence = stats.confidence;
-        if (stats.confidence === "low") paperMultiplier = 1.0;
-        else if (stats.confidence === "medium" && stats.avg_pnl_pct > 0) paperMultiplier = 1.2;
-        else if (stats.confidence === "high" && stats.win_rate > 0.6) paperMultiplier = 1.5;
+        let paperMultiplier = 1.0;
+        let riskTagMultiplier = 1.0;
+        let paperConfidence: "low" | "medium" | "high" = "low";
+        if (stats) {
+          paperConfidence = stats.confidence;
+          if (stats.confidence === "low") paperMultiplier = 1.0;
+          else if (stats.confidence === "medium" && stats.avg_pnl_pct > 0) paperMultiplier = 1.2;
+          else if (stats.confidence === "high" && stats.win_rate > 0.6) paperMultiplier = 1.5;
 
-        if ((stats.failed_spike_rate ?? 0) > 0.3) riskTagMultiplier *= 0.7;
-        if ((stats.volume_fade_loss_rate ?? 0) > 0.3) riskTagMultiplier *= 0.6;
-        if ((stats.high_rejected_loss_rate ?? 0) > 0.3) riskTagMultiplier *= 0.6;
-      }
-      meta.paper_pattern_multiplier = paperMultiplier;
-      meta.risk_tag_multiplier = riskTagMultiplier;
+          if ((stats.failed_spike_rate ?? 0) > 0.3) riskTagMultiplier *= 0.7;
+          if ((stats.volume_fade_loss_rate ?? 0) > 0.3) riskTagMultiplier *= 0.6;
+          if ((stats.high_rejected_loss_rate ?? 0) > 0.3) riskTagMultiplier *= 0.6;
+        }
+        meta.paper_pattern_multiplier = paperMultiplier;
+        meta.risk_tag_multiplier = riskTagMultiplier;
 
-      console.info(JSON.stringify({
-        tag: "DEBUG_LIVE_PAPER_PATTERN_REFERENCE",
-        ts: new Date().toISOString(),
-        market,
-        profileKey,
-        paperConfidence,
-        paperPatternMultiplier: paperMultiplier,
-        riskTagMultiplier,
-        winRate: stats?.win_rate,
-        avgPnlPct: stats?.avg_pnl_pct,
-      }));
-
-      const baseBudgetKrw = perPositionBudgetBySymbol.get(market) ?? 0;
-      const surgeMinOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(surgeCapitalLimitKrw * SURGE_MIN_ORDER_RATIO));
-      const surgeNormalOrderKrw = Math.floor(surgeCapitalLimitKrw * SURGE_NORMAL_ORDER_RATIO);
-      const surgeHighConfidenceOrderKrw = Math.floor(surgeCapitalLimitKrw * SURGE_HIGH_CONFIDENCE_ORDER_RATIO);
-
-      let finalOrderKrw = Math.floor(baseBudgetKrw * paperMultiplier * riskTagMultiplier);
-      const highConfidenceSurgeSetup = paperConfidence === "high" && (stats?.win_rate ?? 0) >= 0.55;
-      if (highConfidenceSurgeSetup) {
-        finalOrderKrw = Math.max(finalOrderKrw, surgeHighConfidenceOrderKrw);
-      } else if (paperConfidence !== "low") {
-        finalOrderKrw = Math.max(finalOrderKrw, surgeNormalOrderKrw);
-      }
-
-      if (highConfidenceSurgeSetup && finalOrderKrw < surgeMinOrderKrw && finalOrderKrw > 0) {
-        finalOrderKrw = surgeMinOrderKrw;
-      }
-
-      // Hard Cap by remaining surge capital
-      if (finalOrderKrw > surgeCapitalRemainingKrw) {
         console.info(JSON.stringify({
-          tag: "DEBUG_LIVE_SURGE_CAPITAL_BLOCK",
+          tag: "DEBUG_LIVE_PAPER_PATTERN_REFERENCE",
           ts: new Date().toISOString(),
           market,
-          totalLiveCapitalKrw,
-          surgeCapitalLimitKrw,
-          surgeUsedCapitalKrw,
-          surgeCapitalRemainingKrw,
-          requestedOrderKrw: finalOrderKrw,
-          reason: "surge_capital_limit_exceeded"
+          paperProfileKey: profileKey,
+          paperStatsFound: Boolean(stats),
+          paperStatsSource: stats ? "entry_profile_key" : "missing",
+          paperConfidence,
+          paperPatternMultiplier: paperMultiplier,
+          riskTagMultiplier,
+          winRate: stats?.win_rate,
+          avgPnlPct: stats?.avg_pnl_pct,
         }));
-        finalOrderKrw = surgeCapitalRemainingKrw;
+
+        const baseBudgetKrw = perPositionBudgetBySymbol.get(market) ?? 0;
+        const surgeMinOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(surgeCapitalLimitKrw * SURGE_MIN_ORDER_RATIO));
+        const surgeNormalOrderKrw = Math.floor(surgeCapitalLimitKrw * SURGE_NORMAL_ORDER_RATIO);
+        const surgeHighConfidenceOrderKrw = Math.floor(surgeCapitalLimitKrw * SURGE_HIGH_CONFIDENCE_ORDER_RATIO);
+
+        let finalOrderKrw = Math.floor(baseBudgetKrw * paperMultiplier * riskTagMultiplier);
+        const highConfidenceSurgeSetup = paperConfidence === "high" && (stats?.win_rate ?? 0) >= 0.55;
+        if (highConfidenceSurgeSetup) {
+          finalOrderKrw = Math.max(finalOrderKrw, surgeHighConfidenceOrderKrw);
+        } else if (paperConfidence !== "low") {
+          finalOrderKrw = Math.max(finalOrderKrw, surgeNormalOrderKrw);
+        }
+
+        if (highConfidenceSurgeSetup && finalOrderKrw < surgeMinOrderKrw && finalOrderKrw > 0) {
+          finalOrderKrw = surgeMinOrderKrw;
+        }
+        if (surgeRemainingForTickKrw < surgeMinOrderKrw) {
+          console.info(JSON.stringify({
+            tag: "DEBUG_LIVE_SURGE_CAPITAL_BLOCK",
+            ts: new Date().toISOString(),
+            market,
+            totalLiveCapitalKrw,
+            surgeCapitalLimitKrw,
+            surgeUsedCapitalKrw,
+            surgeCapitalRemainingKrw: surgeRemainingForTickKrw,
+            requestedOrderKrw: finalOrderKrw,
+            reason: "surge_remaining_below_min_order",
+          }));
+          finalOrderKrw = 0;
+        } else if (finalOrderKrw > surgeRemainingForTickKrw) {
+          console.info(JSON.stringify({
+            tag: "DEBUG_LIVE_SURGE_CAPITAL_BLOCK",
+            ts: new Date().toISOString(),
+            market,
+            totalLiveCapitalKrw,
+            surgeCapitalLimitKrw,
+            surgeUsedCapitalKrw,
+            surgeCapitalRemainingKrw: surgeRemainingForTickKrw,
+            requestedOrderKrw: finalOrderKrw,
+            reason: "surge_capital_limit_exceeded"
+          }));
+          finalOrderKrw = surgeRemainingForTickKrw;
+        }
+
+        console.info(JSON.stringify({
+          tag: "DEBUG_LIVE_SURGE_ORDER_SIZE_DECISION",
+          ts: new Date().toISOString(),
+          market,
+          baseBudgetKrw,
+          surgeMinOrderKrw,
+          surgeNormalOrderKrw,
+          surgeHighConfidenceOrderKrw,
+          paperPatternMultiplier: paperMultiplier,
+          riskTagMultiplier,
+          finalOrderKrw,
+          surgeCapitalRemainingKrw: surgeRemainingForTickKrw,
+        }));
+
+        perPositionBudgetBySymbol.set(market, finalOrderKrw);
       }
-
-      console.info(JSON.stringify({
-        tag: "DEBUG_LIVE_SURGE_ORDER_SIZE_DECISION",
-        ts: new Date().toISOString(),
-        market,
-        baseBudgetKrw,
-        surgeMinOrderKrw,
-        surgeNormalOrderKrw,
-        surgeHighConfidenceOrderKrw,
-        paperPatternMultiplier: paperMultiplier,
-        riskTagMultiplier,
-        finalOrderKrw,
-        surgeCapitalRemainingKrw,
-      }));
-
-      // Override budget in the map
-      perPositionBudgetBySymbol.set(market, finalOrderKrw);
     }
     console.info(
       JSON.stringify({
@@ -3751,9 +3801,30 @@ export function createLiveDataStrategy(opts: {
         );
 
         if (earlyAllowed) {
-          const minOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, LIVE_MIN_ENTRY_KRW);
+          const surgeMinOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(surgeCapitalLimitKrw * SURGE_MIN_ORDER_RATIO));
+          if (liveTradingOn && surgeRemainingForTickKrw < surgeMinOrderKrw) {
+            console.info(
+              JSON.stringify({
+                tag: "DEBUG_LIVE_SURGE_CAPITAL_BLOCK",
+                ts: new Date().toISOString(),
+                market,
+                totalLiveCapitalKrw,
+                surgeCapitalLimitKrw,
+                surgeUsedCapitalKrw,
+                surgeCapitalRemainingKrw: surgeRemainingForTickKrw,
+                requestedOrderKrw: null,
+                reason: "surge_remaining_below_min_order",
+              }),
+            );
+            bumpSkip("surge_remaining_below_min_order");
+            continue;
+          }
+          const minOrderKrw = Math.max(surgeMinOrderKrw, LIVE_MIN_ENTRY_KRW);
           const baseBudget = perPositionBudgetBySymbol.get(market) ?? minOrderKrw;
-          const earlyOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(baseBudget * LIVE_EARLY_ENTRY_SIZE_RATIO));
+          let earlyOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(baseBudget * LIVE_EARLY_ENTRY_SIZE_RATIO));
+          if (liveTradingOn) {
+            earlyOrderKrw = Math.min(earlyOrderKrw, surgeRemainingForTickKrw, LIVE_MAX_ENTRY_KRW);
+          }
           try {
             await opts.trade.placeBuy(market, true, earlyOrderKrw, "momentum", "strategy", {
               ...sig.p,
@@ -3795,6 +3866,9 @@ export function createLiveDataStrategy(opts: {
                 filled_price: currentPrice,
               }),
             );
+            if (liveTradingOn) {
+              surgeRemainingForTickKrw = Math.max(0, surgeRemainingForTickKrw - earlyOrderKrw);
+            }
             bumpSkip("early_entry_filled");
             continue; // do not run normal entry in same tick for same symbol
           } catch {
@@ -4121,6 +4195,23 @@ export function createLiveDataStrategy(opts: {
       const openCountNow = Object.keys(state.positions).length;
       const remainingSlots = Math.max(0, state.safety_guard.max_positions - openCountNow);
       const surgeMinOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(surgeCapitalLimitKrw * SURGE_MIN_ORDER_RATIO));
+      if (liveTradingOn && surgeRemainingForTickKrw < surgeMinOrderKrw) {
+        console.info(
+          JSON.stringify({
+            tag: "DEBUG_LIVE_SURGE_CAPITAL_BLOCK",
+            ts: new Date().toISOString(),
+            market,
+            totalLiveCapitalKrw,
+            surgeCapitalLimitKrw,
+            surgeUsedCapitalKrw,
+            surgeCapitalRemainingKrw: surgeRemainingForTickKrw,
+            requestedOrderKrw: null,
+            reason: "surge_remaining_below_min_order",
+          }),
+        );
+        bumpSkip("surge_remaining_below_min_order");
+        continue;
+      }
       const minOrderKrw = Math.max(surgeMinOrderKrw, LIVE_MIN_ENTRY_KRW);
       const baseBudget = perPositionBudgetBySymbol.get(market) ?? minOrderKrw;
       let orderKrw = Math.max(minOrderKrw, Math.min(LIVE_MAX_ENTRY_KRW, baseBudget));
@@ -4133,7 +4224,7 @@ export function createLiveDataStrategy(opts: {
       const investedSoFar = Math.max(0, Number(stPos?.invested_krw_total ?? 0));
       const remainingPerMarket = Math.max(0, ORDER_LIMITS.MAX_STRATEGY_INVESTED_KRW_PER_MARKET - investedSoFar);
       orderKrw = Math.min(orderKrw, remainingPerMarket);
-      orderKrw = Math.min(orderKrw, surgeCapitalRemainingKrw, liveOrderAvailableKrw, LIVE_MAX_ENTRY_KRW);
+      orderKrw = Math.min(orderKrw, surgeRemainingForTickKrw, liveOrderAvailableKrw, LIVE_MAX_ENTRY_KRW);
 
       const gateScore = Number(opts.marketState.entryGate(sig.p, marketState).score ?? 0);
       emitEval("DEBUG_LIVE_ORDER_SIZING", {
@@ -4154,27 +4245,31 @@ export function createLiveDataStrategy(opts: {
         entry_size_pct: entrySizePct,
         legacy_dca_buy_enabled: LIVE_LEGACY_DCA_BUY_ENABLED,
       });
-      console.info(
-        JSON.stringify({
-          tag: "DEBUG_LIVE_SIZE_AFTER_PAPER_PATTERN",
-          ts: new Date().toISOString(),
-          market,
-          totalLiveCapitalKrw,
-          surgeCapitalLimitKrw,
-          surgeUsedCapitalKrw,
-          surgeCapitalRemainingKrw,
-          baseOrderKrw: baseBudget,
-          surgeMinOrderKrw,
-          paperPatternMultiplier: candidateMeta.find((c) => c.market === market)?.paper_pattern_multiplier ?? 1,
-          riskTagMultiplier: candidateMeta.find((c) => c.market === market)?.risk_tag_multiplier ?? 1,
-          lateEntryMultiplier: lateEntrySizingMultiplier,
-          finalOrderKrw: orderKrw,
-          paperProfileKey: candidateMeta.find((c) => c.market === market)?.setupReason ?? "default",
-          paperConfidence: paperStatsMap[candidateMeta.find((c) => c.market === market)?.setupReason ?? "default"]?.confidence ?? "low",
-          paperWinRate: paperStatsMap[candidateMeta.find((c) => c.market === market)?.setupReason ?? "default"]?.win_rate ?? 0,
-          paperAvgPnlPct: paperStatsMap[candidateMeta.find((c) => c.market === market)?.setupReason ?? "default"]?.avg_pnl_pct ?? 0,
-        }),
-      );
+      if (liveTradingOn) {
+        const paperProfileKey = candidateMeta.find((c) => c.market === market)?.paper_profile_key;
+        const paperStat = paperProfileKey ? paperStatsMap[paperProfileKey] : undefined;
+        console.info(
+          JSON.stringify({
+            tag: "DEBUG_LIVE_SIZE_AFTER_PAPER_PATTERN",
+            ts: new Date().toISOString(),
+            market,
+            totalLiveCapitalKrw,
+            surgeCapitalLimitKrw,
+            surgeUsedCapitalKrw,
+            surgeCapitalRemainingKrw: surgeRemainingForTickKrw,
+            baseOrderKrw: baseBudget,
+            surgeMinOrderKrw,
+            paperPatternMultiplier: candidateMeta.find((c) => c.market === market)?.paper_pattern_multiplier ?? 1,
+            riskTagMultiplier: candidateMeta.find((c) => c.market === market)?.risk_tag_multiplier ?? 1,
+            lateEntryMultiplier: lateEntrySizingMultiplier,
+            finalOrderKrw: orderKrw,
+            paperProfileKey: paperProfileKey ?? null,
+            paperConfidence: paperStat?.confidence ?? "low",
+            paperWinRate: paperStat?.win_rate ?? 0,
+            paperAvgPnlPct: paperStat?.avg_pnl_pct ?? 0,
+          }),
+        );
+      }
       if (surgeOpenCount >= SURGE_MAX_OPEN_POSITIONS && !stPos) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "surge_max_positions_reached", surgeOpenCount, SURGE_MAX_OPEN_POSITIONS });
         bumpSkip("surge_max_positions_reached");
@@ -4203,6 +4298,9 @@ export function createLiveDataStrategy(opts: {
       };
       try {
         await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", signalPayloadForBuy);
+        if (liveTradingOn) {
+          surgeRemainingForTickKrw = Math.max(0, surgeRemainingForTickKrw - orderKrw);
+        }
         await appendLog({
           company_id: companyIdSchema.parse(opts.companyId),
           service_id: serviceIdSchema.parse(opts.serviceId),
