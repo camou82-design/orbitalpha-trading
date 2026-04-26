@@ -75,6 +75,18 @@ type SignalPayloadV2 = {
   [key: string]: unknown;
 };
 
+type ScannerFeedSignal = {
+  market?: string;
+  score?: number;
+  signal_key?: string;
+  reason?: string;
+  volume_multiple?: number;
+  captured_at?: string | null;
+  updated_at?: string | null;
+  signal_ts?: string | null;
+  [key: string]: unknown;
+};
+
 type TradeApi = {
   status: () => Promise<TradeStatus>;
   placeBuy: (
@@ -492,6 +504,11 @@ const LIVE_ENTRY_SIGNAL_STALE_SECONDS = (() => {
   const n = raw === undefined || raw === "" ? 240 : Number(raw);
   return Number.isFinite(n) ? Math.max(30, Math.min(1800, Math.floor(n))) : 240;
 })();
+const LIVE_ENTRY_UNIVERSE_TOP_N = (() => {
+  const raw = process.env.LIVE_ENTRY_UNIVERSE_TOP_N;
+  const n = raw === undefined || raw === "" ? 5 : Number(raw);
+  return Number.isFinite(n) ? Math.max(1, Math.min(12, Math.floor(n))) : 5;
+})();
 const LIVE_MAX_CHASE_FROM_SIGNAL_PCT = (() => {
   const raw = process.env.LIVE_MAX_CHASE_FROM_SIGNAL_PCT;
   const n = raw === undefined || raw === "" ? 1.2 : Number(raw);
@@ -820,6 +837,42 @@ function buildLiveSignalMissingDetail(market: string, logs: SignalLogEntry[]): R
 
 function todayKst() {
   return new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" });
+}
+
+function resolveFreshestIsoTs(candidates: Array<string | null | undefined>): string | null {
+  let bestMs = -1;
+  for (const c of candidates) {
+    if (typeof c !== "string" || !c) continue;
+    const ms = Date.parse(c);
+    if (!Number.isFinite(ms)) continue;
+    if (ms > bestMs) bestMs = ms;
+  }
+  return bestMs > 0 ? new Date(bestMs).toISOString() : null;
+}
+
+function scannerSignalTimestamp(sig: ScannerFeedSignal): string | null {
+  const fromKey = (() => {
+    const key = typeof sig.signal_key === "string" ? sig.signal_key : "";
+    if (!key) return null;
+    const parts = key.split("|");
+    return typeof parts[1] === "string" ? parts[1] : null;
+  })();
+  return resolveFreshestIsoTs([
+    typeof sig.captured_at === "string" ? sig.captured_at : null,
+    typeof sig.updated_at === "string" ? sig.updated_at : null,
+    typeof sig.signal_ts === "string" ? sig.signal_ts : null,
+    fromKey,
+  ]);
+}
+
+function signalCandidateTimestamp(sig: { ts?: string | null; p?: Record<string, unknown> } | null | undefined): string | null {
+  const p = (sig?.p ?? {}) as Record<string, unknown>;
+  return resolveFreshestIsoTs([
+    typeof p.captured_at === "string" ? p.captured_at : null,
+    typeof p.updated_at === "string" ? p.updated_at : null,
+    typeof p.signal_ts === "string" ? p.signal_ts : null,
+    typeof sig?.ts === "string" ? sig.ts : null,
+  ]);
 }
 
 /**
@@ -1171,6 +1224,7 @@ export function createLiveDataStrategy(opts: {
   companyId: string;
   serviceId: string;
   readLogs: (limit: number) => Promise<SignalLogEntry[]>;
+  getScannerSignals?: () => ScannerFeedSignal[];
   trade: TradeApi;
   marketState: MarketStateApi;
   onEvent?: (row: {
@@ -1501,6 +1555,10 @@ export function createLiveDataStrategy(opts: {
     }
     const latestByMarket = new Map<string, any>();
     const latestAllSignals = new Map<string, any>();
+    const sourceMetaByMarket = new Map<
+      string,
+      { source_kind: "scanner" | "filter_pass"; source_ts: string | null; age_seconds: number | null; stale_filtered_before_eval: boolean }
+    >();
     const logs = await opts.readLogs(220);
     const marketState = await opts.marketState.evaluate();
     const conservativeMode = marketState.market_state === "risk_off";
@@ -1543,6 +1601,49 @@ export function createLiveDataStrategy(opts: {
           );
         }
       }
+    }
+
+    const scannerFeedRaw = typeof opts.getScannerSignals === "function" ? opts.getScannerSignals() : [];
+    const scannerFeed = Array.isArray(scannerFeedRaw) ? scannerFeedRaw : [];
+    const scannerCandidates = scannerFeed
+      .map((raw) => {
+        const market = String(raw?.market ?? "").toUpperCase();
+        if (!market.startsWith("KRW-")) return null;
+        const sourceTs = scannerSignalTimestamp(raw);
+        const ageSeconds = sourceTs ? Math.max(0, Math.floor((Date.now() - Date.parse(sourceTs)) / 1000)) : null;
+        return {
+          market,
+          score: Number(raw?.score ?? 0),
+          sourceTs,
+          ageSeconds,
+          payload: raw,
+        };
+      })
+      .filter((x): x is { market: string; score: number; sourceTs: string | null; ageSeconds: number | null; payload: ScannerFeedSignal } => Boolean(x))
+      .sort((a, b) => b.score - a.score);
+
+    for (const row of scannerCandidates) {
+      const existing = latestAllSignals.get(row.market);
+      const existingTs = signalCandidateTimestamp(existing);
+      const existingMs = existingTs ? Date.parse(existingTs) : NaN;
+      const scannerMs = row.sourceTs ? Date.parse(row.sourceTs) : NaN;
+      const shouldBridge = !existing || (Number.isFinite(scannerMs) && (!Number.isFinite(existingMs) || scannerMs >= existingMs));
+      if (!shouldBridge) continue;
+      latestAllSignals.set(row.market, {
+        ts: row.sourceTs ?? new Date().toISOString(),
+        p: {
+          market: row.market,
+          signal_type: "surge_scanner_bridge",
+          signal_reason: String(row.payload.reason ?? "surge_scanner_candidate"),
+          volume_ratio: Number(row.payload.volume_multiple ?? 0),
+          filter_pass: false,
+          signal_score: Number(row.payload.score ?? 0),
+          signal_ts: row.sourceTs,
+          updated_at: row.sourceTs,
+          captured_at: row.sourceTs,
+          source_kind: "scanner",
+        },
+      });
     }
 
     const exceptionPool = Array.from(latestAllSignals.entries())
@@ -1622,6 +1723,50 @@ export function createLiveDataStrategy(opts: {
     const marketsWithFilterPass = filterPassCandidates.slice(0, 40);
     const filterPassCandidatesExcludingHeld = filterPassCandidates.filter((m) => !heldSymbolSet.has(m));
     const marketsWithFilterPassExcludingHeld = filterPassCandidatesExcludingHeld.slice(0, 40);
+    const scannerCandidatesExcludingHeld = scannerCandidates.filter((x) => !heldSymbolSet.has(x.market));
+    const staleThresholdSeconds = LIVE_ENTRY_SIGNAL_STALE_SECONDS;
+    const freshScannerCandidates = scannerCandidatesExcludingHeld.filter((x) => x.ageSeconds !== null && x.ageSeconds <= staleThresholdSeconds);
+    const staleScannerCandidates = scannerCandidatesExcludingHeld.filter((x) => x.ageSeconds === null || x.ageSeconds > staleThresholdSeconds);
+    const freshFilterPassCandidates = Array.from(latestAllSignals.entries())
+      .map(([market, sig]) => {
+        if (!Boolean(sig?.p?.filter_pass) || heldSymbolSet.has(market)) return null;
+        const sourceTs = signalCandidateTimestamp(sig);
+        const ageSeconds = sourceTs ? Math.max(0, Math.floor((Date.now() - Date.parse(sourceTs)) / 1000)) : null;
+        const gate = opts.marketState.entryGate(sig.p, marketState);
+        return { market, sourceTs, ageSeconds, score: Number(gate.score ?? 0), vol: Number(sig?.p?.volume_ratio ?? 0) };
+      })
+      .filter(
+        (x): x is { market: string; sourceTs: string | null; ageSeconds: number | null; score: number; vol: number } =>
+          Boolean(x && x.ageSeconds !== null && x.ageSeconds <= staleThresholdSeconds),
+      )
+      .sort((a, b) => b.score - a.score || b.vol - a.vol);
+    const staleFilterPassCandidates = Array.from(latestAllSignals.entries())
+      .map(([market, sig]) => {
+        if (!Boolean(sig?.p?.filter_pass) || heldSymbolSet.has(market)) return null;
+        const sourceTs = signalCandidateTimestamp(sig);
+        const ageSeconds = sourceTs ? Math.max(0, Math.floor((Date.now() - Date.parse(sourceTs)) / 1000)) : null;
+        if (ageSeconds !== null && ageSeconds <= staleThresholdSeconds) return null;
+        return { market, ageSeconds };
+      })
+      .filter((x): x is { market: string; ageSeconds: number | null } => Boolean(x));
+
+    const selectedSourceRows: Array<{ market: string; source_kind: "scanner" | "filter_pass"; source_ts: string | null; age_seconds: number | null }> = [];
+    for (const s of freshScannerCandidates) {
+      if (selectedSourceRows.some((x) => x.market === s.market)) continue;
+      selectedSourceRows.push({ market: s.market, source_kind: "scanner", source_ts: s.sourceTs, age_seconds: s.ageSeconds });
+      if (selectedSourceRows.length >= LIVE_ENTRY_UNIVERSE_TOP_N) break;
+    }
+    if (selectedSourceRows.length < LIVE_ENTRY_UNIVERSE_TOP_N) {
+      for (const f of freshFilterPassCandidates) {
+        if (selectedSourceRows.some((x) => x.market === f.market)) continue;
+        selectedSourceRows.push({ market: f.market, source_kind: "filter_pass", source_ts: f.sourceTs, age_seconds: f.ageSeconds });
+        if (selectedSourceRows.length >= LIVE_ENTRY_UNIVERSE_TOP_N) break;
+      }
+    }
+    const selectedEntryUniverseSymbols = selectedSourceRows.map((x) => x.market);
+    for (const m of selectedSourceRows) {
+      sourceMetaByMarket.set(m.market, { ...m, stale_filtered_before_eval: false });
+    }
     console.info(
       JSON.stringify({
         tag: "DEBUG_DISCOVERY_UNIVERSE_EXCLUDING_HELD",
@@ -1631,6 +1776,30 @@ export function createLiveDataStrategy(opts: {
         discovery_symbols: marketsWithFilterPassExcludingHeld.slice(0, 20),
         excluded_held_symbols: marketsWithFilterPass.filter((m) => heldSymbolSet.has(m)).slice(0, 20),
         discovery_count: marketsWithFilterPassExcludingHeld.length,
+      }),
+    );
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_LIVE_ENTRY_SOURCE_FRESHNESS",
+        ts: new Date().toISOString(),
+        source_kind: "scanner_then_filter_pass",
+        candidate_symbols: selectedSourceRows.map((x) => x.market),
+        candidate_age_seconds: selectedSourceRows.map((x) => ({ symbol: x.market, age_seconds: x.age_seconds })),
+        dropped_stale_symbols: [
+          ...staleScannerCandidates.map((x) => ({ symbol: x.market, source_kind: "scanner", age_seconds: x.ageSeconds })),
+          ...staleFilterPassCandidates.map((x) => ({ symbol: x.market, source_kind: "filter_pass", age_seconds: x.ageSeconds })),
+        ].slice(0, 30),
+        stale_threshold_seconds: staleThresholdSeconds,
+      }),
+    );
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_LIVE_FRESH_SCANNER_BRIDGE",
+        ts: new Date().toISOString(),
+        scanner_symbols: freshScannerCandidates.map((x) => x.market).slice(0, 20),
+        filter_pass_symbols: freshFilterPassCandidates.map((x) => x.market).slice(0, 20),
+        selected_entry_universe_symbols: selectedEntryUniverseSymbols,
+        source_priority_used: freshScannerCandidates.length > 0 ? "scanner_then_filter_pass" : "filter_pass_only",
       }),
     );
     const marketsWithScore = topSignals.slice(0, 12).map((x) => `${x.market}:${x.score.toFixed(1)}`);
@@ -2838,9 +3007,9 @@ export function createLiveDataStrategy(opts: {
       return;
     }
     const exceptionSlot = state.regime?.exception_slot_market ?? null;
-    const fallbackUsed = filterPassCandidatesExcludingHeld.length === 0;
-    const inputSourceKind = fallbackUsed ? "legacy_fallback" : "filter_pass_primary";
-    const primary = fallbackUsed ? watchMarkets.filter((m) => !heldSymbolSet.has(m)) : filterPassCandidatesExcludingHeld;
+    const fallbackUsed = selectedEntryUniverseSymbols.length === 0;
+    const inputSourceKind = fallbackUsed ? "legacy_fallback" : "scanner_filter_fresh";
+    const primary = fallbackUsed ? watchMarkets.filter((m) => !heldSymbolSet.has(m)).slice(0, LIVE_ENTRY_UNIVERSE_TOP_N) : selectedEntryUniverseSymbols;
     const baseEntryUniverseInput = Array.from(new Set([...primary, ...(exceptionSlot ? [exceptionSlot] : []), ...debugUniverseExtra]));
     console.info(
       JSON.stringify({
@@ -2853,8 +3022,8 @@ export function createLiveDataStrategy(opts: {
         filter_pass_count: filterPassCandidatesExcludingHeld.length,
         fallback_used: fallbackUsed,
         note: fallbackUsed
-          ? "filter_pass_candidates empty → fallback to watchMarkets"
-          : "primary=filter_pass_candidates + secondary(exceptionSlot, debugUniverseExtra)",
+          ? "fresh scanner/filter_pass empty → fallback to watchMarkets(topN)"
+          : "primary=fresh_scanner_then_filter_pass + secondary(exceptionSlot, debugUniverseExtra)",
       }),
     );
     const baseEntryUniverse = baseEntryUniverseInput;
@@ -3427,6 +3596,7 @@ export function createLiveDataStrategy(opts: {
 
       // precheck 루프 진입 강제 로그 (이게 없으면 entryUniverse가 비었거나 루프 전에서 끊긴 것)
       const sigPre = latestAllSignals.get(market);
+      const sourceMeta = sourceMetaByMarket.get(market);
       const gatePre = sigPre ? opts.marketState.entryGate(sigPre.p, marketState) : null;
       console.info(
         JSON.stringify({
@@ -3437,6 +3607,9 @@ export function createLiveDataStrategy(opts: {
           entry_score: gatePre ? Number(gatePre.score ?? 0) : null,
           market_state: marketState.market_state,
           position_exists: Boolean(state.positions[market]),
+          source_kind: sourceMeta?.source_kind ?? null,
+          source_ts: sourceMeta?.source_ts ?? null,
+          age_seconds: sourceMeta?.age_seconds ?? null,
           open_positions: Object.keys(state.positions).length,
           max_positions: state.safety_guard.max_positions,
         }),
@@ -3614,6 +3787,15 @@ export function createLiveDataStrategy(opts: {
 
       // Late-entry diagnostics & guard (entry timing)
       const signalTs = typeof sig.ts === "string" ? sig.ts : null;
+      const sourceMetaResolved = sourceMetaByMarket.get(market) ?? {
+        source_kind: (sig?.p?.source_kind === "scanner" ? "scanner" : "filter_pass") as "scanner" | "filter_pass",
+        source_ts: signalCandidateTimestamp(sig),
+        age_seconds: null,
+        stale_filtered_before_eval: false,
+      };
+      if (sourceMetaResolved.age_seconds === null && sourceMetaResolved.source_ts) {
+        sourceMetaResolved.age_seconds = Math.max(0, Math.floor((Date.now() - Date.parse(sourceMetaResolved.source_ts)) / 1000));
+      }
       const signalTsMs = signalTs ? Date.parse(signalTs) : NaN;
       const nowMs = Date.now();
       const secondsSinceSignal = Number.isFinite(signalTsMs) ? Math.max(0, Math.floor((nowMs - signalTsMs) / 1000)) : null;
@@ -3814,6 +3996,10 @@ export function createLiveDataStrategy(opts: {
           tag: "DEBUG_LIVE_ENTRY_DECISION",
           ts: new Date().toISOString(),
           symbol: market,
+          source_kind: sourceMetaResolved.source_kind,
+          source_ts: sourceMetaResolved.source_ts,
+          age_seconds: sourceMetaResolved.age_seconds,
+          stale_filtered_before_eval: sourceMetaResolved.stale_filtered_before_eval,
           market_state: marketState.market_state,
           btc_tier: btcTierNow,
           score,

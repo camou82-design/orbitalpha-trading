@@ -280,10 +280,12 @@ async function main() {
       if (!r.ok) throw new Error(`order_entry_gate: ${r.blocked_reason}`);
     },
   });
+  let pumpScannerRef: ReturnType<typeof createPumpScanner> | null = null;
   const strategy = createLiveDataStrategy({
     companyId: env.companyId,
     serviceId: env.serviceId,
     readLogs: (limit: number) => readRecentLogs(env.companyId, env.serviceId, limit),
+    getScannerSignals: () => (pumpScannerRef ? pumpScannerRef.signalFeed() : []),
     trade,
     marketState: marketFilter,
     onEvent: (row) => opLog.event(row),
@@ -293,6 +295,7 @@ async function main() {
   const pumpScanner = createPumpScanner(() => Object.keys((strategy.status() as any).open_positions ?? {}), {
     onEvent: (row) => opLog.event(row),
   });
+  pumpScannerRef = pumpScanner;
   const paper = createPaperTradingEngine({
     companyId: env.companyId,
     serviceId: env.serviceId,
