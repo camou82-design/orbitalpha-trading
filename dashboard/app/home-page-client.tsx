@@ -1953,7 +1953,7 @@ export default function HomePage() {
               <div>실주문 가능 KRW: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.live_order_available_krw ?? 0)).toLocaleString()}</strong></div>
               <div>예약/미체결 KRW: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.reserved_krw ?? 0)).toLocaleString()}</strong></div>
               <div>기존 전략 투입 KRW: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.strategy_allocated_krw ?? 0)).toLocaleString()}</strong></div>
-              <div>급등주 판단 사용 자금: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.pump_paper_allocated_krw ?? 0)).toLocaleString()}</strong></div>
+              <div>급등주 실거래 한도 사용액: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.pump_paper_allocated_krw ?? 0)).toLocaleString()}</strong></div>
             </div>
             <div style={{ marginTop: "0.35rem", fontSize: "0.72rem", color: UI.mutedSoft }}>
               총 보유 KRW = 사용 가능 KRW + 이미 투입 KRW · 모든 손익은 수수료 반영 후 순금액 기준
