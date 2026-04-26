@@ -289,6 +289,10 @@ type AssetSummaryKpi =
   | { kpi: "pending" }
   | { kpi: "unavailable" };
 
+type LiveOperatingCapital = {
+  totalOperatingKrw: number | null;
+};
+
 type AuthSession = {
   authenticated: boolean;
   user_id?: string;
@@ -620,6 +624,41 @@ function toPaperPanelSummary(raw: unknown): PaperPanelSummary {
     updatedAt: typeof r.updated_at === "string" ? r.updated_at : null,
     experienceStats: statsRaw as PaperSurgePatternStats[],
   };
+}
+
+function deriveLiveOperatingCapital(trade: TradeStatus | null): LiveOperatingCapital {
+  if (!trade) return { totalOperatingKrw: null };
+  const apTotal = Number(trade.account_portfolio?.total_evaluated_krw);
+  if (Number.isFinite(apTotal) && apTotal > 0) {
+    return { totalOperatingKrw: apTotal };
+  }
+
+  const totalKrw = Number(trade.total_krw);
+  if (Number.isFinite(totalKrw) && totalKrw > 0) {
+    return { totalOperatingKrw: totalKrw };
+  }
+
+  const krwAvailable = Number(trade.krw_available);
+  const safeKrwAvailable = Number.isFinite(krwAvailable) ? Math.max(0, krwAvailable) : 0;
+  const markPrices = trade.mark_prices ?? {};
+  let holdingsEvaluated = 0;
+  for (const bal of Array.isArray(trade.balances) ? trade.balances : []) {
+    const currency = String(bal?.currency ?? "").toUpperCase();
+    if (!currency || currency === "KRW") continue;
+    const qty = Math.max(0, Number(bal?.balance ?? 0)) + Math.max(0, Number(bal?.locked ?? 0));
+    if (!(qty > 0)) continue;
+    const market = `KRW-${currency}`;
+    const markPrice = Number((markPrices as Record<string, unknown>)[market]);
+    const avgBuy = Number(bal?.avg_buy_price ?? 0);
+    const px = Number.isFinite(markPrice) && markPrice > 0 ? markPrice : Number.isFinite(avgBuy) && avgBuy > 0 ? avgBuy : 0;
+    if (px <= 0) continue;
+    holdingsEvaluated += qty * px;
+  }
+  const combined = safeKrwAvailable + holdingsEvaluated;
+  if (combined > 0) {
+    return { totalOperatingKrw: combined };
+  }
+  return { totalOperatingKrw: null };
 }
 
 function failedFilterLabels(parsed: NonNullable<ReturnType<typeof parseSignalPayload>>): string {
@@ -1529,6 +1568,7 @@ export default function HomePage() {
   }, [holdingCards]);
 
   const paperSummary = useMemo<PaperPanelSummary>(() => toPaperPanelSummary(paper), [paper]);
+  const liveOperatingCapital = useMemo(() => deriveLiveOperatingCapital(trade), [trade]);
 
   const assetSummary = useMemo((): AssetSummaryKpi => {
     if (!trade) return { kpi: "unavailable" };
@@ -2377,19 +2417,33 @@ export default function HomePage() {
                   {/* 3단: 실거래 자금 상태 */}
                   <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
                     <div style={{ fontSize: "0.85rem", color: UI.title, fontWeight: 900, marginBottom: 8 }}>실거래 급등주 자금 상태</div>
-                    <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "1rem", fontSize: "0.8rem" }}>
-                      <div>
-                        <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", marginBottom: 2 }}>급등주 실거래 한도 (50%)</div>
-                        <strong>{assetSummary.kpi === "ready" ? Math.round(assetSummary.totalAssets * 0.5).toLocaleString() : "수집 대기"}원</strong>
-                      </div>
-                      <div>
-                        <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", marginBottom: 2 }}>현재 사용 중 / 남은 자금</div>
-                        <strong>{Math.round(trade?.pump_paper_allocated_krw ?? 0).toLocaleString()} / {assetSummary.kpi === "ready" ? Math.round(assetSummary.totalAssets * 0.5 - (trade?.pump_paper_allocated_krw ?? 0)).toLocaleString() : "-"}</strong>
-                      </div>
-                      <div>
-                        <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", marginBottom: 2 }}>동시 보유 / 모드</div>
-                        <strong>{(strategy?.open_positions ? Object.keys(strategy.open_positions).length : 0)} / 3 (실거래 ON 시 적용)</strong>
-                      </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "1rem", fontSize: "0.8rem" }}>
+                      {(() => {
+                        const totalOperatingKrw = liveOperatingCapital.totalOperatingKrw;
+                        const surgeLiveCap = totalOperatingKrw != null ? totalOperatingKrw * 0.5 : null;
+                        const usedKrw = Math.max(0, Number(trade?.pump_paper_allocated_krw ?? 0));
+                        const remainingKrw = surgeLiveCap != null ? surgeLiveCap - usedKrw : null;
+                        return (
+                          <>
+                            <div>
+                              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", marginBottom: 2 }}>실거래 총 운용금액</div>
+                              <strong>{totalOperatingKrw != null ? `${Math.round(totalOperatingKrw).toLocaleString()}원` : "수집 대기"}</strong>
+                            </div>
+                            <div>
+                              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", marginBottom: 2 }}>급등주 실거래 한도 = 실거래 총 운용금액의 50%</div>
+                              <strong>{surgeLiveCap != null ? `${Math.round(surgeLiveCap).toLocaleString()}원` : "수집 대기"}</strong>
+                            </div>
+                            <div>
+                              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", marginBottom: 2 }}>현재 급등주 사용액</div>
+                              <strong>{Math.round(usedKrw).toLocaleString()}원</strong>
+                            </div>
+                            <div>
+                              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", marginBottom: 2 }}>남은 급등주 한도</div>
+                              <strong>{remainingKrw != null ? `${Math.round(remainingKrw).toLocaleString()}원` : "수집 대기"}</strong>
+                            </div>
+                          </>
+                        );
+                      })()}
                     </div>
                   </div>
 
