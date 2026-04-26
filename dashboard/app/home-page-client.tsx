@@ -1269,7 +1269,7 @@ export default function HomePage() {
           setPaperPanelError(null);
         } else {
           setPaper(null);
-          setPaperPanelError("모의매매 데이터를 불러오지 못했습니다");
+          setPaperPanelError("검증 이력 데이터를 불러오지 못했습니다");
         }
         if (marketStateStatus) setMarketState(marketStateStatus as MarketStateStatus);
         setLastUpdatedAt(new Date().toLocaleTimeString("ko-KR", { hour12: false }));
@@ -2200,7 +2200,7 @@ export default function HomePage() {
             </div>
           </div>
           <div style={{ fontSize: "0.72rem", color: UI.mutedSoft, marginTop: -4, marginBottom: 12, lineHeight: 1.4 }}>
-            스캐너 신호는 즉시 진입이 아니라, 원형 매매법 + paper 경험치 + live 리스크 게이트를 통과해야 실거래 후보가 됩니다.
+            스캐너 신호는 즉시 진입이 아니라, 원형 매매법 + 검증이력 경험치 + live 리스크 게이트를 통과해야 실거래 후보가 됩니다.
           </div>
           {scannerItemsExcludingHeld.after.length ? (
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -2278,7 +2278,7 @@ export default function HomePage() {
               })}
             </div>
           ) : (
-            <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>급등 후보 수집 및 경험치 대조 중...</p>
+            <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>급등주 실거래 후보 수집 및 경험치 대조 중...</p>
           )}
         </section>
 
@@ -2294,8 +2294,8 @@ export default function HomePage() {
         >
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "0.55rem" }}>
             <div>
-              <div style={{ fontSize: "0.95rem", color: UI.title, fontWeight: 900, letterSpacing: "0.02em" }}>급등주 경험치 엔진 (Paper → Live 학습)</div>
-              <div style={{ fontSize: "0.72rem", color: UI.mutedSoft, marginTop: 2 }}>모의매매 결과를 원인별 경험치로 분석해 실거래 진입금액/차단 판단에 반영합니다.</div>
+              <div style={{ fontSize: "0.95rem", color: UI.title, fontWeight: 900, letterSpacing: "0.02em" }}>급등주 실거래 판단 엔진</div>
+              <div style={{ fontSize: "0.72rem", color: UI.mutedSoft, marginTop: 2 }}>급등주 후보의 과거 검증 결과를 원인별 경험치로 분석해 실거래 진입금액·감액·차단 판단에 반영합니다.</div>
             </div>
             <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>
               갱신 {paperSummary.updatedAt ? formatTsLocal(paperSummary.updatedAt) : "-"}
@@ -2308,7 +2308,7 @@ export default function HomePage() {
                 return <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>데이터를 불러오지 못했습니다</p>;
               }
               if (!paper) {
-                return <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>아직 표시할 경험치 표본이 없습니다. 서버가 기존 paper history를 bootstrap하면 profile별 경험치가 표시됩니다.</p>;
+                return <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>아직 표시할 급등주 판단 표본이 없습니다. 서버가 기존 검증 이력을 불러오면 profile별 경험치가 표시됩니다.</p>;
               }
 
               const stats = paperSummary.experienceStats ?? [];
@@ -2341,7 +2341,7 @@ export default function HomePage() {
                       { label: "수익 표본", value: `${totalWins}건`, color: UI.pass },
                       { label: "손실 표본", value: `${totalLosses}건`, color: UI.fail },
                       { label: "평균 손익", value: `${avgPnl.toFixed(2)}%`, color: avgPnl >= 0 ? UI.pass : UI.fail },
-                      { label: "실거래 반영", value: liveReflection, color: autoTradeEnabled ? UI.pass : UI.watch },
+                      { label: "실거래 판단 반영", value: liveReflection, color: autoTradeEnabled ? UI.pass : UI.watch },
                     ].map((c, i) => (
                       <div key={i} style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 8, padding: "0.6rem", textAlign: "center" }}>
                         <div style={{ fontSize: "0.68rem", color: UI.mutedSoft, marginBottom: 4 }}>{c.label}</div>
@@ -2408,6 +2408,9 @@ export default function HomePage() {
                             <th style={{ padding: "0.6rem 0.8rem" }}>Sizing</th>
                             <th style={{ padding: "0.6rem 0.8rem" }}>Fast%</th>
                             <th style={{ padding: "0.6rem 0.8rem" }}>SurgeSL%</th>
+                            <th style={{ padding: "0.6rem 0.8rem" }}>EarlySL%</th>
+                            <th style={{ padding: "0.6rem 0.8rem" }}>Fade%</th>
+                            <th style={{ padding: "0.6rem 0.8rem" }}>HighRej%</th>
                             <th style={{ padding: "0.6rem 0.8rem" }}>Unk%</th>
                             <th style={{ padding: "0.6rem 0.8rem" }}>Live 판단</th>
                           </tr>
@@ -2431,6 +2434,9 @@ export default function HomePage() {
                                 <td style={{ padding: "0.5rem 0.8rem" }}>x{s.suggested_size_multiplier.toFixed(1)}</td>
                                 <td style={{ padding: "0.5rem 0.8rem" }}>{(s.fast_profit_rate * 100).toFixed(0)}%</td>
                                 <td style={{ padding: "0.5rem 0.8rem" }}>{(s.surge_stop_loss_rate * 100).toFixed(0)}%</td>
+                                <td style={{ padding: "0.5rem 0.8rem" }}>{(s.early_entry_loss_rate * 100).toFixed(0)}%</td>
+                                <td style={{ padding: "0.5rem 0.8rem" }}>{(s.volume_fade_loss_rate * 100).toFixed(0)}%</td>
+                                <td style={{ padding: "0.5rem 0.8rem" }}>{(s.high_rejected_loss_rate * 100).toFixed(0)}%</td>
                                 <td style={{ padding: "0.5rem 0.8rem" }}>{(s.profile_unknown_loss_rate * 100).toFixed(0)}%</td>
                                 <td style={{ padding: "0.5rem 0.8rem" }}><span style={{ color: liveColor, fontWeight: 900 }}>{liveLabel}</span></td>
                               </tr>
@@ -2441,17 +2447,17 @@ export default function HomePage() {
                     </div>
                   </div>
 
-                  {/* 5단: 최근 모의매매 내역 */}
+                  {/* 5단: 최근 급등주 판단 표본 내역 */}
                   <div style={{ border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem", background: UI.cardSoftBg }}>
-                    <div style={{ fontSize: "0.85rem", color: UI.title, fontWeight: 900, marginBottom: 10 }}>최근 모의매매 (Experience Samples)</div>
+                    <div style={{ fontSize: "0.85rem", color: UI.title, fontWeight: 900, marginBottom: 10 }}>최근 급등주 판단 표본</div>
                     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                       {(paperSummary.recentTrades ?? []).length > 0 ? (
                         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                          <div style={{ display: "grid", gridTemplateColumns: "85px 75px 85px 120px 140px 100px 1fr", gap: 8, fontSize: "0.65rem", color: UI.mutedSoft, padding: "0 4px", borderBottom: "1px solid #1e293b", paddingBottom: 4 }}>
-                            <span>시간</span><span>종목</span><span>상태</span><span>진입사유</span><span>경험치분류</span><span>RiskTags</span><span>반영결과</span>
+                          <div style={{ display: "grid", gridTemplateColumns: "85px 70px 90px 65px 120px 140px 100px 1fr", gap: 8, fontSize: "0.65rem", color: UI.mutedSoft, padding: "0 4px", borderBottom: "1px solid #1e293b", paddingBottom: 4 }}>
+                            <span>시간</span><span>종목</span><span>상태</span><span>손익%</span><span>진입사유</span><span>경험치분류</span><span>RiskTags</span><span>반영결과</span>
                           </div>
                           {paperSummary.recentTrades.slice(0, 15).map((row, idx) => {
-                            let expLabel = "관찰 표본 수집";
+                            let expLabel = "실거래 판단 표본 수집";
                             let reflection = "-";
                             if (row.state === "CLOSED_WIN") { expLabel = "이익 / 패턴 적중"; reflection = "Live 유지/확대"; }
                             if (row.state === "CLOSED_LOSS") { 
@@ -2459,14 +2465,14 @@ export default function HomePage() {
                               reflection = "다음 유사 패턴 감액";
                             }
                             if (row.note.includes("unknown")) { expLabel = "unknown 표본 수집"; reflection = "Live 고신뢰 아님"; }
-                            if (row.state === "OPEN") { expLabel = "진입 / 추적 중"; reflection = "진행 중"; }
+                            if (row.state === "OPEN") { expLabel = "진입 / 추적 중"; reflection = "검증이력 진행 중"; }
 
                             return (
                               <div
                                 key={idx}
                                 style={{
                                   display: "grid",
-                                  gridTemplateColumns: "85px 75px 85px 120px 140px 100px 1fr",
+                                  gridTemplateColumns: "85px 70px 90px 65px 120px 140px 100px 1fr",
                                   gap: 8,
                                   fontSize: "0.72rem",
                                   color: UI.body,
@@ -2481,7 +2487,13 @@ export default function HomePage() {
                                   color: row.state.includes("WIN") ? UI.pass : row.state.includes("LOSS") ? UI.fail : UI.body,
                                   fontSize: "0.68rem"
                                 }}>
-                                  {row.state} {row.pnlPct != null ? `(${row.pnlPct.toFixed(2)}%)` : ""}
+                                  {row.state}
+                                </span>
+                                <span style={{ 
+                                  color: row.pnlPct != null ? (row.pnlPct >= 0 ? UI.pass : UI.fail) : UI.body,
+                                  fontSize: "0.68rem"
+                                }}>
+                                  {row.pnlPct != null ? `${row.pnlPct.toFixed(2)}%` : "-"}
                                 </span>
                                 <span style={{ fontSize: "0.68rem", color: UI.mutedSoft, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={row.profileReason}>{row.profileReason}</span>
                                 <span style={{ fontSize: "0.68rem" }}>{expLabel}</span>
@@ -2512,6 +2524,8 @@ export default function HomePage() {
           isNearMissFiveOfSix={isNearMissFiveOfSix}
           getCardFailReason={getCardFailReason}
           formatTsLocal={formatTsLocal}
+          paperStats={paperSummary?.experienceStats ?? []}
+          autoTradeEnabled={autoTradeEnabled}
         />
 
         {err ? (
