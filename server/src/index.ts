@@ -456,7 +456,7 @@ async function main() {
       return {
         authenticated: false,
         message: "세션 없음",
-        auto_trade_enabled: false,
+        auto_trade_enabled: null,
         recovery_ready: false,
         safety_guard_state: "주의" as const,
         can_enable_auto_trade: false,
@@ -526,11 +526,11 @@ async function main() {
         trade_status_error: "timeout" as const,
         trade_status_fallback_used: fallbackUsed,
         trade_status_fallback_age_ms: fallbackAgeMs,
-        auto_trade_enabled: fallbackValue?.auto_trade_enabled ?? false,
+        auto_trade_enabled: fallbackValue?.auto_trade_enabled ?? null,
         auto_trade_changed_at: fallbackValue?.auto_trade_changed_at ?? null,
-        live_enabled: fallbackValue?.live_enabled ?? false,
-        api_connected: fallbackValue?.api_connected ?? false,
-        recovery_ready: fallbackValue?.recovery_ready === true ? true : false,
+        live_enabled: fallbackValue?.live_enabled ?? null,
+        api_connected: fallbackValue?.api_connected ?? null,
+        recovery_ready: fallbackValue?.recovery_ready ?? null,
         safety_guard_state: (ss.safety_guard_state ?? "주의") as "정상" | "주의" | "자동정지",
         can_enable_auto_trade: false,
         cannot_enable_reason: "trade_status_timeout" as const,
@@ -690,7 +690,6 @@ async function main() {
   app.post("/api/v1/auth/logout", async (req, reply) => {
     const token = readSessionToken(req.headers.cookie);
     if (token) sessions.delete(token);
-    await trade.setAutoTradeEnabled(false);
     clearSessionCookie(reply, req);
     app.log.info({ route: "auth_logout" }, "Auth logout");
     await opLog.event({
@@ -709,7 +708,7 @@ async function main() {
       pnl_net_pct: null,
       note: null,
     });
-    return { authenticated: false, auto_trade_enabled: false };
+    return { authenticated: false };
   });
 
   app.get("/api/v1/auth/session", async (req) => buildAuthSessionPayload(req));
