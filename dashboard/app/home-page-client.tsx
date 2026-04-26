@@ -1308,7 +1308,7 @@ export default function HomePage() {
           setPaperPanelError(null);
         } else {
           setPaper(null);
-          setPaperPanelError("검증 이력 데이터를 불러오지 못했습니다");
+          setPaperPanelError("급등주 판단 데이터를 불러오지 못했습니다");
         }
         if (marketStateStatus) setMarketState(marketStateStatus as MarketStateStatus);
         setLastUpdatedAt(new Date().toLocaleTimeString("ko-KR", { hour12: false }));
@@ -1953,7 +1953,7 @@ export default function HomePage() {
               <div>실주문 가능 KRW: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.live_order_available_krw ?? 0)).toLocaleString()}</strong></div>
               <div>예약/미체결 KRW: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.reserved_krw ?? 0)).toLocaleString()}</strong></div>
               <div>기존 전략 투입 KRW: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.strategy_allocated_krw ?? 0)).toLocaleString()}</strong></div>
-              <div>급등주 가상검증 자금: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.pump_paper_allocated_krw ?? 0)).toLocaleString()}</strong></div>
+              <div>급등주 판단 사용 자금: <strong style={{ color: UI.body }}>{Math.round(Number(trade?.pump_paper_allocated_krw ?? 0)).toLocaleString()}</strong></div>
             </div>
             <div style={{ marginTop: "0.35rem", fontSize: "0.72rem", color: UI.mutedSoft }}>
               총 보유 KRW = 사용 가능 KRW + 이미 투입 KRW · 모든 손익은 수수료 반영 후 순금액 기준
@@ -2234,7 +2234,7 @@ export default function HomePage() {
             <div style={{ fontSize: "0.9rem", color: UI.title, fontWeight: 800, letterSpacing: "0.02em" }}>급등주 스캐너</div>
             <div style={{ fontSize: "0.74rem", color: UI.mutedSoft, display: "flex", gap: 8, alignItems: "center" }}>
               <span style={{ color: "#f59e0b" }}>
-                {scanner?.mode === "paper_validation" ? "가상검증중" : "가상검증중"}
+                {scanner?.mode === "paper_validation" ? "실거래 후보 검증중" : "실거래 후보 검증중"}
               </span>
               갱신 {scanner?.updated_at ? formatTsLocal(scanner.updated_at) : "-"}
             </div>
@@ -2503,7 +2503,7 @@ export default function HomePage() {
 
                   {/* 5단: 최근 급등주 판단 표본 내역 */}
                   <div style={{ border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem", background: UI.cardSoftBg }}>
-                    <div style={{ fontSize: "0.85rem", color: UI.title, fontWeight: 900, marginBottom: 10 }}>최근 급등주 판단 표본</div>
+                    <div style={{ fontSize: "0.85rem", color: UI.title, fontWeight: 900, marginBottom: 10 }}>최근 급등주 판단 이력</div>
                     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                       {(paperSummary.recentTrades ?? []).length > 0 ? (
                         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -2558,7 +2558,7 @@ export default function HomePage() {
                           })}
                         </div>
                       ) : (
-                        <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>표시할 경험치 표본이 없습니다.</div>
+                        <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>급등주 판단 데이터 수집 중</div>
                       )}
                     </div>
                   </div>
