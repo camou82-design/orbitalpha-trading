@@ -1557,7 +1557,12 @@ export function createLiveDataStrategy(opts: {
     const latestAllSignals = new Map<string, any>();
     const sourceMetaByMarket = new Map<
       string,
-      { source_kind: "scanner" | "filter_pass"; source_ts: string | null; age_seconds: number | null; stale_filtered_before_eval: boolean }
+      {
+        source_kind: "scanner" | "filter_pass" | "scanner_filter_fresh" | "scanner_then_filter_pass";
+        source_ts: string | null;
+        age_seconds: number | null;
+        stale_filtered_before_eval: boolean;
+      }
     >();
     const logs = await opts.readLogs(220);
     const marketState = await opts.marketState.evaluate();
@@ -1889,10 +1894,10 @@ export function createLiveDataStrategy(opts: {
     );
 
     // 진입 후보 집합(base/precheck)과 ticker fetch 집합(보유/기준가 보강)을 개념적으로 분리한다.
-    const fallbackUsedForPrimary = filterPassCandidates.length === 0;
-    const tickerRequestSourceKind = fallbackUsedForPrimary ? "fallback" : "filter_pass_primary";
-    const watchMarketsExcludingHeld = watchMarkets.filter((m) => !heldSymbolSet.has(m));
-    const primaryForUniverse = fallbackUsedForPrimary ? watchMarketsExcludingHeld : filterPassCandidatesExcludingHeld;
+    const fallbackUsedForPrimary = selectedEntryUniverseSymbols.length === 0;
+    const tickerRequestSourceKind = fallbackUsedForPrimary ? "fallback_watch_markets" : "scanner_filter_fresh";
+    const watchMarketsExcludingHeld = watchMarkets.filter((m) => !heldSymbolSet.has(m)).slice(0, LIVE_ENTRY_UNIVERSE_TOP_N);
+    const primaryForUniverse = fallbackUsedForPrimary ? watchMarketsExcludingHeld : selectedEntryUniverseSymbols;
     const baseInputSymbols = Array.from(
       new Set([...primaryForUniverse, ...(exceptionSlotMarket ? [exceptionSlotMarket] : []), ...debugUniverseExtra]),
     );
@@ -3772,27 +3777,78 @@ export function createLiveDataStrategy(opts: {
         emitEval("blocked_low_signal", { signal_strength_score: rawStrength });
         continue;
       }
-      if (marketState.market_state === "risk_off") {
+      // Late-entry diagnostics & guard (entry timing)
+      const signalTs = typeof sig.ts === "string" ? sig.ts : null;
+      const sourceMetaResolved = sourceMetaByMarket.get(market) ?? {
+        source_kind: (sig?.p?.source_kind === "scanner" ? "scanner" : "filter_pass") as
+          | "scanner"
+          | "filter_pass"
+          | "scanner_filter_fresh"
+          | "scanner_then_filter_pass",
+        source_ts: signalCandidateTimestamp(sig),
+        age_seconds: null,
+        stale_filtered_before_eval: false,
+      };
+      const sourceKindForJudgment =
+        sourceMetaResolved.source_kind === "scanner" || sourceMetaResolved.source_kind === "filter_pass"
+          ? inputSourceKind
+          : sourceMetaResolved.source_kind;
+      const isSurgeSource =
+        sourceKindForJudgment === "scanner_filter_fresh" ||
+        sourceKindForJudgment === "scanner_then_filter_pass";
+      const btcCrashGuard = btcChange <= -0.025;
+      const marketPanicGuard =
+        btcChange <= -0.015 &&
+        (marketState.btc_5m_trend === "down" || marketState.btc_15m_trend === "down");
+      const surgeHardBlock = btcCrashGuard || marketPanicGuard;
+      const surgeMarketState: "risk_on" | "neutral" | "risk_off" | "panic" = surgeHardBlock ? "panic" : marketState.market_state;
+      const surgeMarketJudgmentReason = surgeHardBlock
+        ? btcCrashGuard
+          ? "btc_crash_guard"
+          : "market_panic_guard"
+        : surgeMarketState === "neutral"
+          ? "neutral_allow_with_size_reduction"
+          : surgeMarketState === "risk_off"
+            ? "risk_off_allow_with_size_reduction"
+            : "risk_on_normal";
+      let surgeMarketSizeMultiplier = surgeMarketState === "risk_on" ? 1 : surgeMarketState === "neutral" ? 0.7 : surgeHardBlock ? 0 : 0.45;
+      if (!isSurgeSource && marketState.market_state === "risk_off") {
         await appendLog({
           company_id: companyIdSchema.parse(opts.companyId),
           service_id: serviceIdSchema.parse(opts.serviceId),
           ts: new Date().toISOString(),
           kind: "system",
           message: "entry_skipped_risk_off",
-          payload: { symbol: market, market_state: marketState.market_state, note: "no_exception_entries" },
+          payload: { symbol: market, market_state: marketState.market_state, note: "non_surge_source_block" },
         });
-        emitEval("entry_skipped_risk_off", { symbol: market, market_state: marketState.market_state });
+        emitEval("entry_skipped_risk_off", { symbol: market, market_state: marketState.market_state, source_kind: sourceKindForJudgment });
+        bumpSkip("entry_skipped_risk_off");
         continue;
       }
-
-      // Late-entry diagnostics & guard (entry timing)
-      const signalTs = typeof sig.ts === "string" ? sig.ts : null;
-      const sourceMetaResolved = sourceMetaByMarket.get(market) ?? {
-        source_kind: (sig?.p?.source_kind === "scanner" ? "scanner" : "filter_pass") as "scanner" | "filter_pass",
-        source_ts: signalCandidateTimestamp(sig),
-        age_seconds: null,
-        stale_filtered_before_eval: false,
-      };
+      if (isSurgeSource && surgeHardBlock) {
+        console.info(
+          JSON.stringify({
+            tag: "DEBUG_LIVE_SURGE_MARKET_JUDGMENT",
+            ts: new Date().toISOString(),
+            symbol: market,
+            source_kind: sourceKindForJudgment,
+            global_market_state: marketState.market_state,
+            surge_market_state: surgeMarketState,
+            btc_crash_guard: btcCrashGuard,
+            market_panic_guard: marketPanicGuard,
+            candidate_volume_strength: Number(sig.p.volume_ratio ?? 0),
+            candidate_momentum: Number(sig.p.momentum_3m_pct ?? sig.p.price_change_3m_pct ?? 0),
+            distance_from_local_high_pct: null,
+            volume_fade_triggered: null,
+            setup_ok: candidateMetaMap.has(market),
+            decision: "hard_block",
+            size_multiplier: 0,
+            reason: surgeMarketJudgmentReason,
+          }),
+        );
+        bumpSkip("surge_market_crash_guard");
+        continue;
+      }
       if (sourceMetaResolved.age_seconds === null && sourceMetaResolved.source_ts) {
         sourceMetaResolved.age_seconds = Math.max(0, Math.floor((Date.now() - Date.parse(sourceMetaResolved.source_ts)) / 1000));
       }
@@ -3881,6 +3937,28 @@ export function createLiveDataStrategy(opts: {
               : "late";
       const volumeState: "alive" | "faded" = volumeFadeTriggered || (volumeRatio1m5 !== null && volumeRatio1m5 < 0.65) ? "faded" : "alive";
       const positionState: "empty" | "holding" = state.positions[market] ? "holding" : "empty";
+      if (isSurgeSource) {
+        console.info(
+          JSON.stringify({
+            tag: "DEBUG_LIVE_SURGE_MARKET_JUDGMENT",
+            ts: new Date().toISOString(),
+            symbol: market,
+            source_kind: sourceKindForJudgment,
+            global_market_state: marketState.market_state,
+            surge_market_state: surgeMarketState,
+            btc_crash_guard: btcCrashGuard,
+            market_panic_guard: marketPanicGuard,
+            candidate_volume_strength: Number(sig.p.volume_ratio ?? 0),
+            candidate_momentum: Number(sig.p.momentum_3m_pct ?? sig.p.price_change_3m_pct ?? 0),
+            distance_from_local_high_pct: distanceFromLocalHighPct,
+            volume_fade_triggered: volumeFadeTriggered,
+            setup_ok: candidateMetaMap.has(market),
+            decision: "allow_eval",
+            size_multiplier: Number(surgeMarketSizeMultiplier.toFixed(4)),
+            reason: surgeMarketJudgmentReason,
+          }),
+        );
+      }
 
       // ① EARLY 후보 포착 — “초입 후보까지는 왔다” 확인용 (candidate → decision → summary 연결의 시작점)
       console.info(
@@ -3972,6 +4050,9 @@ export function createLiveDataStrategy(opts: {
           lateEntrySizingMultiplier = 1;
           lateEntryGuardReason = `weak_market_min_volume_ratio:${volumeRatio.toFixed(3)}<${LIVE_WEAK_MARKET_MIN_VOLUME_RATIO}`;
         }
+      }
+      if (isSurgeSource && !lateEntryGuardTriggered && lateEntrySizingMultiplier < 1 - 1e-9) {
+        surgeMarketSizeMultiplier *= lateEntrySizingMultiplier;
       }
 
       console.info(
@@ -4507,8 +4588,11 @@ export function createLiveDataStrategy(opts: {
       const baseBudget = perPositionBudgetBySymbol.get(market) ?? minOrderKrw;
       let orderKrw = Math.max(minOrderKrw, Math.min(LIVE_MAX_ENTRY_KRW, baseBudget));
       if (isExceptionMarket) orderKrw = Math.floor(orderKrw * 0.9);
-      if (lateEntrySizingMultiplier < 1 - 1e-9) {
+      if (!isSurgeSource && lateEntrySizingMultiplier < 1 - 1e-9) {
         orderKrw = Math.max(minOrderKrw, Math.floor(orderKrw * lateEntrySizingMultiplier));
+      }
+      if (isSurgeSource && surgeMarketSizeMultiplier < 1 - 1e-9) {
+        orderKrw = Math.max(minOrderKrw, Math.floor(orderKrw * surgeMarketSizeMultiplier));
       }
 
       const stPos = st.strategy_positions?.[market];
@@ -4523,6 +4607,7 @@ export function createLiveDataStrategy(opts: {
         max_alloc_krw: capPlan.deployableAfterBufferKrw,
         planned_entry_krw: orderKrw,
         late_entry_sizing_multiplier: lateEntrySizingMultiplier,
+        surge_market_size_multiplier: isSurgeSource ? Number(surgeMarketSizeMultiplier.toFixed(4)) : null,
         min_entry_krw: minOrderKrw,
         max_entry_krw: LIVE_MAX_ENTRY_KRW,
         allocation_mode: "weighted",
@@ -4782,6 +4867,14 @@ export function createLiveDataStrategy(opts: {
       }),
     );
     if (candidateCount === 0) {
+      const sourceKindsInUniverse = entryUniverse
+        .map((symbol) => sourceMetaByMarket.get(symbol)?.source_kind ?? inputSourceKind)
+        .slice(0, 20);
+      const globalMarketStateBlockApplied =
+        marketState.market_state === "risk_off" && entryUniverse.some((symbol) => {
+          const sk = sourceMetaByMarket.get(symbol)?.source_kind ?? inputSourceKind;
+          return sk !== "scanner" && sk !== "scanner_filter_fresh" && sk !== "scanner_then_filter_pass";
+        });
       console.info(
         JSON.stringify({
           tag: "DEBUG_LIVE_EMPTY_CANDIDATES",
@@ -4793,8 +4886,16 @@ export function createLiveDataStrategy(opts: {
             Boolean(skippedByReason["candles_fetch_failed"] ?? 0) ||
             Boolean(skippedByReason["volume_filter_failed"] ?? 0),
           no_breakout: Boolean(skippedByReason["no_breakout"] ?? 0),
-          market_state_block: marketState.market_state === "risk_off",
+          market_state_block: globalMarketStateBlockApplied,
           max_positions_reached: Boolean(skippedByReason["max_positions_reached"] ?? 0),
+          source_kind: sourceKindsInUniverse,
+          surge_market_judgment_reason:
+            skippedByReason["surge_market_crash_guard"] > 0
+              ? "crash_or_panic_hard_block"
+              : marketState.market_state === "risk_off"
+                ? "risk_off_but_surge_eval_allowed_with_reduced_size"
+                : "market_not_blocking",
+          global_market_state_block_applied: globalMarketStateBlockApplied,
           skipped_by_reason: skippedByReason,
         }),
       );
