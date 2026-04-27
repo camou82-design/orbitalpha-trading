@@ -60,12 +60,24 @@ export async function fetchTradeStatusDetailed(apiBase: string): Promise<TradeSt
     // 동일 본문(account_portfolio 포함): GET /api/v1/account/status
     const ctrl = new AbortController();
     const tid = setTimeout(() => ctrl.abort(), 5000);
+    const t0 = Date.now();
     const r = await fetch(`/api/v1/trade/status?_=${ts}`, {
       cache: "no-store",
       credentials: "include",
       signal: ctrl.signal,
     });
     clearTimeout(tid);
+    const elapsed = Date.now() - t0;
+    if (elapsed >= 2500) {
+      console.info(
+        JSON.stringify({
+          tag: "DASHBOARD_TRADE_STATUS_SLOW",
+          endpoint: "client_fetch /api/v1/trade/status",
+          ms: elapsed,
+          threshold_ms: 2500,
+        }),
+      );
+    }
     httpStatus = r.status;
     const text = await r.text();
     try {

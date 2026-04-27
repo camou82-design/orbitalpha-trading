@@ -296,10 +296,14 @@ type LiveOperatingCapital = {
 type AuthSession = {
   authenticated: boolean;
   user_id?: string;
-  auto_trade_enabled?: boolean;
-  live_enabled?: boolean;
-  api_connected?: boolean;
-  recovery_ready?: boolean;
+  /** When true, auto/live/api flags are loaded via `/api/v1/trade/status`, not from this session payload. */
+  trade_status_pending?: boolean;
+  trade_status_available?: boolean;
+  trade_status_fetch_hint?: string;
+  auto_trade_enabled?: boolean | null;
+  live_enabled?: boolean | null;
+  api_connected?: boolean | null;
+  recovery_ready?: boolean | null;
   safety_guard_state?: "정상" | "주의" | "자동정지";
   can_enable_auto_trade?: boolean;
   cannot_enable_reason?: string | null;
@@ -560,17 +564,22 @@ function resolveAutoTradeGate(params: {
 }): { canEnable: boolean; reason: string | null; softDelay: boolean } {
   const { session, trade, strategy } = params;
   const rawReason = typeof session.cannot_enable_reason === "string" ? session.cannot_enable_reason : null;
-  const softDelay =
-    session.session_status_degraded === true ||
-    rawReason === "light_status_timeout" ||
-    rawReason === "session_status_delayed";
+  const tradeStatusPending =
+    rawReason === "trade_status_pending" || session.trade_status_pending === true || session.trade_status_available === false;
+  const softDelay = false;
   if (trade?.api_connected === false) return { canEnable: false, reason: "api disconnected", softDelay };
   if (trade?.live_enabled === false) return { canEnable: false, reason: "live disabled", softDelay };
   if (trade?.recovery_ready === false) return { canEnable: false, reason: "recovery not ready", softDelay };
   if (strategy?.safety_guard_state === "자동정지") return { canEnable: false, reason: "safety guard stopped", softDelay };
   if (rawReason === "unauthenticated") return { canEnable: false, reason: rawReason, softDelay };
-  if (softDelay) return { canEnable: true, reason: null, softDelay: true };
+  if (tradeStatusPending && !trade) return { canEnable: false, reason: "거래 상태 확인 중", softDelay };
   if (session.can_enable_auto_trade === true) return { canEnable: true, reason: null, softDelay };
+  if (trade && tradeStatusPending) {
+    if (!trade.api_connected) return { canEnable: false, reason: "api disconnected", softDelay };
+    if (!trade.live_enabled) return { canEnable: false, reason: "live disabled", softDelay };
+    if (trade.recovery_ready === false) return { canEnable: false, reason: "recovery not ready", softDelay };
+    return { canEnable: true, reason: null, softDelay };
+  }
   if (rawReason) return { canEnable: false, reason: rawReason, softDelay };
   return { canEnable: false, reason: "조건 미충족", softDelay };
 }
@@ -1160,8 +1169,10 @@ export default function HomePage() {
           setAuthState("ok");
           setCurrentSession(session);
           setSessionUserId(session.user_id ?? null);
-          setAutoTradeEnabled(session.auto_trade_enabled === true);
-          setAutoTradeChangedAt(typeof session.auto_trade_changed_at === "string" ? session.auto_trade_changed_at : null);
+          if (typeof session.auto_trade_enabled === "boolean") {
+            setAutoTradeEnabled(session.auto_trade_enabled);
+            setAutoTradeChangedAt(typeof session.auto_trade_changed_at === "string" ? session.auto_trade_changed_at : null);
+          }
         }
 
         if (!tradeInitialSyncDoneRef.current) {
@@ -1624,8 +1635,7 @@ export default function HomePage() {
   }, [lastClientTradeFailure]);
   const sessionDelayNotice = useMemo(() => {
     const reason = currentSession?.cannot_enable_reason;
-    if (currentSession?.session_status_degraded === true) return "상태 갱신 지연";
-    if (reason === "light_status_timeout" || reason === "session_status_delayed") return "상태 갱신 지연";
+    if (reason === "light_status_timeout" || reason === "session_status_delayed") return "세션 보조: 상태 갱신 지연(레거시)";
     return null;
   }, [currentSession]);
 

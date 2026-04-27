@@ -447,12 +447,15 @@ async function main() {
     }
   });
 
-  const SESSION_LIGHT_STATUS_TIMEOUT_MS = Math.min(
-    8_000,
-    Math.max(1200, Number(process.env.ORBITALPHA_SESSION_LIGHT_STATUS_TIMEOUT_MS ?? 2500)),
+  const TRADE_STATUS_SLOW_MS = Math.min(
+    30_000,
+    Math.max(1500, Number(process.env.ORBITALPHA_TRADE_STATUS_SLOW_LOG_MS ?? 2500)),
   );
-  let lastGoodSessionLightStatus: { value: Awaited<ReturnType<typeof trade.statusLightweight>>; atMs: number } | null = null;
 
+  /**
+   * Auth session must not block on Upbit-heavy `trade.statusLightweight()`.
+   * Trading flags are loaded separately via `/api/v1/trade/status` or `/api/v1/trade/status-lightweight`.
+   */
   const buildAuthSessionPayload = async (req: FastifyRequest) => {
     const s = getSession(req.headers.cookie);
     if (!s) {
@@ -460,10 +463,11 @@ async function main() {
         authenticated: false,
         message: "세션 없음",
         auto_trade_enabled: null,
-        recovery_ready: false,
+        recovery_ready: null,
         safety_guard_state: "주의" as const,
         can_enable_auto_trade: false,
         cannot_enable_reason: "unauthenticated" as const,
+        trade_status_pending: true,
       };
     }
     req.log.info(
@@ -475,116 +479,38 @@ async function main() {
       "DEBUG_AUTH_SESSION_VERIFIED",
     );
     const ss = strategy.status() as { safety_guard_state?: string };
-    let st: Awaited<ReturnType<typeof trade.statusLightweight>>;
     const startedAtMs = Date.now();
-    try {
-      st = (await Promise.race([
-        trade.statusLightweight(),
-        new Promise<never>((_, rej) =>
-          setTimeout(() => rej(new Error("SESSION_LIGHT_STATUS_TIMEOUT")), SESSION_LIGHT_STATUS_TIMEOUT_MS),
-        ),
-      ])) as Awaited<ReturnType<typeof trade.statusLightweight>>;
-      lastGoodSessionLightStatus = { value: st, atMs: Date.now() };
-      req.log.info(
-        {
-          route: "session",
-          authenticated: true,
-          trade_status_available: true,
-          auto_trade_enabled: st.auto_trade_enabled,
-          live_enabled: st.live_enabled,
-          api_connected: st.api_connected,
-          recovery_ready: st.recovery_ready === true,
-          ms: Date.now() - startedAtMs,
-          user_id: s.user_id,
-        },
-        "DEBUG_SESSION_TRADE_STATUS_OK",
-      );
-    } catch {
-      const fallback = lastGoodSessionLightStatus;
-      const fallbackUsed = fallback != null;
-      const fallbackAgeMs = fallback ? Math.max(0, Date.now() - fallback.atMs) : null;
-      const fallbackValue = fallback?.value ?? null;
-      req.log.warn(
-        {
-          route: "session",
-          authenticated: true,
-          trade_status_available: false,
-          ms: SESSION_LIGHT_STATUS_TIMEOUT_MS,
-          reason: "trade_status_timeout",
-          user_id: s.user_id,
-        },
-        "DEBUG_SESSION_TRADE_STATUS_TIMEOUT",
-      );
-      req.log.warn(
-        {
-          route: "session",
-          ms: SESSION_LIGHT_STATUS_TIMEOUT_MS,
-        },
-        "session_light_status_timeout_or_error",
-      );
-      const degraded = {
-        authenticated: true,
-        user_id: s.user_id,
-        trade_status_available: false,
-        trade_status_error: "timeout" as const,
-        trade_status_fallback_used: fallbackUsed,
-        trade_status_fallback_age_ms: fallbackAgeMs,
-        auto_trade_enabled: fallbackValue?.auto_trade_enabled ?? null,
-        auto_trade_changed_at: fallbackValue?.auto_trade_changed_at ?? null,
-        live_enabled: fallbackValue?.live_enabled ?? null,
-        api_connected: fallbackValue?.api_connected ?? null,
-        recovery_ready: fallbackValue?.recovery_ready ?? null,
-        safety_guard_state: (ss.safety_guard_state ?? "주의") as "정상" | "주의" | "자동정지",
-        can_enable_auto_trade: false,
-        cannot_enable_reason: "trade_status_timeout" as const,
-        session_status_degraded: true,
-      };
-      req.log.warn(
-        {
-          route: "session",
-          authenticated: true,
-          trade_status_available: false,
-          reason: "trade_status_timeout",
-          user_id: s.user_id,
-          ms: SESSION_LIGHT_STATUS_TIMEOUT_MS,
-          fallback_used: fallbackUsed,
-          fallback_age_ms: fallbackAgeMs,
-          fallback_auto_trade_enabled: fallbackValue?.auto_trade_enabled ?? null,
-          fallback_live_enabled: fallbackValue?.live_enabled ?? null,
-          fallback_api_connected: fallbackValue?.api_connected ?? null,
-          fallback_recovery_ready: fallbackValue?.recovery_ready ?? null,
-        },
-        "DEBUG_AUTH_SESSION_RESPONSE_DEGRADED",
-      );
-      return degraded;
-    }
-    const cannotEnableReason =
-      !st.api_connected
-        ? "api disconnected"
-        : !st.live_enabled
-          ? "live disabled"
-          : !st.recovery_ready
-            ? "recovery not ready"
-            : ss.safety_guard_state === "자동정지"
-              ? "safety guard stopped"
-              : null;
-    const response = {
-      authenticated: true,
+    const safety = (ss.safety_guard_state ?? "주의") as "정상" | "주의" | "자동정지";
+    const payload = {
+      authenticated: true as const,
       user_id: s.user_id,
-      trade_status_available: true,
+      trade_status_available: false,
+      trade_status_pending: true,
+      trade_status_fetch_hint: "GET /api/v1/trade/status or /api/v1/trade/status-lightweight",
       trade_status_error: null,
       trade_status_fallback_used: false,
       trade_status_fallback_age_ms: null,
-      auto_trade_enabled: st.auto_trade_enabled,
-      auto_trade_changed_at: st.auto_trade_changed_at,
-      live_enabled: st.live_enabled,
-      api_connected: st.api_connected,
-      recovery_ready: st.recovery_ready === true,
-      safety_guard_state: (ss.safety_guard_state ?? "주의") as "정상" | "주의" | "자동정지",
-      can_enable_auto_trade: cannotEnableReason === null,
-      cannot_enable_reason: cannotEnableReason,
+      session_status_degraded: false,
+      auto_trade_enabled: null as boolean | null,
+      auto_trade_changed_at: null as string | null,
+      live_enabled: null as boolean | null,
+      api_connected: null as boolean | null,
+      recovery_ready: null as boolean | null,
+      safety_guard_state: safety,
+      can_enable_auto_trade: false,
+      cannot_enable_reason: "trade_status_pending" as const,
     };
-    return response;
+    req.log.info(
+      JSON.stringify({
+        tag: "DASHBOARD_SESSION_FAST_OK",
+        route: "session",
+        authenticated: true,
+        user_id: s.user_id,
+        ms: Date.now() - startedAtMs,
+        safety_guard_state: safety,
+      }),
+    );
+    return payload;
   };
 
   /** Alias routes — 본문은 `/api/v1/auth/session` 과 동일 필드로 맞춤 */
@@ -744,7 +670,19 @@ async function main() {
 
   /** 동일 페이로드(account_portfolio 포함) — 레거시 클라이언트가 /account/status 를 호출하는 경우 대비. */
   const buildTradeStatusResponse = async (req: FastifyRequest, route: string) => {
+    const t0 = Date.now();
     const body = await trade.status();
+    const ms = Date.now() - t0;
+    if (ms >= TRADE_STATUS_SLOW_MS) {
+      req.log.warn(
+        JSON.stringify({
+          tag: "DASHBOARD_TRADE_STATUS_SLOW",
+          endpoint: route,
+          ms,
+          threshold_ms: TRADE_STATUS_SLOW_MS,
+        }),
+      );
+    }
     if (!body.api_connected) {
       const egressIp = await getEgressPublicIp();
       req.log.warn(
@@ -768,6 +706,31 @@ async function main() {
 
   app.get("/api/v1/trade/status", async (req) => buildTradeStatusResponse(req, "GET /api/v1/trade/status"));
   app.get("/api/v1/account/status", async (req) => buildTradeStatusResponse(req, "GET /api/v1/account/status"));
+
+  app.get("/api/v1/trade/status-lightweight", async (req) => {
+    const t0 = Date.now();
+    const st = await trade.statusLightweight();
+    const ms = Date.now() - t0;
+    req.log.info(
+      JSON.stringify({
+        tag: "TRADE_STATUS_LIGHTWEIGHT_LATENCY",
+        ms,
+        api_connected: st.api_connected,
+        auto_trade_enabled: st.auto_trade_enabled,
+      }),
+    );
+    if (ms >= TRADE_STATUS_SLOW_MS) {
+      req.log.warn(
+        JSON.stringify({
+          tag: "DASHBOARD_TRADE_STATUS_SLOW",
+          endpoint: "GET /api/v1/trade/status-lightweight",
+          ms,
+          threshold_ms: TRADE_STATUS_SLOW_MS,
+        }),
+      );
+    }
+    return st;
+  });
   app.get("/api/v1/trades/recent", async (req) => {
     const q = req.query as { limit?: string };
     const n = Number(q.limit ?? 10);

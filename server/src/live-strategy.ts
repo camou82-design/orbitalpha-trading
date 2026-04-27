@@ -2247,6 +2247,16 @@ export function createLiveDataStrategy(opts: {
         const promoteFillKrw = Math.max(0, Math.floor(targetBudget - filledSoFar));
         if (promoteFillKrw >= UPBIT_MIN_ORDER_KRW) {
           try {
+            console.info(
+              JSON.stringify({
+                tag: "LIVE_PLACEBUY_ATTEMPT",
+                ts: new Date().toISOString(),
+                market,
+                path: "early_promote_fill",
+                order_krw: promoteFillKrw,
+                strategy_type: "momentum",
+              }),
+            );
             await opts.trade.placeBuy(market, true, promoteFillKrw, "momentum", "strategy", {
               __early_promote_fill: true,
               __early_promote_fill_krw: promoteFillKrw,
@@ -4387,6 +4397,27 @@ export function createLiveDataStrategy(opts: {
           if (liveTradingOn) {
             earlyOrderKrw = Math.min(earlyOrderKrw, surgeRemainingForTickKrw, LIVE_MAX_ENTRY_KRW);
           }
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_ORDER_PRECHECK_RESULT",
+              ts: new Date().toISOString(),
+              market,
+              ok: true,
+              path: "early_entry",
+              order_krw: earlyOrderKrw,
+              score: Math.round(score),
+            }),
+          );
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_PLACEBUY_ATTEMPT",
+              ts: new Date().toISOString(),
+              market,
+              path: "early_entry",
+              order_krw: earlyOrderKrw,
+              strategy_type: "momentum",
+            }),
+          );
           try {
             await opts.trade.placeBuy(market, true, earlyOrderKrw, "momentum", "strategy", {
               ...sig.p,
@@ -4685,6 +4716,16 @@ export function createLiveDataStrategy(opts: {
           volumeRatio: vol,
         });
         if (!pr.ok) {
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_ENTRY_PIPELINE_RESULT",
+              ts: new Date().toISOString(),
+              market,
+              ok: false,
+              message: pr.message,
+              detail: pr.detail ?? null,
+            }),
+          );
           await appendLog({
             company_id: companyIdSchema.parse(opts.companyId),
             service_id: serviceIdSchema.parse(opts.serviceId),
@@ -4708,6 +4749,15 @@ export function createLiveDataStrategy(opts: {
           continue;
         }
         entryPipelineDetail = pr.detail;
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_ENTRY_PIPELINE_RESULT",
+            ts: new Date().toISOString(),
+            market,
+            ok: true,
+            detail: entryPipelineDetail,
+          }),
+        );
       } catch (e) {
         await appendLog({
           company_id: companyIdSchema.parse(opts.companyId),
@@ -4862,6 +4912,32 @@ export function createLiveDataStrategy(opts: {
         __strong_symbol_override: strongSymbolOverride,
         __risk_off_exception_reason: exception?.reason,
       };
+      console.info(
+        JSON.stringify({
+          tag: "LIVE_ORDER_PRECHECK_RESULT",
+          ts: new Date().toISOString(),
+          market,
+          ok: true,
+          path: "normal",
+          order_krw: orderKrw,
+          live_order_available_krw: liveOrderAvailableKrw,
+          open_positions: openCountNow,
+          remaining_slots: remainingSlots,
+          strategy_type: strategyType,
+          source_kind: sourceKindForJudgment,
+          filter_pass: Boolean(sig.p.filter_pass),
+        }),
+      );
+      console.info(
+        JSON.stringify({
+          tag: "LIVE_PLACEBUY_ATTEMPT",
+          ts: new Date().toISOString(),
+          market,
+          path: "normal",
+          order_krw: orderKrw,
+          strategy_type: strategyType,
+        }),
+      );
       try {
         await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", signalPayloadForBuy);
         if (liveTradingOn) {
