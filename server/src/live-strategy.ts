@@ -4715,9 +4715,8 @@ export function createLiveDataStrategy(opts: {
           sourceMetaResolved.age_seconds !== null && sourceMetaResolved.age_seconds <= LIVE_ENTRY_SIGNAL_STALE_SECONDS;
         const bridgePass = Boolean(scannerBridgeScore?.pass);
         const surgeSourceKindLog = payloadSourceKind || sourceKindForJudgment;
-        let pr: { ok: boolean; message?: string; detail?: Record<string, unknown> };
         if (isSurgeSource) {
-          pr = evaluateSurgeEntryPipeline({
+          const pr = evaluateSurgeEntryPipeline({
             market,
             payload: sig.p,
             candles5,
@@ -4747,7 +4746,7 @@ export function createLiveDataStrategy(opts: {
               bridge_pass: bridgePass,
               filter_pass: filterPass,
               ok: pr.ok,
-              reason: pr.ok ? "surge_pipeline_ok" : (pr.message ?? "surge_pipeline_fail"),
+              reason: pr.ok ? "surge_pipeline_ok" : pr.message,
             }),
           );
           if (!pr.ok) {
@@ -4756,10 +4755,10 @@ export function createLiveDataStrategy(opts: {
               service_id: serviceIdSchema.parse(opts.serviceId),
               ts: new Date().toISOString(),
               kind: "system",
-              message: pr.message ?? "blocked_surge_pipeline",
+              message: pr.message,
               payload: pr.detail,
             });
-            emitEval(pr.message ?? "blocked_surge_pipeline", pr.detail);
+            emitEval(pr.message, pr.detail);
             emitEval("DEBUG_LIVE_DECISION_LINE", {
               available_krw: Number((await opts.trade.status()).live_order_available_krw ?? 0),
               planned_entry_krw: null,
@@ -4768,14 +4767,14 @@ export function createLiveDataStrategy(opts: {
               volume_ratio: Number(vol.toFixed(3)),
               breakout,
               breakout_relaxed: breakoutRelaxed,
-              final_block_reason: pr.message ?? "blocked_surge_pipeline",
+              final_block_reason: pr.message,
             });
-            bumpSkip(pr.message ?? "blocked_surge_pipeline");
+            bumpSkip(pr.message);
             continue;
           }
-          entryPipelineDetail = { ...(pr.detail ?? {}), entry_pipeline: "surge" };
+          entryPipelineDetail = { ...pr.detail, entry_pipeline: "surge" };
         } else {
-          pr = evaluateSpotLongEntryPipeline({
+          const pr = evaluateSpotLongEntryPipeline({
             market,
             payload: sig.p,
             candles5,

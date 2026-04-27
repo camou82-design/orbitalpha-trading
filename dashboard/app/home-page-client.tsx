@@ -575,9 +575,6 @@ function resolveAutoTradeGate(params: {
   if (tradeStatusPending && !trade) return { canEnable: false, reason: "거래 상태 확인 중", softDelay };
   if (session.can_enable_auto_trade === true) return { canEnable: true, reason: null, softDelay };
   if (trade && tradeStatusPending) {
-    if (!trade.api_connected) return { canEnable: false, reason: "api disconnected", softDelay };
-    if (!trade.live_enabled) return { canEnable: false, reason: "live disabled", softDelay };
-    if (trade.recovery_ready === false) return { canEnable: false, reason: "recovery not ready", softDelay };
     return { canEnable: true, reason: null, softDelay };
   }
   if (rawReason) return { canEnable: false, reason: rawReason, softDelay };
