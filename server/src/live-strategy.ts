@@ -1558,7 +1558,12 @@ export function createLiveDataStrategy(opts: {
     const sourceMetaByMarket = new Map<
       string,
       {
-        source_kind: "scanner" | "filter_pass" | "scanner_filter_fresh" | "scanner_then_filter_pass";
+        source_kind:
+          | "scanner_filter_fresh"
+          | "fresh_filter_pass"
+          | "legacy_filter_pass"
+          | "fallback_watch_markets"
+          | "scanner_then_filter_pass";
         source_ts: string | null;
         age_seconds: number | null;
         stale_filtered_before_eval: boolean;
@@ -1755,16 +1760,31 @@ export function createLiveDataStrategy(opts: {
       })
       .filter((x): x is { market: string; ageSeconds: number | null } => Boolean(x));
 
-    const selectedSourceRows: Array<{ market: string; source_kind: "scanner" | "filter_pass"; source_ts: string | null; age_seconds: number | null }> = [];
+    const selectedSourceRows: Array<{
+      market: string;
+      source_kind: "scanner_filter_fresh" | "fresh_filter_pass";
+      source_ts: string | null;
+      age_seconds: number | null;
+    }> = [];
     for (const s of freshScannerCandidates) {
       if (selectedSourceRows.some((x) => x.market === s.market)) continue;
-      selectedSourceRows.push({ market: s.market, source_kind: "scanner", source_ts: s.sourceTs, age_seconds: s.ageSeconds });
+      selectedSourceRows.push({
+        market: s.market,
+        source_kind: "scanner_filter_fresh",
+        source_ts: s.sourceTs,
+        age_seconds: s.ageSeconds,
+      });
       if (selectedSourceRows.length >= LIVE_ENTRY_UNIVERSE_TOP_N) break;
     }
     if (selectedSourceRows.length < LIVE_ENTRY_UNIVERSE_TOP_N) {
       for (const f of freshFilterPassCandidates) {
         if (selectedSourceRows.some((x) => x.market === f.market)) continue;
-        selectedSourceRows.push({ market: f.market, source_kind: "filter_pass", source_ts: f.sourceTs, age_seconds: f.ageSeconds });
+        selectedSourceRows.push({
+          market: f.market,
+          source_kind: "fresh_filter_pass",
+          source_ts: f.sourceTs,
+          age_seconds: f.ageSeconds,
+        });
         if (selectedSourceRows.length >= LIVE_ENTRY_UNIVERSE_TOP_N) break;
       }
     }
@@ -1789,10 +1809,15 @@ export function createLiveDataStrategy(opts: {
         ts: new Date().toISOString(),
         source_kind: "scanner_then_filter_pass",
         candidate_symbols: selectedSourceRows.map((x) => x.market),
+        candidate_source_rows: selectedSourceRows.map((x) => ({
+          symbol: x.market,
+          source_kind: x.source_kind,
+          age_seconds: x.age_seconds,
+        })),
         candidate_age_seconds: selectedSourceRows.map((x) => ({ symbol: x.market, age_seconds: x.age_seconds })),
         dropped_stale_symbols: [
-          ...staleScannerCandidates.map((x) => ({ symbol: x.market, source_kind: "scanner", age_seconds: x.ageSeconds })),
-          ...staleFilterPassCandidates.map((x) => ({ symbol: x.market, source_kind: "filter_pass", age_seconds: x.ageSeconds })),
+          ...staleScannerCandidates.map((x) => ({ symbol: x.market, source_kind: "scanner_filter_fresh", age_seconds: x.ageSeconds })),
+          ...staleFilterPassCandidates.map((x) => ({ symbol: x.market, source_kind: "legacy_filter_pass", age_seconds: x.ageSeconds })),
         ].slice(0, 30),
         stale_threshold_seconds: staleThresholdSeconds,
       }),
@@ -1803,6 +1828,7 @@ export function createLiveDataStrategy(opts: {
         ts: new Date().toISOString(),
         scanner_symbols: freshScannerCandidates.map((x) => x.market).slice(0, 20),
         filter_pass_symbols: freshFilterPassCandidates.map((x) => x.market).slice(0, 20),
+        selected_source_rows: selectedSourceRows.map((x) => ({ symbol: x.market, source_kind: x.source_kind })).slice(0, 20),
         selected_entry_universe_symbols: selectedEntryUniverseSymbols,
         source_priority_used: freshScannerCandidates.length > 0 ? "scanner_then_filter_pass" : "filter_pass_only",
       }),
@@ -1895,7 +1921,7 @@ export function createLiveDataStrategy(opts: {
 
     // 진입 후보 집합(base/precheck)과 ticker fetch 집합(보유/기준가 보강)을 개념적으로 분리한다.
     const fallbackUsedForPrimary = selectedEntryUniverseSymbols.length === 0;
-    const tickerRequestSourceKind = fallbackUsedForPrimary ? "fallback_watch_markets" : "scanner_filter_fresh";
+    const tickerRequestSourceKind = fallbackUsedForPrimary ? "fallback_watch_markets" : "scanner_then_filter_pass";
     const watchMarketsExcludingHeld = watchMarkets.filter((m) => !heldSymbolSet.has(m)).slice(0, LIVE_ENTRY_UNIVERSE_TOP_N);
     const primaryForUniverse = fallbackUsedForPrimary ? watchMarketsExcludingHeld : selectedEntryUniverseSymbols;
     const baseInputSymbols = Array.from(
@@ -3013,8 +3039,19 @@ export function createLiveDataStrategy(opts: {
     }
     const exceptionSlot = state.regime?.exception_slot_market ?? null;
     const fallbackUsed = selectedEntryUniverseSymbols.length === 0;
-    const inputSourceKind = fallbackUsed ? "legacy_fallback" : "scanner_filter_fresh";
+    const inputSourceKind = fallbackUsed ? "fallback_watch_markets" : "scanner_then_filter_pass";
     const primary = fallbackUsed ? watchMarkets.filter((m) => !heldSymbolSet.has(m)).slice(0, LIVE_ENTRY_UNIVERSE_TOP_N) : selectedEntryUniverseSymbols;
+    if (fallbackUsed) {
+      for (const m of primary) {
+        if (sourceMetaByMarket.has(m)) continue;
+        sourceMetaByMarket.set(m, {
+          source_kind: "fallback_watch_markets",
+          source_ts: null,
+          age_seconds: null,
+          stale_filtered_before_eval: false,
+        });
+      }
+    }
     const baseEntryUniverseInput = Array.from(new Set([...primary, ...(exceptionSlot ? [exceptionSlot] : []), ...debugUniverseExtra]));
     console.info(
       JSON.stringify({
@@ -3780,19 +3817,17 @@ export function createLiveDataStrategy(opts: {
       // Late-entry diagnostics & guard (entry timing)
       const signalTs = typeof sig.ts === "string" ? sig.ts : null;
       const sourceMetaResolved = sourceMetaByMarket.get(market) ?? {
-        source_kind: (sig?.p?.source_kind === "scanner" ? "scanner" : "filter_pass") as
-          | "scanner"
-          | "filter_pass"
+        source_kind: (sig?.p?.source_kind === "scanner" ? "scanner_then_filter_pass" : "legacy_filter_pass") as
           | "scanner_filter_fresh"
+          | "fresh_filter_pass"
+          | "legacy_filter_pass"
+          | "fallback_watch_markets"
           | "scanner_then_filter_pass",
         source_ts: signalCandidateTimestamp(sig),
         age_seconds: null,
         stale_filtered_before_eval: false,
       };
-      const sourceKindForJudgment =
-        sourceMetaResolved.source_kind === "scanner" || sourceMetaResolved.source_kind === "filter_pass"
-          ? inputSourceKind
-          : sourceMetaResolved.source_kind;
+      const sourceKindForJudgment = sourceMetaResolved.source_kind;
       const isSurgeSource =
         sourceKindForJudgment === "scanner_filter_fresh" ||
         sourceKindForJudgment === "scanner_then_filter_pass";
@@ -4077,7 +4112,7 @@ export function createLiveDataStrategy(opts: {
           tag: "DEBUG_LIVE_ENTRY_DECISION",
           ts: new Date().toISOString(),
           symbol: market,
-          source_kind: sourceMetaResolved.source_kind,
+          source_kind: sourceKindForJudgment,
           source_ts: sourceMetaResolved.source_ts,
           age_seconds: sourceMetaResolved.age_seconds,
           stale_filtered_before_eval: sourceMetaResolved.stale_filtered_before_eval,
@@ -4873,7 +4908,7 @@ export function createLiveDataStrategy(opts: {
       const globalMarketStateBlockApplied =
         marketState.market_state === "risk_off" && entryUniverse.some((symbol) => {
           const sk = sourceMetaByMarket.get(symbol)?.source_kind ?? inputSourceKind;
-          return sk !== "scanner" && sk !== "scanner_filter_fresh" && sk !== "scanner_then_filter_pass";
+          return sk !== "scanner_filter_fresh" && sk !== "scanner_then_filter_pass";
         });
       console.info(
         JSON.stringify({
