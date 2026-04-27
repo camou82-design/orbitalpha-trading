@@ -14,6 +14,8 @@ import type { StrategyType } from "./strategy-risk-config.js";
 import { ORDER_LIMITS } from "@orbitalpha/shared";
 import { STRATEGY_RISK_CONFIG, grossPnlPct, netPnlPctPerUnit } from "./strategy-risk-config.js";
 import crypto from "node:crypto";
+import path from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
 type TradeOrderSide = "buy" | "sell";
 type PositionBucket = "strategy" | "legacy";
@@ -167,6 +169,8 @@ type LightweightStatus = {
   balances: ConnectionBalances;
 };
 
+const TRADE_CONTROL_STATE_FILE = path.join(process.cwd(), "data", "runtime", "trade-control-state.json");
+
 export function createTradeControl(
   env: Env,
   hooks?: {
@@ -223,6 +227,93 @@ export function createTradeControl(
       "KRW-TRX": { qty: 0, avg: 0, dca_count: 0, dca_max: ORDER_LIMITS.MAX_LEGACY_DCA_COUNT_PER_MARKET, dca_krw_total: 0, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기" },
     },
   };
+  const loadPersistedAutoTradeState = () => {
+    try {
+      if (!existsSync(TRADE_CONTROL_STATE_FILE)) {
+        console.info(
+          JSON.stringify({
+            tag: "TRADE_CONTROL_STATE_RESTORED",
+            ts: new Date().toISOString(),
+            autoTradeEnabled: state.autoTradeEnabled,
+            autoTradeChangedAt: state.autoTradeChangedAt,
+            state_file: TRADE_CONTROL_STATE_FILE,
+          }),
+        );
+        return;
+      }
+      const raw = readFileSync(TRADE_CONTROL_STATE_FILE, "utf8");
+      const parsed = JSON.parse(raw) as { autoTradeEnabled?: unknown; autoTradeChangedAt?: unknown };
+      state.autoTradeEnabled = Boolean(parsed.autoTradeEnabled);
+      state.autoTradeChangedAt = typeof parsed.autoTradeChangedAt === "string" ? parsed.autoTradeChangedAt : null;
+      console.info(
+        JSON.stringify({
+          tag: "TRADE_CONTROL_STATE_RESTORED",
+          ts: new Date().toISOString(),
+          autoTradeEnabled: state.autoTradeEnabled,
+          autoTradeChangedAt: state.autoTradeChangedAt,
+          state_file: TRADE_CONTROL_STATE_FILE,
+        }),
+      );
+    } catch (e) {
+      state.autoTradeEnabled = false;
+      state.autoTradeChangedAt = null;
+      console.info(
+        JSON.stringify({
+          tag: "TRADE_CONTROL_STATE_LOAD_FAILED",
+          ts: new Date().toISOString(),
+          state_file: TRADE_CONTROL_STATE_FILE,
+          error: e instanceof Error ? e.message : String(e),
+        }),
+      );
+      console.info(
+        JSON.stringify({
+          tag: "TRADE_CONTROL_STATE_RESTORED",
+          ts: new Date().toISOString(),
+          autoTradeEnabled: state.autoTradeEnabled,
+          autoTradeChangedAt: state.autoTradeChangedAt,
+          state_file: TRADE_CONTROL_STATE_FILE,
+        }),
+      );
+    }
+  };
+  const persistAutoTradeState = () => {
+    try {
+      mkdirSync(path.dirname(TRADE_CONTROL_STATE_FILE), { recursive: true });
+      writeFileSync(
+        TRADE_CONTROL_STATE_FILE,
+        JSON.stringify(
+          {
+            autoTradeEnabled: state.autoTradeEnabled,
+            autoTradeChangedAt: state.autoTradeChangedAt,
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+      console.info(
+        JSON.stringify({
+          tag: "TRADE_CONTROL_STATE_SAVED",
+          ts: new Date().toISOString(),
+          autoTradeEnabled: state.autoTradeEnabled,
+          autoTradeChangedAt: state.autoTradeChangedAt,
+          state_file: TRADE_CONTROL_STATE_FILE,
+        }),
+      );
+    } catch (e) {
+      console.info(
+        JSON.stringify({
+          tag: "TRADE_CONTROL_STATE_SAVE_FAILED",
+          ts: new Date().toISOString(),
+          state_file: TRADE_CONTROL_STATE_FILE,
+          autoTradeEnabled: state.autoTradeEnabled,
+          autoTradeChangedAt: state.autoTradeChangedAt,
+          error: e instanceof Error ? e.message : String(e),
+        }),
+      );
+    }
+  };
+  loadPersistedAutoTradeState();
 
   const computeKrwFunds = (conn: ConnectionResult) => {
     const krwAcc = conn.balances.find((b) => b.currency === "KRW");
@@ -447,6 +538,7 @@ export function createTradeControl(
   const setAutoTradeEnabled = async (enabled: boolean) => {
     state.autoTradeEnabled = enabled;
     state.autoTradeChangedAt = new Date().toISOString();
+    persistAutoTradeState();
     await log(enabled ? "auto_trade_enabled" : "auto_trade_disabled", { enabled, changed_at: state.autoTradeChangedAt });
     await hooks?.onEvent?.({
       timestamp: state.autoTradeChangedAt ?? new Date().toISOString(),
