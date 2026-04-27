@@ -23,7 +23,11 @@ import {
   type StopTriggerKind,
   type StrategyType,
 } from "./strategy-risk-config.js";
-import { ENTRY_PIPELINE_MID_SCORE_FLOOR, evaluateSpotLongEntryPipeline } from "./live-entry-pipeline.js";
+import {
+  ENTRY_PIPELINE_MID_SCORE_FLOOR,
+  evaluateSpotLongEntryPipeline,
+  evaluateSurgeEntryPipeline,
+} from "./live-entry-pipeline.js";
 
 function num(x: unknown): number {
   return typeof x === "number" ? x : Number(x);
@@ -3923,18 +3927,24 @@ export function createLiveDataStrategy(opts: {
         sourceMetaResolved.age_seconds = Math.max(0, Math.floor((Date.now() - Date.parse(sourceMetaResolved.source_ts)) / 1000));
       }
       const sourceKindForJudgment = sourceMetaResolved.source_kind;
-      const scannerBridgeScore =
-        sourceKindForJudgment === "scanner_filter_fresh" || sourceKindForJudgment === "scanner_then_filter_pass"
-          ? computeScannerBridgeScore({
-              scannerScore: Number(sig?.p?.scanner_score ?? sig?.p?.signal_score ?? 0),
-              volumeMultiple: Number(sig?.p?.volume_ratio ?? 0),
-              breakout: Boolean(sig?.p?.breakout),
-              closeUpperHold: Boolean(sig?.p?.close_upper_hold),
-              rise3mPct: Number(sig?.p?.rise_3m_pct ?? sig?.p?.momentum_3m_pct ?? sig?.p?.price_change_3m_pct ?? 0),
-              ageSeconds: sourceMetaResolved.age_seconds,
-              staleThresholdSeconds: LIVE_ENTRY_SIGNAL_STALE_SECONDS,
-            })
-          : null;
+      const payloadSourceKind = String(sig?.p?.source_kind ?? "");
+      const isSurgeSource =
+        sourceKindForJudgment === "scanner_filter_fresh" ||
+        sourceKindForJudgment === "scanner_then_filter_pass" ||
+        payloadSourceKind === "scanner_tradable_candidate" ||
+        payloadSourceKind === "scanner_filter_fresh" ||
+        payloadSourceKind === "scanner_then_filter_pass";
+      const scannerBridgeScore = isSurgeSource
+        ? computeScannerBridgeScore({
+            scannerScore: Number(sig?.p?.scanner_score ?? sig?.p?.signal_score ?? 0),
+            volumeMultiple: Number(sig?.p?.volume_ratio ?? 0),
+            breakout: Boolean(sig?.p?.breakout),
+            closeUpperHold: Boolean(sig?.p?.close_upper_hold),
+            rise3mPct: Number(sig?.p?.rise_3m_pct ?? sig?.p?.momentum_3m_pct ?? sig?.p?.price_change_3m_pct ?? 0),
+            ageSeconds: sourceMetaResolved.age_seconds,
+            staleThresholdSeconds: LIVE_ENTRY_SIGNAL_STALE_SECONDS,
+          })
+        : null;
       const rawStrength = signalStrengthScore(sig.p);
       const bridgedStrength = scannerBridgeScore ? Math.max(rawStrength, scannerBridgeScore.signalStrengthScore) : rawStrength;
       if (scannerBridgeScore) {
@@ -3996,9 +4006,6 @@ export function createLiveDataStrategy(opts: {
       // Late-entry diagnostics & guard (entry timing)
       const signalTs = typeof sig.ts === "string" ? sig.ts : null;
 
-      const isSurgeSource =
-        sourceKindForJudgment === "scanner_filter_fresh" ||
-        sourceKindForJudgment === "scanner_then_filter_pass";
       const btcCrashGuard = btcChange <= -0.025;
       const marketPanicGuard =
         btcChange <= -0.015 &&
@@ -4704,60 +4711,125 @@ export function createLiveDataStrategy(opts: {
       let entryPipelineDetail: Record<string, unknown> = {};
       try {
         const candles5 = await fetchMinuteCandlesCached(market, 5, 48);
-        const pr = evaluateSpotLongEntryPipeline({
-          market,
-          payload: sig.p,
-          candles5,
-          marketState: {
-            market_state: marketState.market_state,
-            btc_5m_trend: marketState.btc_5m_trend ?? "flat",
-            btc_15m_trend: marketState.btc_15m_trend ?? "flat",
-          },
-          volumeRatio: vol,
-        });
-        if (!pr.ok) {
+        const staleOk =
+          sourceMetaResolved.age_seconds !== null && sourceMetaResolved.age_seconds <= LIVE_ENTRY_SIGNAL_STALE_SECONDS;
+        const bridgePass = Boolean(scannerBridgeScore?.pass);
+        const surgeSourceKindLog = payloadSourceKind || sourceKindForJudgment;
+        let pr: { ok: boolean; message?: string; detail?: Record<string, unknown> };
+        if (isSurgeSource) {
+          pr = evaluateSurgeEntryPipeline({
+            market,
+            payload: sig.p,
+            candles5,
+            marketState: {
+              market_state: marketState.market_state,
+              btc_5m_trend: marketState.btc_5m_trend ?? "flat",
+              btc_15m_trend: marketState.btc_15m_trend ?? "flat",
+            },
+            volumeRatio: vol,
+            bridgePass,
+            staleOk,
+            ageSeconds: sourceMetaResolved.age_seconds,
+          });
+          const scannerScoreLog = Number(sig?.p?.scanner_score ?? sig?.p?.signal_score ?? 0);
+          const rise3Log = Number(sig?.p?.rise_3m_pct ?? sig?.p?.momentum_3m_pct ?? sig?.p?.price_change_3m_pct ?? 0);
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_SURGE_ENTRY_PIPELINE_RESULT",
+              ts: new Date().toISOString(),
+              market,
+              source_kind: surgeSourceKindLog,
+              scanner_score: scannerScoreLog,
+              volume_multiple: vol,
+              breakout: Boolean(sig?.p?.breakout),
+              close_upper_hold: Boolean(sig?.p?.close_upper_hold),
+              rise_3m_pct: rise3Log,
+              bridge_pass: bridgePass,
+              filter_pass: filterPass,
+              ok: pr.ok,
+              reason: pr.ok ? "surge_pipeline_ok" : (pr.message ?? "surge_pipeline_fail"),
+            }),
+          );
+          if (!pr.ok) {
+            await appendLog({
+              company_id: companyIdSchema.parse(opts.companyId),
+              service_id: serviceIdSchema.parse(opts.serviceId),
+              ts: new Date().toISOString(),
+              kind: "system",
+              message: pr.message ?? "blocked_surge_pipeline",
+              payload: pr.detail,
+            });
+            emitEval(pr.message ?? "blocked_surge_pipeline", pr.detail);
+            emitEval("DEBUG_LIVE_DECISION_LINE", {
+              available_krw: Number((await opts.trade.status()).live_order_available_krw ?? 0),
+              planned_entry_krw: null,
+              entry_score: Number(signalScore.toFixed(2)),
+              min_entry_score: marketState.min_entry_score,
+              volume_ratio: Number(vol.toFixed(3)),
+              breakout,
+              breakout_relaxed: breakoutRelaxed,
+              final_block_reason: pr.message ?? "blocked_surge_pipeline",
+            });
+            bumpSkip(pr.message ?? "blocked_surge_pipeline");
+            continue;
+          }
+          entryPipelineDetail = { ...(pr.detail ?? {}), entry_pipeline: "surge" };
+        } else {
+          pr = evaluateSpotLongEntryPipeline({
+            market,
+            payload: sig.p,
+            candles5,
+            marketState: {
+              market_state: marketState.market_state,
+              btc_5m_trend: marketState.btc_5m_trend ?? "flat",
+              btc_15m_trend: marketState.btc_15m_trend ?? "flat",
+            },
+            volumeRatio: vol,
+          });
+          if (!pr.ok) {
+            console.info(
+              JSON.stringify({
+                tag: "LIVE_ENTRY_PIPELINE_RESULT",
+                ts: new Date().toISOString(),
+                market,
+                ok: false,
+                message: pr.message,
+                detail: pr.detail ?? null,
+              }),
+            );
+            await appendLog({
+              company_id: companyIdSchema.parse(opts.companyId),
+              service_id: serviceIdSchema.parse(opts.serviceId),
+              ts: new Date().toISOString(),
+              kind: "system",
+              message: pr.message,
+              payload: pr.detail,
+            });
+            emitEval(pr.message, pr.detail);
+            emitEval("DEBUG_LIVE_DECISION_LINE", {
+              available_krw: Number((await opts.trade.status()).live_order_available_krw ?? 0),
+              planned_entry_krw: null,
+              entry_score: Number(signalScore.toFixed(2)),
+              min_entry_score: marketState.min_entry_score,
+              volume_ratio: Number(vol.toFixed(3)),
+              breakout,
+              breakout_relaxed: breakoutRelaxed,
+              final_block_reason: pr.message,
+            });
+            bumpSkip(pr.message);
+            continue;
+          }
+          entryPipelineDetail = pr.detail;
           console.info(
             JSON.stringify({
               tag: "LIVE_ENTRY_PIPELINE_RESULT",
               ts: new Date().toISOString(),
               market,
-              ok: false,
-              message: pr.message,
-              detail: pr.detail ?? null,
+              ok: true,
+              detail: entryPipelineDetail,
             }),
           );
-          await appendLog({
-            company_id: companyIdSchema.parse(opts.companyId),
-            service_id: serviceIdSchema.parse(opts.serviceId),
-            ts: new Date().toISOString(),
-            kind: "system",
-            message: pr.message,
-            payload: pr.detail,
-          });
-          emitEval(pr.message, pr.detail);
-          emitEval("DEBUG_LIVE_DECISION_LINE", {
-            available_krw: Number((await opts.trade.status()).live_order_available_krw ?? 0),
-            planned_entry_krw: null,
-            entry_score: Number(signalScore.toFixed(2)),
-            min_entry_score: marketState.min_entry_score,
-            volume_ratio: Number(vol.toFixed(3)),
-            breakout,
-            breakout_relaxed: breakoutRelaxed,
-            final_block_reason: pr.message,
-          });
-          bumpSkip(pr.message);
-          continue;
         }
-        entryPipelineDetail = pr.detail;
-        console.info(
-          JSON.stringify({
-            tag: "LIVE_ENTRY_PIPELINE_RESULT",
-            ts: new Date().toISOString(),
-            market,
-            ok: true,
-            detail: entryPipelineDetail,
-          }),
-        );
       } catch (e) {
         await appendLog({
           company_id: companyIdSchema.parse(opts.companyId),
@@ -4918,7 +4990,7 @@ export function createLiveDataStrategy(opts: {
           ts: new Date().toISOString(),
           market,
           ok: true,
-          path: "normal",
+          path: isSurgeSource ? "surge_normal" : "normal",
           order_krw: orderKrw,
           live_order_available_krw: liveOrderAvailableKrw,
           open_positions: openCountNow,
@@ -4933,7 +5005,7 @@ export function createLiveDataStrategy(opts: {
           tag: "LIVE_PLACEBUY_ATTEMPT",
           ts: new Date().toISOString(),
           market,
-          path: "normal",
+          path: isSurgeSource ? "surge_normal" : "normal",
           order_krw: orderKrw,
           strategy_type: strategyType,
         }),
