@@ -98,7 +98,11 @@ const MOMENTUM_LOOKBACK_MIN = Math.max(1, Math.min(30, Number(process.env.PUMP_S
 const USE_VOLUME_WEIGHT = (process.env.PUMP_SCANNER_USE_VOLUME_WEIGHT ?? process.env.USE_VOLUME_WEIGHT ?? "true").toLowerCase() === "true";
 const CANDLE_MAX_MARKETS_PER_TICK = Math.max(
   1,
-  Number(process.env.PUMP_SCANNER_CANDLE_MAX_MARKETS_PER_TICK ?? process.env.UPBIT_TICKER_MAX_MARKETS_PER_TICK ?? 12),
+  Math.min(5, Number(process.env.PUMP_SCANNER_CANDLE_MAX_MARKETS_PER_TICK ?? process.env.UPBIT_TICKER_MAX_MARKETS_PER_TICK ?? 5)),
+);
+const LIVE_ENTRY_SIGNAL_STALE_SECONDS_FOR_WARN = Math.max(
+  30,
+  Math.min(1800, Number(process.env.LIVE_ENTRY_SIGNAL_STALE_SECONDS ?? 240)),
 );
 const CANDLE_BATCH_SIZE = Math.max(1, Number(process.env.PUMP_SCANNER_CANDLE_BATCH_SIZE ?? 3));
 const CANDLE_BATCH_DELAY_MS = Math.max(0, Number(process.env.PUMP_SCANNER_CANDLE_BATCH_DELAY_MS ?? 2_000));
@@ -685,6 +689,7 @@ export function createPumpScanner(
       if (PUMP_TIMING_LOG) {
         const tickerBatchesAlt = Math.ceil(altMarkets.length / PUMP_TICKER_BATCH_SIZE);
         const tickTotalMs = Date.now() - tickT0;
+        const candleMs = tAfterCandles - tBeforeCandles;
         console.info(
           JSON.stringify({
             tag: "DEBUG_PUMP_SCANNER_TICK_TIMING",
@@ -695,7 +700,7 @@ export function createPumpScanner(
             ticker_phase_ms: tAfterHeldExtraTickers - tickT0,
             momentum_ms: tAfterMomentum - tAfterHeldExtraTickers,
             post_momentum_prep_ms: tBeforeCandles - tAfterMomentum,
-            candle_ms: tAfterCandles - tBeforeCandles,
+            candle_ms: candleMs,
             alt_market_count: altMarkets.length,
             ticker_returned: tickers.length,
             ticker_batches_alt: tickerBatchesAlt,
@@ -710,6 +715,17 @@ export function createPumpScanner(
             tradable_confirmed_count: tradableCandidates.length,
           }),
         );
+        if (tickTotalMs > LIVE_ENTRY_SIGNAL_STALE_SECONDS_FOR_WARN * 1_000) {
+          console.warn(
+            JSON.stringify({
+              tag: "PUMP_SCANNER_TICK_EXCEEDS_STALE_THRESHOLD",
+              tick_total_ms: tickTotalMs,
+              candle_ms: candleMs,
+              stale_threshold_seconds: LIVE_ENTRY_SIGNAL_STALE_SECONDS_FOR_WARN,
+              candle_targets_count: candleTargets.length,
+            }),
+          );
+        }
       }
 
       const priceBy = new Map(allTickers.map((t) => [t.market, t.trade_price]));
@@ -785,14 +801,18 @@ export function createPumpScanner(
         .map((r) => ({
           market: r.market,
           score: r.score,
+          scanner_score: r.score,
           status: r.status,
           breakout: r.breakout,
+          close_upper_hold: r.close_upper_hold,
+          rise_3m_pct: r.rise_3m_pct,
           volume_multiple: r.volume_multiple,
           captured_at: r.captured_at ?? null,
           updated_at: r.updated_at,
           signal_ts: r.updated_at,
           early_entry_eligible: r.early_entry_eligible,
           add_entry_eligible: r.add_entry_eligible,
+          source_kind: "scanner_tradable_candidate",
           signal_key: `${r.market}|${r.updated_at}|${r.score.toFixed(1)}|${r.status}|e${r.early_entry_eligible ? 1 : 0}a${r.add_entry_eligible ? 1 : 0}`,
           reason: r.early_entry_eligible
             ? `surge_scanner:pre_breakout_early:vr_${r.volume_multiple.toFixed(2)}:score_${r.score.toFixed(1)}`
