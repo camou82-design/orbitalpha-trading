@@ -28,6 +28,8 @@ import {
   evaluateSpotLongEntryPipeline,
   evaluateSurgeEntryPipeline,
 } from "./live-entry-pipeline.js";
+import { readJsonFile } from "./runtime-file-io.js";
+import { surgeCandidatesRuntimePath } from "./runtime-paths.js";
 
 function num(x: unknown): number {
   return typeof x === "number" ? x : Number(x);
@@ -852,6 +854,39 @@ function resolveFreshestIsoTs(candidates: Array<string | null | undefined>): str
     if (ms > bestMs) bestMs = ms;
   }
   return bestMs > 0 ? new Date(bestMs).toISOString() : null;
+}
+
+type SurgeCandidatesShadowFile = {
+  kind?: string;
+  updated_at?: string;
+  items?: Array<Record<string, unknown>>;
+};
+
+function loadSurgeCandidatesShadow() {
+  const p = surgeCandidatesRuntimePath();
+  const j = readJsonFile<SurgeCandidatesShadowFile>(p);
+  const updated_at = j && typeof j.updated_at === "string" ? j.updated_at : null;
+  const raw = Array.isArray(j?.items) ? j!.items! : [];
+  const items = raw
+    .map((r) => {
+      const market = typeof r.market === "string" ? r.market : "";
+      if (!market.startsWith("KRW-")) return null;
+      const scannerScoreRaw = typeof r.scanner_score === "number" ? r.scanner_score : Number(r.scanner_score ?? 0);
+      const volRaw =
+        typeof r.volume_multiple === "number"
+          ? r.volume_multiple
+          : typeof r.volume_ratio === "number"
+            ? r.volume_ratio
+            : Number(r.volume_multiple ?? r.volume_ratio ?? 0);
+      const scanner_score = Number.isFinite(scannerScoreRaw) ? scannerScoreRaw : 0;
+      const volume_multiple = Number.isFinite(volRaw) ? volRaw : 0;
+      const filter_pass = Boolean(r.breakout) && Boolean(r.close_upper_hold);
+      const signal_ts = typeof r.signal_ts === "string" ? r.signal_ts : null;
+      const source_kind = typeof r.source_kind === "string" ? r.source_kind : "surge_scanner_worker";
+      return { market, scanner_score, volume_multiple, filter_pass, signal_ts, source_kind };
+    })
+    .filter((x): x is NonNullable<typeof x> => Boolean(x));
+  return { updated_at, items, path: p };
 }
 
 function scannerSignalTimestamp(sig: ScannerFeedSignal): string | null {
@@ -1910,6 +1945,58 @@ export function createLiveDataStrategy(opts: {
     const selectedEntryUniverseSymbols = selectedSourceRows.map((x) => x.market);
     for (const m of selectedSourceRows) {
       sourceMetaByMarket.set(m.market, { ...m, stale_filtered_before_eval: false });
+    }
+    const candidateSourceModeRaw = String(process.env.LIVE_SURGE_CANDIDATE_SOURCE ?? "legacy").toLowerCase().trim();
+    const candidateSourceMode =
+      candidateSourceModeRaw === "file" || candidateSourceModeRaw === "shadow" || candidateSourceModeRaw === "legacy"
+        ? (candidateSourceModeRaw as "legacy" | "shadow" | "file")
+        : "legacy";
+    const shadow = candidateSourceMode === "shadow" || candidateSourceMode === "file" ? loadSurgeCandidatesShadow() : null;
+    if (shadow) {
+      const oldSet = new Set(selectedEntryUniverseSymbols);
+      const newSet = new Set(shadow.items.map((x) => x.market));
+      const union = Array.from(new Set([...Array.from(oldSet), ...Array.from(newSet)])).slice(0, 40);
+      const oldScoreBy = new Map(freshScannerCandidates.map((x) => [x.market, x.score]));
+      const oldPassBy = new Map(latestAllSignals.entries());
+      const newBy = new Map(shadow.items.map((x) => [x.market, x]));
+      const rows = union
+        .map((market) => {
+          const old_source_present = oldSet.has(market);
+          const new_source_present = newSet.has(market);
+          const old_score = oldScoreBy.get(market) ?? null;
+          const oldSig = oldPassBy.get(market);
+          const old_filter_pass = Boolean(oldSig?.p?.filter_pass);
+          const newItem = newBy.get(market) ?? null;
+          const new_score = newItem ? Number(newItem.scanner_score ?? 0) : null;
+          const new_candidate_valid = Boolean(newItem && newItem.filter_pass);
+          const selected_by_old = old_source_present;
+          const selected_by_new = Boolean(new_source_present && new_candidate_valid);
+          return {
+            market,
+            old_source_present,
+            new_source_present,
+            old_score,
+            new_score,
+            old_filter_pass,
+            new_candidate_valid,
+            selected_by_old,
+            selected_by_new,
+          };
+        })
+        .filter((r) => r.old_source_present || r.new_source_present)
+        .slice(0, 25);
+      for (const r of rows) {
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_CANDIDATE_SHADOW_COMPARE",
+            ts: new Date().toISOString(),
+            mode: candidateSourceMode,
+            shadow_updated_at: shadow.updated_at,
+            shadow_path: shadow.path.replace(/\\/g, "/"),
+            ...r,
+          }),
+        );
+      }
     }
     console.info(
       JSON.stringify({
@@ -4877,6 +4964,37 @@ export function createLiveDataStrategy(opts: {
       const liveOrderAvailableKrw = Math.max(0, Number(st.live_order_available_krw ?? st.krw_available ?? 0));
       const openCountNow = Object.keys(state.positions).length;
       const remainingSlots = Math.max(0, state.safety_guard.max_positions - openCountNow);
+      const bridgePassForLog = Boolean(scannerBridgeScore?.pass);
+      const scannerScoreForLog = Number(sig?.p?.scanner_score ?? sig?.p?.signal_score ?? 0);
+      const rise3ForLog = Number(sig?.p?.rise_3m_pct ?? sig?.p?.momentum_3m_pct ?? sig?.p?.price_change_3m_pct ?? 0);
+      const emitFinalBlocked = (finalReason: string, extra?: Record<string, unknown>) => {
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_ENTRY_FINAL_BLOCKED",
+            ts: new Date().toISOString(),
+            market,
+            source_kind: sourceKindForJudgment,
+            scanner_score: Number.isFinite(scannerScoreForLog) ? scannerScoreForLog : 0,
+            volume_multiple: Number.isFinite(vol) ? vol : Number(sig?.p?.volume_ratio ?? 0),
+            breakout: Boolean(sig?.p?.breakout),
+            close_upper_hold: Boolean(sig?.p?.close_upper_hold),
+            rise_3m_pct: Number.isFinite(rise3ForLog) ? rise3ForLog : 0,
+            bridge_pass: bridgePassForLog,
+            filter_pass: Boolean(sig?.p?.filter_pass),
+            surge_pipeline_ok: true,
+            order_precheck_ok: false,
+            final_reason: finalReason,
+            auto_trade_enabled: Boolean(st.auto_trade_enabled),
+            live_enabled: Boolean(st.live_enabled),
+            api_connected: Boolean(st.api_connected),
+            recovery_ready: (st as any)?.recovery_ready === true ? true : (st as any)?.recovery_ready === false ? false : null,
+            available_krw: liveOrderAvailableKrw,
+            open_positions: openCountNow,
+            max_positions: state.safety_guard.max_positions,
+            ...extra,
+          }),
+        );
+      };
       const surgeMinOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(surgeCapitalLimitKrw * SURGE_MIN_ORDER_RATIO));
       if (liveTradingOn && surgeRemainingForTickKrw < surgeMinOrderKrw) {
         console.info(
@@ -4893,6 +5011,7 @@ export function createLiveDataStrategy(opts: {
           }),
         );
         bumpSkip("surge_remaining_below_min_order");
+        emitFinalBlocked("surge_remaining_below_min_order", { surge_remaining_krw: surgeRemainingForTickKrw, min_order_krw: surgeMinOrderKrw });
         continue;
       }
       const minOrderKrw = Math.max(surgeMinOrderKrw, LIVE_MIN_ENTRY_KRW);
@@ -4960,11 +5079,13 @@ export function createLiveDataStrategy(opts: {
       if (surgeOpenCount >= SURGE_MAX_OPEN_POSITIONS && !stPos) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "surge_max_positions_reached", surgeOpenCount, SURGE_MAX_OPEN_POSITIONS });
         bumpSkip("surge_max_positions_reached");
+        emitFinalBlocked("surge_max_positions_reached", { surge_open_positions: surgeOpenCount, surge_max_open_positions: SURGE_MAX_OPEN_POSITIONS });
         continue;
       }
       if (orderKrw < 5000) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "order_krw_below_min", order_krw: orderKrw });
         bumpSkip("order_krw_below_min");
+        emitFinalBlocked("order_krw_below_min", { order_krw: orderKrw });
         continue;
       }
       if (liveOrderAvailableKrw < orderKrw) {
@@ -4974,6 +5095,7 @@ export function createLiveDataStrategy(opts: {
           order_krw: orderKrw,
         });
         bumpSkip("insufficient_live_order_krw");
+        emitFinalBlocked("insufficient_live_order_krw", { live_order_available_krw: liveOrderAvailableKrw, order_krw: orderKrw });
         continue;
       }
       const strategyType: StrategyType = marketState.market_state === "risk_on" ? "momentum" : "stable";
@@ -5011,6 +5133,17 @@ export function createLiveDataStrategy(opts: {
       );
       try {
         await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", signalPayloadForBuy);
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_PLACEBUY_RESULT",
+            ts: new Date().toISOString(),
+            market,
+            ok: true,
+            path: isSurgeSource ? "surge_normal" : "normal",
+            order_krw: orderKrw,
+            strategy_type: strategyType,
+          }),
+        );
         if (liveTradingOn) {
           surgeRemainingForTickKrw = Math.max(0, surgeRemainingForTickKrw - orderKrw);
         }
@@ -5033,6 +5166,18 @@ export function createLiveDataStrategy(opts: {
         emitEval("entry_opened", { symbol: market, order_krw: orderKrw });
         selectedCount += 1;
       } catch (e) {
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_PLACEBUY_RESULT",
+            ts: new Date().toISOString(),
+            market,
+            ok: false,
+            path: isSurgeSource ? "surge_normal" : "normal",
+            order_krw: orderKrw,
+            strategy_type: strategyType,
+            error: e instanceof Error ? e.message.slice(0, 240) : String(e).slice(0, 240),
+          }),
+        );
         state.safety_guard.order_fail_count_today += 1;
         if (state.safety_guard.order_fail_count_today >= 3) {
           state.safety_guard.state = "자동정지";
@@ -5057,6 +5202,7 @@ export function createLiveDataStrategy(opts: {
         }
         await persist();
         bumpSkip("order_failed");
+        emitFinalBlocked("order_failed", { order_krw: orderKrw });
         continue;
       }
       const price = priceBy.get(market) ?? 0;

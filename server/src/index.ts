@@ -583,8 +583,20 @@ async function main() {
 
   app.get("/api/v1/logs", async (req) => {
     const q = req.query as { limit?: string };
-    const limit = Math.min(500, Math.max(1, Number(q.limit ?? 100)));
+    const requested = Number(q.limit ?? 80);
+    const limit = Math.min(200, Math.max(1, Number.isFinite(requested) ? requested : 80));
+    // Lightweight caching to avoid dashboard stampede
+    const now = Date.now();
+    const cacheTtlMs = 1500;
+    (globalThis as any).__orbitalpha_logs_cache ??= { at: 0, limit: 0, items: null as any };
+    const c = (globalThis as any).__orbitalpha_logs_cache as { at: number; limit: number; items: any };
+    if (c.items && c.limit === limit && now - c.at < cacheTtlMs) {
+      return { items: c.items };
+    }
     const rows = await readRecentLogs(env.companyId, env.serviceId, limit);
+    c.at = now;
+    c.limit = limit;
+    c.items = rows;
     return { items: rows };
   });
 
@@ -804,8 +816,23 @@ async function main() {
       strategy_available_krw: strategyAvailable,
     };
   });
-  app.get("/api/v1/scanner/status", async () => pumpScanner.status());
+  app.get("/api/v1/scanner/status", async () => {
+    const now = Date.now();
+    const ttlMs = 1200;
+    (globalThis as any).__orbitalpha_scanner_cache ??= { at: 0, body: null as any };
+    const c = (globalThis as any).__orbitalpha_scanner_cache as { at: number; body: any };
+    if (c.body && now - c.at < ttlMs) return c.body;
+    const body = await pumpScanner.status();
+    c.at = now;
+    c.body = body;
+    return body;
+  });
   app.get("/api/v1/paper/status", async () => {
+    const now = Date.now();
+    const ttlMs = 2500;
+    (globalThis as any).__orbitalpha_paper_cache ??= { at: 0, body: null as any };
+    const c = (globalThis as any).__orbitalpha_paper_cache as { at: number; body: any };
+    if (c.body && now - c.at < ttlMs) return c.body;
     const out = (await paper.status()) as any;
     app.log.info(
       {
@@ -819,12 +846,22 @@ async function main() {
       },
       "DEBUG_PAPER_STATUS_API_SOURCE",
     );
-    return { ...out, source_name: "local_paper_engine", source_path: typeof out?.files?.state === "string" ? out.files.state : null };
+    const body = { ...out, source_name: "local_paper_engine", source_path: typeof out?.files?.state === "string" ? out.files.state : null };
+    c.at = now;
+    c.body = body;
+    return body;
   });
   app.get("/api/v1/market-state", async () => {
+    const now = Date.now();
+    const ttlMs = 1200;
+    (globalThis as any).__orbitalpha_market_state_cache ??= { at: 0, body: null as any };
+    const c = (globalThis as any).__orbitalpha_market_state_cache as { at: number; body: any };
+    if (c.body && now - c.at < ttlMs) return c.body;
     const latest = marketFilter.status();
-    if (latest) return latest;
-    return marketFilter.evaluate();
+    const body = latest ? latest : await marketFilter.evaluate();
+    c.at = now;
+    c.body = body;
+    return body;
   });
   app.get("/api/v1/replay/query", async (req, reply) => {
     const q = req.query as { start?: string; end?: string; market?: string };
