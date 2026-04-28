@@ -863,6 +863,55 @@ async function main() {
     c.body = body;
     return body;
   });
+
+  // Shadow status endpoint: read-only runtime file inspection (no worker control, no orders)
+  app.get("/api/v1/surge-shadow/status", async () => {
+    const modeRaw = String(process.env.LIVE_SURGE_CANDIDATE_SOURCE ?? "legacy").toLowerCase().trim();
+    const shadow_mode = modeRaw === "shadow" || modeRaw === "file";
+    const exists = fs.existsSync(surgeCandidatesPath);
+    let updated_at: string | null = null;
+    let items_count = 0;
+    let first_symbols: string[] = [];
+    if (exists) {
+      try {
+        const raw = fs.readFileSync(surgeCandidatesPath, "utf8");
+        const j = raw ? (JSON.parse(raw) as any) : null;
+        updated_at = typeof j?.updated_at === "string" ? j.updated_at : null;
+        const items = Array.isArray(j?.items) ? j.items : [];
+        items_count = items.length;
+        first_symbols = items
+          .map((x: any) => (typeof x?.market === "string" ? x.market : null))
+          .filter((s: any): s is string => typeof s === "string" && s.startsWith("KRW-"))
+          .slice(0, 8);
+      } catch {
+        // ignore parse failures; still report exists
+      }
+    }
+    const age_seconds =
+      updated_at && Number.isFinite(Date.parse(updated_at))
+        ? Math.max(0, Math.floor((Date.now() - Date.parse(updated_at)) / 1000))
+        : null;
+    let order_authority: string | null = "live_execution_only";
+    try {
+      if (fs.existsSync(liveExecutionStatePath)) {
+        const raw2 = fs.readFileSync(liveExecutionStatePath, "utf8");
+        const j2 = raw2 ? (JSON.parse(raw2) as any) : null;
+        if (typeof j2?.order_authority === "string") order_authority = j2.order_authority;
+      }
+    } catch {
+      // ignore
+    }
+    return {
+      ok: true,
+      exists,
+      updated_at,
+      age_seconds,
+      items_count,
+      first_symbols,
+      shadow_mode,
+      order_authority,
+    };
+  });
   app.get("/api/v1/replay/query", async (req, reply) => {
     const q = req.query as { start?: string; end?: string; market?: string };
     const start = q.start ?? "";

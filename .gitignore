@@ -8,7 +8,12 @@ out/
 .env.local
 .env.*.local
 auth_cookie*.txt
-data/
+# runtime data is generated during operation; keep examples only
+data/**
+!data/runtime/
+data/runtime/*.json
+!data/runtime/*.example.json
+server/data/**
 coverage/
 .turbo/
 *.cookies

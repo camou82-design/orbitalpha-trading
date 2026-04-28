@@ -1952,6 +1952,18 @@ export function createLiveDataStrategy(opts: {
         ? (candidateSourceModeRaw as "legacy" | "shadow" | "file")
         : "legacy";
     const shadow = candidateSourceMode === "shadow" || candidateSourceMode === "file" ? loadSurgeCandidatesShadow() : null;
+    console.info(
+      JSON.stringify({
+        tag: "LIVE_SURGE_CANDIDATE_SOURCE_STATE",
+        ts: new Date().toISOString(),
+        mode: candidateSourceMode,
+        shadow_file_loaded: Boolean(shadow && (shadow.updated_at || shadow.items.length > 0)),
+        shadow_items_count: shadow ? shadow.items.length : 0,
+        shadow_updated_at: shadow?.updated_at ?? null,
+        // controlled switch: order input stays legacy for shadow/file in this phase
+        order_input_source: "legacy",
+      }),
+    );
     if (shadow) {
       const oldSet = new Set(selectedEntryUniverseSymbols);
       const newSet = new Set(shadow.items.map((x) => x.market));

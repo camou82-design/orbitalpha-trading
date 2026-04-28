@@ -1,0 +1,17 @@
+{
+  "kind": "surge_candidates_shadow",
+  "updated_at": "1970-01-01T00:00:00.000Z",
+  "items": [
+    {
+      "market": "KRW-XXX",
+      "scanner_score": 0,
+      "volume_multiple": 0,
+      "breakout": true,
+      "close_upper_hold": true,
+      "rise_3m_pct": 0,
+      "signal_ts": "1970-01-01T00:00:00.000Z",
+      "updated_at": "1970-01-01T00:00:00.000Z",
+      "source_kind": "surge_scanner_worker"
+    }
+  ]
+}
