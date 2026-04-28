@@ -10,6 +10,7 @@
     "start": "npm run start:build",
     "start:build": "npm run build && npm run start:runtime",
     "start:runtime": "node dist/index.js",
+    "start:surge-shadow": "node dist/worker-surge-scanner-shadow.js",
     "lint": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
