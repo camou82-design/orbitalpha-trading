@@ -51,15 +51,38 @@ export function isSoftTradeStatusFailureCode(code: string | null | undefined): b
   );
 }
 
-export async function fetchTradeStatusDetailed(apiBase: string): Promise<TradeStatusFetchResult> {
+export type FetchTradeStatusDetailedOptions = {
+  /** Optional external signal (e.g. polling abort / component unmount) */
+  signal?: AbortSignal;
+  /** Request timeout in milliseconds */
+  timeoutMs?: number;
+  /** Optional cache-bust value. Default: Date.now() */
+  cacheBust?: number;
+};
+
+function devInfo(payload: unknown) {
+  if (typeof process !== "undefined" && process.env?.NODE_ENV === "production") return;
+  console.info(typeof payload === "string" ? payload : JSON.stringify(payload));
+}
+
+export async function fetchTradeStatusDetailed(
+  apiBase: string,
+  opts?: FetchTradeStatusDetailedOptions,
+): Promise<TradeStatusFetchResult> {
   void apiBase;
-  const ts = Date.now();
+  const ts = opts?.cacheBust ?? Date.now();
   let httpStatus = 0;
   let body: unknown | null = null;
   try {
     // 동일 본문(account_portfolio 포함): GET /api/v1/account/status
     const ctrl = new AbortController();
-    const tid = setTimeout(() => ctrl.abort(), 5000);
+    const timeoutMs = Math.max(1000, Math.min(30_000, opts?.timeoutMs ?? 5000));
+    const tid = setTimeout(() => ctrl.abort(), timeoutMs);
+    const onAbort = () => ctrl.abort();
+    if (opts?.signal) {
+      if (opts.signal.aborted) ctrl.abort();
+      else opts.signal.addEventListener("abort", onAbort, { once: true });
+    }
     const t0 = Date.now();
     const r = await fetch(`/api/v1/trade/status?_=${ts}`, {
       cache: "no-store",
@@ -67,16 +90,15 @@ export async function fetchTradeStatusDetailed(apiBase: string): Promise<TradeSt
       signal: ctrl.signal,
     });
     clearTimeout(tid);
+    if (opts?.signal) opts.signal.removeEventListener("abort", onAbort);
     const elapsed = Date.now() - t0;
     if (elapsed >= 2500) {
-      console.info(
-        JSON.stringify({
-          tag: "DASHBOARD_TRADE_STATUS_SLOW",
-          endpoint: "client_fetch /api/v1/trade/status",
-          ms: elapsed,
-          threshold_ms: 2500,
-        }),
-      );
+      devInfo({
+        tag: "DASHBOARD_TRADE_STATUS_SLOW",
+        endpoint: "client_fetch /api/v1/trade/status",
+        ms: elapsed,
+        threshold_ms: 2500,
+      });
     }
     httpStatus = r.status;
     const text = await r.text();

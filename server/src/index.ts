@@ -26,6 +26,9 @@ import { createPaperTradingEngine } from "./paper-trading.js";
 import { readLiveStrategyTradesRecent } from "./recent-strategy-trades.js";
 
 const cwd = process.cwd();
+const runtimeDir = path.join(cwd, "data", "runtime");
+const surgeCandidatesPath = path.join(runtimeDir, "surge-candidates.json");
+const liveExecutionStatePath = path.join(runtimeDir, "live-execution-state.json");
 const envRoots = [cwd, path.dirname(cwd)];
 const envFiles = [".env", ".env.local"];
 const envLoadMeta: Array<{ file: string; exists: boolean; loaded: boolean; parsed_keys: string[] }> = [];
@@ -111,6 +114,47 @@ async function main() {
 
   const app = Fastify({ logger: true, trustProxy: env.trustProxy });
   const opLog = createOperationalLogger({ debugEnabled: env.debugLogEnabled });
+
+  // Engine split prep (shadow only): create runtime file paths and initial shapes.
+  // No order authority is delegated here.
+  try {
+    if (!fs.existsSync(runtimeDir)) fs.mkdirSync(runtimeDir, { recursive: true });
+    if (!fs.existsSync(surgeCandidatesPath)) {
+      fs.writeFileSync(
+        surgeCandidatesPath,
+        JSON.stringify(
+          {
+            kind: "surge_candidates_shadow",
+            updated_at: null,
+            items: [],
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+    }
+    if (!fs.existsSync(liveExecutionStatePath)) {
+      fs.writeFileSync(
+        liveExecutionStatePath,
+        JSON.stringify(
+          {
+            kind: "live_execution_state_shadow",
+            updated_at: null,
+            order_authority: "live_execution_only",
+            shadow_mode: true,
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+    }
+    app.log.info({ tag: "SURGE_SCANNER_WORKER_SHADOW_READY", path: surgeCandidatesPath.replace(/\\/g, "/") }, "SURGE_SCANNER_WORKER_SHADOW_READY");
+    app.log.info({ tag: "LIVE_EXECUTION_WORKER_SHADOW_READY", path: liveExecutionStatePath.replace(/\\/g, "/") }, "LIVE_EXECUTION_WORKER_SHADOW_READY");
+  } catch (e) {
+    app.log.warn({ tag: "RUNTIME_FILE_INIT_FAILED", err: String(e) }, "runtime file init failed");
+  }
   const SESSION_COOKIE = "orbitalpha_trading_session";
   const sessions = new Map<string, { user_id: string; created_at: string }>();
 

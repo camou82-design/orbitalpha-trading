@@ -1054,6 +1054,7 @@ export default function HomePage() {
   const [trade, setTrade] = useState<TradeStatus | null>(null);
   const [currentSession, setCurrentSession] = useState<AuthSession | null>(null);
   const [sessionUserId, setSessionUserId] = useState<string | null>(null);
+  const [sessionPanelWarning, setSessionPanelWarning] = useState<{ code: string; message: string } | null>(null);
   const [autoTradeEnabled, setAutoTradeEnabled] = useState(false);
   const [autoTradeChangedAt, setAutoTradeChangedAt] = useState<string | null>(null);
   const [toggleBusy, setToggleBusy] = useState(false);
@@ -1069,7 +1070,85 @@ export default function HomePage() {
   const [lastClientTradeFailure, setLastClientTradeFailure] = useState<{ code: string; message: string } | null>(null);
   const tradeInitialSyncDoneRef = useRef(false);
   const prevPathnameRef = useRef<string | null>(null);
-  const loadInFlightRef = useRef(false);
+  const pollInFlightRef = useRef(new Map<string, AbortController>());
+  const pollSigRef = useRef(new Map<string, string>());
+  const pollTimersRef = useRef(new Map<string, number>());
+  const isHiddenRef = useRef(false);
+
+  const devLog = (row: Record<string, unknown>) => {
+    if (typeof process !== "undefined" && process.env?.NODE_ENV === "production") return;
+    console.info(JSON.stringify(row));
+  };
+
+  const asRecord = (x: unknown): Record<string, unknown> => (x && typeof x === "object" ? (x as Record<string, unknown>) : {});
+  const asArray = (x: unknown): unknown[] => (Array.isArray(x) ? x : []);
+
+  const abortAllPolls = () => {
+    for (const [, ctrl] of pollInFlightRef.current) ctrl.abort();
+    pollInFlightRef.current.clear();
+  };
+
+  const setIfChanged = <T,>(key: string, next: T, setter: (v: T) => void, signature?: (v: T) => unknown) => {
+    let sig: string | null = null;
+    try {
+      const src = signature ? signature(next) : next;
+      sig = JSON.stringify(src);
+    } catch {
+      sig = null;
+    }
+    const prev = pollSigRef.current.get(key);
+    if (sig && prev === sig) {
+      devLog({ tag: "DASHBOARD_POLL_STATE_UNCHANGED", key });
+      return;
+    }
+    if (sig) pollSigRef.current.set(key, sig);
+    setter(next);
+  };
+
+  const pollJson = async <T,>(
+    key: string,
+    url: string,
+    opts: {
+      timeoutMs: number;
+      onOk: (data: T) => void;
+      onHttp?: (status: number, bodyText: string) => void;
+      onErr?: (e: unknown) => void;
+    },
+  ) => {
+    if (pollInFlightRef.current.has(key)) {
+      devLog({ tag: "DASHBOARD_POLL_SKIPPED_IN_FLIGHT", key, url });
+      return;
+    }
+    const ctrl = new AbortController();
+    pollInFlightRef.current.set(key, ctrl);
+    const tid = window.setTimeout(() => ctrl.abort(), opts.timeoutMs);
+    try {
+      const r = await fetch(url, { cache: "no-store", credentials: "include", signal: ctrl.signal });
+      if (!r.ok) {
+        const text = await r.text().catch(() => "");
+        opts.onHttp?.(r.status, text);
+        return;
+      }
+      const j = (await r.json().catch(() => null)) as T;
+      if (j !== null) opts.onOk(j);
+    } catch (e) {
+      if (e instanceof Error && e.name === "AbortError") devLog({ tag: "DASHBOARD_POLL_ABORTED", key, url });
+      opts.onErr?.(e);
+    } finally {
+      window.clearTimeout(tid);
+      pollInFlightRef.current.delete(key);
+    }
+  };
+
+  const scheduleLoop = (key: string, run: () => Promise<void>, visibleMs: number, hiddenMs: number) => {
+    const tick = async () => {
+      await run();
+      const ms = isHiddenRef.current ? hiddenMs : visibleMs;
+      const t = window.setTimeout(tick, ms);
+      pollTimersRef.current.set(key, t);
+    };
+    void tick();
+  };
 
   const {
     heldLiveSymbols,
@@ -1106,234 +1185,355 @@ export default function HomePage() {
     }
   }, [pathname]);
 
+  const tradeRef = useRef<TradeStatus | null>(null);
+  useEffect(() => {
+    tradeRef.current = trade;
+  }, [trade]);
+
   useEffect(() => {
     let cancelled = false;
-    async function load() {
-      if (loadInFlightRef.current) return;
-      loadInFlightRef.current = true;
-      setErr(null);
-      try {
-        if (typeof window !== "undefined") {
-          const sp = new URLSearchParams(window.location.search);
-          if (sp.get("account_sync") === "1") {
-            tradeInitialSyncDoneRef.current = false;
-            window.history.replaceState(null, "", `${window.location.pathname}${window.location.hash}`);
-          }
-        }
-        const ts = Date.now();
-        let sessionRes: Response;
-        try {
-          const sessionCtrl = new AbortController();
-          const sessionTid = setTimeout(() => sessionCtrl.abort(), 15_000);
-          sessionRes = await fetch(`/api/v1/auth/session?_=${ts}`, {
-            cache: "no-store",
-            credentials: "include",
-            signal: sessionCtrl.signal,
-          });
-          clearTimeout(sessionTid);
-        } catch (e) {
-          if (!cancelled) {
-            setErr(e instanceof Error ? e.message : "session_fetch_failed");
-          }
-          return;
-        }
-        const session = (await sessionRes.json().catch(() => ({}))) as AuthSession;
-        if (sessionRes.status === 401) {
-          if (!cancelled) {
-            setAuthState("expired");
-            setAccountSyncState("idle");
-            tradeInitialSyncDoneRef.current = false;
-            router.replace("/login?reason=session_expired");
-          }
-          return;
-        }
-        if (!sessionRes.ok) {
-          if (!cancelled) {
-            setErr(`session_http_${sessionRes.status}`);
-          }
-          return;
-        }
-        if (!session.authenticated) {
-          if (!cancelled) {
-            setAuthState("expired");
-            setAccountSyncState("idle");
-            tradeInitialSyncDoneRef.current = false;
-            router.replace("/login");
-          }
-          return;
-        }
-        if (!cancelled) {
-          setAuthState("ok");
-          setCurrentSession(session);
-          setSessionUserId(session.user_id ?? null);
-          if (typeof session.auto_trade_enabled === "boolean") {
-            setAutoTradeEnabled(session.auto_trade_enabled);
-            setAutoTradeChangedAt(typeof session.auto_trade_changed_at === "string" ? session.auto_trade_changed_at : null);
-          }
-        }
+    setErr(null);
 
-        if (!tradeInitialSyncDoneRef.current) {
-          if (!cancelled) setAccountSyncState("syncing");
-          const syncResult = await fetchTradeStatusUntilSyncedWithLog(apiBase, {
-            maxAttempts: 15,
-            maxWallMs: 24_000,
-            logContext: "trading_page_initial",
-          });
-          if (cancelled) return;
-          tradeInitialSyncDoneRef.current = true;
-          const primed = syncResult.payload;
-          if (primed) {
-            if (!cancelled) {
-              const p = primed as TradeStatus;
-              setTrade(p);
-              setLastClientTradeFailure(null);
-              if (p.api_connected) setAccountSyncState("ok");
-              else if (p.env_access_key_present && p.env_secret_key_present) setAccountSyncState("error");
-              else setAccountSyncState("ok");
-              if (!p.api_connected) {
-                console.log("[orbitalpha-trading] /trading initial sync final snapshot", {
-                  attempts: syncResult.attempts,
-                  httpStatus: syncResult.lastFetch?.httpStatus,
-                  api_connected: p.api_connected,
-                  account_sync_failure_code: p.account_sync_failure_code,
-                  account_sync_failure_message: p.account_sync_failure_message,
-                  api_reason: p.api_reason,
-                });
-              }
-            }
-          } else if (!cancelled) {
-            const lf = syncResult.lastFetch;
-            if (lf?.failureCode) {
-              setLastClientTradeFailure({
-                code: lf.failureCode,
-                message: lf.failureMessage ?? "",
-              });
-              if (!isSoftTradeStatusFailureCode(lf.failureCode)) {
-                setAccountSyncState("error");
-              }
-              console.log("[orbitalpha-trading] /trading initial sync no valid payload", {
-                attempts: syncResult.attempts,
-                lastHttpStatus: lf.httpStatus,
-                failureCode: lf.failureCode,
-                failureMessage: lf.failureMessage,
-              });
-            } else {
-              setLastClientTradeFailure(null);
-            }
-          }
-        }
+    const visibilityHandler = () => {
+      isHiddenRef.current = Boolean(document.hidden);
+    };
+    visibilityHandler();
+    document.addEventListener("visibilitychange", visibilityHandler);
 
-        const [c, l, tradePollRes, s, scannerStatus, paperStatus, marketStateStatus] = await Promise.all([
-          fetch(`/api/v1/context?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()),
-          fetch(`/api/v1/logs?limit=200&_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()),
-          fetchTradeStatusDetailed(apiBase),
-          fetch(`/api/v1/strategy/status?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()).catch(() => null),
-          fetch(`/api/v1/scanner/status?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()).catch(() => null),
-          fetch(`/api/v1/paper/status?_=${ts}`, { cache: "no-store", credentials: "include" })
-            .then(async (r) => {
-              if (!r.ok) return null;
-              return r.json().catch(() => null);
-            })
-            .catch(() => null),
-          fetch(`/api/v1/market-state?_=${ts}`, { cache: "no-store", credentials: "include" }).then((r) => r.json()).catch(() => null),
-        ]);
-        if (cancelled) return;
-        setCtx({
-          company_id: c.company_id ?? DEFAULT_TRADING_COMPANY_ID,
-          service_id: c.service_id ?? DEFAULT_TRADING_SERVICE_ID,
-          product: c.product,
-          service_line: c.service_line ?? THIS_REPO_SERVICE_LINE,
-          monitor_instance_id: typeof c.monitor_instance_id === "string" ? c.monitor_instance_id : null,
-          monitor_started_at: typeof c.monitor_started_at === "string" ? c.monitor_started_at : null,
-          watch_markets: Array.isArray(c.watch_markets)
-            ? (c.watch_markets as string[])
-            : ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"],
-          excluded_markets: Array.isArray(c.excluded_markets) ? (c.excluded_markets as string[]) : [],
-          volume_threshold_fallback:
-            typeof c.volume_threshold_fallback === "number"
-              ? c.volume_threshold_fallback
-              : typeof c.volume_threshold_main === "number"
-                ? c.volume_threshold_main
-                : 1.15,
-          volume_thresholds_by_market:
-            c.volume_thresholds_by_market && typeof c.volume_thresholds_by_market === "object"
-              ? (c.volume_thresholds_by_market as Record<string, number>)
-              : DEFAULT_VOLUME_THRESHOLDS_BY_MARKET,
-          volume_threshold_alt:
-            c.volume_threshold_alt && typeof c.volume_threshold_alt === "object"
-              ? c.volume_threshold_alt
-              : { "095": 0.95, "075": 0.75 },
-        });
-        setLogs(l.items ?? []);
-        const t = tradePollRes.payload;
-        if (t) {
-          setTrade(t as TradeStatus);
-          if (!cancelled) {
-            setLastClientTradeFailure(null);
-            const p = t as TradeStatus;
-            if (p.api_connected) setAccountSyncState("ok");
-            else if (p.env_access_key_present && p.env_secret_key_present) setAccountSyncState("error");
-            else setAccountSyncState("ok");
-          }
-        } else if (!cancelled && tradePollRes.failureCode) {
-          setLastClientTradeFailure({
-            code: tradePollRes.failureCode,
-            message: tradePollRes.failureMessage ?? "",
-          });
-          console.log("[orbitalpha-trading] trade/status poll (invalid or error body)", {
-            httpStatus: tradePollRes.httpStatus,
-            failureCode: tradePollRes.failureCode,
-            failureMessage: tradePollRes.failureMessage,
-          });
-        }
-        if (s) setStrategy(s as StrategyStatus);
-        if (scannerStatus) setScanner(scannerStatus as PumpScannerStatus);
-        if (paperStatus && typeof paperStatus === "object") {
-          try {
-            const p = paperStatus as Record<string, unknown>;
-            const holdingsRaw = Array.isArray(p.holdings) ? p.holdings : [];
-            const counters = (p.counters && typeof p.counters === "object" ? p.counters : {}) as Record<string, unknown>;
-            const config = (p.config && typeof p.config === "object" ? p.config : {}) as Record<string, unknown>;
-            const positionsCount = holdingsRaw.length;
-            const openPositions = Number(counters.open_positions ?? positionsCount);
-            const maxOpen = Number(config.max_open_positions ?? 0);
-            const recentHistoryCount = Array.isArray(p.recent_history) ? (p.recent_history as unknown[]).length : 0;
-            console.info(
-              JSON.stringify({
-                tag: "DEBUG_PAPER_DASHBOARD_BINDING",
-                ts: new Date().toISOString(),
-                positions_count: positionsCount,
-                open_positions: openPositions,
-                max_open: maxOpen,
-                recent_history_count: recentHistoryCount,
-                uses_live_recent_api: false,
-              }),
-            );
-          } catch {
-            // ignore logging failures
-          }
-          setPaper(paperStatus as PaperStatus);
-          setPaperPanelError(null);
-        } else {
-          setPaper(null);
-          setPaperPanelError("급등주 판단 데이터를 불러오지 못했습니다");
-        }
-        if (marketStateStatus) setMarketState(marketStateStatus as MarketStateStatus);
-        setLastUpdatedAt(new Date().toLocaleTimeString("ko-KR", { hour12: false }));
-      } catch (e) {
-        if (!cancelled) {
-          setErr(e instanceof Error ? e.message : "load failed");
-          setAuthState((prev) => (prev === "loading" ? "error" : prev));
-        }
-      } finally {
-        loadInFlightRef.current = false;
+    if (typeof window !== "undefined") {
+      const isLight = window.matchMedia?.("(prefers-color-scheme: light)")?.matches ?? false;
+      devLog({ tag: "DASHBOARD_RENDER_LIGHT_MODE", light: isLight });
+      const sp = new URLSearchParams(window.location.search);
+      if (sp.get("account_sync") === "1") {
+        tradeInitialSyncDoneRef.current = false;
+        window.history.replaceState(null, "", `${window.location.pathname}${window.location.hash}`);
       }
     }
-    void load();
-    const t = setInterval(load, 7_000);
+
+    const pollSessionOnce = async () => {
+      const ts = Date.now();
+      await pollJson<AuthSession>(
+        "auth_session",
+        `/api/v1/auth/session?_=${ts}`,
+        {
+          timeoutMs: 12_000,
+          onHttp: (status) => {
+            if (cancelled) return;
+            const code = `session_http_${status}`;
+            const message =
+              status === 502 ? "세션 API 일시 실패 (502) — 대시보드는 유지됩니다" : `세션 API 오류 (HTTP ${status}) — 대시보드는 유지됩니다`;
+            setSessionPanelWarning({ code, message });
+            if (authState === "loading" && tradeRef.current) setAuthState("ok");
+          },
+          onOk: (session) => {
+            if (cancelled) return;
+            setSessionPanelWarning(null);
+            if (session.authenticated !== true) {
+              setAuthState("expired");
+              setAccountSyncState("idle");
+              tradeInitialSyncDoneRef.current = false;
+              router.replace("/login");
+              return;
+            }
+            setAuthState("ok");
+            setCurrentSession(session);
+            setSessionUserId(session.user_id ?? null);
+            if (typeof session.auto_trade_enabled === "boolean") {
+              setAutoTradeEnabled(session.auto_trade_enabled);
+              setAutoTradeChangedAt(typeof session.auto_trade_changed_at === "string" ? session.auto_trade_changed_at : null);
+            }
+          },
+          onErr: (e) => {
+            if (cancelled) return;
+            const msg = e instanceof Error ? e.message : "session_fetch_failed";
+            setSessionPanelWarning({ code: "session_fetch_failed", message: msg.slice(0, 180) });
+            if (authState === "loading" && tradeRef.current) setAuthState("ok");
+          },
+        },
+      );
+    };
+
+    const pollTradeOnce = async () => {
+      const key = "trade_status";
+      if (pollInFlightRef.current.has(key)) {
+        devLog({ tag: "DASHBOARD_POLL_SKIPPED_IN_FLIGHT", key, url: "/api/v1/trade/status" });
+        return;
+      }
+      const ctrl = new AbortController();
+      pollInFlightRef.current.set(key, ctrl);
+      const tid = window.setTimeout(() => ctrl.abort(), 6500);
+      try {
+        const ts = Date.now();
+        const tradePollRes = await fetchTradeStatusDetailed(apiBase, { signal: ctrl.signal, timeoutMs: 6000, cacheBust: ts });
+        if (cancelled) return;
+        const t = tradePollRes.payload;
+        if (t) {
+          setIfChanged(
+            "trade",
+            t as TradeStatus,
+            setTrade,
+            (p) => ({
+              api_connected: (p as TradeStatus).api_connected,
+              live_enabled: (p as TradeStatus).live_enabled,
+              auto_trade_enabled: (p as TradeStatus).auto_trade_enabled,
+              recovery_ready: (p as TradeStatus).recovery_ready,
+              total_krw: (p as TradeStatus).total_krw,
+              krw_available: (p as TradeStatus).krw_available,
+              reserved_krw: (p as TradeStatus).reserved_krw,
+              strategy_allocated_krw: (p as TradeStatus).strategy_allocated_krw,
+              pump_paper_allocated_krw: (p as TradeStatus).pump_paper_allocated_krw,
+              open_positions_count: (() => {
+                const rec = asRecord(p);
+                const pos = rec.strategy_positions;
+                if (!pos || typeof pos !== "object") return 0;
+                return Object.values(pos as Record<string, unknown>).filter((v) => Number(asRecord(v).qty ?? 0) > 0).length;
+              })(),
+              balances_len: Array.isArray((p as TradeStatus).balances) ? (p as TradeStatus).balances.length : 0,
+            }),
+          );
+          setLastClientTradeFailure(null);
+          const p = t as TradeStatus;
+          if (p.api_connected) setAccountSyncState("ok");
+          else if (p.env_access_key_present && p.env_secret_key_present) setAccountSyncState("error");
+          else setAccountSyncState("ok");
+          if (authState === "loading") setAuthState("ok");
+        } else if (tradePollRes.failureCode) {
+          setLastClientTradeFailure({ code: tradePollRes.failureCode, message: tradePollRes.failureMessage ?? "" });
+        }
+      } finally {
+        window.clearTimeout(tid);
+        pollInFlightRef.current.delete(key);
+      }
+    };
+
+    const bootstrap = async () => {
+      await pollSessionOnce();
+      if (!tradeInitialSyncDoneRef.current) {
+        setAccountSyncState("syncing");
+        const syncResult = await fetchTradeStatusUntilSyncedWithLog(apiBase, {
+          maxAttempts: 15,
+          maxWallMs: 24_000,
+          logContext: "trading_page_initial",
+        });
+        if (cancelled) return;
+        tradeInitialSyncDoneRef.current = true;
+        const primed = syncResult.payload;
+        if (primed) {
+          const p = primed as TradeStatus;
+          setTrade(p);
+          setLastClientTradeFailure(null);
+          if (p.api_connected) setAccountSyncState("ok");
+          else if (p.env_access_key_present && p.env_secret_key_present) setAccountSyncState("error");
+          else setAccountSyncState("ok");
+          if (authState === "loading") setAuthState("ok");
+        } else {
+          const lf = syncResult.lastFetch;
+          if (lf?.failureCode) setLastClientTradeFailure({ code: lf.failureCode, message: lf.failureMessage ?? "" });
+          if (lf?.failureCode && !isSoftTradeStatusFailureCode(lf.failureCode)) setAccountSyncState("error");
+        }
+      }
+
+      // start loops (staggered & independent)
+      scheduleLoop("auth_session", pollSessionOnce, 45_000, 60_000);
+      scheduleLoop("trade_status", pollTradeOnce, 7_000, 10_000);
+      scheduleLoop(
+        "context",
+        async () => {
+          const ts = Date.now();
+          await pollJson<Record<string, unknown>>("context", `/api/v1/context?_=${ts}`, {
+            timeoutMs: 8000,
+            onOk: (c) => {
+              if (cancelled) return;
+              const cr = asRecord(c);
+              const next = {
+                company_id: typeof cr.company_id === "string" ? cr.company_id : DEFAULT_TRADING_COMPANY_ID,
+                service_id: typeof cr.service_id === "string" ? cr.service_id : DEFAULT_TRADING_SERVICE_ID,
+                product: cr.product,
+                service_line: typeof cr.service_line === "string" ? cr.service_line : THIS_REPO_SERVICE_LINE,
+                monitor_instance_id: typeof cr.monitor_instance_id === "string" ? cr.monitor_instance_id : null,
+                monitor_started_at: typeof cr.monitor_started_at === "string" ? cr.monitor_started_at : null,
+                watch_markets: Array.isArray(cr.watch_markets) ? (cr.watch_markets as string[]) : ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"],
+                excluded_markets: Array.isArray(cr.excluded_markets) ? (cr.excluded_markets as string[]) : [],
+                volume_threshold_fallback:
+                  typeof cr.volume_threshold_fallback === "number"
+                    ? cr.volume_threshold_fallback
+                    : typeof cr.volume_threshold_main === "number"
+                      ? cr.volume_threshold_main
+                      : 1.15,
+                volume_thresholds_by_market:
+                  cr.volume_thresholds_by_market && typeof cr.volume_thresholds_by_market === "object"
+                    ? (cr.volume_thresholds_by_market as Record<string, number>)
+                    : DEFAULT_VOLUME_THRESHOLDS_BY_MARKET,
+                volume_threshold_alt:
+                  cr.volume_threshold_alt && typeof cr.volume_threshold_alt === "object" ? cr.volume_threshold_alt : { "095": 0.95, "075": 0.75 },
+              } as Ctx;
+              setIfChanged("ctx", next, setCtx);
+            },
+          });
+        },
+        30_000,
+        60_000,
+      );
+
+      scheduleLoop(
+        "logs",
+        async () => {
+          const ts = Date.now();
+          await pollJson<{ items?: SignalLogEntry[] }>("logs", `/api/v1/logs?limit=80&_=${ts}`, {
+            timeoutMs: 9000,
+            onOk: (l) => {
+              if (cancelled) return;
+              const items = Array.isArray(l.items) ? l.items : [];
+              setIfChanged("logs", items, setLogs, (rows) => ({ len: rows.length, head: rows[0]?.ts, tail: rows[rows.length - 1]?.ts }));
+            },
+          });
+        },
+        25_000,
+        60_000,
+      );
+
+      scheduleLoop(
+        "strategy",
+        async () => {
+          const ts = Date.now();
+          await pollJson<StrategyStatus>("strategy", `/api/v1/strategy/status?_=${ts}`, {
+            timeoutMs: 9000,
+            onOk: (s) => {
+              if (cancelled) return;
+              setIfChanged("strategy", s, setStrategy, (x) => ({
+                safety_guard_state: asRecord(x).safety_guard_state,
+                open_positions_count: (() => {
+                  const r = asRecord(x);
+                  const pos = r.open_positions;
+                  if (!pos || typeof pos !== "object") return 0;
+                  return Object.values(pos as Record<string, unknown>).filter((v) => Number(asRecord(v).qty ?? 0) > 0).length;
+                })(),
+                pnl: asRecord(x).strategy_pnl_krw,
+                invested: asRecord(x).strategy_invested_krw,
+                total_fills: asRecord(x).strategy_total_fills,
+              }));
+            },
+          });
+        },
+        15_000,
+        30_000,
+      );
+
+      scheduleLoop(
+        "scanner",
+        async () => {
+          const ts = Date.now();
+          await pollJson<PumpScannerStatus>("scanner", `/api/v1/scanner/status?_=${ts}`, {
+            timeoutMs: 9000,
+            onOk: (sc) => {
+              if (cancelled) return;
+              const r = asRecord(sc);
+              setIfChanged("scanner", sc, setScanner, (x) => ({
+                updated_at: asRecord(x).updated_at,
+                items_len: asArray(r.items).length,
+              }));
+            },
+          });
+        },
+        10_000,
+        30_000,
+      );
+
+      scheduleLoop(
+        "paper",
+        async () => {
+          const ts = Date.now();
+          await pollJson<PaperStatus>("paper", `/api/v1/paper/status?_=${ts}`, {
+            timeoutMs: 12_000,
+            onOk: (paperStatus) => {
+              if (cancelled) return;
+              if (paperStatus && typeof paperStatus === "object") {
+                if (typeof process === "undefined" || process.env?.NODE_ENV !== "production") {
+                  try {
+                    const p = asRecord(paperStatus);
+                    const holdingsRaw = asArray(p.holdings);
+                    const counters = asRecord(p.counters);
+                    const config = asRecord(p.config);
+                    devLog({
+                      tag: "DEBUG_PAPER_DASHBOARD_BINDING",
+                      ts: new Date().toISOString(),
+                      positions_count: holdingsRaw.length,
+                      open_positions: Number(counters.open_positions ?? holdingsRaw.length),
+                      max_open: Number(config.max_open_positions ?? 0),
+                      recent_history_count: asArray(p.recent_history).length,
+                      uses_live_recent_api: false,
+                    });
+                  } catch {
+                    // ignore
+                  }
+                }
+                setIfChanged("paper", paperStatus as PaperStatus, setPaper, (x) => ({
+                  updated_at: asRecord(x).updated_at,
+                  holdings_len: asArray(asRecord(x).holdings).length,
+                }));
+                setPaperPanelError(null);
+              } else {
+                setPaper(null);
+                setPaperPanelError("급등주 판단 데이터를 불러오지 못했습니다");
+              }
+            },
+            onHttp: () => {
+              if (cancelled) return;
+              setPaper(null);
+              setPaperPanelError("급등주 판단 데이터 갱신 지연");
+            },
+            onErr: () => {
+              if (cancelled) return;
+              setPaper(null);
+              setPaperPanelError("급등주 판단 데이터 갱신 지연");
+            },
+          });
+        },
+        30_000,
+        60_000,
+      );
+
+      scheduleLoop(
+        "market_state",
+        async () => {
+          const ts = Date.now();
+          await pollJson<MarketStateStatus>("market_state", `/api/v1/market-state?_=${ts}`, {
+            timeoutMs: 9000,
+            onOk: (m) => {
+              if (cancelled) return;
+              const r = asRecord(m);
+              setIfChanged("market_state", m, setMarketState, () => ({
+                entry_policy: r.entry_policy,
+                btc_5m_trend: r.btc_5m_trend,
+                btc_15m_trend: r.btc_15m_trend,
+              }));
+            },
+          });
+        },
+        15_000,
+        30_000,
+      );
+
+      // UI updated clock (cheap) - keep modest even when hidden
+      scheduleLoop(
+        "updated_at",
+        async () => {
+          if (cancelled) return;
+          setLastUpdatedAt(new Date().toLocaleTimeString("ko-KR", { hour12: false }));
+        },
+        5_000,
+        30_000,
+      );
+    };
+
+    void bootstrap();
+
     return () => {
       cancelled = true;
-      clearInterval(t);
+      document.removeEventListener("visibilitychange", visibilityHandler);
+      abortAllPolls();
+      for (const [, t] of pollTimersRef.current) window.clearTimeout(t);
+      pollTimersRef.current.clear();
     };
   }, [router, pathname]);
 
@@ -1691,31 +1891,7 @@ export default function HomePage() {
     );
   }
 
-  if (authState === "error") {
-    return (
-      <div style={{ background: UI.pageOuterBg, minHeight: "100vh", display: "grid", placeItems: "center", color: UI.body, padding: "2rem", textAlign: "center" }}>
-        <div>
-          <h2 style={{ color: "#ef4444" }}>인증 서버 연결 오류</h2>
-          <p style={{ marginBottom: "0.75rem" }}>
-            {err ?? "서버 응답이 없거나 /api/session 경로를 찾을 수 없습니다."}
-          </p>
-          <p style={{ fontSize: "0.85rem", color: UI.muted, marginBottom: "1rem" }}>
-            배포 시 대시보드에 <code style={{ color: UI.body }}>ORBITALPHA_TRADING_API_ORIGIN</code> 로 trading API 주소를 지정하세요.
-          </p>
-          <button type="button" onClick={() => window.location.reload()} style={{ padding: "0.5rem 1rem", background: UI.accent, color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", marginRight: "0.5rem" }}>
-            다시 시도
-          </button>
-          <button
-            type="button"
-            onClick={() => router.replace("/login")}
-            style={{ padding: "0.5rem 1rem", background: UI.cardSoftBg, color: UI.body, border: `1px solid ${UI.border}`, borderRadius: 6, cursor: "pointer" }}
-          >
-            로그인으로
-          </button>
-        </div>
-      </div>
-    );
-  }
+  // NOTE: auth/session 오류는 전체 화면을 죽이지 않는다. (401/unauthenticated만 만료 처리)
 
   if (accountSyncState === "failed" && !trade) {
     return (
@@ -1946,6 +2122,11 @@ export default function HomePage() {
           ) : null}
           <details style={{ marginTop: "0.55rem" }}>
             <summary style={{ cursor: "pointer", color: UI.muted, fontSize: "0.74rem" }}>운영 정보 보기</summary>
+            {sessionPanelWarning ? (
+              <div style={{ marginTop: "0.45rem", fontSize: "0.72rem", color: UI.watch }}>
+                세션 경고: <strong>{sessionPanelWarning.code}</strong> — {sessionPanelWarning.message}
+              </div>
+            ) : null}
             <div style={{ marginTop: "0.45rem", display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: "0.55rem", fontSize: "0.74rem", color: UI.mutedSoft }}>
               <div>로그인 상태: <strong style={{ color: UI.body }}>인증됨</strong></div>
               <div>세션 사용자 ID: <strong style={{ color: UI.body }}>{sessionUserId ?? "-"}</strong></div>
