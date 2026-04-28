@@ -24,11 +24,12 @@ import { createOperationalLogger } from "./operational-logs.js";
 import { readReplayRange } from "./replay-store.js";
 import { createPaperTradingEngine } from "./paper-trading.js";
 import { readLiveStrategyTradesRecent } from "./recent-strategy-trades.js";
+import { liveExecutionStateRuntimePath, runtimeRoot, surgeCandidatesRuntimePath } from "./runtime-paths.js";
 
 const cwd = process.cwd();
-const runtimeDir = path.join(cwd, "data", "runtime");
-const surgeCandidatesPath = path.join(runtimeDir, "surge-candidates.json");
-const liveExecutionStatePath = path.join(runtimeDir, "live-execution-state.json");
+const runtimeDir = runtimeRoot();
+const surgeCandidatesPath = surgeCandidatesRuntimePath();
+const liveExecutionStatePath = liveExecutionStateRuntimePath();
 const envRoots = [cwd, path.dirname(cwd)];
 const envFiles = [".env", ".env.local"];
 const envLoadMeta: Array<{ file: string; exists: boolean; loaded: boolean; parsed_keys: string[] }> = [];
@@ -150,7 +151,16 @@ async function main() {
         "utf8",
       );
     }
-    app.log.info({ tag: "SURGE_SCANNER_WORKER_SHADOW_READY", path: surgeCandidatesPath.replace(/\\/g, "/") }, "SURGE_SCANNER_WORKER_SHADOW_READY");
+    app.log.info(
+      {
+        tag: "SURGE_SCANNER_WORKER_SHADOW_READY",
+        worker: "engine2_surge_scanner",
+        order_authority: "none",
+        path: surgeCandidatesPath.replace(/\\/g, "/"),
+        runtime_root: runtimeDir.replace(/\\/g, "/"),
+      },
+      "SURGE_SCANNER_WORKER_SHADOW_READY",
+    );
     app.log.info({ tag: "LIVE_EXECUTION_WORKER_SHADOW_READY", path: liveExecutionStatePath.replace(/\\/g, "/") }, "LIVE_EXECUTION_WORKER_SHADOW_READY");
   } catch (e) {
     app.log.warn({ tag: "RUNTIME_FILE_INIT_FAILED", err: String(e) }, "runtime file init failed");
@@ -300,10 +310,12 @@ async function main() {
       ? liveScannerRuntimeModeRaw
       : "legacy";
   const engine1PumpScannerDisabled = String(process.env.ENGINE1_PUMP_SCANNER_DISABLED ?? "false").toLowerCase() === "true";
-  const engine1PumpScannerIntervalMsFromEnv = Math.max(
-    1_000,
-    Number(process.env.ENGINE1_PUMP_SCANNER_INTERVAL_MS ?? 0) || 0,
-  );
+  const engine1PumpScannerIntervalRaw = String(process.env.ENGINE1_PUMP_SCANNER_INTERVAL_MS ?? "").trim();
+  const engine1PumpScannerIntervalParsed =
+    engine1PumpScannerIntervalRaw.length > 0 ? Number(engine1PumpScannerIntervalRaw) : Number.NaN;
+  const hasEngine1IntervalEnv =
+    engine1PumpScannerIntervalRaw.length > 0 && Number.isFinite(engine1PumpScannerIntervalParsed) && engine1PumpScannerIntervalParsed > 0;
+  const engine1PumpScannerIntervalMsFromEnv = hasEngine1IntervalEnv ? Math.max(1_000, engine1PumpScannerIntervalParsed) : null;
   const marketFilter = createMarketStateFilter({
     companyId: env.companyId,
     serviceId: env.serviceId,
@@ -366,15 +378,17 @@ async function main() {
     app.log.info({ tag: "DEBUG_LIVE_LOOP_TICK", ts: lastStrategyTickAt }, "DEBUG_LIVE_LOOP_TICK");
     void strategy.tick().catch((e) => app.log.error({ err: String(e) }, "strategy_tick_failed"));
   }, 30_000);
-  const scannerIntervalMs = (() => {
+  const scannerIntervalMsResolved = (() => {
     if (engine1PumpScannerDisabled) return null;
+    const baseInterval = engine1PumpScannerIntervalMsFromEnv ?? pumpScanner.intervalMs;
     if (liveScannerRuntimeMode === "external") {
       const externalFloor = 10 * 60_000;
-      const base = engine1PumpScannerIntervalMsFromEnv > 0 ? engine1PumpScannerIntervalMsFromEnv : pumpScanner.intervalMs;
-      return Math.max(externalFloor, base);
+      return Math.max(externalFloor, baseInterval);
     }
-    return engine1PumpScannerIntervalMsFromEnv > 0 ? engine1PumpScannerIntervalMsFromEnv : pumpScanner.intervalMs;
+    return baseInterval;
   })();
+  const scannerIntervalMs = scannerIntervalMsResolved;
+  const scannerIntervalSource = hasEngine1IntervalEnv ? "env" : "pumpScanner.intervalMs";
   const scannerTimer =
     scannerIntervalMs === null
       ? null
@@ -388,6 +402,7 @@ async function main() {
       mode: liveScannerRuntimeMode,
       engine1_scanner_disabled: engine1PumpScannerDisabled,
       engine1_scanner_interval_ms: scannerIntervalMs,
+      interval_source: scannerIntervalSource,
       order_input_source: "legacy",
     },
     "ENGINE1_SCANNER_RUNTIME_MODE",
@@ -929,6 +944,7 @@ async function main() {
     return {
       ok: true,
       exists,
+      path: surgeCandidatesPath.replace(/\\/g, "/"),
       updated_at,
       age_seconds,
       items_count,

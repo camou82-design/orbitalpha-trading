@@ -33,6 +33,30 @@ If you need to pass env vars explicitly:
 pm2 start server/dist/worker-surge-scanner-shadow.js --name orbitalpha-trading-surge-shadow --update-env
 ```
 
+### Important: API env and worker env are separate
+
+`orbitalpha-trading-api` and `orbitalpha-trading-surge-shadow` do not share PM2 env automatically.
+Set scanner runtime mode on the API process explicitly, then restart API:
+
+```bash
+export LIVE_SCANNER_RUNTIME_MODE=shadow
+pm2 restart orbitalpha-trading-api --update-env
+```
+
+Worker can keep its own env (interval/stale/topM settings) and should be restarted separately:
+
+```bash
+pm2 restart orbitalpha-trading-surge-shadow --update-env
+```
+
+To force API and worker to read/write the same runtime JSON path, set:
+
+```bash
+export ORBITALPHA_TRADING_RUNTIME_ROOT=/home/admin/orbitalpha-trading/server/data/runtime
+```
+
+Then restart both target processes with `--update-env`.
+
 ### Stop / remove
 
 ```bash

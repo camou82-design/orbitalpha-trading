@@ -1,5 +1,6 @@
 import { DEFAULT_TRADING_COMPANY_ID, DEFAULT_TRADING_SERVICE_ID } from "@orbitalpha/shared";
 import { startEngine2SurgeScannerWorker } from "./engine-v2/surge-scanner/worker.js";
+import { runtimeRoot, surgeCandidatesRuntimePath } from "./runtime-paths.js";
 
 type SurgeShadowWorkerEnv = {
   companyId: string;
@@ -31,12 +32,16 @@ function loadSurgeShadowWorkerEnv(): SurgeShadowWorkerEnv {
 
 async function main() {
   const env = loadSurgeShadowWorkerEnv();
+  const outPath = surgeCandidatesRuntimePath();
+  const runtimeRootPath = runtimeRoot();
   console.info(
     JSON.stringify({
       tag: "SURGE_SCANNER_WORKER_SHADOW_READY",
       worker: "engine2_surge_scanner",
       mode: "shadow_only",
       order_authority: "none",
+      path: outPath.replace(/\\/g, "/"),
+      runtime_root: runtimeRootPath.replace(/\\/g, "/"),
       company_id: env.companyId,
       service_id: env.serviceId,
     }),
