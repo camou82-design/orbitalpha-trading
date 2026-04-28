@@ -882,8 +882,12 @@ function loadSurgeCandidatesShadow() {
       const volume_multiple = Number.isFinite(volRaw) ? volRaw : 0;
       const filter_pass = Boolean(r.breakout) && Boolean(r.close_upper_hold);
       const signal_ts = typeof r.signal_ts === "string" ? r.signal_ts : null;
-      const source_kind = typeof r.source_kind === "string" ? r.source_kind : "surge_scanner_worker";
-      return { market, scanner_score, volume_multiple, filter_pass, signal_ts, source_kind };
+      const source_kind = typeof r.source_kind === "string" ? r.source_kind : "engine2_surge_scanner";
+      const age_seconds =
+        signal_ts && Number.isFinite(Date.parse(signal_ts))
+          ? Math.max(0, Math.floor((Date.now() - Date.parse(signal_ts)) / 1000))
+          : null;
+      return { market, scanner_score, volume_multiple, filter_pass, signal_ts, source_kind, age_seconds };
     })
     .filter((x): x is NonNullable<typeof x> => Boolean(x));
   return { updated_at, items, path: p };
@@ -1951,12 +1955,17 @@ export function createLiveDataStrategy(opts: {
       candidateSourceModeRaw === "file" || candidateSourceModeRaw === "shadow" || candidateSourceModeRaw === "legacy"
         ? (candidateSourceModeRaw as "legacy" | "shadow" | "file")
         : "legacy";
-    const shadow = candidateSourceMode === "shadow" || candidateSourceMode === "file" ? loadSurgeCandidatesShadow() : null;
+    const scannerRuntimeModeRaw = String(process.env.LIVE_SCANNER_RUNTIME_MODE ?? "legacy").toLowerCase().trim();
+    const scannerRuntimeMode =
+      scannerRuntimeModeRaw === "legacy" || scannerRuntimeModeRaw === "shadow" || scannerRuntimeModeRaw === "external"
+        ? scannerRuntimeModeRaw
+        : "legacy";
+    const shadow = scannerRuntimeMode === "shadow" || scannerRuntimeMode === "external" ? loadSurgeCandidatesShadow() : null;
     console.info(
       JSON.stringify({
         tag: "LIVE_SURGE_CANDIDATE_SOURCE_STATE",
         ts: new Date().toISOString(),
-        mode: candidateSourceMode,
+        mode: scannerRuntimeMode,
         shadow_file_loaded: Boolean(shadow && (shadow.updated_at || shadow.items.length > 0)),
         shadow_items_count: shadow ? shadow.items.length : 0,
         shadow_updated_at: shadow?.updated_at ?? null,
@@ -1965,44 +1974,52 @@ export function createLiveDataStrategy(opts: {
       }),
     );
     if (shadow) {
-      const oldSet = new Set(selectedEntryUniverseSymbols);
+      const legacyByMarket = new Map(scannerCandidatesExcludingHeld.map((x) => [x.market, x]));
+      const oldSet = new Set(Array.from(legacyByMarket.keys()));
+      const selectedLegacySet = new Set(selectedEntryUniverseSymbols);
       const newSet = new Set(shadow.items.map((x) => x.market));
       const union = Array.from(new Set([...Array.from(oldSet), ...Array.from(newSet)])).slice(0, 40);
-      const oldScoreBy = new Map(freshScannerCandidates.map((x) => [x.market, x.score]));
       const oldPassBy = new Map(latestAllSignals.entries());
       const newBy = new Map(shadow.items.map((x) => [x.market, x]));
       const rows = union
         .map((market) => {
-          const old_source_present = oldSet.has(market);
-          const new_source_present = newSet.has(market);
-          const old_score = oldScoreBy.get(market) ?? null;
+          const legacy = legacyByMarket.get(market);
+          const legacy_present = Boolean(legacy);
+          const engine2_present = newSet.has(market);
+          const legacy_score = legacy ? Number(legacy.score ?? 0) : null;
           const oldSig = oldPassBy.get(market);
-          const old_filter_pass = Boolean(oldSig?.p?.filter_pass);
+          const legacy_filter_pass = Boolean(oldSig?.p?.filter_pass);
           const newItem = newBy.get(market) ?? null;
-          const new_score = newItem ? Number(newItem.scanner_score ?? 0) : null;
-          const new_candidate_valid = Boolean(newItem && newItem.filter_pass);
-          const selected_by_old = old_source_present;
-          const selected_by_new = Boolean(new_source_present && new_candidate_valid);
+          const engine2_score = newItem ? Number(newItem.scanner_score ?? 0) : null;
+          const engine2_valid = Boolean(newItem && newItem.filter_pass);
+          const legacy_age_seconds = legacy?.ageSeconds ?? null;
+          const engine2_age_seconds = newItem?.age_seconds ?? null;
+          const selected_by_legacy = selectedLegacySet.has(market);
+          const selected_by_engine2 = Boolean(engine2_present && engine2_valid);
           return {
             market,
-            old_source_present,
-            new_source_present,
-            old_score,
-            new_score,
-            old_filter_pass,
-            new_candidate_valid,
-            selected_by_old,
-            selected_by_new,
+            legacy_present,
+            engine2_present,
+            legacy_score,
+            engine2_score,
+            legacy_filter_pass,
+            engine2_valid,
+            legacy_age_seconds,
+            engine2_age_seconds,
+            selected_by_legacy,
+            selected_by_engine2,
+            order_input_source: "legacy",
           };
         })
-        .filter((r) => r.old_source_present || r.new_source_present)
+        .filter((r) => r.legacy_present || r.engine2_present)
         .slice(0, 25);
       for (const r of rows) {
         console.info(
           JSON.stringify({
-            tag: "SURGE_CANDIDATE_SHADOW_COMPARE",
+            tag: "ENGINE2_SCANNER_SHADOW_COMPARE",
             ts: new Date().toISOString(),
-            mode: candidateSourceMode,
+            mode: scannerRuntimeMode,
+            candidate_source_mode: candidateSourceMode,
             shadow_updated_at: shadow.updated_at,
             shadow_path: shadow.path.replace(/\\/g, "/"),
             ...r,

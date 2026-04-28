@@ -294,6 +294,16 @@ async function main() {
   );
 
   const monitor = startSignalMonitor(env);
+  const liveScannerRuntimeModeRaw = String(process.env.LIVE_SCANNER_RUNTIME_MODE ?? "legacy").toLowerCase().trim();
+  const liveScannerRuntimeMode =
+    liveScannerRuntimeModeRaw === "legacy" || liveScannerRuntimeModeRaw === "shadow" || liveScannerRuntimeModeRaw === "external"
+      ? liveScannerRuntimeModeRaw
+      : "legacy";
+  const engine1PumpScannerDisabled = String(process.env.ENGINE1_PUMP_SCANNER_DISABLED ?? "false").toLowerCase() === "true";
+  const engine1PumpScannerIntervalMsFromEnv = Math.max(
+    1_000,
+    Number(process.env.ENGINE1_PUMP_SCANNER_INTERVAL_MS ?? 0) || 0,
+  );
   const marketFilter = createMarketStateFilter({
     companyId: env.companyId,
     serviceId: env.serviceId,
@@ -356,10 +366,32 @@ async function main() {
     app.log.info({ tag: "DEBUG_LIVE_LOOP_TICK", ts: lastStrategyTickAt }, "DEBUG_LIVE_LOOP_TICK");
     void strategy.tick().catch((e) => app.log.error({ err: String(e) }, "strategy_tick_failed"));
   }, 30_000);
-  const scannerTimer = setInterval(() => {
-    lastScannerTickAt = new Date().toISOString();
-    void pumpScanner.tick().catch((e) => app.log.error({ err: String(e) }, "pump_scanner_tick_failed"));
-  }, pumpScanner.intervalMs);
+  const scannerIntervalMs = (() => {
+    if (engine1PumpScannerDisabled) return null;
+    if (liveScannerRuntimeMode === "external") {
+      const externalFloor = 10 * 60_000;
+      const base = engine1PumpScannerIntervalMsFromEnv > 0 ? engine1PumpScannerIntervalMsFromEnv : pumpScanner.intervalMs;
+      return Math.max(externalFloor, base);
+    }
+    return engine1PumpScannerIntervalMsFromEnv > 0 ? engine1PumpScannerIntervalMsFromEnv : pumpScanner.intervalMs;
+  })();
+  const scannerTimer =
+    scannerIntervalMs === null
+      ? null
+      : setInterval(() => {
+          lastScannerTickAt = new Date().toISOString();
+          void pumpScanner.tick().catch((e) => app.log.error({ err: String(e) }, "pump_scanner_tick_failed"));
+        }, scannerIntervalMs);
+  app.log.info(
+    {
+      tag: "ENGINE1_SCANNER_RUNTIME_MODE",
+      mode: liveScannerRuntimeMode,
+      engine1_scanner_disabled: engine1PumpScannerDisabled,
+      engine1_scanner_interval_ms: scannerIntervalMs,
+      order_input_source: "legacy",
+    },
+    "ENGINE1_SCANNER_RUNTIME_MODE",
+  );
   const marketStateTimer = setInterval(() => {
     lastMarketStateTickAt = new Date().toISOString();
     void marketFilter.evaluate().catch((e) => app.log.error({ err: String(e) }, "market_state_tick_failed"));
@@ -398,7 +430,10 @@ async function main() {
   const paperTimer = setInterval(() => {
     void paper.tick().catch((e) => app.log.error({ err: String(e) }, "paper_tick_failed"));
   }, 15_000);
-  lastScannerTickAt = new Date().toISOString();
+  if (scannerTimer && liveScannerRuntimeMode !== "external") {
+    lastScannerTickAt = new Date().toISOString();
+    void pumpScanner.tick().catch((e) => app.log.error({ err: String(e) }, "pump_scanner_tick_failed"));
+  }
   lastMarketStateTickAt = new Date().toISOString();
   void marketFilter.evaluate().catch((e) => app.log.error({ err: String(e) }, "market_state_tick_failed"));
   await opLog.event({
@@ -891,16 +926,6 @@ async function main() {
       updated_at && Number.isFinite(Date.parse(updated_at))
         ? Math.max(0, Math.floor((Date.now() - Date.parse(updated_at)) / 1000))
         : null;
-    let order_authority: string | null = "live_execution_only";
-    try {
-      if (fs.existsSync(liveExecutionStatePath)) {
-        const raw2 = fs.readFileSync(liveExecutionStatePath, "utf8");
-        const j2 = raw2 ? (JSON.parse(raw2) as any) : null;
-        if (typeof j2?.order_authority === "string") order_authority = j2.order_authority;
-      }
-    } catch {
-      // ignore
-    }
     return {
       ok: true,
       exists,
@@ -908,8 +933,12 @@ async function main() {
       age_seconds,
       items_count,
       first_symbols,
+      mode: liveScannerRuntimeMode,
+      file_exists: exists,
       shadow_mode,
-      order_authority,
+      order_authority: "none",
+      worker: "engine2_surge_scanner",
+      engine1_scanner_mode: liveScannerRuntimeMode,
     };
   });
   app.get("/api/v1/replay/query", async (req, reply) => {
@@ -1196,7 +1225,7 @@ async function main() {
 
   const close = async () => {
     clearInterval(strategyTimer);
-    clearInterval(scannerTimer);
+    if (scannerTimer) clearInterval(scannerTimer);
     clearInterval(marketStateTimer);
     clearInterval(snapshotTimer);
     clearInterval(paperTimer);
