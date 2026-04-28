@@ -68,6 +68,49 @@ function keyFingerprint(value?: string): string | null {
   return h.slice(0, 12);
 }
 
+const API_CACHE_MAX_ARRAY_ITEMS = Math.max(50, Number(process.env.API_CACHE_MAX_ARRAY_ITEMS ?? 150));
+const API_CACHE_MAX_MAP_ITEMS = Math.max(50, Number(process.env.API_CACHE_MAX_MAP_ITEMS ?? 150));
+const API_CACHE_MAX_OBJECT_KEYS = Math.max(50, Number(process.env.API_CACHE_MAX_OBJECT_KEYS ?? 200));
+
+function trimCacheSnapshot(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (value == null) return value;
+  if (Array.isArray(value)) {
+    return value.slice(0, API_CACHE_MAX_ARRAY_ITEMS).map((v) => trimCacheSnapshot(v, seen));
+  }
+  if (value instanceof Map) {
+    const out: Record<string, unknown> = {};
+    let n = 0;
+    for (const [k, v] of value.entries()) {
+      if (n >= API_CACHE_MAX_MAP_ITEMS) break;
+      out[String(k)] = trimCacheSnapshot(v, seen);
+      n += 1;
+    }
+    return out;
+  }
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    if (seen.has(obj)) return null;
+    seen.add(obj);
+    const out: Record<string, unknown> = {};
+    let n = 0;
+    for (const [k, v] of Object.entries(obj)) {
+      if (n >= API_CACHE_MAX_OBJECT_KEYS) break;
+      out[k] = trimCacheSnapshot(v, seen);
+      n += 1;
+    }
+    return out;
+  }
+  return value;
+}
+
+function serializeBoundedCacheBody(value: unknown): string {
+  return JSON.stringify(trimCacheSnapshot(value));
+}
+
+function parseBoundedCacheBody<T>(json: string): T {
+  return JSON.parse(json) as T;
+}
+
 let cachedEgressIp: { ip: string; atMs: number } | null = null;
 async function getEgressPublicIp(): Promise<string | null> {
   const now = Date.now();
@@ -638,16 +681,17 @@ async function main() {
     // Lightweight caching to avoid dashboard stampede
     const now = Date.now();
     const cacheTtlMs = 1500;
-    (globalThis as any).__orbitalpha_logs_cache ??= { at: 0, limit: 0, items: null as any };
-    const c = (globalThis as any).__orbitalpha_logs_cache as { at: number; limit: number; items: any };
-    if (c.items && c.limit === limit && now - c.at < cacheTtlMs) {
-      return { items: c.items };
+    (globalThis as any).__orbitalpha_logs_cache ??= { at: 0, limit: 0, bodyJson: "" };
+    const c = (globalThis as any).__orbitalpha_logs_cache as { at: number; limit: number; bodyJson: string };
+    if (c.bodyJson && c.limit === limit && now - c.at < cacheTtlMs) {
+      return parseBoundedCacheBody<{ items: unknown[] }>(c.bodyJson);
     }
-    const rows = await readRecentLogs(env.companyId, env.serviceId, limit);
+    const rows = (await readRecentLogs(env.companyId, env.serviceId, limit)).slice(0, API_CACHE_MAX_ARRAY_ITEMS);
+    const body = { items: rows };
     c.at = now;
     c.limit = limit;
-    c.items = rows;
-    return { items: rows };
+    c.bodyJson = serializeBoundedCacheBody(body);
+    return body;
   });
 
   app.post("/api/v1/auth/login", async (req, reply) => {
@@ -869,20 +913,20 @@ async function main() {
   app.get("/api/v1/scanner/status", async () => {
     const now = Date.now();
     const ttlMs = 1200;
-    (globalThis as any).__orbitalpha_scanner_cache ??= { at: 0, body: null as any };
-    const c = (globalThis as any).__orbitalpha_scanner_cache as { at: number; body: any };
-    if (c.body && now - c.at < ttlMs) return c.body;
+    (globalThis as any).__orbitalpha_scanner_cache ??= { at: 0, bodyJson: "" };
+    const c = (globalThis as any).__orbitalpha_scanner_cache as { at: number; bodyJson: string };
+    if (c.bodyJson && now - c.at < ttlMs) return parseBoundedCacheBody(c.bodyJson);
     const body = await pumpScanner.status();
     c.at = now;
-    c.body = body;
+    c.bodyJson = serializeBoundedCacheBody(body);
     return body;
   });
   app.get("/api/v1/paper/status", async () => {
     const now = Date.now();
     const ttlMs = 2500;
-    (globalThis as any).__orbitalpha_paper_cache ??= { at: 0, body: null as any };
-    const c = (globalThis as any).__orbitalpha_paper_cache as { at: number; body: any };
-    if (c.body && now - c.at < ttlMs) return c.body;
+    (globalThis as any).__orbitalpha_paper_cache ??= { at: 0, bodyJson: "" };
+    const c = (globalThis as any).__orbitalpha_paper_cache as { at: number; bodyJson: string };
+    if (c.bodyJson && now - c.at < ttlMs) return parseBoundedCacheBody(c.bodyJson);
     const out = (await paper.status()) as any;
     app.log.info(
       {
@@ -898,7 +942,7 @@ async function main() {
     );
     const body = { ...out, source_name: "local_paper_engine", source_path: typeof out?.files?.state === "string" ? out.files.state : null };
     c.at = now;
-    c.body = body;
+    c.bodyJson = serializeBoundedCacheBody(body);
     return body;
   });
   app.get("/api/v1/market-state", async () => {

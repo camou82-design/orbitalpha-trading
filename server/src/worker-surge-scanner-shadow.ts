@@ -20,13 +20,13 @@ function loadSurgeShadowWorkerEnv(): SurgeShadowWorkerEnv {
   return {
     companyId,
     serviceId,
-    intervalMs: Math.max(5000, Number(process.env.SURGE_SCANNER_WORKER_INTERVAL_MS ?? 10_000)),
+    intervalMs: Math.max(5000, Number(process.env.SURGE_SCANNER_WORKER_INTERVAL_MS ?? 30_000)),
     staleSeconds: Math.max(60, Number(process.env.SURGE_SCANNER_WORKER_STALE_SECONDS ?? 300)),
     maxItems: Math.max(20, Number(process.env.SURGE_SCANNER_WORKER_MAX_ITEMS ?? 60)),
-    topM: Math.max(10, Number(process.env.ENGINE2_SURGE_TOP_M ?? 50)),
-    candleMaxPerTick: Math.max(5, Number(process.env.ENGINE2_SURGE_CANDLE_MAX_PER_TICK ?? 18)),
-    candleBatchSize: Math.max(1, Number(process.env.ENGINE2_SURGE_CANDLE_BATCH_SIZE ?? 3)),
-    candleBatchDelayMs: Math.max(0, Number(process.env.ENGINE2_SURGE_CANDLE_BATCH_DELAY_MS ?? 1200)),
+    topM: Math.max(10, Number(process.env.ENGINE2_SURGE_TOP_M ?? 25)),
+    candleMaxPerTick: Math.max(5, Number(process.env.ENGINE2_SURGE_CANDLE_MAX_PER_TICK ?? 5)),
+    candleBatchSize: Math.max(1, Number(process.env.ENGINE2_SURGE_CANDLE_BATCH_SIZE ?? 1)),
+    candleBatchDelayMs: Math.max(0, Number(process.env.ENGINE2_SURGE_CANDLE_BATCH_DELAY_MS ?? 1500)),
   };
 }
 

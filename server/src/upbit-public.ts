@@ -229,6 +229,12 @@ export async function fetchMinuteCandles(
   const key = candleKey(market, unit, count);
   const nowMs = Date.now();
   maybeLogCandleCacheStats(nowMs);
+  const circuitOpenUntil = candleCircuitOpenUntilByKey.get(key) ?? 0;
+  if (nowMs < circuitOpenUntil) {
+    const cachedOnCircuit = candleCache.get(key);
+    if (cachedOnCircuit) return cachedOnCircuit.value;
+    return [];
+  }
 
   const cached = candleCache.get(key);
   if (cached) {
@@ -271,6 +277,8 @@ export async function fetchMinuteCandles(
         const rows = await fetchJson<UpbitCandle[]>(path);
         const value = [...rows].reverse();
         const fetchedAtMs = Date.now();
+        candleFailureCountByKey.delete(key);
+        candleCircuitOpenUntilByKey.delete(key);
         candleHttpFetchesSinceLastLog += 1;
         candleCache.set(key, {
           value,
@@ -282,6 +290,20 @@ export async function fetchMinuteCandles(
       } catch (e) {
         if (is404MarketError(e)) {
           markInvalidMarket(market);
+          return [];
+        }
+        const failCount = (candleFailureCountByKey.get(key) ?? 0) + 1;
+        candleFailureCountByKey.set(key, failCount);
+        if (failCount >= UPBIT_FETCH_CIRCUIT_BREAKER_FAIL_THRESHOLD) {
+          const circuitUntil = Date.now() + UPBIT_FETCH_CIRCUIT_BREAKER_COOLDOWN_MS;
+          candleCircuitOpenUntilByKey.set(key, circuitUntil);
+          maybeLogRateLimitedFailure(
+            candleFailureLastLogAtMs,
+            key,
+            `[upbit-candle] circuit_open market=${market} unit=${unit} count=${count} fails=${failCount} cooldown_ms=${UPBIT_FETCH_CIRCUIT_BREAKER_COOLDOWN_MS}`,
+          );
+          const cachedOnFailure = candleCache.get(key);
+          if (cachedOnFailure) return cachedOnFailure.value;
           return [];
         }
         if (e instanceof UpbitHttpError && e.status === 429) {
@@ -387,6 +409,9 @@ const TICKER_CACHE_TTL_MS = Number(process.env.UPBIT_TICKER_CACHE_TTL_MS ?? 12_0
 const TICKER_CACHE_STALE_GRACE_MS = Number(process.env.UPBIT_TICKER_CACHE_STALE_GRACE_MS ?? 30_000); // 429 시 마지막 값 서빙
 const TICKER_429_COOLDOWN_MS = Number(process.env.UPBIT_TICKER_429_COOLDOWN_MS ?? 20_000); // 10~30s 권장
 const TICKER_429_LOG_INTERVAL_MS = Number(process.env.UPBIT_TICKER_429_LOG_INTERVAL_MS ?? 60_000);
+const UPBIT_FETCH_CIRCUIT_BREAKER_FAIL_THRESHOLD = Math.max(1, Number(process.env.UPBIT_FETCH_CIRCUIT_BREAKER_FAIL_THRESHOLD ?? 3));
+const UPBIT_FETCH_CIRCUIT_BREAKER_COOLDOWN_MS = Math.max(1_000, Number(process.env.UPBIT_FETCH_CIRCUIT_BREAKER_COOLDOWN_MS ?? 60_000));
+const UPBIT_FETCH_FAILURE_LOG_INTERVAL_MS = Math.max(1_000, Number(process.env.UPBIT_FETCH_FAILURE_LOG_INTERVAL_MS ?? 30_000));
 
 type TickerCacheEntry = {
   value: UpbitTicker;
@@ -398,6 +423,9 @@ type TickerCacheEntry = {
 const tickerCache = new Map<string, TickerCacheEntry>();
 const tickerCooldownUntilMs = new Map<string, number>();
 const ticker429LastLogAtMs = new Map<string, number>();
+const tickerFailureCountByMarket = new Map<string, number>();
+const tickerCircuitOpenUntilByMarket = new Map<string, number>();
+const tickerFailureLastLogAtMs = new Map<string, number>();
 
 function tickerDebugEnabled(): boolean {
   return (
@@ -416,6 +444,17 @@ function maybeLogTicker429(nowMs: number, payload: Record<string, unknown>) {
 }
 
 const ticker24hVolumeHintByMarket = new Map<string, number>();
+const candleFailureCountByKey = new Map<string, number>();
+const candleCircuitOpenUntilByKey = new Map<string, number>();
+const candleFailureLastLogAtMs = new Map<string, number>();
+
+function maybeLogRateLimitedFailure(lastLogMap: Map<string, number>, key: string, message: string): void {
+  const now = Date.now();
+  const last = lastLogMap.get(key) ?? 0;
+  if (now - last < UPBIT_FETCH_FAILURE_LOG_INTERVAL_MS) return;
+  lastLogMap.set(key, now);
+  console.warn(message);
+}
 
 function chunk<T>(arr: T[], size: number): T[][] {
   if (size <= 0) return [arr];
@@ -454,6 +493,8 @@ async function fetchTickerBatchGroup(group: string[]): Promise<UpbitTicker[]> {
       }));
       for (const t of mapped) {
         ticker24hVolumeHintByMarket.set(t.market, Number(t.acc_trade_price_24h ?? 0));
+        tickerFailureCountByMarket.delete(t.market);
+        tickerCircuitOpenUntilByMarket.delete(t.market);
       }
       out.push(...mapped);
       break;
@@ -478,7 +519,16 @@ async function fetchTickerBatchGroup(group: string[]): Promise<UpbitTicker[]> {
         }
       }
       if (!is429 || attempt >= Math.max(1, TICKER_429_MAX_ATTEMPTS)) {
-        console.warn(
+        for (const market of group) {
+          const failCount = (tickerFailureCountByMarket.get(market) ?? 0) + 1;
+          tickerFailureCountByMarket.set(market, failCount);
+          if (failCount >= UPBIT_FETCH_CIRCUIT_BREAKER_FAIL_THRESHOLD) {
+            tickerCircuitOpenUntilByMarket.set(market, Date.now() + UPBIT_FETCH_CIRCUIT_BREAKER_COOLDOWN_MS);
+          }
+        }
+        maybeLogRateLimitedFailure(
+          tickerFailureLastLogAtMs,
+          `batch:${group.join(",")}`,
           `[upbit-ticker] batch_failed markets=${group.length} attempt=${attempt} status=${status ?? "unknown"} error=${e instanceof Error ? e.message : String(e)}`,
         );
         break;
@@ -511,6 +561,17 @@ export async function fetchTickers(markets: string[], opts?: FetchTickersOptions
   const cachedOut: UpbitTicker[] = [];
   for (const m of limited) {
     const c = tickerCache.get(m);
+    const circuitOpenUntil = tickerCircuitOpenUntilByMarket.get(m) ?? 0;
+    if (circuitOpenUntil > now0) {
+      if (c) {
+        cachedOut.push(c.value);
+        sourceByMarket.set(m, "fallback");
+        ageByMarketMs.set(m, now0 - c.fetchedAtMs);
+      } else {
+        sourceByMarket.set(m, "cooldown_skip");
+      }
+      continue;
+    }
     if (c && now0 <= c.expiresAtMs) {
       cachedOut.push(c.value);
       sourceByMarket.set(m, "cache");
