@@ -179,7 +179,7 @@ export type TradeStatusUntilSyncedOptions = {
   /** 전체 재시도 상한(밀리초). 초과 시 마지막 유효 payload 또는 null 로 종료 — 무한 대기 방지 */
   maxWallMs?: number;
   /** When set, each attempt and the final summary are logged to the console. */
-  logContext?: "login" | "trading_page_initial";
+  logContext?: "login" | "trading_page_initial" | "dashboard_initial_background";
 };
 
 export type TradeStatusUntilSyncedResult = {

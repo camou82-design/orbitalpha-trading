@@ -1069,6 +1069,8 @@ export default function HomePage() {
   const [accountSyncState, setAccountSyncState] = useState<"idle" | "syncing" | "ok" | "error" | "failed">("idle");
   const [lastClientTradeFailure, setLastClientTradeFailure] = useState<{ code: string; message: string } | null>(null);
   const tradeInitialSyncDoneRef = useRef(false);
+  const fastShellLoggedRef = useRef(false);
+  const mountedAtRef = useRef<number>(Date.now());
   const prevPathnameRef = useRef<string | null>(null);
   const pollInFlightRef = useRef(new Map<string, AbortController>());
   const pollSigRef = useRef(new Map<string, string>());
@@ -1189,6 +1191,16 @@ export default function HomePage() {
   useEffect(() => {
     tradeRef.current = trade;
   }, [trade]);
+  useEffect(() => {
+    if (authState !== "ok" || fastShellLoggedRef.current) return;
+    fastShellLoggedRef.current = true;
+    devLog({
+      tag: "DASHBOARD_SHELL_RENDERED_FAST",
+      ms_after_mount: Math.max(0, Date.now() - mountedAtRef.current),
+      auth_state: authState,
+      trade_loaded: Boolean(tradeRef.current),
+    });
+  }, [authState]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1223,7 +1235,7 @@ export default function HomePage() {
             const message =
               status === 502 ? "세션 API 일시 실패 (502) — 대시보드는 유지됩니다" : `세션 API 오류 (HTTP ${status}) — 대시보드는 유지됩니다`;
             setSessionPanelWarning({ code, message });
-            if (authState === "loading" && tradeRef.current) setAuthState("ok");
+            setAuthState((prev) => (prev === "loading" ? "ok" : prev));
           },
           onOk: (session) => {
             if (cancelled) return;
@@ -1247,7 +1259,7 @@ export default function HomePage() {
             if (cancelled) return;
             const msg = e instanceof Error ? e.message : "session_fetch_failed";
             setSessionPanelWarning({ code: "session_fetch_failed", message: msg.slice(0, 180) });
-            if (authState === "loading" && tradeRef.current) setAuthState("ok");
+            setAuthState((prev) => (prev === "loading" ? "ok" : prev));
           },
         },
       );
@@ -1308,30 +1320,6 @@ export default function HomePage() {
 
     const bootstrap = async () => {
       await pollSessionOnce();
-      if (!tradeInitialSyncDoneRef.current) {
-        setAccountSyncState("syncing");
-        const syncResult = await fetchTradeStatusUntilSyncedWithLog(apiBase, {
-          maxAttempts: 15,
-          maxWallMs: 24_000,
-          logContext: "trading_page_initial",
-        });
-        if (cancelled) return;
-        tradeInitialSyncDoneRef.current = true;
-        const primed = syncResult.payload;
-        if (primed) {
-          const p = primed as TradeStatus;
-          setTrade(p);
-          setLastClientTradeFailure(null);
-          if (p.api_connected) setAccountSyncState("ok");
-          else if (p.env_access_key_present && p.env_secret_key_present) setAccountSyncState("error");
-          else setAccountSyncState("ok");
-          if (authState === "loading") setAuthState("ok");
-        } else {
-          const lf = syncResult.lastFetch;
-          if (lf?.failureCode) setLastClientTradeFailure({ code: lf.failureCode, message: lf.failureMessage ?? "" });
-          if (lf?.failureCode && !isSoftTradeStatusFailureCode(lf.failureCode)) setAccountSyncState("error");
-        }
-      }
 
       // start loops (staggered & independent)
       scheduleLoop("auth_session", pollSessionOnce, 45_000, 60_000);
@@ -1524,6 +1512,62 @@ export default function HomePage() {
         5_000,
         30_000,
       );
+
+      // Initial trade/account sync should not block dashboard shell rendering.
+      if (!tradeInitialSyncDoneRef.current) {
+        setAccountSyncState("syncing");
+        const syncStartedAt = Date.now();
+        devLog({ tag: "DASHBOARD_INITIAL_TRADE_SYNC_BACKGROUND_START" });
+        void fetchTradeStatusUntilSyncedWithLog(apiBase, {
+          maxAttempts: 10,
+          maxWallMs: 9_000,
+          logContext: "dashboard_initial_background",
+        })
+          .then((syncResult) => {
+            if (cancelled) return;
+            tradeInitialSyncDoneRef.current = true;
+            const primed = syncResult.payload;
+            if (primed) {
+              const p = primed as TradeStatus;
+              setTrade(p);
+              setLastClientTradeFailure(null);
+              if (p.api_connected) setAccountSyncState("ok");
+              else if (p.env_access_key_present && p.env_secret_key_present) setAccountSyncState("error");
+              else setAccountSyncState("ok");
+              devLog({
+                tag: "DASHBOARD_INITIAL_TRADE_SYNC_BACKGROUND_DONE",
+                ok: true,
+                ms: Date.now() - syncStartedAt,
+                attempts: syncResult.attempts,
+                failure_code: null,
+              });
+            } else {
+              const lf = syncResult.lastFetch;
+              if (lf?.failureCode) setLastClientTradeFailure({ code: lf.failureCode, message: lf.failureMessage ?? "" });
+              if (lf?.failureCode && !isSoftTradeStatusFailureCode(lf.failureCode)) setAccountSyncState("error");
+              devLog({
+                tag: "DASHBOARD_INITIAL_TRADE_SYNC_BACKGROUND_DONE",
+                ok: false,
+                ms: Date.now() - syncStartedAt,
+                attempts: syncResult.attempts,
+                failure_code: lf?.failureCode ?? null,
+              });
+            }
+          })
+          .catch((e) => {
+            if (cancelled) return;
+            setAccountSyncState("error");
+            const msg = e instanceof Error ? e.message : String(e);
+            setLastClientTradeFailure({ code: "initial_sync_failed", message: msg.slice(0, 240) });
+            devLog({
+              tag: "DASHBOARD_INITIAL_TRADE_SYNC_BACKGROUND_DONE",
+              ok: false,
+              ms: Date.now() - syncStartedAt,
+              attempts: 0,
+              failure_code: "initial_sync_failed",
+            });
+          });
+      }
     };
 
     void bootstrap();
@@ -1830,6 +1874,11 @@ export default function HomePage() {
     if (!isSoftTradeStatusFailureCode(lastClientTradeFailure.code)) return null;
     return `상태 갱신 지연: ${lastClientTradeFailure.code}${lastClientTradeFailure.message ? ` — ${lastClientTradeFailure.message}` : ""}`.slice(0, 220);
   }, [lastClientTradeFailure]);
+  const tradeStatusPendingDisplay = useMemo(() => {
+    if (trade) return null;
+    if (accountSyncState === "syncing" || accountSyncState === "idle") return "거래 상태 확인 중";
+    return null;
+  }, [trade, accountSyncState]);
   const sessionDelayNotice = useMemo(() => {
     const reason = currentSession?.cannot_enable_reason;
     if (reason === "light_status_timeout" || reason === "session_status_delayed") return "세션 보조: 상태 갱신 지연(레거시)";
@@ -1893,27 +1942,7 @@ export default function HomePage() {
 
   // NOTE: auth/session 오류는 전체 화면을 죽이지 않는다. (401/unauthenticated만 만료 처리)
 
-  if (accountSyncState === "failed" && !trade) {
-    return (
-      <div style={{ background: UI.pageOuterBg, minHeight: "100vh", display: "grid", placeItems: "center", color: UI.body, padding: "2rem", textAlign: "center" }}>
-        <div>
-          <h2 style={{ color: "#ef4444" }}>계좌 동기화 실패</h2>
-          <p>거래소 API 연결에 실패했거나 서버 응답이 지연되었습니다.</p>
-          <button onClick={() => window.location.reload()} style={{ padding: "0.5rem 1rem", background: UI.accent, color: "#fff", border: "none", borderRadius: 6, cursor: "pointer" }}>
-            다시 시도
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  if (accountSyncState === "syncing" && !trade) {
-    return (
-      <div style={{ background: UI.pageOuterBg, minHeight: "100vh", display: "grid", placeItems: "center", color: UI.body }}>
-        계좌 동기화 중...
-      </div>
-    );
-  }
+  // Keep dashboard shell visible while trade/account sync runs in background.
 
   return (
     <div style={{ background: UI.pageOuterBg, minHeight: "100vh", padding: "1rem 0.85rem" }}>
@@ -2110,6 +2139,11 @@ export default function HomePage() {
               ) : null}
             </div>
           </section>
+          {tradeStatusPendingDisplay ? (
+            <div style={{ marginTop: "0.45rem", fontSize: "0.72rem", color: UI.mutedSoft }}>
+              {tradeStatusPendingDisplay}
+            </div>
+          ) : null}
           {accountSyncFailureDisplay ? (
             <div style={{ marginTop: "0.45rem", fontSize: "0.72rem", color: UI.watch }}>
               계좌 동기화 실패 사유: {accountSyncFailureDisplay}
