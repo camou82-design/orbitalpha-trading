@@ -31,6 +31,8 @@ import {
 } from "./live-entry-pipeline.js";
 import { readJsonFile } from "./runtime-file-io.js";
 import { surgeCandidatesRuntimePath } from "./runtime-paths.js";
+import { isSurgePosition } from "./surge-v2/surge-position-classifier.js";
+import { evaluateSurgeExit } from "./surge-v2/surge-exit-engine.js";
 
 function num(x: unknown): number {
   return typeof x === "number" ? x : Number(x);
@@ -2706,357 +2708,393 @@ export function createLiveDataStrategy(opts: {
         });
       }
       const holdMin = minutesSince(p.entry_ts);
-      const weakModeTighterStop = (state.regime?.btc_filter_state ?? "neutral") === "weak" ? LIVE_BTC_WEAK_TIGHT_STOP_PCT : null;
-      if (weakModeTighterStop !== null && pnlGross <= weakModeTighterStop) {
-        reasonExit = "weak_market_price_stop";
-        stopTriggerKind = "price_stop";
-        exitAuthorityClass = "hard_loss";
-        exitReasonDetail = "weak_tight_stop";
-      }
-      // Emergency stop loss — always allowed even within grace period.
-      if (!reasonExit && pnlGross <= LIVE_EMERGENCY_STOP_LOSS_PCT) {
-        reasonExit = "emergency_stop_loss";
-        stopTriggerKind = "price_stop";
-        exitAuthorityClass = "emergency_exit";
-        exitReasonDetail = "emergency_stop_loss_threshold";
-      }
-      if (!reasonExit) {
-        const auth = evaluateExitAuthority({
-          p,
-          pnlGross,
-          heldMs,
-          marketTier: state.regime?.btc_filter_state ?? "neutral",
-          weakReboundPoor: p.max_pnl_pct < 0.6,
-        });
-        if (auth.reasonExit) {
-          reasonExit = auth.reasonExit;
-          ratio = auth.ratio;
-          stopTriggerKind = auth.stopTriggerKind;
-          exitAuthorityClass = auth.authorityClass;
-          exitReasonDetail = auth.reasonDetail;
-          if (auth.authorityClass === "breakeven_protect" && !p.breakeven_armed) {
-            p.breakeven_armed = true;
-            p.breakeven_armed_at = new Date().toISOString();
-          }
-          if (auth.authorityClass === "runner_trail") {
-            p.trailing_stop_price = p.highest_price_after_entry * (1 - ((state.regime?.btc_filter_state ?? "neutral") === "weak" ? 1.8 : 2.2) / 100);
-          }
+      const isSurge = isSurgePosition(p);
+      if (isSurge && !reasonExit) {
+        const decision = evaluateSurgeExit(p, now);
+        if (decision.runnerTrailActive !== (p as any).runner_trail_active) {
+          (p as any).runner_trail_active = decision.runnerTrailActive;
         }
-      }
-      if (!reasonExit && p.strategy_type === "stable") {
-        const xs = p.strict_exit ? STRICT_NEW_POSITION_EXIT.stable : null;
-        const s = xs
-          ? {
-              breakeven_arm_pct: xs.breakeven_arm_pct,
-              breakeven_floor_pct: xs.breakeven_floor_pct,
-              partial_take_profit_pct: xs.partial_tp_pct,
-              partial_take_profit_ratio: xs.partial_tp_ratio,
-              trailing_from_peak_pct: xs.trailing_peak_pct,
-            }
-          : STRATEGY_RISK_CONFIG.stable;
-        const weakHoldMin = xs ? xs.weak_hold_stop_minutes : LIVE_STABLE_WEAK_REBOUND_TIME_STOP_MINUTES;
-        const recv = xs
-          ? {
-              giveup_minutes: xs.giveup_minutes,
-              min_peak_pct_to_skip_catastrophic: xs.min_peak_pct_skip_catastrophic,
-              catastrophic_exit_pct: xs.catastrophic_exit_pct,
-            }
-          : RECOVERY_EXIT_CONFIG.stable;
 
-        if (xs) {
-          if (holdMin >= xs.hard_stop_min_hold_min && pnlGross <= xs.hard_stop_pct) {
-            reasonExit = "strict_hard_stop_loss";
-            stopTriggerKind = "price_stop";
-          }
-          if (!reasonExit && holdMin >= xs.early_cut_minutes && p.max_pnl_pct < xs.early_cut_max_peak_pct && pnlGross <= xs.early_cut_pnl_pct) {
-            reasonExit = "strict_early_loss_cut";
-            stopTriggerKind = "price_stop";
-          }
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_V2_EXIT_DECISION_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            entry_price: p.entry_price,
+            current_price: now,
+            pnl_pct: pnlGross,
+            max_pnl_pct: p.max_pnl_pct,
+            hold_minutes: holdMin,
+            partial_tp_done: p.partial_tp_done,
+            is_surge_position: true,
+            decision_action: decision.action,
+            decision_reason: decision.reason,
+            exit_ratio: decision.ratio,
+            runner_trail_active: (p as any).runner_trail_active,
+            authority_source: "surge-v2",
+          }),
+        );
+
+        if (decision.action === "sell") {
+          reasonExit = decision.reason;
+          ratio = decision.ratio;
+          stopTriggerKind = "price_stop";
+          exitAuthorityClass = "none";
+          exitReasonDetail = "surge-v2-exit-engine";
+        }
+      } else if (!isSurge && !reasonExit) {
+        const weakModeTighterStop = (state.regime?.btc_filter_state ?? "neutral") === "weak" ? LIVE_BTC_WEAK_TIGHT_STOP_PCT : null;
+        if (weakModeTighterStop !== null && pnlGross <= weakModeTighterStop) {
+          reasonExit = "weak_market_price_stop";
+          stopTriggerKind = "price_stop";
+          exitAuthorityClass = "hard_loss";
+          exitReasonDetail = "weak_tight_stop";
+        }
+        // Emergency stop loss — always allowed even within grace period.
+        if (!reasonExit && pnlGross <= LIVE_EMERGENCY_STOP_LOSS_PCT) {
+          reasonExit = "emergency_stop_loss";
+          stopTriggerKind = "price_stop";
+          exitAuthorityClass = "emergency_exit";
+          exitReasonDetail = "emergency_stop_loss_threshold";
         }
         if (!reasonExit) {
-          if (!p.breakeven_armed && pnlGross >= s.breakeven_arm_pct) {
-            p.breakeven_armed = true;
-            p.breakeven_armed_at = new Date().toISOString();
-            state.trades.push({
-              timestamp: p.breakeven_armed_at,
-              entry_ts: p.entry_ts,
-              market,
-              action: "buy",
-              order_krw: 0,
-              filled_qty: 0,
-              avg_buy_price: p.entry_price,
-              exit_price: now,
-              pnl_krw: 0,
-              pnl_pct: pnlGross,
-              reason_enter: p.reason_enter,
-              reason_exit: "breakeven_armed",
-              holding_minutes: holdMin,
-              signal_strength: p.signal_strength,
-              volume_ratio: p.volume_ratio,
-              strategy_tag: "live_data_mode_v1",
-              strategy_type: p.strategy_type,
-              stop_trigger_kind: "breakeven_protect",
-              current_net_pnl_pct: pnlGross,
-              liquidation_reason: "breakeven_armed",
-              remaining_qty: p.qty,
-              highest_price_after_entry: p.highest_price_after_entry,
-              trailing_stop_price: p.trailing_stop_price,
-              breakeven_armed_at: p.breakeven_armed_at,
-              partial_tp_at: p.partial_tp_at,
-            });
-            await opts.onEvent?.({
-              timestamp: p.breakeven_armed_at,
-              event_type: "breakeven_armed",
-              market,
-              strategy_type: p.strategy_type,
-              market_state: null,
-              side: "sell",
-              reason: "breakeven_protect",
-              balance_krw: null,
-              position_qty: p.qty,
-              avg_buy_price: p.entry_price,
-              current_price: now,
-              pnl_net: null,
-              pnl_net_pct: pnlGross,
-              note: p.strict_exit ? "stable breakeven armed (strict_new)" : "stable breakeven armed",
-            });
-          }
-          p.trailing_stop_price = p.highest_price_after_entry * (1 - s.trailing_from_peak_pct / 100);
-          // break-even / stop-up (env)
-          if (!reasonExit) {
-            if (!p.breakeven_armed && pnlGross >= LIVE_BREAK_EVEN_ARM_PCT) {
+          const auth = evaluateExitAuthority({
+            p,
+            pnlGross,
+            heldMs,
+            marketTier: state.regime?.btc_filter_state ?? "neutral",
+            weakReboundPoor: p.max_pnl_pct < 0.6,
+          });
+          if (auth.reasonExit) {
+            reasonExit = auth.reasonExit;
+            ratio = auth.ratio;
+            stopTriggerKind = auth.stopTriggerKind;
+            exitAuthorityClass = auth.authorityClass;
+            exitReasonDetail = auth.reasonDetail;
+            if (auth.authorityClass === "breakeven_protect" && !p.breakeven_armed) {
               p.breakeven_armed = true;
               p.breakeven_armed_at = new Date().toISOString();
-              console.info(
-                JSON.stringify({
-                  tag: "DEBUG_LIVE_STOP_UP_ARMED",
-                  ts: p.breakeven_armed_at,
-                  symbol: market,
-                  entry_price: p.entry_price,
-                  current_price: now,
-                  gross_pnl_pct: pnlGross,
-                  break_even_arm_pct: LIVE_BREAK_EVEN_ARM_PCT,
-                  break_even_lock_pct: LIVE_BREAK_EVEN_LOCK_PCT,
-                }),
-              );
             }
-            if (p.breakeven_armed && pnlGross <= LIVE_BREAK_EVEN_LOCK_PCT) {
-              reasonExit = "break_even_stop";
-              stopTriggerKind = "breakeven_protect";
+            if (auth.authorityClass === "runner_trail") {
+              p.trailing_stop_price = p.highest_price_after_entry * (1 - ((state.regime?.btc_filter_state ?? "neutral") === "weak" ? 1.8 : 2.2) / 100);
             }
-          }
-          // partial TP (env) — before legacy strict partial/trailing
-          if (!reasonExit && !p.partial_tp_done && pnlGross >= LIVE_PARTIAL_TAKE_PROFIT_PCT) {
-            reasonExit = "partial_take_profit";
-            ratio = LIVE_PARTIAL_TAKE_PROFIT_RATIO;
-            stopTriggerKind = null;
-          }
-          // runner trail (env) for scaled out positions
-          if (!reasonExit && p.partial_tp_done && p.highest_price_after_entry > 0) {
-            const dd = ((p.highest_price_after_entry - now) / p.highest_price_after_entry) * 100;
-            if (dd >= LIVE_RUNNER_TRAIL_FROM_PEAK_PCT) {
-              reasonExit = "trail_from_peak_stop";
-              stopTriggerKind = "time_stop";
-            }
-          }
-          if (!reasonExit && p.partial_tp_done && p.partial_tp_at) {
-            const minSincePartial = minutesSince(p.partial_tp_at);
-            const peakGiveback = p.max_pnl_pct - pnlGross;
-            const stalledFromPeak =
-              minSincePartial >= LIVE_RESIDUAL_MIN_MINUTES_AFTER_PARTIAL &&
-              peakGiveback >= LIVE_RESIDUAL_PEAK_GIVEBACK_PCT &&
-              pnlGross < LIVE_RESIDUAL_STALL_PNL_CAP;
-            const slotHog =
-              holdMin >= LIVE_RESIDUAL_MAX_HOLD_MINUTES && p.max_pnl_pct < 3.5 && pnlGross < 2.2;
-            if (stalledFromPeak || slotHog) {
-              reasonExit = "residual_full_exit_escalation";
-              ratio = 1;
-              stopTriggerKind = "time_stop";
-              console.info(
-                JSON.stringify({
-                  tag: "DEBUG_LIVE_RESIDUAL_EXIT_ESCALATION",
-                  ts: new Date().toISOString(),
-                  symbol: market,
-                  strategy_type: "stable",
-                  stalled_from_peak: stalledFromPeak,
-                  slot_hog: slotHog,
-                  minutes_since_partial: Math.round(minSincePartial),
-                  peak_giveback_pct: Number(peakGiveback.toFixed(4)),
-                  gross_pnl_pct: pnlGross,
-                  hold_minutes: holdMin,
-                }),
-              );
-            }
-          }
-          if (!p.partial_tp_done && pnlGross >= s.partial_take_profit_pct) {
-            reasonExit = p.strict_exit ? "partial_take_profit_1st_strict" : "partial_take_profit";
-            ratio = s.partial_take_profit_ratio;
-            stopTriggerKind = null;
-          } else if (p.partial_tp_done && now <= p.trailing_stop_price) {
-            reasonExit = p.strict_exit ? "trailing_runner_exit_strict" : "trailing_take_profit";
-            stopTriggerKind = "time_stop";
-          } else if (p.breakeven_armed && pnlGross <= s.breakeven_floor_pct) {
-            reasonExit = "breakeven_exit";
-            stopTriggerKind = "breakeven_protect";
-          } else if (
-            holdMin >= recv.giveup_minutes &&
-            p.max_pnl_pct < recv.min_peak_pct_to_skip_catastrophic &&
-            pnlGross <= recv.catastrophic_exit_pct
-          ) {
-            reasonExit = `stable_catastrophic_exit_${recv.catastrophic_exit_pct}`;
-            stopTriggerKind = "price_stop";
-          } else if (holdMin >= weakHoldMin && p.max_pnl_pct < 0.35 && pnlGross < 0) {
-            reasonExit = "weak_market_time_stop";
-            stopTriggerKind = "time_stop";
           }
         }
-      } else if (!reasonExit) {
-        const xm = p.strict_exit ? STRICT_NEW_POSITION_EXIT.momentum : null;
-        const m = xm
-          ? {
-              breakeven_arm_pct: xm.breakeven_arm_pct,
-              breakeven_floor_pct: xm.breakeven_floor_pct,
-              partial_take_profit_pct: xm.partial_tp_pct,
-              partial_take_profit_ratio: xm.partial_tp_ratio,
-              trailing_from_peak_pct: xm.trailing_peak_pct,
-              time_stop_min_minutes: STRATEGY_RISK_CONFIG.momentum.time_stop_min_minutes,
-              time_stop_max_minutes: STRATEGY_RISK_CONFIG.momentum.time_stop_max_minutes,
-            }
-          : STRATEGY_RISK_CONFIG.momentum;
-        const recvM = xm
-          ? {
-              giveup_minutes: xm.giveup_minutes,
-              min_peak_pct_to_skip_catastrophic: xm.min_peak_pct_skip_catastrophic,
-              catastrophic_exit_pct: xm.catastrophic_exit_pct,
-            }
-          : RECOVERY_EXIT_CONFIG.momentum;
-
-        if (xm) {
-          if (holdMin >= xm.hard_stop_min_hold_min && pnlGross <= xm.hard_stop_pct) {
-            reasonExit = "strict_hard_stop_loss";
-            stopTriggerKind = "price_stop";
-          }
-          if (!reasonExit && holdMin >= xm.early_cut_minutes && p.max_pnl_pct < xm.early_cut_max_peak_pct && pnlGross <= xm.early_cut_pnl_pct) {
-            reasonExit = "strict_early_loss_cut";
-            stopTriggerKind = "price_stop";
-          }
-        }
-        if (!reasonExit) {
-          if (!p.breakeven_armed && pnlGross >= m.breakeven_arm_pct) {
-            p.breakeven_armed = true;
-            p.breakeven_armed_at = new Date().toISOString();
-            state.trades.push({
-              timestamp: p.breakeven_armed_at,
-              entry_ts: p.entry_ts,
-              market,
-              action: "buy",
-              order_krw: 0,
-              filled_qty: 0,
-              avg_buy_price: p.entry_price,
-              exit_price: now,
-              pnl_krw: 0,
-              pnl_pct: pnlGross,
-              reason_enter: p.reason_enter,
-              reason_exit: "breakeven_armed",
-              holding_minutes: holdMin,
-              signal_strength: p.signal_strength,
-              volume_ratio: p.volume_ratio,
-              strategy_tag: "live_data_mode_v1",
-              strategy_type: p.strategy_type,
-              stop_trigger_kind: "breakeven_protect",
-              current_net_pnl_pct: pnlGross,
-              liquidation_reason: "breakeven_armed",
-              remaining_qty: p.qty,
-              highest_price_after_entry: p.highest_price_after_entry,
-              trailing_stop_price: p.trailing_stop_price,
-              breakeven_armed_at: p.breakeven_armed_at,
-              partial_tp_at: p.partial_tp_at,
-            });
-            await opts.onEvent?.({
-              timestamp: p.breakeven_armed_at,
-              event_type: "breakeven_armed",
-              market,
-              strategy_type: p.strategy_type,
-              market_state: null,
-              side: "sell",
-              reason: "breakeven_protect",
-              balance_krw: null,
-              position_qty: p.qty,
-              avg_buy_price: p.entry_price,
-              current_price: now,
-              pnl_net: null,
-              pnl_net_pct: pnlGross,
-              note: p.strict_exit ? "momentum breakeven armed (strict_new)" : "momentum breakeven armed",
-            });
-          }
-          p.trailing_stop_price = p.highest_price_after_entry * (1 - m.trailing_from_peak_pct / 100);
-          if (!reasonExit && p.partial_tp_done && p.partial_tp_at) {
-            const minSincePartial = minutesSince(p.partial_tp_at);
-            const peakGiveback = p.max_pnl_pct - pnlGross;
-            const stalledFromPeak =
-              minSincePartial >= LIVE_RESIDUAL_MIN_MINUTES_AFTER_PARTIAL &&
-              peakGiveback >= LIVE_RESIDUAL_PEAK_GIVEBACK_PCT &&
-              pnlGross < LIVE_RESIDUAL_STALL_PNL_CAP;
-            const slotHog =
-              holdMin >= LIVE_RESIDUAL_MAX_HOLD_MINUTES && p.max_pnl_pct < 3.5 && pnlGross < 2.2;
-            if (stalledFromPeak || slotHog) {
-              reasonExit = "residual_full_exit_escalation";
-              ratio = 1;
-              stopTriggerKind = "time_stop";
-              console.info(
-                JSON.stringify({
-                  tag: "DEBUG_LIVE_RESIDUAL_EXIT_ESCALATION",
-                  ts: new Date().toISOString(),
-                  symbol: market,
-                  strategy_type: "momentum",
-                  stalled_from_peak: stalledFromPeak,
-                  slot_hog: slotHog,
-                  minutes_since_partial: Math.round(minSincePartial),
-                  peak_giveback_pct: Number(peakGiveback.toFixed(4)),
-                  gross_pnl_pct: pnlGross,
-                  hold_minutes: holdMin,
-                }),
-              );
-            }
-          }
-          if (!p.partial_tp_done && pnlGross >= m.partial_take_profit_pct) {
-            reasonExit = p.strict_exit ? "partial_take_profit_1st_strict" : "partial_take_profit";
-            ratio = m.partial_take_profit_ratio;
-          } else if (p.partial_tp_done && now <= p.trailing_stop_price) {
-            reasonExit = p.strict_exit ? "trailing_runner_exit_strict" : "trailing_take_profit";
-            stopTriggerKind = "time_stop";
-          } else if (p.breakeven_armed && pnlGross <= m.breakeven_floor_pct) {
-            reasonExit = "momentum_breakeven_protect";
-            stopTriggerKind = "breakeven_protect";
-          } else if (
-            holdMin >= recvM.giveup_minutes &&
-            p.max_pnl_pct < recvM.min_peak_pct_to_skip_catastrophic &&
-            pnlGross <= recvM.catastrophic_exit_pct
-          ) {
-            reasonExit = `momentum_catastrophic_exit_${recvM.catastrophic_exit_pct}`;
-            stopTriggerKind = "price_stop";
-          } else {
-            try {
-              const c1 = await fetchMinuteCandlesCached(market, 1, 8);
-              const last = c1[c1.length - 1];
-              const prev = c1[c1.length - 2];
-              if (last && prev) {
-                const lastNotional = last.candle_acc_trade_volume * last.trade_price;
-                const prevNotional = Math.max(1, prev.candle_acc_trade_volume * prev.trade_price);
-                const dealDrop = lastNotional / prevNotional < 0.45;
-                const range = Math.max(1e-9, last.high_price - last.low_price);
-                const closeLow = (last.trade_price - last.low_price) / range < 0.28;
-                const upperWickWeak = (last.high_price - last.trade_price) / range > 0.55 && last.trade_price <= last.opening_price;
-                const breakoutLowBreak = last.trade_price < prev.low_price;
-                if (dealDrop || closeLow || upperWickWeak || breakoutLowBreak) {
-                  reasonExit = "momentum_pattern_break";
-                  stopTriggerKind = "pattern_break";
-                }
+        if (!reasonExit && p.strategy_type === "stable") {
+          const xs = p.strict_exit ? STRICT_NEW_POSITION_EXIT.stable : null;
+          const s = xs
+            ? {
+                breakeven_arm_pct: xs.breakeven_arm_pct,
+                breakeven_floor_pct: xs.breakeven_floor_pct,
+                partial_take_profit_pct: xs.partial_tp_pct,
+                partial_take_profit_ratio: xs.partial_tp_ratio,
+                trailing_from_peak_pct: xs.trailing_peak_pct,
               }
-            } catch {}
-            if (!reasonExit && holdMin >= m.time_stop_min_minutes && holdMin <= m.time_stop_max_minutes && p.max_pnl_pct < 0.8 && pnlGross <= -0.1) {
-              reasonExit = "momentum_time_stop";
+            : STRATEGY_RISK_CONFIG.stable;
+          const weakHoldMin = xs ? xs.weak_hold_stop_minutes : LIVE_STABLE_WEAK_REBOUND_TIME_STOP_MINUTES;
+          const recv = xs
+            ? {
+                giveup_minutes: xs.giveup_minutes,
+                min_peak_pct_to_skip_catastrophic: xs.min_peak_pct_skip_catastrophic,
+                catastrophic_exit_pct: xs.catastrophic_exit_pct,
+              }
+            : RECOVERY_EXIT_CONFIG.stable;
+
+          if (xs) {
+            if (holdMin >= xs.hard_stop_min_hold_min && pnlGross <= xs.hard_stop_pct) {
+              reasonExit = "strict_hard_stop_loss";
+              stopTriggerKind = "price_stop";
+            }
+            if (!reasonExit && holdMin >= xs.early_cut_minutes && p.max_pnl_pct < xs.early_cut_max_peak_pct && pnlGross <= xs.early_cut_pnl_pct) {
+              reasonExit = "strict_early_loss_cut";
+              stopTriggerKind = "price_stop";
+            }
+          }
+          if (!reasonExit) {
+            if (!p.breakeven_armed && pnlGross >= s.breakeven_arm_pct) {
+              p.breakeven_armed = true;
+              p.breakeven_armed_at = new Date().toISOString();
+              state.trades.push({
+                timestamp: p.breakeven_armed_at,
+                entry_ts: p.entry_ts,
+                market,
+                action: "buy",
+                order_krw: 0,
+                filled_qty: 0,
+                avg_buy_price: p.entry_price,
+                exit_price: now,
+                pnl_krw: 0,
+                pnl_pct: pnlGross,
+                reason_enter: p.reason_enter,
+                reason_exit: "breakeven_armed",
+                holding_minutes: holdMin,
+                signal_strength: p.signal_strength,
+                volume_ratio: p.volume_ratio,
+                strategy_tag: "live_data_mode_v1",
+                strategy_type: p.strategy_type,
+                stop_trigger_kind: "breakeven_protect",
+                current_net_pnl_pct: pnlGross,
+                liquidation_reason: "breakeven_armed",
+                remaining_qty: p.qty,
+                highest_price_after_entry: p.highest_price_after_entry,
+                trailing_stop_price: p.trailing_stop_price,
+                breakeven_armed_at: p.breakeven_armed_at,
+                partial_tp_at: p.partial_tp_at,
+              });
+              await opts.onEvent?.({
+                timestamp: p.breakeven_armed_at,
+                event_type: "breakeven_armed",
+                market,
+                strategy_type: p.strategy_type,
+                market_state: null,
+                side: "sell",
+                reason: "breakeven_protect",
+                balance_krw: null,
+                position_qty: p.qty,
+                avg_buy_price: p.entry_price,
+                current_price: now,
+                pnl_net: null,
+                pnl_net_pct: pnlGross,
+                note: p.strict_exit ? "stable breakeven armed (strict_new)" : "stable breakeven armed",
+              });
+            }
+            p.trailing_stop_price = p.highest_price_after_entry * (1 - s.trailing_from_peak_pct / 100);
+            // break-even / stop-up (env)
+            if (!reasonExit) {
+              if (!p.breakeven_armed && pnlGross >= LIVE_BREAK_EVEN_ARM_PCT) {
+                p.breakeven_armed = true;
+                p.breakeven_armed_at = new Date().toISOString();
+                console.info(
+                  JSON.stringify({
+                    tag: "DEBUG_LIVE_STOP_UP_ARMED",
+                    ts: p.breakeven_armed_at,
+                    symbol: market,
+                    entry_price: p.entry_price,
+                    current_price: now,
+                    gross_pnl_pct: pnlGross,
+                    break_even_arm_pct: LIVE_BREAK_EVEN_ARM_PCT,
+                    break_even_lock_pct: LIVE_BREAK_EVEN_LOCK_PCT,
+                  }),
+                );
+              }
+              if (p.breakeven_armed && pnlGross <= LIVE_BREAK_EVEN_LOCK_PCT) {
+                reasonExit = "break_even_stop";
+                stopTriggerKind = "breakeven_protect";
+              }
+            }
+            // partial TP (env) — before legacy strict partial/trailing
+            if (!reasonExit && !p.partial_tp_done && pnlGross >= LIVE_PARTIAL_TAKE_PROFIT_PCT) {
+              reasonExit = "partial_take_profit";
+              ratio = LIVE_PARTIAL_TAKE_PROFIT_RATIO;
+              stopTriggerKind = null;
+            }
+            // runner trail (env) for scaled out positions
+            if (!reasonExit && p.partial_tp_done && p.highest_price_after_entry > 0) {
+              const dd = ((p.highest_price_after_entry - now) / p.highest_price_after_entry) * 100;
+              if (dd >= LIVE_RUNNER_TRAIL_FROM_PEAK_PCT) {
+                reasonExit = "trail_from_peak_stop";
+                stopTriggerKind = "time_stop";
+              }
+            }
+            if (!reasonExit && p.partial_tp_done && p.partial_tp_at) {
+              const minSincePartial = minutesSince(p.partial_tp_at);
+              const peakGiveback = p.max_pnl_pct - pnlGross;
+              const stalledFromPeak =
+                minSincePartial >= LIVE_RESIDUAL_MIN_MINUTES_AFTER_PARTIAL &&
+                peakGiveback >= LIVE_RESIDUAL_PEAK_GIVEBACK_PCT &&
+                pnlGross < LIVE_RESIDUAL_STALL_PNL_CAP;
+              const slotHog =
+                holdMin >= LIVE_RESIDUAL_MAX_HOLD_MINUTES && p.max_pnl_pct < 3.5 && pnlGross < 2.2;
+              if (stalledFromPeak || slotHog) {
+                reasonExit = "residual_full_exit_escalation";
+                ratio = 1;
+                stopTriggerKind = "time_stop";
+                console.info(
+                  JSON.stringify({
+                    tag: "DEBUG_LIVE_RESIDUAL_EXIT_ESCALATION",
+                    ts: new Date().toISOString(),
+                    symbol: market,
+                    strategy_type: "stable",
+                    stalled_from_peak: stalledFromPeak,
+                    slot_hog: slotHog,
+                    minutes_since_partial: Math.round(minSincePartial),
+                    peak_giveback_pct: Number(peakGiveback.toFixed(4)),
+                    gross_pnl_pct: pnlGross,
+                    hold_minutes: holdMin,
+                  }),
+                );
+              }
+            }
+            if (!p.partial_tp_done && pnlGross >= s.partial_take_profit_pct) {
+              reasonExit = p.strict_exit ? "partial_take_profit_1st_strict" : "partial_take_profit";
+              ratio = s.partial_take_profit_ratio;
+              stopTriggerKind = null;
+            } else if (p.partial_tp_done && now <= p.trailing_stop_price) {
+              reasonExit = p.strict_exit ? "trailing_runner_exit_strict" : "trailing_take_profit";
               stopTriggerKind = "time_stop";
+            } else if (p.breakeven_armed && pnlGross <= s.breakeven_floor_pct) {
+              reasonExit = "breakeven_exit";
+              stopTriggerKind = "breakeven_protect";
+            } else if (
+              holdMin >= recv.giveup_minutes &&
+              p.max_pnl_pct < recv.min_peak_pct_to_skip_catastrophic &&
+              pnlGross <= recv.catastrophic_exit_pct
+            ) {
+              reasonExit = `stable_catastrophic_exit_${recv.catastrophic_exit_pct}`;
+              stopTriggerKind = "price_stop";
+            } else if (holdMin >= weakHoldMin && p.max_pnl_pct < 0.35 && pnlGross < 0) {
+              reasonExit = "weak_market_time_stop";
+              stopTriggerKind = "time_stop";
+            }
+          }
+        } else if (!reasonExit) {
+          const xm = p.strict_exit ? STRICT_NEW_POSITION_EXIT.momentum : null;
+          const m = xm
+            ? {
+                breakeven_arm_pct: xm.breakeven_arm_pct,
+                breakeven_floor_pct: xm.breakeven_floor_pct,
+                partial_take_profit_pct: xm.partial_tp_pct,
+                partial_take_profit_ratio: xm.partial_tp_ratio,
+                trailing_from_peak_pct: xm.trailing_peak_pct,
+                time_stop_min_minutes: STRATEGY_RISK_CONFIG.momentum.time_stop_min_minutes,
+                time_stop_max_minutes: STRATEGY_RISK_CONFIG.momentum.time_stop_max_minutes,
+              }
+            : STRATEGY_RISK_CONFIG.momentum;
+          const recvM = xm
+            ? {
+                giveup_minutes: xm.giveup_minutes,
+                min_peak_pct_to_skip_catastrophic: xm.min_peak_pct_skip_catastrophic,
+                catastrophic_exit_pct: xm.catastrophic_exit_pct,
+              }
+            : RECOVERY_EXIT_CONFIG.momentum;
+
+          if (xm) {
+            if (holdMin >= xm.hard_stop_min_hold_min && pnlGross <= xm.hard_stop_pct) {
+              reasonExit = "strict_hard_stop_loss";
+              stopTriggerKind = "price_stop";
+            }
+            if (!reasonExit && holdMin >= xm.early_cut_minutes && p.max_pnl_pct < xm.early_cut_max_peak_pct && pnlGross <= xm.early_cut_pnl_pct) {
+              reasonExit = "strict_early_loss_cut";
+              stopTriggerKind = "price_stop";
+            }
+          }
+          if (!reasonExit) {
+            if (!p.breakeven_armed && pnlGross >= m.breakeven_arm_pct) {
+              p.breakeven_armed = true;
+              p.breakeven_armed_at = new Date().toISOString();
+              state.trades.push({
+                timestamp: p.breakeven_armed_at,
+                entry_ts: p.entry_ts,
+                market,
+                action: "buy",
+                order_krw: 0,
+                filled_qty: 0,
+                avg_buy_price: p.entry_price,
+                exit_price: now,
+                pnl_krw: 0,
+                pnl_pct: pnlGross,
+                reason_enter: p.reason_enter,
+                reason_exit: "breakeven_armed",
+                holding_minutes: holdMin,
+                signal_strength: p.signal_strength,
+                volume_ratio: p.volume_ratio,
+                strategy_tag: "live_data_mode_v1",
+                strategy_type: p.strategy_type,
+                stop_trigger_kind: "breakeven_protect",
+                current_net_pnl_pct: pnlGross,
+                liquidation_reason: "breakeven_armed",
+                remaining_qty: p.qty,
+                highest_price_after_entry: p.highest_price_after_entry,
+                trailing_stop_price: p.trailing_stop_price,
+                breakeven_armed_at: p.breakeven_armed_at,
+                partial_tp_at: p.partial_tp_at,
+              });
+              await opts.onEvent?.({
+                timestamp: p.breakeven_armed_at,
+                event_type: "breakeven_armed",
+                market,
+                strategy_type: p.strategy_type,
+                market_state: null,
+                side: "sell",
+                reason: "breakeven_protect",
+                balance_krw: null,
+                position_qty: p.qty,
+                avg_buy_price: p.entry_price,
+                current_price: now,
+                pnl_net: null,
+                pnl_net_pct: pnlGross,
+                note: p.strict_exit ? "momentum breakeven armed (strict_new)" : "momentum breakeven armed",
+              });
+            }
+            p.trailing_stop_price = p.highest_price_after_entry * (1 - m.trailing_from_peak_pct / 100);
+            if (!reasonExit && p.partial_tp_done && p.partial_tp_at) {
+              const minSincePartial = minutesSince(p.partial_tp_at);
+              const peakGiveback = p.max_pnl_pct - pnlGross;
+              const stalledFromPeak =
+                minSincePartial >= LIVE_RESIDUAL_MIN_MINUTES_AFTER_PARTIAL &&
+                peakGiveback >= LIVE_RESIDUAL_PEAK_GIVEBACK_PCT &&
+                pnlGross < LIVE_RESIDUAL_STALL_PNL_CAP;
+              const slotHog =
+                holdMin >= LIVE_RESIDUAL_MAX_HOLD_MINUTES && p.max_pnl_pct < 3.5 && pnlGross < 2.2;
+              if (stalledFromPeak || slotHog) {
+                reasonExit = "residual_full_exit_escalation";
+                ratio = 1;
+                stopTriggerKind = "time_stop";
+                console.info(
+                  JSON.stringify({
+                    tag: "DEBUG_LIVE_RESIDUAL_EXIT_ESCALATION",
+                    ts: new Date().toISOString(),
+                    symbol: market,
+                    strategy_type: "momentum",
+                    stalled_from_peak: stalledFromPeak,
+                    slot_hog: slotHog,
+                    minutes_since_partial: Math.round(minSincePartial),
+                    peak_giveback_pct: Number(peakGiveback.toFixed(4)),
+                    gross_pnl_pct: pnlGross,
+                    hold_minutes: holdMin,
+                  }),
+                );
+              }
+            }
+            if (!p.partial_tp_done && pnlGross >= m.partial_take_profit_pct) {
+              reasonExit = p.strict_exit ? "partial_take_profit_1st_strict" : "partial_take_profit";
+              ratio = m.partial_take_profit_ratio;
+            } else if (p.partial_tp_done && now <= p.trailing_stop_price) {
+              reasonExit = p.strict_exit ? "trailing_runner_exit_strict" : "trailing_take_profit";
+              stopTriggerKind = "time_stop";
+            } else if (p.breakeven_armed && pnlGross <= m.breakeven_floor_pct) {
+              reasonExit = "momentum_breakeven_protect";
+              stopTriggerKind = "breakeven_protect";
+            } else if (
+              holdMin >= recvM.giveup_minutes &&
+              p.max_pnl_pct < recvM.min_peak_pct_to_skip_catastrophic &&
+              pnlGross <= recvM.catastrophic_exit_pct
+            ) {
+              reasonExit = `momentum_catastrophic_exit_${recvM.catastrophic_exit_pct}`;
+              stopTriggerKind = "price_stop";
+            } else {
+              try {
+                const c1 = await fetchMinuteCandlesCached(market, 1, 8);
+                const last = c1[c1.length - 1];
+                const prev = c1[c1.length - 2];
+                if (last && prev) {
+                  const lastNotional = last.candle_acc_trade_volume * last.trade_price;
+                  const prevNotional = Math.max(1, prev.candle_acc_trade_volume * prev.trade_price);
+                  const dealDrop = lastNotional / prevNotional < 0.45;
+                  const range = Math.max(1e-9, last.high_price - last.low_price);
+                  const closeLow = (last.trade_price - last.low_price) / range < 0.28;
+                  const upperWickWeak = (last.high_price - last.trade_price) / range > 0.55 && last.trade_price <= last.opening_price;
+                  const breakoutLowBreak = last.trade_price < prev.low_price;
+                  if (dealDrop || closeLow || upperWickWeak || breakoutLowBreak) {
+                    reasonExit = "momentum_pattern_break";
+                    stopTriggerKind = "pattern_break";
+                  }
+                }
+              } catch {}
+              if (!reasonExit && holdMin >= m.time_stop_min_minutes && holdMin <= m.time_stop_max_minutes && p.max_pnl_pct < 0.8 && pnlGross <= -0.1) {
+                reasonExit = "momentum_time_stop";
+                stopTriggerKind = "time_stop";
+              }
             }
           }
         }
@@ -3071,6 +3109,7 @@ export function createLiveDataStrategy(opts: {
       const blockedByMicroLoss = withinEarlyLossGuard && isStopLike && netPnlPctEst > LIVE_MIN_EXIT_LOSS_PCT && reasonExit !== "emergency_stop_loss";
 
       const emergencyExit =
+        reasonExit.startsWith("surge_") ||
         reasonExit === "emergency_stop_loss" ||
         reasonExit === "weak_market_price_stop" ||
         reasonExit === "strict_hard_stop_loss" ||
