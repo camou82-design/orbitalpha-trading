@@ -2709,6 +2709,7 @@ export function createLiveDataStrategy(opts: {
       }
       const holdMin = minutesSince(p.entry_ts);
       const isSurge = isSurgePosition(p);
+      let isSurgeExitDecision = false;
       if (isSurge && !reasonExit) {
         const decision = evaluateSurgeExit(p, now);
         if (decision.runnerTrailActive !== (p as any).runner_trail_active) {
@@ -2739,8 +2740,9 @@ export function createLiveDataStrategy(opts: {
           reasonExit = decision.reason;
           ratio = decision.ratio;
           stopTriggerKind = "price_stop";
-          exitAuthorityClass = "none";
+          exitAuthorityClass = "emergency_exit";
           exitReasonDetail = "surge-v2-exit-engine";
+          isSurgeExitDecision = true;
         }
       } else if (!isSurge && !reasonExit) {
         const weakModeTighterStop = (state.regime?.btc_filter_state ?? "neutral") === "weak" ? LIVE_BTC_WEAK_TIGHT_STOP_PCT : null;
@@ -3110,6 +3112,7 @@ export function createLiveDataStrategy(opts: {
 
       const emergencyExit =
         reasonExit.startsWith("surge_") ||
+        isSurgeExitDecision ||
         reasonExit === "emergency_stop_loss" ||
         reasonExit === "weak_market_price_stop" ||
         reasonExit === "strict_hard_stop_loss" ||
