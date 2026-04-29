@@ -1405,7 +1405,8 @@ export function createPaperTradingEngine(opts: {
   };
 
   function emaLast(values: number[], period: number): number | null {
-    if (values.length < period) return null;
+    // 250 -> 200 대응: 200 EMA 계산 시 180개 이상이면 허용
+    if (values.length < Math.min(period, 180)) return null;
     let ema = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
     const k = 2 / (period + 1);
     for (let i = period; i < values.length; i++) {
@@ -1626,9 +1627,9 @@ export function createPaperTradingEngine(opts: {
       // [ORIGINAL SETUP] Primary Filter for Paper Trading
       let setupResult: OriginalSpotSetupResult | null = null;
       try {
-        const c250 = await fetchMinuteCandles(market, 1, 250);
-        if (c250.length >= 250) {
-          const completed = c250.slice(0, -1);
+        const c1 = await fetchMinuteCandles(market, 1, 200);
+        if (c1.length >= 200) {
+          const completed = c1.slice(0, -1);
           const closes = completed.map(c => Number(c.trade_price));
           const lows = completed.map(c => Number(c.low_price));
           const volumes = completed.map(c => Number(c.candle_acc_trade_volume));

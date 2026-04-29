@@ -36,7 +36,8 @@ function num(x: unknown): number {
 }
 
 function emaLast(closes: readonly number[], period: number): number | null {
-  if (closes.length < period) return null;
+  // 250 -> 200 대응: EMA 200 계산 시 180개 이상이면 허용 (A안)
+  if (closes.length < Math.min(period, 180)) return null;
   const k = 2 / (period + 1);
   let e = closes[0]!;
   for (let i = 1; i < closes.length; i++) e = closes[i]! * k + e * (1 - k);
@@ -1038,8 +1039,9 @@ function evaluateOriginalSpotScalpingSetup(
   candles1: UpbitCandle[],
   currentPrice: number,
 ): OriginalSpotSetupResult {
-  if (candles1.length < 250) {
-    return { ok: false, mode: "none", reason: `insufficient_candles:${candles1.length}<250` };
+  // 250 -> 200 대응 (Upbit 단일 fetch 최대가 200이므로 250 요구 시 모두 탈락함)
+  if (candles1.length < 200) {
+    return { ok: false, mode: "none", reason: `insufficient_candles:${candles1.length}<200` };
   }
 
   const completed = candles1.slice(0, -1);
@@ -3505,8 +3507,8 @@ export function createLiveDataStrategy(opts: {
           return null;
         }
 
-        // [ORIGINAL SETUP] Primary Gate Enforcement
-        const candles1 = await fetchMinuteCandlesCached(m, 1, 250);
+        // [ORIGINAL SETUP] Primary Gate Enforcement (Upbit fetch limit is 200)
+        const candles1 = await fetchMinuteCandlesCached(m, 1, 200);
         const setup = evaluateOriginalSpotScalpingSetup(m, candles1, currentPx);
         if (!setup.ok) {
           evaluationDroppedReasons[m] = `setup_blocked:${setup.reason}`;
