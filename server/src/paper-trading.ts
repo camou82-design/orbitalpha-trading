@@ -587,7 +587,16 @@ export function createPaperTradingEngine(opts: {
     seenSignalKeys: Set<string>;
     lifecycle: Map<string, MarketLifecycle>;
     /** 스캐너 기준 진입 직전(선·추가 진입 조건 감시), 과거 candidate_pool */
-    preEntryWatch: Map<string, { score: number; reason: string; status: string; detectedAt: number; signalStrength: string }>;
+    preEntryWatch: Map<string, { 
+      score: number; 
+      reason: string; 
+      status: string; 
+      detectedAt: number; 
+      signalStrength: string;
+      breakout?: boolean;
+      volumeMultiple?: number;
+      excludeReasons?: string[];
+    }>;
     metrics: {
       preEntryWatchHits: number;
       entriesOpened: number;
@@ -1717,7 +1726,10 @@ export function createPaperTradingEngine(opts: {
           reason: sig.reason,
           status: sig.status,
           detectedAt: Date.now(),
-          signalStrength: sig.signal_strength,
+          signalStrength: (sig as any).signal_strength ?? "normal",
+          breakout: sig.breakout,
+          volumeMultiple: sig.volume_multiple,
+          excludeReasons: sig.exclude_reasons,
         });
         state.metrics.preEntryWatchHits += 1;
         setLifecycle(market, "pre_entry", { candidate_score: sig.score, last_reason: sig.reason });
@@ -2350,7 +2362,29 @@ export function createPaperTradingEngine(opts: {
       })),
       surge_v2_shadow: watchMarkets.slice(0, 5).map((m) => {
         const px = priceByMarket[m] ?? 0;
-        const sj = buildSurgeV2ShadowJudgment(m, { price: px });
+        const candidate = state.preEntryWatch.get(m);
+        const position = state.positions[m];
+        
+        // Collect indicators safely from candidate/position/state
+        const indicators = {
+          price: px,
+          volume_ratio: candidate?.volumeMultiple ?? 0,
+          volume_ratio_proxy: candidate?.volumeMultiple ?? 0,
+          change_rate: candidate ? 0.5 : 0, // Placeholder if not in signal
+          score: candidate?.score ?? 0,
+          breakout: candidate?.breakout ?? false,
+          box_breakout: candidate?.reason?.includes("box") ?? false,
+          upper_wick: candidate?.excludeReasons?.includes("volume_spike_close_fail") ?? false,
+          volume_spike_close_fail: candidate?.excludeReasons?.includes("volume_spike_close_fail") ?? false,
+          late_chase_risk: candidate?.reason?.includes("chase") ?? false,
+          stale_data: candidate ? (Date.now() - candidate.detectedAt) > 60000 : true,
+          unrealized_pnl_pct: position ? ((px / position.entry_price) - 1) * 100 : 0,
+          hold_ms: position ? (Date.now() - Date.parse(position.entry_ts)) : 0,
+          entry_price: position?.entry_price,
+          current_price: px,
+        };
+
+        const sj = buildSurgeV2ShadowJudgment(m, indicators);
         console.info(JSON.stringify({
           tag: "SURGE_V2_PERF_PROOF",
           ts: sj.ts,

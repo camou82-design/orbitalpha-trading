@@ -1,31 +1,34 @@
 
 export type SurgeEarlyReport = {
   score: number;
-  stage: "COLD" | "WARM" | "HOT" | "EXPLOSIVE";
+  stage: "cold" | "warming" | "early_surge_candidate" | "active_surge" | "late_chase_risk";
   reason: string;
 };
 
 export function detectEarlySurge(market: string, indicators: any): SurgeEarlyReport {
-  // Shadow mode logic: heuristic based on price and market name
-  const price = Number(indicators?.price ?? 0);
+  // Use indicators: volume_ratio, change_rate, score, breakout flags
+  const vr = Number(indicators?.volume_ratio ?? indicators?.volume_ratio_proxy ?? 0);
+  const cr = Number(indicators?.change_rate ?? 0);
+  const sc = Number(indicators?.score ?? 0);
+  const breakout = Boolean(indicators?.breakout || indicators?.box_breakout);
+  
   let score = 50;
+  if (vr > 2) score += 10;
+  if (cr > 1) score += 10;
+  if (sc > 80) score += 15;
+  if (breakout) score += 15;
+
+  let stage: SurgeEarlyReport["stage"] = "cold";
+  if (score > 85) stage = "active_surge";
+  else if (score > 75) stage = "early_surge_candidate";
+  else if (score > 60) stage = "warming";
   
-  if (market.startsWith("KRW-")) score += 5;
-  if (price > 1000) score += 5;
-  if (price > 10000) score += 10;
-  if (price > 100000) score += 15;
-  
-  // Cap at 95
-  score = Math.min(score, 95);
-  
-  let stage: SurgeEarlyReport["stage"] = "COLD";
-  if (score > 80) stage = "EXPLOSIVE";
-  else if (score > 65) stage = "HOT";
-  else if (score > 55) stage = "WARM";
+  // Late chase check
+  if (cr > 5 && vr < 1.5) stage = "late_chase_risk";
 
   return {
     score,
     stage,
-    reason: `Price-based heuristic: ${price}`,
+    reason: `vr=${vr.toFixed(1)}, cr=${cr.toFixed(1)}, breakout=${breakout}`,
   };
 }

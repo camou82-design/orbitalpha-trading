@@ -9,8 +9,9 @@ export type SurgeV2Judgment = {
   ts: string;
   surgeEarlyScore: number;
   surgeValidationScore: number;
-  surgeProfitAction: "HOLD" | "EXIT" | "PARTIAL_EXIT";
-  validationGrade: "S" | "A" | "B" | "C" | "F";
+  surgeProfitAction: "none" | "protect_break_even" | "partial_take_profit" | "hold_runner" | "tighten_exit" | "exit_now_candidate";
+  validationGrade: "strong" | "valid" | "weak" | "reject_risk";
+  surgeStage: "cold" | "warming" | "early_surge_candidate" | "active_surge" | "late_chase_risk";
   runnerAllowed: boolean;
   fakePumpExitRisk: number;
 };
@@ -28,6 +29,7 @@ export function buildSurgeV2ShadowJudgment(market: string, data: any): SurgeV2Ju
     surgeValidationScore: validation.validationScore,
     surgeProfitAction: profit.action,
     validationGrade: validation.validationGrade,
+    surgeStage: early.stage,
     runnerAllowed: profit.runnerAllowed,
     fakePumpExitRisk: risk.fakePumpExitRisk,
   };

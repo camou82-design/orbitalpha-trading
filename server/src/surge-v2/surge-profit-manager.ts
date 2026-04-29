@@ -1,18 +1,30 @@
 
 export type SurgeProfitReport = {
-  action: "HOLD" | "EXIT" | "PARTIAL_EXIT";
+  action: "none" | "protect_break_even" | "partial_take_profit" | "hold_runner" | "tighten_exit" | "exit_now_candidate";
   runnerAllowed: boolean;
   pnlProtectionNeeded: boolean;
 };
 
 export function manageSurgeProfit(market: string, position: any): SurgeProfitReport {
-  // Shadow mode logic
-  const price = Number(position?.price ?? 0);
+  // Use position: unrealized_pnl_pct, hold_ms, current_price, entry_price
   const pnl = Number(position?.unrealized_pnl_pct ?? 0);
-  
+  const holdMs = Number(position?.hold_ms ?? 0);
+  const hasPos = Boolean(position && position.entry_price);
+
+  if (!hasPos) {
+    return { action: "none", runnerAllowed: false, pnlProtectionNeeded: false };
+  }
+
+  let action: SurgeProfitReport["action"] = "none";
+  if (pnl > 10) action = "exit_now_candidate";
+  else if (pnl > 5) action = "tighten_exit";
+  else if (pnl > 3) action = "hold_runner";
+  else if (pnl > 1.5) action = "partial_take_profit";
+  else if (pnl > 0.5) action = "protect_break_even";
+
   const report: SurgeProfitReport = {
-    action: pnl > 5 ? "EXIT" : pnl > 2 ? "PARTIAL_EXIT" : price > 0 ? "HOLD" : "EXIT",
-    runnerAllowed: pnl < 3,
+    action,
+    runnerAllowed: pnl < 4,
     pnlProtectionNeeded: pnl > 1,
   };
   
@@ -21,8 +33,8 @@ export function manageSurgeProfit(market: string, position: any): SurgeProfitRep
     ts: new Date().toISOString(),
     market,
     pnl,
+    hold_ms: holdMs,
     action: report.action,
-    runner_allowed: report.runnerAllowed,
   }));
 
   return report;
