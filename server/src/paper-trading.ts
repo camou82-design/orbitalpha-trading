@@ -2337,43 +2337,68 @@ export function createPaperTradingEngine(opts: {
     const avgWinLossRatio = avgLoss > 0 ? avgWin / avgLoss : 0;
 
     // shadow_v2 targets: positions + top candidates (using available prices only)
-    const shadowTargetMarkets = Array.from(new Set([
-      ...positionsMarkets,
-      ...candidateMarkets.slice(0, 5)
-    ])).slice(0, 10);
+    const LOCAL_SHADOW_ENABLED = (process.env.PAPER_STATUS_LOCAL_SURGE_SHADOW_ENABLED ?? "true").toLowerCase() === "true";
+    let shadowV2: any[] = [];
+    
+    if (LOCAL_SHADOW_ENABLED) {
+      const shadowTargetMarkets = Array.from(new Set([
+        ...positionsMarkets,
+        ...candidateMarkets.slice(0, 5)
+      ])).slice(0, 10);
 
-    const shadowV2 = shadowTargetMarkets.map((m) => {
-      const px = priceByMarket[m] ?? 0;
-      const candidate = state.preEntryWatch.get(m);
-      const position = state.positions[m];
-      
-      const volMul = candidate?.volumeMultiple ?? 0;
-      const indicators = {
-        price: px,
-        volume_ratio: volMul,
-        volume_ratio_proxy: volMul,
-        volume_sustain: volMul >= 2 ? 0.8 : volMul >= 1.2 ? 0.55 : 0.5,
-        price_hold: 0.5,
-        pullback_quality: (candidate?.reason?.includes("pullback") || candidate?.reason?.includes("reclaim")) ? 0.7 : 0.5,
-        change_rate: candidate?.changeRate ?? 0,
-        score: candidate?.score ?? 0,
-        breakout: candidate?.breakout ?? false,
-        box_breakout: candidate?.reason?.includes("box") ?? false,
-        upper_wick: candidate?.excludeReasons?.includes("volume_spike_close_fail") || candidate?.excludeReasons?.includes("윗꼬리 과다"),
-        volume_spike_close_fail: candidate?.excludeReasons?.includes("volume_spike_close_fail") ?? false,
-        late_chase_risk: candidate?.reason?.includes("chase") || candidate?.excludeReasons?.includes("과열 (추격주의)"),
-        fake_pump_risk: (candidate?.excludeReasons?.includes("volume_spike_close_fail") || candidate?.excludeReasons?.includes("윗꼬리 과다") || candidate?.reason?.includes("chase")) ? 0.7 : 0.3,
-        candidate_missing: !candidate,
-        stale_data: candidate ? (Date.now() - candidate.detectedAt) > 60000 : false,
-        unrealized_pnl_pct: position ? ((px / position.entry_price) - 1) * 100 : 0,
-        hold_ms: position ? (Date.now() - Date.parse(position.entry_ts)) : 0,
-        entry_price: position?.entry_price,
-        current_price: px,
-      };
+      shadowV2 = shadowTargetMarkets.map((m) => {
+        const px = priceByMarket[m] ?? 0;
+        const candidate = state.preEntryWatch.get(m);
+        const position = state.positions[m];
+        
+        const volMul = candidate?.volumeMultiple ?? 0;
+        const indicators = {
+          price: px,
+          volume_ratio: volMul,
+          volume_ratio_proxy: volMul,
+          volume_sustain: volMul >= 2 ? 0.8 : volMul >= 1.2 ? 0.55 : 0.5,
+          price_hold: 0.5,
+          pullback_quality: (candidate?.reason?.includes("pullback") || candidate?.reason?.includes("reclaim")) ? 0.7 : 0.5,
+          change_rate: candidate?.changeRate ?? 0,
+          score: candidate?.score ?? 0,
+          breakout: candidate?.breakout ?? false,
+          box_breakout: candidate?.reason?.includes("box") ?? false,
+          upper_wick: candidate?.excludeReasons?.includes("volume_spike_close_fail") || candidate?.excludeReasons?.includes("윗꼬리 과다"),
+          volume_spike_close_fail: candidate?.excludeReasons?.includes("volume_spike_close_fail") ?? false,
+          late_chase_risk: candidate?.reason?.includes("chase") || candidate?.excludeReasons?.includes("과열 (추격주의)"),
+          fake_pump_risk: (candidate?.excludeReasons?.includes("volume_spike_close_fail") || candidate?.excludeReasons?.includes("윗꼬리 과다") || candidate?.reason?.includes("chase")) ? 0.7 : 0.3,
+          candidate_missing: !candidate,
+          stale_data: candidate ? (Date.now() - candidate.detectedAt) > 60000 : false,
+          unrealized_pnl_pct: position ? ((px / position.entry_price) - 1) * 100 : 0,
+          hold_ms: position ? (Date.now() - Date.parse(position.entry_ts)) : 0,
+          entry_price: position?.entry_price,
+          current_price: px,
+        };
 
-      const sj = buildSurgeV2ShadowJudgment(m, indicators);
-      return sj;
-    });
+        const sj = buildSurgeV2ShadowJudgment(m, indicators);
+        return {
+          ...sj,
+          source: "api_local_shadow_v2"
+        };
+      });
+    }
+
+    const localShadowV2Count = shadowV2.length;
+    const workerShadowV2Count = workerShadowItems.length;
+    const workerAvailable = workerShadowV2Count > 0 && workerAgeMs !== null;
+    const workerStaleLimit = 180000; // 3 minutes
+    const workerIsFresh = workerAvailable && workerAgeMs! < workerStaleLimit;
+
+    let preferredSource: "worker" | "local" | "none" = "none";
+    let preferredItems: any[] = [];
+
+    if (workerIsFresh) {
+      preferredSource = "worker";
+      preferredItems = workerShadowItems;
+    } else if (LOCAL_SHADOW_ENABLED) {
+      preferredSource = "local";
+      preferredItems = shadowV2;
+    }
 
     const shadowV2Count = shadowV2.length;
     const updatedAt = new Date().toISOString();
@@ -2387,7 +2412,7 @@ export function createPaperTradingEngine(opts: {
     if (universeCount === 0) {
       statusCode = "empty_universe";
       statusMessage = "현재 감시 유니버스가 없습니다";
-    } else if (candidateCount === 0 && shadowV2Count === 0) {
+    } else if (candidateCount === 0 && preferredItems.length === 0) {
       statusCode = "no_candidate";
       statusMessage = "현재 실거래 후보가 없습니다";
     }
@@ -2409,10 +2434,19 @@ export function createPaperTradingEngine(opts: {
       data_source: "live",
       has_universe: universeCount > 0,
       has_candidate: candidateCount > 0,
-      has_shadow_v2: shadowV2Count > 0,
+      has_shadow_v2: preferredItems.length > 0,
       universe_count: universeCount,
       candidate_count: candidateCount,
-      shadow_v2_count: shadowV2Count,
+      shadow_v2_count: preferredItems.length,
+      
+      // Detailed Shadow Stats
+      preferred_shadow_v2_source: preferredSource,
+      preferred_shadow_v2_count: preferredItems.length,
+      local_shadow_v2_enabled: LOCAL_SHADOW_ENABLED,
+      local_shadow_v2_count: localShadowV2Count,
+      worker_shadow_v2_available: workerAvailable,
+      worker_shadow_v2_age_ms: workerAgeMs,
+      
       degraded_reasons: degradedReasons,
       last_error: null,
       ...summary,
@@ -2470,6 +2504,7 @@ export function createPaperTradingEngine(opts: {
         items: workerShadowItems,
         diagnostics: workerSnap?.diagnostics ?? null
       },
+      preferred_shadow_v2_items: preferredItems,
       files: { state: stateFile },
     };
     return res;
