@@ -6,6 +6,7 @@ import { fetchMinuteCandles, fetchTickers } from "./upbit-public.js";
 import { buildSurgeV2ShadowJudgment } from "./surge-v2/index.js";
 import { readJsonFile } from "./runtime-file-io.js";
 import { surgeCandidatesRuntimePath } from "./runtime-paths.js";
+import { LogDeduper } from "./log-deduper.js";
 
 type PaperStateValue = "SIGNAL" | "OPEN" | "PARTIAL_EXIT" | "CLOSED_WIN" | "CLOSED_LOSS" | "CLOSED_TIMEOUT" | "SKIPPED";
 
@@ -626,6 +627,9 @@ export function createPaperTradingEngine(opts: {
     fineProfileStats: {},
     surgePatternStats: {},
   };
+
+  let tickInFlight = false;
+  const setupBlockLogDeduper = new LogDeduper(3000, 60_000);
 
   const trimHistoryAndSignals = () => {
     if (state.history.length > PAPER_HISTORY_MAX) state.history = state.history.slice(-PAPER_HISTORY_MAX);
@@ -1604,8 +1608,14 @@ export function createPaperTradingEngine(opts: {
   }
 
   const tick = async () => {
-    const loopId = Date.now();
-    const scannerSignals = opts.getScannerSignals();
+    if (tickInFlight) {
+      emitPaper("PAPER_TICK_SKIPPED_IN_FLIGHT", { ts: new Date().toISOString() });
+      return;
+    }
+    tickInFlight = true;
+    try {
+      const loopId = Date.now();
+      const scannerSignals = opts.getScannerSignals();
     emitPaper("DEBUG_PAPER_SIGNAL_HANDOFF", {
       scanner_signals_length: scannerSignals.length,
       markets: scannerSignals.map((s) => String(s?.market ?? "")).filter((m) => m).slice(0, 50),
@@ -1859,38 +1869,42 @@ export function createPaperTradingEngine(opts: {
       }
 
       if (!setupResult || !setupResult.ok) {
-        emitPaper("DEBUG_ORIGINAL_SPOT_SETUP_BLOCK", { 
-          market, 
-          ok: false, 
-          reason: setupResult?.reason ?? "setup_conditions_not_met",
-          loop_id: loopId,
-          evaluation_source: "paper_trading_tick",
-          candles_count: c1.length,
-          current_price: px,
-          ema50: setupResult?.ema50,
-          ema200: setupResult?.ema200,
-          rsi: setupResult?.rsi,
-          stochK: setupResult?.stochK,
-          stochD: setupResult?.stochD,
-          volumeRatio: setupResult?.volumeRatio,
-          swingLow: setupResult?.swingLow,
-          stopPrice: setupResult?.stop,
-          targetPrice: setupResult?.target,
-          riskReward: setupResult?.rr,
-          safePriceAboveEma200: setupResult?.safePriceAboveEma200,
-          pullbackToEma200: setupResult?.pullbackToEma200,
-          stochOversoldBullishCross: setupResult?.stochOversoldBullishCross,
-          isBullish: setupResult?.isBullish,
-          safe_condition_pass: setupResult?.safe_condition_pass,
-          aggressiveEmaStack: setupResult?.aggressiveEmaStack,
-          aggressivePriceAbove: setupResult?.aggressivePriceAbove,
-          aggressiveRsiOk: setupResult?.aggressiveRsiOk,
-          aggressiveVolumeOk: setupResult?.aggressiveVolumeOk,
-          aggressiveRiskRewardOk: setupResult?.aggressiveRiskRewardOk,
-          aggressive_condition_pass: setupResult?.aggressive_condition_pass,
-          final_reason: setupResult?.reason ?? "setup_conditions_not_met",
-          failed_conditions: setupResult?.failed_conditions ?? ["unknown"],
-        });
+        const blockReason = setupResult?.reason ?? "setup_conditions_not_met";
+        const dedupeKey = `DEBUG_ORIGINAL_SPOT_SETUP_BLOCK|paper_trading_tick|${market}|${blockReason}|paper`;
+        if (setupBlockLogDeduper.shouldLog(dedupeKey)) {
+          emitPaper("DEBUG_ORIGINAL_SPOT_SETUP_BLOCK", { 
+            market, 
+            ok: false, 
+            reason: blockReason,
+            loop_id: loopId,
+            evaluation_source: "paper_trading_tick",
+            candles_count: c1.length,
+            current_price: px,
+            ema50: setupResult?.ema50,
+            ema200: setupResult?.ema200,
+            rsi: setupResult?.rsi,
+            stochK: setupResult?.stochK,
+            stochD: setupResult?.stochD,
+            volumeRatio: setupResult?.volumeRatio,
+            swingLow: setupResult?.swingLow,
+            stopPrice: setupResult?.stop,
+            targetPrice: setupResult?.target,
+            riskReward: setupResult?.rr,
+            safePriceAboveEma200: setupResult?.safePriceAboveEma200,
+            pullbackToEma200: setupResult?.pullbackToEma200,
+            stochOversoldBullishCross: setupResult?.stochOversoldBullishCross,
+            isBullish: setupResult?.isBullish,
+            safe_condition_pass: setupResult?.safe_condition_pass,
+            aggressiveEmaStack: setupResult?.aggressiveEmaStack,
+            aggressivePriceAbove: setupResult?.aggressivePriceAbove,
+            aggressiveRsiOk: setupResult?.aggressiveRsiOk,
+            aggressiveVolumeOk: setupResult?.aggressiveVolumeOk,
+            aggressiveRiskRewardOk: setupResult?.aggressiveRiskRewardOk,
+            aggressive_condition_pass: setupResult?.aggressive_condition_pass,
+            final_reason: blockReason,
+            failed_conditions: setupResult?.failed_conditions ?? ["unknown"],
+          });
+        }
         continue; 
       }
       emitPaper("DEBUG_ORIGINAL_SPOT_SETUP_PASS", { market, mode: setupResult.mode, reason: setupResult.reason });
@@ -2493,6 +2507,9 @@ export function createPaperTradingEngine(opts: {
     }
 
     await persist();
+    } finally {
+      tickInFlight = false;
+    }
   };
 
   const status = async () => {

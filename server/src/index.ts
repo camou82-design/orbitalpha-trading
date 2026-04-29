@@ -454,9 +454,29 @@ async function main() {
     },
     "ENGINE1_SCANNER_RUNTIME_MODE",
   );
+  let marketStateTickInFlight = false;
+  let marketStateFailCount = 0;
+  let nextMarketStateEvalAt = 0;
   const marketStateTimer = setInterval(() => {
+    const now = Date.now();
+    if (marketStateTickInFlight || now < nextMarketStateEvalAt) return;
+
     lastMarketStateTickAt = new Date().toISOString();
-    void marketFilter.evaluate().catch((e) => app.log.error({ err: String(e) }, "market_state_tick_failed"));
+    marketStateTickInFlight = true;
+    void marketFilter.evaluate()
+      .then(() => {
+        marketStateFailCount = 0;
+        nextMarketStateEvalAt = 0;
+      })
+      .catch((e) => {
+        marketStateFailCount++;
+        const backoffMs = Math.min(300_000, 15_000 * Math.pow(2, Math.min(marketStateFailCount - 1, 5)));
+        nextMarketStateEvalAt = Date.now() + backoffMs;
+        app.log.error({ err: String(e), failCount: marketStateFailCount, nextEvalInMs: backoffMs }, "market_state_tick_failed_storm_prevented");
+      })
+      .finally(() => {
+        marketStateTickInFlight = false;
+      });
   }, 15_000);
   const snapshotTimer = setInterval(() => {
     void (async () => {

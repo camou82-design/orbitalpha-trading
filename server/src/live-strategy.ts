@@ -11,6 +11,7 @@ import {
 import { tradingDataRoot } from "./paths.js";
 import { appendLog } from "./log-store.js";
 import { fetchMinuteCandles, fetchTickers, partitionKrwMarketsByUpbitValidity, type UpbitCandle } from "./upbit-public.js";
+import { LogDeduper } from "./log-deduper.js";
 import {
   LIVE_ENTRY_SIGNAL_GATES,
   RECOVERY_EXIT_CONFIG,
@@ -1542,6 +1543,9 @@ export function createLiveDataStrategy(opts: {
     entry_profile_stats: {},
   };
 
+  let runTickInFlight = false;
+  const setupBlockLogDeduper = new LogDeduper(3000, 60_000);
+
   const persist = async () => {
     await fs.mkdir(baseDir, { recursive: true });
     await fs.writeFile(tradesFile, JSON.stringify(state.trades, null, 2), "utf8");
@@ -1664,6 +1668,11 @@ export function createLiveDataStrategy(opts: {
   };
 
   const runTick = async () => {
+    if (runTickInFlight) {
+      console.info(JSON.stringify({ tag: "LIVE_TICK_SKIPPED_IN_FLIGHT", ts: new Date().toISOString() }));
+      return;
+    }
+    runTickInFlight = true;
     const loopId = Date.now();
     try {
     // 운영 최종값 단일화: persisted 값과 무관하게 매 tick env cap으로 재설정.
@@ -3706,39 +3715,43 @@ export function createLiveDataStrategy(opts: {
         }
 
         if (!setup.ok) {
-          evaluationDroppedReasons[m] = `setup_blocked:${setup.reason}`;
-          console.info(JSON.stringify({
-            tag: "DEBUG_ORIGINAL_SPOT_SETUP_BLOCK",
-            market: m,
-            reason: setup.reason,
-            loop_id: typeof loopId !== 'undefined' ? loopId : Date.now(),
-            evaluation_source: "live_strategy_tick",
-            candles_count: candles1.length,
-            current_price: currentPx,
-            ema50: setup.ema50,
-            ema200: setup.ema200,
-            rsi: setup.rsi,
-            stochK: setup.stochK,
-            stochD: setup.stochD,
-            volumeRatio: setup.volumeRatio,
-            swingLow: setup.swingLow,
-            stopPrice: setup.stopPrice,
-            targetPrice: setup.targetPrice,
-            riskReward: setup.riskReward,
-            safePriceAboveEma200: setup.safePriceAboveEma200,
-            pullbackToEma200: setup.pullbackToEma200,
-            stochOversoldBullishCross: setup.stochOversoldBullishCross,
-            isBullish: setup.isBullish,
-            safe_condition_pass: setup.safe_condition_pass,
-            aggressiveEmaStack: setup.aggressiveEmaStack,
-            aggressivePriceAbove: setup.aggressivePriceAbove,
-            aggressiveRsiOk: setup.aggressiveRsiOk,
-            aggressiveVolumeOk: setup.aggressiveVolumeOk,
-            aggressiveRiskRewardOk: setup.aggressiveRiskRewardOk,
-            aggressive_condition_pass: setup.aggressive_condition_pass,
-            final_reason: setup.reason,
-            failed_conditions: setup.failed_conditions,
-          }));
+          const blockReason = setup.reason ?? "setup_conditions_not_met";
+          const dedupeKey = `DEBUG_ORIGINAL_SPOT_SETUP_BLOCK|live_strategy_tick|${m}|${blockReason}|live`;
+          if (setupBlockLogDeduper.shouldLog(dedupeKey)) {
+            evaluationDroppedReasons[m] = `setup_blocked:${blockReason}`;
+            console.info(JSON.stringify({
+              tag: "DEBUG_ORIGINAL_SPOT_SETUP_BLOCK",
+              market: m,
+              reason: blockReason,
+              loop_id: typeof loopId !== 'undefined' ? loopId : Date.now(),
+              evaluation_source: "live_strategy_tick",
+              candles_count: candles1.length,
+              current_price: currentPx,
+              ema50: setup.ema50,
+              ema200: setup.ema200,
+              rsi: setup.rsi,
+              stochK: setup.stochK,
+              stochD: setup.stochD,
+              volumeRatio: setup.volumeRatio,
+              swingLow: setup.swingLow,
+              stopPrice: setup.stopPrice,
+              targetPrice: setup.targetPrice,
+              riskReward: setup.riskReward,
+              safePriceAboveEma200: setup.safePriceAboveEma200,
+              pullbackToEma200: setup.pullbackToEma200,
+              stochOversoldBullishCross: setup.stochOversoldBullishCross,
+              isBullish: setup.isBullish,
+              safe_condition_pass: setup.safe_condition_pass,
+              aggressiveEmaStack: setup.aggressiveEmaStack,
+              aggressivePriceAbove: setup.aggressivePriceAbove,
+              aggressiveRsiOk: setup.aggressiveRsiOk,
+              aggressiveVolumeOk: setup.aggressiveVolumeOk,
+              aggressiveRiskRewardOk: setup.aggressiveRiskRewardOk,
+              aggressive_condition_pass: setup.aggressive_condition_pass,
+              final_reason: blockReason,
+              failed_conditions: setup.failed_conditions,
+            }));
+          }
           return null;
         }
         console.info(JSON.stringify({ tag: "DEBUG_ORIGINAL_SPOT_SETUP_PASS", market: m, mode: setup.mode, rr: setup.riskReward }));
@@ -5707,6 +5720,8 @@ export function createLiveDataStrategy(opts: {
           stack: e instanceof Error ? String(e.stack ?? "").slice(0, 800) : null,
         }),
       );
+    } finally {
+      runTickInFlight = false;
     }
   };
 
