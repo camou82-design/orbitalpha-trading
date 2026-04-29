@@ -4,6 +4,8 @@ import { tradingDataRoot } from "./paths.js";
 import { UPBIT_FEE_RATE } from "./strategy-risk-config.js";
 import { fetchMinuteCandles, fetchTickers } from "./upbit-public.js";
 import { buildSurgeV2ShadowJudgment } from "./surge-v2/index.js";
+import { readJsonFile } from "./runtime-file-io.js";
+import { surgeCandidatesRuntimePath } from "./runtime-paths.js";
 
 type PaperStateValue = "SIGNAL" | "OPEN" | "PARTIAL_EXIT" | "CLOSED_WIN" | "CLOSED_LOSS" | "CLOSED_TIMEOUT" | "SKIPPED";
 
@@ -2286,6 +2288,20 @@ export function createPaperTradingEngine(opts: {
     const universeMarkets = Array.from(state.preEntryWatch.keys());
     const candidateMarkets = universeMarkets.filter((m) => !state.positions[m]);
 
+    // [New] Read Surge V2 Worker Snapshot (External Shadow)
+    const workerSnapPath = surgeCandidatesRuntimePath();
+    const workerSnap = readJsonFile<{
+      items: any[];
+      updated_at: string;
+      source: string;
+      diagnostics?: any;
+    }>(workerSnapPath);
+    
+    const workerShadowItems = workerSnap?.items ?? [];
+    const workerUpdatedAt = workerSnap?.updated_at ?? null;
+    const workerSource = workerSnap?.source ?? "none";
+    const workerAgeMs = workerUpdatedAt ? Date.now() - Date.parse(workerUpdatedAt) : null;
+
     const universeCount = state.preEntryWatch.size;
     const candidateCount = candidateMarkets.length;
 
@@ -2447,6 +2463,13 @@ export function createPaperTradingEngine(opts: {
         suggested_size_multiplier: Number(s.suggested_size_multiplier ?? 1),
       })),
       surge_v2_shadow: shadowV2,
+      worker_shadow_v2: {
+        source: workerSource,
+        updated_at: workerUpdatedAt,
+        age_ms: workerAgeMs,
+        items: workerShadowItems,
+        diagnostics: workerSnap?.diagnostics ?? null
+      },
       files: { state: stateFile },
     };
     return res;
