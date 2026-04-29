@@ -3,6 +3,7 @@ import path from "node:path";
 import { tradingDataRoot } from "./paths.js";
 import { UPBIT_FEE_RATE } from "./strategy-risk-config.js";
 import { fetchMinuteCandles, fetchTickers } from "./upbit-public.js";
+import { buildSurgeV2ShadowJudgment } from "./surge-v2/index.js";
 
 type PaperStateValue = "SIGNAL" | "OPEN" | "PARTIAL_EXIT" | "CLOSED_WIN" | "CLOSED_LOSS" | "CLOSED_TIMEOUT" | "SKIPPED";
 
@@ -2347,6 +2348,20 @@ export function createPaperTradingEngine(opts: {
         chase_loss_rate: Number(s.chase_loss_rate ?? 0),
         suggested_size_multiplier: Number(s.suggested_size_multiplier ?? 1),
       })),
+      surge_v2_shadow: watchMarkets.slice(0, 5).map((m) => {
+        const sj = buildSurgeV2ShadowJudgment(m, {});
+        console.info(JSON.stringify({
+          tag: "SURGE_V2_PERF_PROOF",
+          ts: sj.ts,
+          market: m,
+          early_score: sj.early.score,
+          validation_grade: sj.validation.validationGrade,
+          fake_pump_risk: sj.risk.fakePumpExitRisk,
+        }));
+        return sj;
+      }),
+      status_code: watchMarkets.length > 0 ? "OK" : "EMPTY_UNIVERSE",
+      status_message: watchMarkets.length > 0 ? "Active monitoring" : "No candidates in universe",
       files: { state: stateFile },
     };
   };

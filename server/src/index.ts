@@ -946,6 +946,14 @@ async function main() {
         "DEBUG_PAPER_STATUS_API_SOURCE",
       );
       const body = { ...out, source_name: "local_paper_engine", source_path: typeof out?.files?.state === "string" ? out.files.state : null };
+      app.log.info(
+        {
+          tag: "SURGE_REAL_TRADE_JUDGMENT_API_PROOF",
+          status_code: out.status_code,
+          shadow_v2_items: Array.isArray(out.surge_v2_shadow) ? out.surge_v2_shadow.length : 0,
+        },
+        "SURGE_REAL_TRADE_JUDGMENT_API_PROOF",
+      );
       c.at = now;
       c.bodyJson = serializeBoundedCacheBody(body);
       return body;

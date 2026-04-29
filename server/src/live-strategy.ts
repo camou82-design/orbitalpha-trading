@@ -3300,6 +3300,17 @@ export function createLiveDataStrategy(opts: {
     const baseEntryUniverseInput = Array.from(new Set([...primary, ...(exceptionSlot ? [exceptionSlot] : []), ...debugUniverseExtra]));
     console.info(
       JSON.stringify({
+        tag: "SURGE_ENTRY_PIPELINE_PROOF",
+        ts: new Date().toISOString(),
+        primary_source: fallbackUsed ? "watch_markets_fallback" : "filter_pass_fresh",
+        primary_count: primary.length,
+        base_input_count: baseEntryUniverseInput.length,
+        base_input_symbols: baseEntryUniverseInput.slice(0, 10),
+        fallback_used: fallbackUsed,
+      }),
+    );
+    console.info(
+      JSON.stringify({
         tag: "DEBUG_ENTRY_INPUT_SOURCE",
         ts: new Date().toISOString(),
         stage: "before_base_entry_universe",
