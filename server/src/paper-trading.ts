@@ -2282,15 +2282,24 @@ export function createPaperTradingEngine(opts: {
   };
 
   const status = async () => {
-    const watchMarkets = Object.keys(state.positions);
-    const tickerRows: any[] = [];
+    const positionsMarkets = Object.keys(state.positions);
+    const universeMarkets = Array.from(state.preEntryWatch.keys());
+    const candidateMarkets = universeMarkets.filter((m) => !state.positions[m]);
+
+    const universeCount = state.preEntryWatch.size;
+    const candidateCount = candidateMarkets.length;
+
+    let tickerRows: any[] = [];
+    let fetchFailed = false;
     try {
-      if (watchMarkets.length > 0) {
-        const rows = await fetchTickers(watchMarkets);
-        tickerRows.push(...rows);
+      // Fetch tickers for both positions and a few top candidates for shadow v2
+      const targets = Array.from(new Set([...positionsMarkets, ...candidateMarkets.slice(0, 10)]));
+      if (targets.length > 0) {
+        tickerRows = await fetchTickers(targets);
       }
     } catch (e) {
-      console.warn({ tag: "PAPER_STATUS_TICKER_FETCH_FAILED", markets: watchMarkets, error: String(e) });
+      console.warn({ tag: "PAPER_STATUS_TICKER_FETCH_FAILED", markets: positionsMarkets, error: String(e) });
+      fetchFailed = true;
     }
 
     const priceByMarket: Record<string, number> = {};
@@ -2302,8 +2311,8 @@ export function createPaperTradingEngine(opts: {
     const summary = buildSummary(priceByMarket);
     const avgEntryLatencyMs =
       state.metrics.entryLatencyMs.length > 0
-        ? state.metrics.entryLatencyMs.reduce((a, b) => a + b, 0) / state.metrics.entryLatencyMs.length
-        : 0;
+    ? state.metrics.entryLatencyMs.reduce((a, b) => a + b, 0) / state.metrics.entryLatencyMs.length
+    : 0;
     const closed = state.history.filter((h) => h.state === "CLOSED_WIN" || h.state === "CLOSED_LOSS" || h.state === "CLOSED_TIMEOUT");
     const wins = closed.filter((h) => (h.pnl_krw ?? 0) > 0).map((h) => Number(h.pnl_krw ?? 0));
     const losses = closed.filter((h) => (h.pnl_krw ?? 0) < 0).map((h) => Math.abs(Number(h.pnl_krw ?? 0)));
@@ -2311,20 +2320,95 @@ export function createPaperTradingEngine(opts: {
     const avgLoss = losses.length > 0 ? losses.reduce((a, b) => a + b, 0) / losses.length : 0;
     const avgWinLossRatio = avgLoss > 0 ? avgWin / avgLoss : 0;
 
-    return {
+    // shadow_v2 targets: positions + top candidates
+    const shadowTargetMarkets = Array.from(new Set([
+      ...positionsMarkets,
+      ...candidateMarkets.slice(0, 5)
+    ])).slice(0, 10);
+
+    const shadowV2 = shadowTargetMarkets.map((m) => {
+      const px = priceByMarket[m] ?? 0;
+      const candidate = state.preEntryWatch.get(m);
+      const position = state.positions[m];
+      
+      const volMul = candidate?.volumeMultiple ?? 0;
+      const indicators = {
+        price: px,
+        volume_ratio: volMul,
+        volume_ratio_proxy: volMul,
+        volume_sustain: volMul >= 2 ? 0.8 : volMul >= 1.2 ? 0.55 : 0.5,
+        price_hold: 0.5,
+        pullback_quality: (candidate?.reason?.includes("pullback") || candidate?.reason?.includes("reclaim")) ? 0.7 : 0.5,
+        change_rate: candidate?.changeRate ?? 0,
+        score: candidate?.score ?? 0,
+        breakout: candidate?.breakout ?? false,
+        box_breakout: candidate?.reason?.includes("box") ?? false,
+        upper_wick: candidate?.excludeReasons?.includes("volume_spike_close_fail") || candidate?.excludeReasons?.includes("윗꼬리 과다"),
+        volume_spike_close_fail: candidate?.excludeReasons?.includes("volume_spike_close_fail") ?? false,
+        late_chase_risk: candidate?.reason?.includes("chase") || candidate?.excludeReasons?.includes("과열 (추격주의)"),
+        fake_pump_risk: (candidate?.excludeReasons?.includes("volume_spike_close_fail") || candidate?.excludeReasons?.includes("윗꼬리 과다") || candidate?.reason?.includes("chase")) ? 0.7 : 0.3,
+        candidate_missing: !candidate,
+        stale_data: candidate ? (Date.now() - candidate.detectedAt) > 60000 : false,
+        unrealized_pnl_pct: position ? ((px / position.entry_price) - 1) * 100 : 0,
+        hold_ms: position ? (Date.now() - Date.parse(position.entry_ts)) : 0,
+        entry_price: position?.entry_price,
+        current_price: px,
+      };
+
+      const sj = buildSurgeV2ShadowJudgment(m, indicators);
+      return sj;
+    });
+
+    const shadowV2Count = shadowV2.length;
+    const updatedAt = new Date().toISOString();
+
+    // Status Code logic
+    let statusCode: "ok" | "empty_universe" | "no_candidate" | "calculating" | "stale" | "degraded" | "error" = "ok";
+    let statusMessage = "정상 작동 중";
+    const degradedReasons: string[] = [];
+
+    if (fetchFailed) {
+      statusCode = "degraded";
+      statusMessage = "일부 데이터 조회 실패";
+      degradedReasons.push("ticker_fetch_failed");
+    }
+
+    if (shadowV2Count === 0 && candidateCount === 0) {
+      if (universeCount === 0) {
+        statusCode = "empty_universe";
+        statusMessage = "현재 감시 유니버스가 없습니다";
+      } else {
+        statusCode = "no_candidate";
+        statusMessage = "현재 실거래 후보가 없습니다";
+      }
+    }
+
+    const res = {
       mode: "paper_trading",
-      updated_at: new Date().toISOString(),
+      updated_at: updatedAt,
+      status_code: statusCode,
+      status_message: statusMessage,
+      status_updated_at: updatedAt,
+      status_age_ms: 0,
+      data_source: "live",
+      has_universe: universeCount > 0,
+      has_candidate: candidateCount > 0,
+      has_shadow_v2: shadowV2Count > 0,
+      universe_count: universeCount,
+      candidate_count: candidateCount,
+      shadow_v2_count: shadowV2Count,
+      degraded_reasons: degradedReasons,
+      last_error: null,
       ...summary,
       execution_metrics: {
         pre_entry_watch_hits: state.metrics.preEntryWatchHits,
         entry_count: state.metrics.entriesOpened,
         entries_opened: state.metrics.entriesOpened,
         avg_entry_latency_sec: Number((avgEntryLatencyMs / 1000).toFixed(2)),
-        early_exit_ratio:
-          closed.length > 0 ? Number((state.metrics.earlyExitCount / closed.length).toFixed(4)) : 0,
+        early_exit_ratio: closed.length > 0 ? Number((state.metrics.earlyExitCount / closed.length).toFixed(4)) : 0,
         avg_win_loss_ratio: Number(avgWinLossRatio.toFixed(3)),
-        active_pre_entry_watch_count: state.preEntryWatch.size,
-        tracked_pre_entry_watch: state.preEntryWatch.size,
+        active_pre_entry_watch_count: universeCount,
+        tracked_pre_entry_watch: universeCount,
       },
       holdings: Object.values(state.positions).map((p) => {
         const px = priceByMarket[p.market] ?? 0;
@@ -2362,56 +2446,10 @@ export function createPaperTradingEngine(opts: {
         chase_loss_rate: Number(s.chase_loss_rate ?? 0),
         suggested_size_multiplier: Number(s.suggested_size_multiplier ?? 1),
       })),
-      surge_v2_shadow: watchMarkets.slice(0, 5).map((m) => {
-        const px = priceByMarket[m] ?? 0;
-        const candidate = state.preEntryWatch.get(m);
-        const position = state.positions[m];
-        
-        // Collect indicators safely from candidate/position/state
-        const volMul = candidate?.volumeMultiple ?? 0;
-        const indicators = {
-          price: px,
-          volume_ratio: volMul,
-          volume_ratio_proxy: volMul,
-          volume_sustain: volMul >= 2 ? 0.8 : volMul >= 1.2 ? 0.55 : 0.5,
-          price_hold: 0.5, // Neutral fallback
-          pullback_quality: (candidate?.reason?.includes("pullback") || candidate?.reason?.includes("reclaim")) ? 0.7 : 0.5,
-          change_rate: candidate?.changeRate ?? 0,
-          score: candidate?.score ?? 0,
-          breakout: candidate?.breakout ?? false,
-          box_breakout: candidate?.reason?.includes("box") ?? false,
-          upper_wick: candidate?.excludeReasons?.includes("volume_spike_close_fail") || candidate?.excludeReasons?.includes("윗꼬리 과다"),
-          volume_spike_close_fail: candidate?.excludeReasons?.includes("volume_spike_close_fail") ?? false,
-          late_chase_risk: candidate?.reason?.includes("chase") || candidate?.excludeReasons?.includes("과열 (추격주의)"),
-          fake_pump_risk: (candidate?.excludeReasons?.includes("volume_spike_close_fail") || candidate?.excludeReasons?.includes("윗꼬리 과다") || candidate?.reason?.includes("chase")) ? 0.7 : 0.3,
-          candidate_missing: !candidate,
-          stale_data: candidate ? (Date.now() - candidate.detectedAt) > 60000 : false,
-          unrealized_pnl_pct: position ? ((px / position.entry_price) - 1) * 100 : 0,
-          hold_ms: position ? (Date.now() - Date.parse(position.entry_ts)) : 0,
-          entry_price: position?.entry_price,
-          current_price: px,
-        };
-
-        const sj = buildSurgeV2ShadowJudgment(m, indicators);
-        console.info(JSON.stringify({
-          tag: "SURGE_V2_PERF_PROOF",
-          ts: sj.ts,
-          market: m,
-          surgeEarlyScore: sj.surgeEarlyScore,
-          surgeStage: sj.surgeStage,
-          surgeValidationScore: sj.surgeValidationScore,
-          validationGrade: sj.validationGrade,
-          surgeProfitAction: sj.surgeProfitAction,
-          fakePumpExitRisk: sj.fakePumpExitRisk,
-          candidate_missing: indicators.candidate_missing,
-          stale_data: indicators.stale_data,
-        }));
-        return sj;
-      }),
-      status_code: watchMarkets.length > 0 ? "OK" : "EMPTY_UNIVERSE",
-      status_message: watchMarkets.length > 0 ? "Active monitoring" : "No candidates in universe",
+      surge_v2_shadow: shadowV2,
       files: { state: stateFile },
     };
+    return res;
   };
 
   return {

@@ -930,41 +930,71 @@ async function main() {
     const ttlMs = 2500;
     (globalThis as any).__orbitalpha_paper_cache ??= { at: 0, bodyJson: "" };
     const c = (globalThis as any).__orbitalpha_paper_cache as { at: number; bodyJson: string };
-    if (c.bodyJson && now - c.at < ttlMs) return parseBoundedCacheBody(c.bodyJson);
-    try {
-      const out = (await paper.status()) as any;
-      app.log.info(
-        {
-          tag: "DEBUG_PAPER_STATUS_API_SOURCE",
-          source_name: "local_paper_engine",
-          source_path: typeof out?.files?.state === "string" ? out.files.state : null,
-          positions_count: Array.isArray(out?.holdings) ? out.holdings.length : 0,
-          open_positions: Number(out?.counters?.open_positions ?? 0),
-          max_open: Number(out?.config?.max_open_positions ?? 0),
-          recent_history_count: Array.isArray(out?.recent_history) ? out.recent_history.length : 0,
-        },
-        "DEBUG_PAPER_STATUS_API_SOURCE",
-      );
-      const body = { ...out, source_name: "local_paper_engine", source_path: typeof out?.files?.state === "string" ? out.files.state : null };
+    
+    const sendWithCache = (out: any, isCache: boolean) => {
+      const updatedAt = out.updated_at || new Date().toISOString();
+      const ageMs = now - (isCache ? c.at : now);
+      const stale = isCache && ageMs > 10000;
+      
+      const body = {
+        ...out,
+        status_code: stale ? "stale" : out.status_code || "ok",
+        status_age_ms: ageMs,
+        data_source: isCache ? (stale ? "stale_cache" : "cache") : "live",
+        source_name: "local_paper_engine",
+        source_path: typeof out?.files?.state === "string" ? out.files.state : null,
+      };
+
       app.log.info(
         {
           tag: "SURGE_REAL_TRADE_JUDGMENT_API_PROOF",
-          status_code: out.status_code,
-          shadow_v2_items: Array.isArray(out.surge_v2_shadow) ? out.surge_v2_shadow.length : 0,
+          status_code: body.status_code,
+          data_source: body.data_source,
+          universe_count: Number(body.universe_count ?? 0),
+          candidate_count: Number(body.candidate_count ?? 0),
+          shadow_v2_count: Number(body.shadow_v2_count ?? 0),
+          degraded_reasons: body.degraded_reasons ?? [],
+          status_age_ms: body.status_age_ms,
         },
         "SURGE_REAL_TRADE_JUDGMENT_API_PROOF",
       );
-      c.at = now;
-      c.bodyJson = serializeBoundedCacheBody(body);
-      return body;
-    } catch (e) {
-      app.log.error({ tag: "PAPER_STATUS_API_FAILED", error: String(e) }, "PAPER_STATUS_API_FAILED");
-      // Fallback to cached version even if expired, or return empty valid object
-      if (c.bodyJson) {
-        const fallback = parseBoundedCacheBody(c.bodyJson);
-        if (fallback) return fallback;
+
+      if (!isCache) {
+        c.at = now;
+        c.bodyJson = serializeBoundedCacheBody(body);
       }
-      return { mode: "paper_trading", error: "internal_error", updated_at: new Date().toISOString() };
+      return body;
+    };
+
+    if (c.bodyJson && now - c.at < ttlMs) {
+      return sendWithCache(parseBoundedCacheBody(c.bodyJson), true);
+    }
+
+    try {
+      const out = (await paper.status()) as any;
+      return sendWithCache(out, false);
+    } catch (e) {
+      app.log.error({ tag: "PAPER_STATUS_API_ERROR", error: String(e) });
+      const errorBody = {
+        status_code: "error",
+        status_message: "내부 엔진 오류 발생",
+        status_updated_at: new Date().toISOString(),
+        status_age_ms: 0,
+        data_source: "live",
+        has_universe: false,
+        has_candidate: false,
+        has_shadow_v2: false,
+        universe_count: 0,
+        candidate_count: 0,
+        shadow_v2_count: 0,
+        degraded_reasons: ["internal_engine_error"],
+        last_error: String(e),
+        holdings: [],
+        recent_history: [],
+        surge_v2_shadow: [],
+        paper_surge_pattern_stats: [],
+      };
+      return errorBody;
     }
   });
   app.get("/api/v1/market-state", async () => {

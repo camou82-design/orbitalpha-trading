@@ -501,6 +501,16 @@ type PaperPanelSummary = {
   timeoutMinutes: number;
   updatedAt: string | null;
   experienceStats: PaperSurgePatternStats[];
+
+  statusCode: string;
+  statusMessage: string;
+  statusAgeMs: number;
+  dataSource: string;
+  universeCount: number;
+  candidateCount: number;
+  shadowV2Count: number;
+  degradedReasons: string[];
+  lastError: string | null;
 };
 
 type MarketStateStatus = {
@@ -629,6 +639,16 @@ function toPaperPanelSummary(raw: unknown): PaperPanelSummary {
     timeoutMinutes: safeNum(config.timeout_minutes),
     updatedAt: typeof r.updated_at === "string" ? r.updated_at : null,
     experienceStats: statsRaw as PaperSurgePatternStats[],
+
+    statusCode: String(r.status_code ?? "calculating"),
+    statusMessage: String(r.status_message ?? "데이터 확인 중"),
+    statusAgeMs: safeNum(r.status_age_ms),
+    dataSource: String(r.data_source ?? "live"),
+    candidateCount: safeNum(r.candidate_count),
+    shadowV2Count: safeNum(r.shadow_v2_count),
+    degradedReasons: Array.isArray(r.degraded_reasons) ? r.degraded_reasons.map(String) : [],
+    lastError: typeof r.last_error === "string" ? r.last_error : null,
+    universeCount: safeNum(r.universe_count),
   };
 }
 
@@ -2605,11 +2625,29 @@ export default function HomePage() {
 
           {(() => {
             try {
-              if (paperPanelError) {
-                return <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>데이터를 불러오지 못했습니다</p>;
+              const sc = paperSummary.statusCode;
+              const isError = sc === "error";
+
+              if (paperPanelError || isError) {
+                return (
+                  <div style={{ padding: "1rem", background: UI.errorChipBg, border: `1px solid ${UI.errorChipBorder}`, borderRadius: 10 }}>
+                    <p style={{ margin: 0, color: UI.error, fontSize: "0.85rem", fontWeight: 700 }}>데이터를 불러오지 못했습니다</p>
+                    {paperSummary.lastError && <p style={{ margin: "0.4rem 0 0", color: UI.error, fontSize: "0.72rem" }}>사유: {paperSummary.lastError}</p>}
+                  </div>
+                );
               }
               if (!paper) {
                 return <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>아직 표시할 급등주 판단 표본이 없습니다. 서버가 기존 검증 이력을 불러오면 profile별 경험치가 표시됩니다.</p>;
+              }
+
+              if (sc === "empty_universe") {
+                return <p style={{ margin: "0.5rem 0", color: UI.muted, fontSize: "0.85rem", textAlign: "center", padding: "1.5rem", background: UI.cardSoftBg, borderRadius: 10, border: `1px dashed ${UI.borderSoft}` }}>현재 감시 유니버스가 없습니다</p>;
+              }
+              if (sc === "no_candidate") {
+                return <p style={{ margin: "0.5rem 0", color: UI.muted, fontSize: "0.85rem", textAlign: "center", padding: "1.5rem", background: UI.cardSoftBg, borderRadius: 10, border: `1px dashed ${UI.borderSoft}` }}>현재 실거래 후보가 없습니다</p>;
+              }
+              if (sc === "calculating") {
+                return <p style={{ margin: "0.5rem 0", color: UI.watch, fontSize: "0.85rem", textAlign: "center", padding: "1.5rem", background: UI.cardSoftBg, borderRadius: 10 }}>계산 중입니다...</p>;
               }
 
               const stats = paperSummary.experienceStats ?? [];
@@ -2822,6 +2860,50 @@ export default function HomePage() {
                         <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>급등주 판단 데이터 수집 중</div>
                       )}
                     </div>
+                  </div>
+
+                  {/* 진단 영역 */}
+                  <div 
+                    style={{ 
+                      marginTop: "0.5rem", 
+                      padding: "0.6rem 0.8rem", 
+                      background: UI.cardSoftBg, 
+                      borderRadius: 8, 
+                      border: `1px solid ${UI.borderSoft}`,
+                      fontSize: "0.72rem",
+                      color: UI.mutedSoft,
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: "1rem",
+                      flexWrap: "wrap"
+                    }}
+                  >
+                    <div style={{ display: "flex", gap: "1rem" }}>
+                      <span>Status: <strong style={{ color: paperSummary.statusCode === "ok" ? UI.pass : UI.watch }}>{paperSummary.statusCode.toUpperCase()}</strong></span>
+                      <span>Source: <strong>{paperSummary.dataSource}</strong></span>
+                      <span>Age: <strong>{paperSummary.statusAgeMs}ms</strong></span>
+                    </div>
+                    <div style={{ display: "flex", gap: "1rem" }}>
+                      <span>Universe: <strong>{paperSummary.universeCount}</strong></span>
+                      <span>Candidates: <strong>{paperSummary.candidateCount}</strong></span>
+                      <span>ShadowV2: <strong>{paperSummary.shadowV2Count}</strong></span>
+                    </div>
+                    {paperSummary.degradedReasons.length > 0 && (
+                      <div style={{ width: "100%", marginTop: 4, color: UI.watch }}>
+                        Degraded: {paperSummary.degradedReasons.join(", ")}
+                      </div>
+                    )}
+                    {paperSummary.statusCode === "stale" && (
+                      <div style={{ width: "100%", marginTop: 4, color: UI.watch }}>
+                        주의: 오래된 캐시 데이터를 표시 중입니다.
+                      </div>
+                    )}
+                    {paperSummary.statusCode === "degraded" && (
+                      <div style={{ width: "100%", marginTop: 4, color: UI.watch }}>
+                        주의: 일부 데이터 누락으로 제한 표시 중입니다.
+                      </div>
+                    )}
                   </div>
                 </div>
               );
