@@ -3302,11 +3302,15 @@ export function createLiveDataStrategy(opts: {
       JSON.stringify({
         tag: "SURGE_ENTRY_PIPELINE_PROOF",
         ts: new Date().toISOString(),
+        stage: "initial_discovery",
         primary_source: fallbackUsed ? "watch_markets_fallback" : "filter_pass_fresh",
-        primary_count: primary.length,
-        base_input_count: baseEntryUniverseInput.length,
-        base_input_symbols: baseEntryUniverseInput.slice(0, 10),
+        filter_pass_count: filterPassCandidatesExcludingHeld.length,
+        filter_pass_symbols: filterPassCandidatesExcludingHeld.slice(0, 15),
+        watch_markets_count: watchMarkets.length,
+        watch_markets_top: watchMarkets.slice(0, 10),
         fallback_used: fallbackUsed,
+        base_entry_universe_count: baseEntryUniverseInput.length,
+        base_entry_universe_symbols: baseEntryUniverseInput.slice(0, 25),
       }),
     );
     console.info(
@@ -3410,11 +3414,29 @@ export function createLiveDataStrategy(opts: {
       }
     }
     /** discovery_universe: 신규 급등주 탐색/진입용. 현재 보유(holdings) 종목은 제외한다. */
+    const universeDroppedReasons: Record<string, string> = {};
     const entryUniverse = baseEntryUniverse.filter((m) => {
-      if (heldSymbolSet.has(m)) return false;
-      if (heldMeaningfulMarkets.has(m)) return false;
+      if (heldSymbolSet.has(m)) {
+        universeDroppedReasons[m] = "held_in_state_set";
+        return false;
+      }
+      if (heldMeaningfulMarkets.has(m)) {
+        universeDroppedReasons[m] = "held_meaningful_balance";
+        return false;
+      }
       return true;
     });
+    console.info(
+      JSON.stringify({
+        tag: "SURGE_ENTRY_PIPELINE_PROOF",
+        ts: new Date().toISOString(),
+        stage: "universe_held_filtering",
+        base_universe_count: baseEntryUniverse.length,
+        entry_universe_count: entryUniverse.length,
+        dropped_count: Object.keys(universeDroppedReasons).length,
+        dropped_reasons: universeDroppedReasons,
+      }),
+    );
 
     const strategyUsableKrwForAlloc = Math.max(
       0,
@@ -3469,17 +3491,25 @@ export function createLiveDataStrategy(opts: {
     const paperStatsMap = await loadPaperSurgePatternStats(opts.companyId, opts.serviceId);
 
     const candidateMetaMap = new Map<string, CandidateMeta>();
+    const evaluationDroppedReasons: Record<string, string> = {};
     const candidateMeta = (await Promise.all(entryUniverse
       .map(async (m) => {
         const s = latestAllSignals.get(m);
-        if (!s?.p) return null;
+        if (!s?.p) {
+          evaluationDroppedReasons[m] = "missing_signal_payload";
+          return null;
+        }
         const currentPx = priceBy.get(m) ?? 0;
-        if (!(currentPx > 0)) return null;
+        if (!(currentPx > 0)) {
+          evaluationDroppedReasons[m] = "missing_ticker_price";
+          return null;
+        }
 
         // [ORIGINAL SETUP] Primary Gate Enforcement
         const candles1 = await fetchMinuteCandlesCached(m, 1, 250);
         const setup = evaluateOriginalSpotScalpingSetup(m, candles1, currentPx);
         if (!setup.ok) {
+          evaluationDroppedReasons[m] = `setup_blocked:${setup.reason}`;
           console.info(JSON.stringify({ tag: "DEBUG_ORIGINAL_SPOT_SETUP_BLOCK", market: m, reason: setup.reason }));
           return null;
         }
@@ -3510,7 +3540,10 @@ export function createLiveDataStrategy(opts: {
         });
 
         const riskReward = Number(setup.riskReward ?? 0);
-        if (!(riskReward > 0)) return null;
+        if (!(riskReward > 0)) {
+          evaluationDroppedReasons[m] = "risk_reward_invalid";
+          return null;
+        }
 
         const meta: CandidateMeta = {
           market: m,
@@ -3535,6 +3568,18 @@ export function createLiveDataStrategy(opts: {
         return meta;
       }))
     ).filter((x): x is CandidateMeta => x !== null);
+
+    console.info(
+      JSON.stringify({
+        tag: "SURGE_ENTRY_PIPELINE_PROOF",
+        ts: new Date().toISOString(),
+        stage: "entry_evaluation_done",
+        entry_universe_count: entryUniverse.length,
+        candidate_meta_count: candidateMeta.length,
+        dropped_count: Object.keys(evaluationDroppedReasons).length,
+        dropped_reasons: evaluationDroppedReasons,
+      }),
+    );
     const capPlan = computeTargetPositionBudget({
       strategyUsableKrw: strategyUsableKrwForAlloc,
       regime: btcTier,
