@@ -2349,14 +2349,15 @@ export function createPaperTradingEngine(opts: {
         suggested_size_multiplier: Number(s.suggested_size_multiplier ?? 1),
       })),
       surge_v2_shadow: watchMarkets.slice(0, 5).map((m) => {
-        const sj = buildSurgeV2ShadowJudgment(m, {});
+        const px = priceByMarket[m] ?? 0;
+        const sj = buildSurgeV2ShadowJudgment(m, { price: px });
         console.info(JSON.stringify({
           tag: "SURGE_V2_PERF_PROOF",
           ts: sj.ts,
           market: m,
-          early_score: sj.early.score,
-          validation_grade: sj.validation.validationGrade,
-          fake_pump_risk: sj.risk.fakePumpExitRisk,
+          early_score: sj.surgeEarlyScore,
+          validation_grade: sj.validationGrade,
+          fake_pump_risk: sj.fakePumpExitRisk,
         }));
         return sj;
       }),

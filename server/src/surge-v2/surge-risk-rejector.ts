@@ -7,7 +7,8 @@ export type SurgeRiskReport = {
 
 export function evaluateSurgeRisk(market: string, riskData: any): SurgeRiskReport {
   // Shadow mode logic
-  const exitRisk = 0.15;
+  const price = Number(riskData?.price ?? 0);
+  const exitRisk = price > 50000 ? 0.1 : price > 1000 ? 0.2 : 0.3;
   const shouldReject = exitRisk > 0.8;
 
   return {

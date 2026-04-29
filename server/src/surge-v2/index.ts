@@ -7,10 +7,12 @@ import { manageSurgeProfit, SurgeProfitReport } from "./surge-profit-manager.js"
 export type SurgeV2Judgment = {
   market: string;
   ts: string;
-  early: SurgeEarlyReport;
-  validation: SurgeValidationReport;
-  risk: SurgeRiskReport;
-  profit: SurgeProfitReport;
+  surgeEarlyScore: number;
+  surgeValidationScore: number;
+  surgeProfitAction: "HOLD" | "EXIT" | "PARTIAL_EXIT";
+  validationGrade: "S" | "A" | "B" | "C" | "F";
+  runnerAllowed: boolean;
+  fakePumpExitRisk: number;
 };
 
 export function buildSurgeV2ShadowJudgment(market: string, data: any): SurgeV2Judgment {
@@ -22,9 +24,11 @@ export function buildSurgeV2ShadowJudgment(market: string, data: any): SurgeV2Ju
   return {
     market,
     ts: new Date().toISOString(),
-    early,
-    validation,
-    risk,
-    profit,
+    surgeEarlyScore: early.score,
+    surgeValidationScore: validation.validationScore,
+    surgeProfitAction: profit.action,
+    validationGrade: validation.validationGrade,
+    runnerAllowed: profit.runnerAllowed,
+    fakePumpExitRisk: risk.fakePumpExitRisk,
   };
 }

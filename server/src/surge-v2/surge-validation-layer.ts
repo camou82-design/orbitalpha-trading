@@ -7,12 +7,16 @@ export type SurgeValidationReport = {
 
 export function validateSurge(market: string, context: any): SurgeValidationReport {
   // Shadow mode logic
-  const score = 75;
-  const grade = score > 90 ? "S" : score > 70 ? "A" : "B";
+  const price = Number(context?.price ?? 0);
+  let score = 60;
+  if (market.includes("BTC") || market.includes("ETH")) score += 20;
+  if (price > 0) score += 5;
+
+  const grade = score > 90 ? "S" : score > 75 ? "A" : score > 65 ? "B" : "C";
   
   return {
     validationScore: score,
     validationGrade: grade,
-    isValid: score > 60,
+    isValid: score > 65,
   };
 }
