@@ -2268,9 +2268,19 @@ export function createPaperTradingEngine(opts: {
 
   const status = async () => {
     const watchMarkets = Object.keys(state.positions);
-    const tickerRows = watchMarkets.length > 0 ? await fetchTickers(watchMarkets) : [];
+    const tickerRows: any[] = [];
+    try {
+      if (watchMarkets.length > 0) {
+        const rows = await fetchTickers(watchMarkets);
+        tickerRows.push(...rows);
+      }
+    } catch (e) {
+      console.warn({ tag: "PAPER_STATUS_TICKER_FETCH_FAILED", markets: watchMarkets, error: String(e) });
+    }
+
     const priceByMarket: Record<string, number> = {};
     for (const t of tickerRows) {
+      if (!t) continue;
       const p = toNum(t.trade_price, 0);
       if (p > 0) priceByMarket[t.market] = p;
     }
@@ -2321,7 +2331,22 @@ export function createPaperTradingEngine(opts: {
         };
       }),
       recent_history: state.history.slice(-40).reverse(),
-      paper_surge_pattern_stats: Object.values(state.surgePatternStats),
+      paper_surge_pattern_stats: Object.values(state.surgePatternStats).map((s) => ({
+        ...s,
+        sample_count: Number(s.sample_count ?? 0),
+        win_count: Number(s.win_count ?? 0),
+        loss_count: Number(s.loss_count ?? 0),
+        avg_pnl_pct: Number(s.avg_pnl_pct ?? 0),
+        win_rate: Number(s.win_rate ?? 0),
+        fast_profit_rate: Number(s.fast_profit_rate ?? 0),
+        surge_stop_loss_rate: Number(s.surge_stop_loss_rate ?? 0),
+        early_entry_loss_rate: Number(s.early_entry_loss_rate ?? 0),
+        volume_fade_loss_rate: Number(s.volume_fade_loss_rate ?? 0),
+        high_rejected_loss_rate: Number(s.high_rejected_loss_rate ?? 0),
+        profile_unknown_loss_rate: Number(s.profile_unknown_loss_rate ?? 0),
+        chase_loss_rate: Number(s.chase_loss_rate ?? 0),
+        suggested_size_multiplier: Number(s.suggested_size_multiplier ?? 1),
+      })),
       files: { state: stateFile },
     };
   };

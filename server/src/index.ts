@@ -88,17 +88,21 @@ function trimCacheSnapshot(value: unknown, seen = new WeakSet<object>()): unknow
     return out;
   }
   if (typeof value === "object") {
-    const obj = value as Record<string, unknown>;
-    if (seen.has(obj)) return null;
-    seen.add(obj);
-    const out: Record<string, unknown> = {};
-    let n = 0;
-    for (const [k, v] of Object.entries(obj)) {
-      if (n >= API_CACHE_MAX_OBJECT_KEYS) break;
-      out[k] = trimCacheSnapshot(v, seen);
-      n += 1;
+    try {
+      const obj = value as Record<string, unknown>;
+      if (seen.has(obj)) return null;
+      seen.add(obj);
+      const out: Record<string, unknown> = {};
+      let n = 0;
+      for (const [k, v] of Object.entries(obj)) {
+        if (n >= API_CACHE_MAX_OBJECT_KEYS) break;
+        out[k] = trimCacheSnapshot(v, seen);
+        n += 1;
+      }
+      return out;
+    } catch {
+      return null;
     }
-    return out;
   }
   return value;
 }
@@ -927,23 +931,33 @@ async function main() {
     (globalThis as any).__orbitalpha_paper_cache ??= { at: 0, bodyJson: "" };
     const c = (globalThis as any).__orbitalpha_paper_cache as { at: number; bodyJson: string };
     if (c.bodyJson && now - c.at < ttlMs) return parseBoundedCacheBody(c.bodyJson);
-    const out = (await paper.status()) as any;
-    app.log.info(
-      {
-        tag: "DEBUG_PAPER_STATUS_API_SOURCE",
-        source_name: "local_paper_engine",
-        source_path: typeof out?.files?.state === "string" ? out.files.state : null,
-        positions_count: Array.isArray(out?.holdings) ? out.holdings.length : 0,
-        open_positions: Number(out?.counters?.open_positions ?? 0),
-        max_open: Number(out?.config?.max_open_positions ?? 0),
-        recent_history_count: Array.isArray(out?.recent_history) ? out.recent_history.length : 0,
-      },
-      "DEBUG_PAPER_STATUS_API_SOURCE",
-    );
-    const body = { ...out, source_name: "local_paper_engine", source_path: typeof out?.files?.state === "string" ? out.files.state : null };
-    c.at = now;
-    c.bodyJson = serializeBoundedCacheBody(body);
-    return body;
+    try {
+      const out = (await paper.status()) as any;
+      app.log.info(
+        {
+          tag: "DEBUG_PAPER_STATUS_API_SOURCE",
+          source_name: "local_paper_engine",
+          source_path: typeof out?.files?.state === "string" ? out.files.state : null,
+          positions_count: Array.isArray(out?.holdings) ? out.holdings.length : 0,
+          open_positions: Number(out?.counters?.open_positions ?? 0),
+          max_open: Number(out?.config?.max_open_positions ?? 0),
+          recent_history_count: Array.isArray(out?.recent_history) ? out.recent_history.length : 0,
+        },
+        "DEBUG_PAPER_STATUS_API_SOURCE",
+      );
+      const body = { ...out, source_name: "local_paper_engine", source_path: typeof out?.files?.state === "string" ? out.files.state : null };
+      c.at = now;
+      c.bodyJson = serializeBoundedCacheBody(body);
+      return body;
+    } catch (e) {
+      app.log.error({ tag: "PAPER_STATUS_API_FAILED", error: String(e) }, "PAPER_STATUS_API_FAILED");
+      // Fallback to cached version even if expired, or return empty valid object
+      if (c.bodyJson) {
+        const fallback = parseBoundedCacheBody(c.bodyJson);
+        if (fallback) return fallback;
+      }
+      return { mode: "paper_trading", error: "internal_error", updated_at: new Date().toISOString() };
+    }
   });
   app.get("/api/v1/market-state", async () => {
     const now = Date.now();
