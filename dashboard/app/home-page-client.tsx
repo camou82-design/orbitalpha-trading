@@ -1073,6 +1073,8 @@ export default function HomePage() {
   const mountedAtRef = useRef<number>(Date.now());
   const prevPathnameRef = useRef<string | null>(null);
   const pollInFlightRef = useRef(new Map<string, AbortController>());
+  const pollJsonSeqRef = useRef(0);
+  const tradePollSeqRef = useRef(0);
   const pollSigRef = useRef(new Map<string, string>());
   const pollTimersRef = useRef(new Map<string, number>());
   const isHiddenRef = useRef(false);
@@ -1117,30 +1119,54 @@ export default function HomePage() {
       onErr?: (e: unknown) => void;
     },
   ) => {
-    if (pollInFlightRef.current.has(key)) {
-      devLog({ tag: "DASHBOARD_POLL_SKIPPED_IN_FLIGHT", key, url });
-      return;
-    }
+    const slotKey = `${key}:${++pollJsonSeqRef.current}`;
     const ctrl = new AbortController();
-    pollInFlightRef.current.set(key, ctrl);
+    pollInFlightRef.current.set(slotKey, ctrl);
     const tid = window.setTimeout(() => ctrl.abort(), opts.timeoutMs);
     try {
       const r = await fetch(url, { cache: "no-store", credentials: "include", signal: ctrl.signal });
+      const text = await r.text().catch(() => "");
       if (!r.ok) {
-        const text = await r.text().catch(() => "");
         opts.onHttp?.(r.status, text);
         return;
       }
-      const j = (await r.json().catch(() => null)) as T;
-      if (j !== null) opts.onOk(j);
+      let j: T | null = null;
+      const trimmed = text.trim();
+      if (trimmed.length > 0) {
+        try {
+          j = JSON.parse(trimmed) as T;
+        } catch {
+          j = null;
+        }
+      }
+      if (j !== null && typeof j === "object") {
+        opts.onOk(j);
+      } else {
+        opts.onErr?.(new Error("poll_json_empty_or_invalid"));
+      }
     } catch (e) {
       if (e instanceof Error && e.name === "AbortError") devLog({ tag: "DASHBOARD_POLL_ABORTED", key, url });
       opts.onErr?.(e);
     } finally {
       window.clearTimeout(tid);
-      pollInFlightRef.current.delete(key);
+      pollInFlightRef.current.delete(slotKey);
     }
   };
+
+  useEffect(() => {
+    if (authState !== "loading") return;
+    const tid = window.setTimeout(() => {
+      devLog({ tag: "DASHBOARD_AUTH_LOADING_WATCHDOG", ms: 4500 });
+      setSessionPanelWarning((prev) =>
+        prev ?? {
+          code: "auth_loading_watchdog",
+          message: "세션 확인 지연 — 대시보드를 먼저 표시합니다 (네트워크/API 상태를 확인하세요)",
+        },
+      );
+      setAuthState((prev) => (prev === "loading" ? "ok" : prev));
+    }, 4500);
+    return () => window.clearTimeout(tid);
+  }, [authState]);
 
   const scheduleLoop = (key: string, run: () => Promise<void>, visibleMs: number, hiddenMs: number) => {
     const tick = async () => {
@@ -1231,6 +1257,14 @@ export default function HomePage() {
           timeoutMs: 12_000,
           onHttp: (status) => {
             if (cancelled) return;
+            if (status === 401) {
+              setSessionPanelWarning(null);
+              setAuthState("expired");
+              setAccountSyncState("idle");
+              tradeInitialSyncDoneRef.current = false;
+              router.replace("/login?reason=session_expired");
+              return;
+            }
             const code = `session_http_${status}`;
             const message =
               status === 502 ? "세션 API 일시 실패 (502) — 대시보드는 유지됩니다" : `세션 API 오류 (HTTP ${status}) — 대시보드는 유지됩니다`;
@@ -1266,13 +1300,9 @@ export default function HomePage() {
     };
 
     const pollTradeOnce = async () => {
-      const key = "trade_status";
-      if (pollInFlightRef.current.has(key)) {
-        devLog({ tag: "DASHBOARD_POLL_SKIPPED_IN_FLIGHT", key, url: "/api/v1/trade/status" });
-        return;
-      }
+      const slotKey = `trade_status:${++tradePollSeqRef.current}`;
       const ctrl = new AbortController();
-      pollInFlightRef.current.set(key, ctrl);
+      pollInFlightRef.current.set(slotKey, ctrl);
       const tid = window.setTimeout(() => ctrl.abort(), 6500);
       try {
         const ts = Date.now();
@@ -1308,13 +1338,13 @@ export default function HomePage() {
           if (p.api_connected) setAccountSyncState("ok");
           else if (p.env_access_key_present && p.env_secret_key_present) setAccountSyncState("error");
           else setAccountSyncState("ok");
-          if (authState === "loading") setAuthState("ok");
+          setAuthState((prev) => (prev === "loading" ? "ok" : prev));
         } else if (tradePollRes.failureCode) {
           setLastClientTradeFailure({ code: tradePollRes.failureCode, message: tradePollRes.failureMessage ?? "" });
         }
       } finally {
         window.clearTimeout(tid);
-        pollInFlightRef.current.delete(key);
+        pollInFlightRef.current.delete(slotKey);
       }
     };
 
@@ -1924,14 +1954,6 @@ export default function HomePage() {
     }
   };
 
-  if (authState === "loading") {
-    return (
-      <div style={{ background: UI.pageOuterBg, minHeight: "100vh", display: "grid", placeItems: "center", color: UI.body }}>
-        인증 상태 확인 중...
-      </div>
-    );
-  }
-
   if (authState === "expired") {
     return (
       <div style={{ background: UI.pageOuterBg, minHeight: "100vh", display: "grid", placeItems: "center", color: UI.body }}>
@@ -1958,6 +1980,23 @@ export default function HomePage() {
           boxShadow: "0 0 0 1px #1d3558 inset, 0 24px 60px rgba(2, 6, 23, 0.55)",
         }}
       >
+        {authState === "loading" ? (
+          <div
+            role="status"
+            style={{
+              marginBottom: "0.85rem",
+              padding: "0.55rem 0.85rem",
+              borderRadius: 10,
+              border: `1px solid ${UI.borderSoft}`,
+              background: UI.cardSoftBg,
+              color: UI.watch,
+              fontWeight: 800,
+              fontSize: "0.84rem",
+            }}
+          >
+            인증 상태 확인 중...
+          </div>
+        ) : null}
         <header
           style={{
             marginBottom: "0.9rem",
