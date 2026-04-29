@@ -3717,8 +3717,8 @@ export function createLiveDataStrategy(opts: {
         if (!setup.ok) {
           const blockReason = setup.reason ?? "setup_conditions_not_met";
           const dedupeKey = `DEBUG_ORIGINAL_SPOT_SETUP_BLOCK|live_strategy_tick|${m}|${blockReason}|live`;
+          evaluationDroppedReasons[m] = `setup_blocked:${blockReason}`;
           if (setupBlockLogDeduper.shouldLog(dedupeKey)) {
-            evaluationDroppedReasons[m] = `setup_blocked:${blockReason}`;
             console.info(JSON.stringify({
               tag: "DEBUG_ORIGINAL_SPOT_SETUP_BLOCK",
               market: m,
