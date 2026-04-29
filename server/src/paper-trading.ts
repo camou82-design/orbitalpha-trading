@@ -2292,10 +2292,10 @@ export function createPaperTradingEngine(opts: {
     let tickerRows: any[] = [];
     let fetchFailed = false;
     try {
-      // Fetch tickers for both positions and a few top candidates for shadow v2
-      const targets = Array.from(new Set([...positionsMarkets, ...candidateMarkets.slice(0, 10)]));
-      if (targets.length > 0) {
-        tickerRows = await fetchTickers(targets);
+      // Conservative: Only fetch tickers for existing positions to minimize Upbit load.
+      // Candidates will use existing cache or neutral fallback.
+      if (positionsMarkets.length > 0) {
+        tickerRows = await fetchTickers(positionsMarkets);
       }
     } catch (e) {
       console.warn({ tag: "PAPER_STATUS_TICKER_FETCH_FAILED", markets: positionsMarkets, error: String(e) });
@@ -2320,7 +2320,7 @@ export function createPaperTradingEngine(opts: {
     const avgLoss = losses.length > 0 ? losses.reduce((a, b) => a + b, 0) / losses.length : 0;
     const avgWinLossRatio = avgLoss > 0 ? avgWin / avgLoss : 0;
 
-    // shadow_v2 targets: positions + top candidates
+    // shadow_v2 targets: positions + top candidates (using available prices only)
     const shadowTargetMarkets = Array.from(new Set([
       ...positionsMarkets,
       ...candidateMarkets.slice(0, 5)
@@ -2362,25 +2362,25 @@ export function createPaperTradingEngine(opts: {
     const shadowV2Count = shadowV2.length;
     const updatedAt = new Date().toISOString();
 
-    // Status Code logic
+    // Status Code Priority: error > stale > degraded > ok > no_candidate > empty_universe
     let statusCode: "ok" | "empty_universe" | "no_candidate" | "calculating" | "stale" | "degraded" | "error" = "ok";
     let statusMessage = "정상 작동 중";
     const degradedReasons: string[] = [];
 
+    // Check conditions from lowest priority to highest
+    if (universeCount === 0) {
+      statusCode = "empty_universe";
+      statusMessage = "현재 감시 유니버스가 없습니다";
+    } else if (candidateCount === 0 && shadowV2Count === 0) {
+      statusCode = "no_candidate";
+      statusMessage = "현재 실거래 후보가 없습니다";
+    }
+
+    // High priority overrides
     if (fetchFailed) {
       statusCode = "degraded";
       statusMessage = "일부 데이터 조회 실패";
       degradedReasons.push("ticker_fetch_failed");
-    }
-
-    if (shadowV2Count === 0 && candidateCount === 0) {
-      if (universeCount === 0) {
-        statusCode = "empty_universe";
-        statusMessage = "현재 감시 유니버스가 없습니다";
-      } else {
-        statusCode = "no_candidate";
-        statusMessage = "현재 실거래 후보가 없습니다";
-      }
     }
 
     const res = {

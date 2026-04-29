@@ -975,9 +975,33 @@ async function main() {
       return sendWithCache(out, false);
     } catch (e) {
       app.log.error({ tag: "PAPER_STATUS_API_ERROR", error: String(e) });
+      
+      // Attempt to fallback to last known cache if available
+      if (c.bodyJson) {
+        try {
+          const fallback = parseBoundedCacheBody(c.bodyJson);
+          if (fallback) {
+            const reasons = Array.isArray(fallback.degraded_reasons) ? [...fallback.degraded_reasons] : [];
+            if (!reasons.includes("fallback_stale_cache")) {
+              reasons.push("fallback_stale_cache");
+            }
+            return {
+              ...fallback,
+              status_code: "stale",
+              data_source: "stale_cache",
+              degraded_reasons: reasons,
+              last_error: String(e),
+              status_updated_at: new Date().toISOString(),
+            };
+          }
+        } catch (parseErr) {
+          app.log.error({ tag: "PAPER_STATUS_CACHE_PARSE_ERROR", error: String(parseErr) });
+        }
+      }
+
       const errorBody = {
         status_code: "error",
-        status_message: "내부 엔진 오류 발생",
+        status_message: "내부 엔진 오류 발생 (Fallback 실패)",
         status_updated_at: new Date().toISOString(),
         status_age_ms: 0,
         data_source: "live",
@@ -987,7 +1011,7 @@ async function main() {
         universe_count: 0,
         candidate_count: 0,
         shadow_v2_count: 0,
-        degraded_reasons: ["internal_engine_error"],
+        degraded_reasons: ["internal_engine_error", "fallback_failed"],
         last_error: String(e),
         holdings: [],
         recent_history: [],
