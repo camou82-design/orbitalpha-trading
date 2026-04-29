@@ -4444,7 +4444,7 @@ export function createLiveDataStrategy(opts: {
           filter_pass: Boolean(sig.p.filter_pass),
         });
       }
-      if (bridgedStrength < ENTRY_PIPELINE_MID_SCORE_FLOOR) {
+      if (!isSurgeSource && bridgedStrength < ENTRY_PIPELINE_MID_SCORE_FLOOR) {
         await appendLog({
           company_id: companyIdSchema.parse(opts.companyId),
           service_id: serviceIdSchema.parse(opts.serviceId),
@@ -4494,6 +4494,7 @@ export function createLiveDataStrategy(opts: {
         continue;
       }
       if (isSurgeSource && surgeHardBlock) {
+        // Log the market condition but do not terminate the loop here; let surge-v2/surge-entry-engine handle the rejection.
         console.info(
           JSON.stringify({
             tag: "DEBUG_LIVE_SURGE_MARKET_JUDGMENT",
@@ -4509,13 +4510,11 @@ export function createLiveDataStrategy(opts: {
             distance_from_local_high_pct: null,
             volume_fade_triggered: null,
             setup_ok: candidateMetaMap.has(market),
-            decision: "hard_block",
+            decision: "delegate_to_surge_v2",
             size_multiplier: 0,
             reason: surgeMarketJudgmentReason,
           }),
         );
-        bumpSkip("surge_market_crash_guard");
-        continue;
       }
       const signalTsMs = signalTs ? Date.parse(signalTs) : NaN;
       const nowMs = Date.now();
@@ -4978,7 +4977,7 @@ export function createLiveDataStrategy(opts: {
         emitEval("entry_blocked_signal_strength", { symbol: market, signal_type: "LOW" });
         continue;
       }
-      if (sigTypeUpper === "MID") {
+      if (!isSurgeSource && sigTypeUpper === "MID") {
         const gatePrev = opts.marketState.entryGate(sig.p, marketState);
         const composite = Number(gatePrev.score ?? 0);
         if (rawStrength < LIVE_ENTRY_SIGNAL_GATES.mid_min_raw_strength_score || composite < LIVE_ENTRY_SIGNAL_GATES.mid_min_entry_gate_score) {
@@ -5161,9 +5160,14 @@ export function createLiveDataStrategy(opts: {
         continue;
       }
       if (!gateOk && !strongSymbolOverride) {
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: detailedReason ?? "base_gate_failed" });
-        bumpSkip(detailedReason ?? "base_gate_failed");
-        continue;
+        // Hard bypass for surge sources: Score/Structure rejections move to surge-v2. 
+        // We only honor the gate here if it's a critical block (cooldown, position_exists) that surge-v2 doesn't handle.
+        const isCriticalGateBlock = detailedReason === "cooldown_active" || detailedReason === "position_exists";
+        if (!isSurgeSource || isCriticalGateBlock) {
+          emitEval("DEBUG_LIVE_PRECHECK", { return_reason: detailedReason ?? "base_gate_failed" });
+          bumpSkip(detailedReason ?? "base_gate_failed");
+          continue;
+        }
       }
 
       let entryPipelineDetail: Record<string, unknown> = {};
@@ -5182,6 +5186,7 @@ export function createLiveDataStrategy(opts: {
               market_state: marketState.market_state,
               btc_5m_trend: marketState.btc_5m_trend ?? "flat",
               btc_15m_trend: marketState.btc_15m_trend ?? "flat",
+              btc_change_24h: btcChange,
             },
             volumeRatio: vol,
             bridgePass,

@@ -13,6 +13,7 @@ export type EntryPipelineMarketState = {
   market_state: string;
   btc_5m_trend: "up" | "down" | "flat";
   btc_15m_trend: "up" | "down" | "flat";
+  btc_change_24h: number;
 };
 
 /**
@@ -37,6 +38,22 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
   const breakout = Boolean(p.breakout);
   const closeUpperHold = Boolean(p.close_upper_hold);
   const rise3mPct = num(p.rise_3m_pct ?? p.momentum_3m_pct ?? p.price_change_3m_pct ?? 0);
+
+  // Market crash guards (moved from live-strategy.ts)
+  const btcChange = input.marketState.btc_change_24h;
+  const btcCrashGuard = btcChange <= -0.025;
+  const marketPanicGuard =
+    btcChange <= -0.015 &&
+    (input.marketState.btc_5m_trend === "down" || input.marketState.btc_15m_trend === "down");
+  
+  if (btcCrashGuard || marketPanicGuard) {
+    return {
+      action: "reject",
+      reason: btcCrashGuard ? "surge_market_crash_guard" : "surge_market_panic_guard",
+      authoritySource: "surge-v2",
+      detail: { symbol: input.market, btc_change: btcChange, btc_5m_trend: input.marketState.btc_5m_trend },
+    };
+  }
 
   if (!input.bridgePass) {
     return {
