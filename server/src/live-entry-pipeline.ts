@@ -1,6 +1,7 @@
 import { mvpSignalPayloadV2Schema, signalStrengthScore } from "@orbitalpha/shared";
 import { LIVE_ENTRY_PIPELINE } from "./strategy-risk-config.js";
 import type { UpbitCandle } from "./upbit-public.js";
+import { evaluateSurgeEntryPipeline as evaluateSurgeV2Entry } from "./surge-v2/index.js";
 
 /** 하위 호환 export — 실제 값은 LIVE_ENTRY_PIPELINE.min_signal_strength_score */
 export const ENTRY_PIPELINE_MID_SCORE_FLOOR = LIVE_ENTRY_PIPELINE.min_signal_strength_score;
@@ -242,11 +243,6 @@ export function evaluateSpotLongEntryPipeline(input: Readonly<{
   };
 }
 
-const SURGE_MIN_SCANNER_SCORE = Math.max(40, Math.min(85, Number(process.env.LIVE_SURGE_MIN_SCANNER_SCORE ?? 52)));
-const SURGE_CRASH_UPPER_WICK_MAX = Math.max(0.35, Math.min(0.85, Number(process.env.LIVE_SURGE_CRASH_UPPER_WICK_MAX ?? 0.58)));
-const SURGE_CRASH_3BAR_5M_RETURN_MAX_PCT = Math.max(8, Math.min(35, Number(process.env.LIVE_SURGE_CRASH_3BAR_5M_RETURN_MAX_PCT ?? 16)));
-
-import { evaluateSurgeEntryPipeline as evaluateSurgeV2Entry } from "./surge-v2/index.js";
 
 /**
  * 급등 스캐너 후보 전용 — 스팟 롱 눌림목(`evaluateSpotLongEntryPipeline`)과 분리.
