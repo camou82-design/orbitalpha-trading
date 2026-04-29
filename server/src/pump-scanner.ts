@@ -26,6 +26,8 @@ type ScannerRow = {
   add_entry_eligible: boolean;
   /** When status is "제외", show why it was excluded. */
   exclude_reasons?: string[];
+  /** Price at the time of scan. */
+  price: number;
   /** 최초 후보 포착 시각 (performance row timestamp). */
   captured_at?: string | null;
   /** Post verification (latest known for this market). */
@@ -619,6 +621,7 @@ export function createPumpScanner(
             early_entry_eligible: s.earlyEntryEligible,
             add_entry_eligible: s.addEntryEligible,
             exclude_reasons: s.exclude_reasons,
+            price: s.price,
             updated_at: new Date().toISOString(),
           };
 
@@ -807,6 +810,7 @@ export function createPumpScanner(
           close_upper_hold: r.close_upper_hold,
           rise_3m_pct: r.rise_3m_pct,
           volume_multiple: r.volume_multiple,
+          price: r.price,
           captured_at: r.captured_at ?? null,
           updated_at: r.updated_at,
           signal_ts: r.updated_at,

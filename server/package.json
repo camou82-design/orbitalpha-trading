@@ -11,6 +11,7 @@
     "start:build": "npm run build && npm run start:runtime",
     "start:runtime": "node dist/index.js",
     "start:surge-shadow": "node dist/worker-surge-scanner-shadow.js",
+    "//": "start:surge-v2-worker: New Surge V2 shadow engine. Note: Concurrent use with engine1 scanner doubles Upbit load.",
     "start:surge-v2-worker": "node dist/surge-v2-worker.js",
     "lint": "tsc -p tsconfig.json --noEmit"
   },

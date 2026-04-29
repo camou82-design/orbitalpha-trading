@@ -979,7 +979,7 @@ async function main() {
       // Attempt to fallback to last known cache if available
       if (c.bodyJson) {
         try {
-          const fallback = parseBoundedCacheBody(c.bodyJson);
+          const fallback = parseBoundedCacheBody(c.bodyJson) as any;
           if (fallback) {
             const reasons = Array.isArray(fallback.degraded_reasons) ? [...fallback.degraded_reasons] : [];
             if (!reasons.includes("fallback_stale_cache")) {

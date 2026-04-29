@@ -3,7 +3,16 @@ import { buildSurgeV2ShadowJudgment } from "./surge-v2/index.js";
 import { surgeCandidatesRuntimePath } from "./runtime-paths.js";
 import { atomicWriteJson } from "./runtime-file-io.js";
 
-const WORKER_TICK_INTERVAL_MS = Math.max(5000, Number(process.env.SURGE_V2_WORKER_INTERVAL_MS ?? 15000));
+/**
+ * [OPERATIONAL WARNING]
+ * This worker performs active scanning by calling createPumpScanner().tick(),
+ * which triggers Upbit public API fetches (tickers, candles).
+ * 
+ * - Running this worker alongside the main API (PM2 11) will effectively DOUBLE the Upbit API fetch load.
+ * - Long-term operation requires disabling the scanner in API 11 or switching to an external data source.
+ * - For initial shadow validation, run with a long interval (e.g., 60s+).
+ */
+const WORKER_TICK_INTERVAL_MS = Math.max(30000, Number(process.env.SURGE_V2_WORKER_INTERVAL_MS ?? 60000));
 const MAX_ITEMS = 50;
 
 async function main() {
@@ -14,14 +23,16 @@ async function main() {
     interval_ms: WORKER_TICK_INTERVAL_MS,
     out_path: surgeCandidatesRuntimePath().replace(/\\/g, "/"),
     order_authority: "none",
-    shadow_mode: true
+    shadow_mode: true,
+    scanner_tick_uses_upbit: true,
+    safe_to_run_with_engine1_scanner: false // CAUTION: Double fetch load if both are active
   }));
 
   // Instantiate scanner. 
   // Note: We provide an empty getHeldMarkets because this worker doesn't manage positions.
   const scanner = createPumpScanner(() => [], {
     onEvent: async (ev) => {
-      // Optional: Log scanner events if needed, but keep it quiet for now
+      // Optional: Log scanner events if needed
     }
   });
 
@@ -63,9 +74,9 @@ async function main() {
         return buildSurgeV2ShadowJudgment(sig.market, indicators);
       });
 
-      // 4) Limit items and sort by score
+      // 4) Limit items and sort by score (using surgeValidationScore as quality proxy)
       const topItems = judgments
-        .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+        .sort((a, b) => b.surgeValidationScore - a.surgeValidationScore)
         .slice(0, MAX_ITEMS);
       
       itemsCount = topItems.length;
@@ -83,7 +94,9 @@ async function main() {
         diagnostics: {
           item_count: itemsCount,
           scanner_rows_count: signals.length,
-          api_call_added_count: 0,
+          scanner_tick_uses_upbit: true,
+          direct_api_call_added_count: 0,
+          api_load_note: "scanner.tick uses existing pump-scanner fetch paths when worker is running",
           last_error: null
         }
       };
