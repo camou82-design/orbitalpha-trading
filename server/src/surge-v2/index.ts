@@ -1,8 +1,13 @@
+export * from "./surge-types.js";
+export { isSurgePosition } from "./surge-position-classifier.js";
+export { evaluateSurgeEntryPipeline } from "./surge-entry-engine.js";
+export { evaluateSurgeExit } from "./surge-exit-engine.js";
 
-import { detectEarlySurge, SurgeEarlyReport } from "./surge-early-detector.js";
-import { validateSurge, SurgeValidationReport } from "./surge-validation-layer.js";
-import { evaluateSurgeRisk, SurgeRiskReport } from "./surge-risk-rejector.js";
-import { manageSurgeProfit, SurgeProfitReport } from "./surge-profit-manager.js";
+// Shadow Judgment Logic (Preserved for paper-trading and workers)
+import { detectEarlySurge } from "./surge-early-detector.js";
+import { validateSurge } from "./surge-validation-layer.js";
+import { evaluateSurgeRisk } from "./surge-risk-rejector.js";
+import { manageSurgeProfit } from "./surge-profit-manager.js";
 
 export type SurgeV2Judgment = {
   market: string;

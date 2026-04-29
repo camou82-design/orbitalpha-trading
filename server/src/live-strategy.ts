@@ -27,12 +27,14 @@ import {
 import {
   ENTRY_PIPELINE_MID_SCORE_FLOOR,
   evaluateSpotLongEntryPipeline,
-  evaluateSurgeEntryPipeline,
 } from "./live-entry-pipeline.js";
 import { readJsonFile } from "./runtime-file-io.js";
 import { surgeCandidatesRuntimePath } from "./runtime-paths.js";
-import { isSurgePosition } from "./surge-v2/surge-position-classifier.js";
-import { evaluateSurgeExit } from "./surge-v2/surge-exit-engine.js";
+import {
+  isSurgePosition,
+  evaluateSurgeEntryPipeline,
+  evaluateSurgeExit,
+} from "./surge-v2/index.js";
 
 function num(x: unknown): number {
   return typeof x === "number" ? x : Number(x);
@@ -2732,7 +2734,7 @@ export function createLiveDataStrategy(opts: {
             decision_reason: decision.reason,
             exit_ratio: decision.ratio,
             runner_trail_active: (p as any).runner_trail_active,
-            authority_source: "surge-v2",
+            authority_source: decision.authoritySource,
           }),
         );
 
@@ -5172,7 +5174,7 @@ export function createLiveDataStrategy(opts: {
         const bridgePass = Boolean(scannerBridgeScore?.pass);
         const surgeSourceKindLog = payloadSourceKind || sourceKindForJudgment;
         if (isSurgeSource) {
-          const pr = evaluateSurgeEntryPipeline({
+          const decision = evaluateSurgeEntryPipeline({
             market,
             payload: sig.p,
             candles5,
@@ -5186,35 +5188,37 @@ export function createLiveDataStrategy(opts: {
             staleOk,
             ageSeconds: sourceMetaResolved.age_seconds,
           });
-          const scannerScoreLog = Number(sig?.p?.scanner_score ?? sig?.p?.signal_score ?? 0);
-          const rise3Log = Number(sig?.p?.rise_3m_pct ?? sig?.p?.momentum_3m_pct ?? sig?.p?.price_change_3m_pct ?? 0);
+
           console.info(
             JSON.stringify({
-              tag: "LIVE_SURGE_ENTRY_PIPELINE_RESULT",
+              tag: "SURGE_V2_ENTRY_DECISION_PROOF",
               ts: new Date().toISOString(),
               market,
               source_kind: surgeSourceKindLog,
-              scanner_score: scannerScoreLog,
+              scanner_score: Number(sig?.p?.scanner_score ?? sig?.p?.signal_score ?? 0),
               volume_multiple: vol,
               breakout: Boolean(sig?.p?.breakout),
               close_upper_hold: Boolean(sig?.p?.close_upper_hold),
-              rise_3m_pct: rise3Log,
+              rise_3m_pct: Number(sig?.p?.rise_3m_pct ?? sig?.p?.momentum_3m_pct ?? sig?.p?.price_change_3m_pct ?? 0),
               bridge_pass: bridgePass,
               filter_pass: filterPass,
-              ok: pr.ok,
-              reason: pr.ok ? "surge_pipeline_ok" : pr.message,
+              stale_ok: staleOk,
+              decision_action: decision.action,
+              decision_reason: decision.reason,
+              authority_source: decision.authoritySource,
             }),
           );
-          if (!pr.ok) {
+
+          if (decision.action === "reject") {
             await appendLog({
               company_id: companyIdSchema.parse(opts.companyId),
               service_id: serviceIdSchema.parse(opts.serviceId),
               ts: new Date().toISOString(),
               kind: "system",
-              message: pr.message,
-              payload: pr.detail,
+              message: decision.reason,
+              payload: decision.detail,
             });
-            emitEval(pr.message, pr.detail);
+            emitEval(decision.reason, decision.detail);
             emitEval("DEBUG_LIVE_DECISION_LINE", {
               available_krw: Number((await opts.trade.status()).live_order_available_krw ?? 0),
               planned_entry_krw: null,
@@ -5223,12 +5227,12 @@ export function createLiveDataStrategy(opts: {
               volume_ratio: Number(vol.toFixed(3)),
               breakout,
               breakout_relaxed: breakoutRelaxed,
-              final_block_reason: pr.message,
+              final_block_reason: decision.reason,
             });
-            bumpSkip(pr.message);
+            bumpSkip(decision.reason);
             continue;
           }
-          entryPipelineDetail = { ...pr.detail, entry_pipeline: "surge" };
+          entryPipelineDetail = { ...decision.detail, entry_pipeline: "surge" };
         } else {
           const pr = evaluateSpotLongEntryPipeline({
             market,

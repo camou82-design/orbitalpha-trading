@@ -1,26 +1,4 @@
-export type SurgeExitDecision =
-  | {
-      action: "hold";
-      reason: "surge_hold";
-      ratio: 0;
-      runnerTrailActive: boolean;
-    }
-  | {
-      action: "sell";
-      reason:
-        | "surge_hard_stop"
-        | "surge_emergency_stop_first_minute"
-        | "surge_early_fail_no_follow_through"
-        | "surge_breakout_failed"
-        | "surge_partial_take_profit"
-        | "surge_breakeven_protect"
-        | "surge_runner_trailing_exit"
-        | "surge_timeout_no_profit"
-        | "surge_residual_timeout_exit"
-        | "surge_force_take_profit";
-      ratio: number;
-      runnerTrailActive: boolean;
-    };
+import { SurgeExitDecision } from "./surge-types.js";
 
 /**
  * Evaluates the exit conditions for a surge position.
@@ -54,54 +32,54 @@ export function evaluateSurgeExit(pos: any, currentPx: number): SurgeExitDecisio
 
   // 1. Emergency Stop (First minute, <= -1.2%)
   if (holdMinutes < 1 && pnlPct <= -1.2) {
-    return { action: "sell", reason: "surge_emergency_stop_first_minute", ratio: 1, runnerTrailActive };
+    return { action: "sell", reason: "surge_emergency_stop_first_minute", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
   // 2. Hard Stop (>= 1 minute, <= -0.9%)
   if (holdMinutes >= 1 && pnlPct <= -0.9) {
-    return { action: "sell", reason: "surge_hard_stop", ratio: 1, runnerTrailActive };
+    return { action: "sell", reason: "surge_hard_stop", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
   // 3. Force Take Profit (>= +10%)
   if (pnlPct >= 10.0) {
-    return { action: "sell", reason: "surge_force_take_profit", ratio: 1, runnerTrailActive };
+    return { action: "sell", reason: "surge_force_take_profit", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
   // 4. Runner Trailing Exit
   if (runnerTrailActive && pnlPct <= maxPnlPct - 1.2) {
-    return { action: "sell", reason: "surge_runner_trailing_exit", ratio: 1, runnerTrailActive };
+    return { action: "sell", reason: "surge_runner_trailing_exit", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
   // 5. Breakeven Protect
   if (maxPnlPct >= 1.2 && pnlPct <= 0.15) {
-    return { action: "sell", reason: "surge_breakeven_protect", ratio: 1, runnerTrailActive };
+    return { action: "sell", reason: "surge_breakeven_protect", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
   // 6. Early Fail (No follow through)
   if (holdMinutes >= 3 && maxPnlPct < 0.3 && pnlPct <= -0.3) {
-    return { action: "sell", reason: "surge_early_fail_no_follow_through", ratio: 1, runnerTrailActive };
+    return { action: "sell", reason: "surge_early_fail_no_follow_through", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
   // 7. Breakout Failed (conservative implementation)
   if (holdMinutes >= 3 && holdMinutes <= 7 && maxPnlPct < 0.5 && pnlPct <= 0) {
-    return { action: "sell", reason: "surge_breakout_failed", ratio: 1, runnerTrailActive };
+    return { action: "sell", reason: "surge_breakout_failed", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
   // 8. Timeout (No profit)
   if (holdMinutes >= 15 && pnlPct < 0.8 && !partialTpDone) {
-    return { action: "sell", reason: "surge_timeout_no_profit", ratio: 1, runnerTrailActive };
+    return { action: "sell", reason: "surge_timeout_no_profit", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
   // 9. Residual Timeout Exit
   if (holdMinutes >= 45 && partialTpDone && pnlPct < 1.0) {
-    return { action: "sell", reason: "surge_residual_timeout_exit", ratio: 1, runnerTrailActive };
+    return { action: "sell", reason: "surge_residual_timeout_exit", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
   // 10. Partial Take Profit
   if (pnlPct >= 1.5 && !partialTpDone) {
-    return { action: "sell", reason: "surge_partial_take_profit", ratio: 0.4, runnerTrailActive };
+    return { action: "sell", reason: "surge_partial_take_profit", ratio: 0.4, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
   // 11. Hold
-  return { action: "hold", reason: "surge_hold", ratio: 0, runnerTrailActive };
+  return { action: "hold", reason: "surge_hold", ratio: 0, runnerTrailActive, authoritySource: "surge-v2" };
 }
