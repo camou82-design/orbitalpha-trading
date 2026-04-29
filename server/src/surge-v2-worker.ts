@@ -16,6 +16,17 @@ const WORKER_TICK_INTERVAL_MS = Math.max(30000, Number(process.env.SURGE_V2_WORK
 const MAX_ITEMS = 50;
 
 async function main() {
+  if (String(process.env.SURGE_V2_WORKER_ENABLED ?? "false").toLowerCase() !== "true") {
+    console.info(JSON.stringify({
+      tag: "SURGE_V2_WORKER_DISABLED_PROOF",
+      reason: "SURGE_V2_WORKER_ENABLED_not_true",
+      order_authority: "none",
+      shadow_mode: true,
+      safe_to_run_with_engine1_scanner: false
+    }));
+    process.exit(0);
+  }
+
   console.info(JSON.stringify({
     tag: "SURGE_V2_WORKER_BOOT_PROOF",
     ts: new Date().toISOString(),
