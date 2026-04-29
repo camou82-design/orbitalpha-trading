@@ -595,6 +595,7 @@ export function createPaperTradingEngine(opts: {
       signalStrength: string;
       breakout?: boolean;
       volumeMultiple?: number;
+      changeRate?: number;
       excludeReasons?: string[];
     }>;
     metrics: {
@@ -1729,6 +1730,7 @@ export function createPaperTradingEngine(opts: {
           signalStrength: (sig as any).signal_strength ?? "normal",
           breakout: sig.breakout,
           volumeMultiple: sig.volume_multiple,
+          changeRate: (sig as any).rise_3m_pct,
           excludeReasons: sig.exclude_reasons,
         });
         state.metrics.preEntryWatchHits += 1;
@@ -2366,18 +2368,24 @@ export function createPaperTradingEngine(opts: {
         const position = state.positions[m];
         
         // Collect indicators safely from candidate/position/state
+        const volMul = candidate?.volumeMultiple ?? 0;
         const indicators = {
           price: px,
-          volume_ratio: candidate?.volumeMultiple ?? 0,
-          volume_ratio_proxy: candidate?.volumeMultiple ?? 0,
-          change_rate: candidate ? 0.5 : 0, // Placeholder if not in signal
+          volume_ratio: volMul,
+          volume_ratio_proxy: volMul,
+          volume_sustain: volMul >= 2 ? 0.8 : volMul >= 1.2 ? 0.55 : 0.5,
+          price_hold: 0.5, // Neutral fallback
+          pullback_quality: (candidate?.reason?.includes("pullback") || candidate?.reason?.includes("reclaim")) ? 0.7 : 0.5,
+          change_rate: candidate?.changeRate ?? 0,
           score: candidate?.score ?? 0,
           breakout: candidate?.breakout ?? false,
           box_breakout: candidate?.reason?.includes("box") ?? false,
-          upper_wick: candidate?.excludeReasons?.includes("volume_spike_close_fail") ?? false,
+          upper_wick: candidate?.excludeReasons?.includes("volume_spike_close_fail") || candidate?.excludeReasons?.includes("윗꼬리 과다"),
           volume_spike_close_fail: candidate?.excludeReasons?.includes("volume_spike_close_fail") ?? false,
-          late_chase_risk: candidate?.reason?.includes("chase") ?? false,
-          stale_data: candidate ? (Date.now() - candidate.detectedAt) > 60000 : true,
+          late_chase_risk: candidate?.reason?.includes("chase") || candidate?.excludeReasons?.includes("과열 (추격주의)"),
+          fake_pump_risk: (candidate?.excludeReasons?.includes("volume_spike_close_fail") || candidate?.excludeReasons?.includes("윗꼬리 과다") || candidate?.reason?.includes("chase")) ? 0.7 : 0.3,
+          candidate_missing: !candidate,
+          stale_data: candidate ? (Date.now() - candidate.detectedAt) > 60000 : false,
           unrealized_pnl_pct: position ? ((px / position.entry_price) - 1) * 100 : 0,
           hold_ms: position ? (Date.now() - Date.parse(position.entry_ts)) : 0,
           entry_price: position?.entry_price,
@@ -2389,9 +2397,14 @@ export function createPaperTradingEngine(opts: {
           tag: "SURGE_V2_PERF_PROOF",
           ts: sj.ts,
           market: m,
-          early_score: sj.surgeEarlyScore,
-          validation_grade: sj.validationGrade,
-          fake_pump_risk: sj.fakePumpExitRisk,
+          surgeEarlyScore: sj.surgeEarlyScore,
+          surgeStage: sj.surgeStage,
+          surgeValidationScore: sj.surgeValidationScore,
+          validationGrade: sj.validationGrade,
+          surgeProfitAction: sj.surgeProfitAction,
+          fakePumpExitRisk: sj.fakePumpExitRisk,
+          candidate_missing: indicators.candidate_missing,
+          stale_data: indicators.stale_data,
         }));
         return sj;
       }),
