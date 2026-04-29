@@ -1497,6 +1497,112 @@ export function createPaperTradingEngine(opts: {
     failed_conditions?: string[];
   };
 
+  type SurgeEntrySetupResult = {
+    ok: boolean;
+    score: number;
+    grade: string;
+    reason: string;
+    failed_conditions?: string[];
+    ema50?: number;
+    ema200?: number;
+    rsi?: number;
+    stochK?: number;
+    stochD?: number;
+    volumeRatio?: number;
+    stopPrice?: number;
+    targetPrice?: number;
+    riskReward?: number;
+    priceAboveEma20?: boolean;
+    highReclaim?: boolean;
+    overextended?: boolean;
+    wickOk?: boolean;
+    rrOk?: boolean;
+  };
+
+  /**
+   * [SURGE SETUP EVALUATOR] - Shadow/Evaluation only.
+   */
+  function evaluateSurgeEntrySetup(
+    market: string,
+    candles1: any[],
+    currentPx: number,
+    payload: any,
+  ): SurgeEntrySetupResult {
+    if (candles1.length < 50) {
+      return { ok: false, score: 0, grade: "F", reason: `insufficient_candles:${candles1.length}<50` };
+    }
+
+    const completed = candles1.slice(0, -1);
+    const lastBar = completed[completed.length - 1]!;
+    const closes = completed.map(c => Number(c.trade_price));
+    const highs = completed.map(c => Number(c.high_price));
+    const lows = completed.map(c => Number(c.low_price));
+    
+    // Paper uses volume_multiple or volume_ratio
+    const volRatio = Number(payload.volume_multiple ?? payload.volume_ratio ?? 0);
+    const volOk = volRatio >= 1.4;
+
+    const momentum = Number(payload.rise_3m_pct ?? payload.momentum_3m_pct ?? payload.price_change_3m_pct ?? 0);
+    const momentumOk = momentum >= 0.7;
+
+    const e20 = emaLast(closes, 20);
+    const priceAboveEma20 = e20 !== null && currentPx > e20;
+    
+    const recentHighs = highs.slice(-15);
+    const localHigh = Math.max(...recentHighs);
+    const highReclaim = currentPx >= localHigh * 0.9985;
+
+    const overextended = e20 !== null && currentPx > e20 * 1.045;
+
+    const lastHigh = Number(lastBar.high_price);
+    const lastLow = Number(lastBar.low_price);
+    const lastClose = Number(lastBar.trade_price);
+    const range = Math.max(1e-9, lastHigh - lastLow);
+    const upperWickRatio = (lastHigh - lastClose) / range;
+    const wickOk = upperWickRatio < 0.45;
+
+    const stopPrice = Math.min(...lows.slice(-6)) * 0.9975;
+    const risk = currentPx - stopPrice;
+    const targetPrice = currentPx + risk * 1.4;
+    const rrOk = risk > 0 && (targetPrice - currentPx) / risk >= 1.25;
+
+    const failed: string[] = [];
+    if (!volOk) failed.push("low_volume");
+    if (!momentumOk) failed.push("low_momentum");
+    if (!priceAboveEma20 && !highReclaim) failed.push("no_breakout_or_ema_support");
+    if (overextended) failed.push("overextended");
+    if (!wickOk) failed.push("upper_wick_rejection");
+    if (!rrOk) failed.push("risk_reward_invalid");
+
+    const pass = failed.length === 0;
+    
+    let score = 0;
+    if (volOk) score += 20;
+    if (momentumOk) score += 20;
+    if (priceAboveEma20 || highReclaim) score += 20;
+    if (!overextended) score += 10;
+    if (wickOk) score += 10;
+    if (rrOk) score += 20;
+    
+    const grade = score >= 90 ? "S" : score >= 80 ? "A" : score >= 70 ? "B" : "F";
+
+    const ema50 = emaLast(closes, 50) ?? 0;
+    const ema200 = emaLast(closes, 200) ?? 0;
+    const rsiValues = calculateRsi(closes, 14);
+    const stoch = calculateStochRsi(rsiValues, 14, 3, 3);
+    const lastIdx = closes.length - 1;
+    const rsi = rsiValues[lastIdx] ?? 0;
+    const k = stoch.k[lastIdx] ?? 0;
+    const d = stoch.d[lastIdx] ?? 0;
+
+    return {
+      ok: pass, score, grade, reason: pass ? "surge_setup_passed" : "surge_setup_failed",
+      failed_conditions: failed, ema50, ema200, rsi, stochK: k, stochD: d, volumeRatio: volRatio,
+      stopPrice, targetPrice, riskReward: risk > 0 ? (targetPrice - currentPx) / risk : 0,
+      priceAboveEma20, highReclaim, overextended, wickOk, rrOk,
+    };
+  }
+
   const tick = async () => {
     const loopId = Date.now();
     const scannerSignals = opts.getScannerSignals();
@@ -1722,6 +1828,35 @@ export function createPaperTradingEngine(opts: {
           }
         }
       } catch (err) {}
+
+      // [SURGE SETUP SHADOW EVALUATION]
+      let surgeShadowSetup: SurgeEntrySetupResult | undefined;
+      const sourceKind = String((sig as any).source_kind ?? "");
+      if (sourceKind === "scanner_filter_fresh" || sourceKind === "scanner_filter" || sig.reason === "surge_scanner") {
+        surgeShadowSetup = evaluateSurgeEntrySetup(market, c1, px, sig);
+        console.info(JSON.stringify({
+          tag: "SURGE_ENTRY_SETUP_PROOF",
+          market,
+          source_kind: sourceKind || sig.reason,
+          candles_count: c1.length,
+          current_price: px,
+          volumeRatio: surgeShadowSetup.volumeRatio,
+          momentum_3m_pct: Number((sig as any).rise_3m_pct ?? (sig as any).momentum_3m_pct ?? 0),
+          ema50: surgeShadowSetup.ema50,
+          ema200: surgeShadowSetup.ema200,
+          rsi: surgeShadowSetup.rsi,
+          stochK: surgeShadowSetup.stochK,
+          stochD: surgeShadowSetup.stochD,
+          original_setup_ok: setupResult?.ok ?? false,
+          original_failed_conditions: setupResult?.failed_conditions,
+          surge_setup_score: surgeShadowSetup.score,
+          surge_setup_grade: surgeShadowSetup.grade,
+          surge_setup_pass: surgeShadowSetup.ok,
+          failed_surge_conditions: surgeShadowSetup.failed_conditions,
+          evaluation_source: "paper_trading_tick",
+          loop_id: loopId,
+        }));
+      }
 
       if (!setupResult || !setupResult.ok) {
         emitPaper("DEBUG_ORIGINAL_SPOT_SETUP_BLOCK", { 

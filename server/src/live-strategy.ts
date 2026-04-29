@@ -311,6 +311,29 @@ type CandidateMeta = {
   paper_pattern_multiplier?: number;
   risk_tag_multiplier?: number;
   engine_bucket?: "surge" | "other";
+  surge_shadow_setup?: SurgeEntrySetupResult;
+};
+
+type SurgeEntrySetupResult = {
+  ok: boolean;
+  score: number;
+  grade: string;
+  reason: string;
+  failed_conditions?: string[];
+  ema50?: number;
+  ema200?: number;
+  rsi?: number;
+  stochK?: number;
+  stochD?: number;
+  volumeRatio?: number;
+  stopPrice?: number;
+  targetPrice?: number;
+  riskReward?: number;
+  priceAboveEma20?: boolean;
+  highReclaim?: boolean;
+  overextended?: boolean;
+  wickOk?: boolean;
+  rrOk?: boolean;
 };
 
 type PaperSurgePatternStats = {
@@ -1169,6 +1192,115 @@ function evaluateOriginalSpotScalpingSetup(
     safePriceAboveEma200, pullbackToEma200, stochOversoldBullishCross, isBullish, safe_condition_pass,
     aggressiveEmaStack, aggressivePriceAbove, aggressiveRsiOk: rsiBullish, aggressiveVolumeOk: volSpike, aggressiveRiskRewardOk, aggressive_condition_pass,
     failed_conditions: failed,
+  };
+}
+
+/**
+ * [SURGE SETUP EVALUATOR] - Shadow/Evaluation only.
+ * 급등주 전용 평가기. 눌림목/정배열 기반인 Original Spot Setup과 달리 
+ * 거래량 폭발, 단기 모멘텀, 직전 고점 돌파 등을 위주로 평가한다.
+ */
+function evaluateSurgeEntrySetup(
+  market: string,
+  candles1: UpbitCandle[],
+  currentPx: number,
+  payload: any,
+): SurgeEntrySetupResult {
+  if (candles1.length < 50) {
+    return { ok: false, score: 0, grade: "F", reason: `insufficient_candles:${candles1.length}<50` };
+  }
+
+  const completed = candles1.slice(0, -1);
+  const lastBar = completed[completed.length - 1]!;
+  const closes = completed.map(c => Number(c.trade_price));
+  const highs = completed.map(c => Number(c.high_price));
+  const lows = completed.map(c => Number(c.low_price));
+  
+  // 1. Volume Expansion (payload's volume_ratio)
+  const volRatio = Number(payload.volume_ratio ?? 0);
+  const volOk = volRatio >= 1.4;
+
+  // 2. Short-term Momentum (rise in last 3m)
+  const momentum = Number(payload.rise_3m_pct ?? payload.momentum_3m_pct ?? payload.price_change_3m_pct ?? 0);
+  const momentumOk = momentum >= 0.7;
+
+  // 3. Price above short EMA (EMA 20) or recent high reclaim
+  const e20 = emaLast(closes, 20);
+  const priceAboveEma20 = e20 !== null && currentPx > e20;
+  
+  const recentHighs = highs.slice(-15);
+  const localHigh = Math.max(...recentHighs);
+  const highReclaim = currentPx >= localHigh * 0.9985;
+
+  // 4. Not extreme late chase (overextended) - Price not more than 4.5% above EMA20
+  const overextended = e20 !== null && currentPx > e20 * 1.045;
+
+  // 5. Not upper wick rejection
+  const lastHigh = Number(lastBar.high_price);
+  const lastLow = Number(lastBar.low_price);
+  const lastClose = Number(lastBar.trade_price);
+  const range = Math.max(1e-9, lastHigh - lastLow);
+  const upperWickRatio = (lastHigh - lastClose) / range;
+  const wickOk = upperWickRatio < 0.45;
+
+  // 6. Risk Reward calculable
+  const stopPrice = Math.min(...lows.slice(-6)) * 0.9975;
+  const risk = currentPx - stopPrice;
+  const targetPrice = currentPx + risk * 1.4;
+  const rrOk = risk > 0 && (targetPrice - currentPx) / risk >= 1.25;
+
+  // Evaluation
+  const failed: string[] = [];
+  if (!volOk) failed.push("low_volume");
+  if (!momentumOk) failed.push("low_momentum");
+  if (!priceAboveEma20 && !highReclaim) failed.push("no_breakout_or_ema_support");
+  if (overextended) failed.push("overextended");
+  if (!wickOk) failed.push("upper_wick_rejection");
+  if (!rrOk) failed.push("risk_reward_invalid");
+
+  const pass = failed.length === 0;
+  
+  // Simple scoring for shadow monitoring
+  let score = 0;
+  if (volOk) score += 20;
+  if (momentumOk) score += 20;
+  if (priceAboveEma20 || highReclaim) score += 20;
+  if (!overextended) score += 10;
+  if (wickOk) score += 10;
+  if (rrOk) score += 20;
+  
+  const grade = score >= 90 ? "S" : score >= 80 ? "A" : score >= 70 ? "B" : "F";
+
+  // Indicators for logging
+  const ema50 = emaLast(closes, 50) ?? 0;
+  const ema200 = emaLast(closes, 200) ?? 0;
+  const rsiValues = calculateRsi(closes, 14);
+  const stoch = calculateStochRsi(rsiValues, 14, 3, 3);
+  const lastIdx = closes.length - 1;
+  const rsi = rsiValues[lastIdx] ?? 0;
+  const k = stoch.k[lastIdx] ?? 0;
+  const d = stoch.d[lastIdx] ?? 0;
+
+  return {
+    ok: pass,
+    score,
+    grade,
+    reason: pass ? "surge_setup_passed" : "surge_setup_failed",
+    failed_conditions: failed,
+    ema50,
+    ema200,
+    rsi,
+    stochK: k,
+    stochD: d,
+    volumeRatio: volRatio,
+    stopPrice,
+    targetPrice,
+    riskReward: risk > 0 ? (targetPrice - currentPx) / risk : 0,
+    priceAboveEma20,
+    highReclaim,
+    overextended,
+    wickOk,
+    rrOk,
   };
 }
 
@@ -3543,6 +3675,36 @@ export function createLiveDataStrategy(opts: {
         // [ORIGINAL SETUP] Primary Gate Enforcement (Upbit fetch limit is 200)
         const candles1 = await fetchMinuteCandlesCached(m, 1, 200);
         const setup = evaluateOriginalSpotScalpingSetup(m, candles1, currentPx);
+
+        // [SURGE SETUP SHADOW EVALUATION]
+        let surgeShadowSetup: SurgeEntrySetupResult | undefined;
+        const sourceKind = String(s.p.source_kind ?? "");
+        if (sourceKind === "scanner_filter_fresh" || sourceKind === "scanner_filter") {
+          surgeShadowSetup = evaluateSurgeEntrySetup(m, candles1, currentPx, s.p);
+          console.info(JSON.stringify({
+            tag: "SURGE_ENTRY_SETUP_PROOF",
+            market: m,
+            source_kind: sourceKind,
+            candles_count: candles1.length,
+            current_price: currentPx,
+            volumeRatio: surgeShadowSetup.volumeRatio,
+            momentum_3m_pct: Number(s.p.rise_3m_pct ?? s.p.momentum_3m_pct ?? 0),
+            ema50: surgeShadowSetup.ema50,
+            ema200: surgeShadowSetup.ema200,
+            rsi: surgeShadowSetup.rsi,
+            stochK: surgeShadowSetup.stochK,
+            stochD: surgeShadowSetup.stochD,
+            original_setup_ok: setup.ok,
+            original_failed_conditions: setup.failed_conditions,
+            surge_setup_score: surgeShadowSetup.score,
+            surge_setup_grade: surgeShadowSetup.grade,
+            surge_setup_pass: surgeShadowSetup.ok,
+            failed_surge_conditions: surgeShadowSetup.failed_conditions,
+            evaluation_source: "live_strategy_tick",
+            loop_id: typeof loopId !== 'undefined' ? loopId : Date.now(),
+          }));
+        }
+
         if (!setup.ok) {
           evaluationDroppedReasons[m] = `setup_blocked:${setup.reason}`;
           console.info(JSON.stringify({
@@ -3629,6 +3791,7 @@ export function createLiveDataStrategy(opts: {
           stochD: setup.stochD,
           volumeRatio: setup.volumeRatio,
           setup,
+          surge_shadow_setup: surgeShadowSetup,
         };
         candidateMetaMap.set(m, meta);
         return meta;
