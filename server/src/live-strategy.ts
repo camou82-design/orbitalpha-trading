@@ -274,6 +274,19 @@ type OriginalSpotSetupResult = {
   stochK?: number;
   stochD?: number;
   volumeRatio?: number;
+  // Detailed flags
+  safePriceAboveEma200?: boolean;
+  pullbackToEma200?: boolean;
+  stochOversoldBullishCross?: boolean;
+  isBullish?: boolean;
+  safe_condition_pass?: boolean;
+  aggressiveEmaStack?: boolean;
+  aggressivePriceAbove?: boolean;
+  aggressiveRsiOk?: boolean;
+  aggressiveVolumeOk?: boolean;
+  aggressiveRiskRewardOk?: boolean;
+  aggressive_condition_pass?: boolean;
+  failed_conditions?: string[];
 };
 
 type CandidateMeta = {
@@ -1083,8 +1096,9 @@ function evaluateOriginalSpotScalpingSetup(
   const safePriceAboveEma200 = currentPrice > ema200Last || Number(lastCandle.trade_price) > ema200Last;
   const pullbackToEma200 = lows.slice(-20).some(l => l <= ema200Last * 1.015);
   const stochOversoldBullishCross = prevK <= 20 && prevD <= 20 && k > d && prevK <= prevD;
-  
-  if (safePriceAboveEma200 && pullbackToEma200 && stochOversoldBullishCross && isBullish) {
+  const safe_condition_pass = safePriceAboveEma200 && pullbackToEma200 && stochOversoldBullishCross && isBullish;
+
+  if (safe_condition_pass) {
     const stopPrice = swingLow * 0.998;
     const risk = currentPrice - stopPrice;
     if (risk > 0) {
@@ -1097,7 +1111,8 @@ function evaluateOriginalSpotScalpingSetup(
         ema50: ema50Last, ema200: ema200Last, rsi, stochK: k, stochD: d,
         volumeRatio: volRatio,
         stopPrice, targetPrice, riskReward: rr,
-        candleLow, swingLow
+        candleLow, swingLow,
+        safePriceAboveEma200, pullbackToEma200, stochOversoldBullishCross, isBullish, safe_condition_pass
       };
     }
   }
@@ -1108,8 +1123,10 @@ function evaluateOriginalSpotScalpingSetup(
   const stochReversal = k > prevK && k > 20;
   const rsiBullish = rsi > 50 || (prevRsi <= 50 && rsi > 50) || rsi > prevRsi;
   const volSpike = volRatio > 1.0;
+  const aggressiveRiskRewardOk = true; // RR checked inside
+  const aggressive_condition_pass = aggressiveEmaStack && aggressivePriceAbove && stochReversal && rsiBullish && volSpike;
 
-  if (aggressiveEmaStack && aggressivePriceAbove && stochReversal && rsiBullish && volSpike) {
+  if (aggressive_condition_pass) {
     const stopPrice = Math.min(candleLow, swingLow) * 0.998;
     const risk = currentPrice - stopPrice;
     if (risk > 0) {
@@ -1122,10 +1139,22 @@ function evaluateOriginalSpotScalpingSetup(
         ema50: ema50Last, ema200: ema200Last, rsi, stochK: k, stochD: d,
         volumeRatio: volRatio,
         stopPrice, targetPrice, riskReward: rr,
-        candleLow, swingLow
+        candleLow, swingLow,
+        aggressiveEmaStack, aggressivePriceAbove, aggressiveRsiOk: rsiBullish, aggressiveVolumeOk: volSpike, aggressiveRiskRewardOk, aggressive_condition_pass
       };
     }
   }
+
+  const failed: string[] = [];
+  if (!safePriceAboveEma200) failed.push("safePriceAboveEma200");
+  if (!pullbackToEma200) failed.push("pullbackToEma200");
+  if (!stochOversoldBullishCross) failed.push("stochOversoldBullishCross");
+  if (!isBullish) failed.push("isBullish");
+  if (!aggressiveEmaStack) failed.push("aggressiveEmaStack");
+  if (!aggressivePriceAbove) failed.push("aggressivePriceAbove");
+  if (!stochReversal) failed.push("stochReversal");
+  if (!rsiBullish) failed.push("rsiBullish");
+  if (volRatio <= 1.0) failed.push("volRatio<=1.0");
 
   return {
     ok: false,
@@ -1137,6 +1166,9 @@ function evaluateOriginalSpotScalpingSetup(
     stochK: k,
     stochD: d,
     volumeRatio: volRatio,
+    safePriceAboveEma200, pullbackToEma200, stochOversoldBullishCross, isBullish, safe_condition_pass,
+    aggressiveEmaStack, aggressivePriceAbove, aggressiveRsiOk: rsiBullish, aggressiveVolumeOk: volSpike, aggressiveRiskRewardOk, aggressive_condition_pass,
+    failed_conditions: failed,
   };
 }
 
@@ -1500,6 +1532,7 @@ export function createLiveDataStrategy(opts: {
   };
 
   const runTick = async () => {
+    const loopId = Date.now();
     try {
     // 운영 최종값 단일화: persisted 값과 무관하게 매 tick env cap으로 재설정.
     state.safety_guard.max_positions = LIVE_MAX_POSITIONS_CAP;
@@ -3512,7 +3545,38 @@ export function createLiveDataStrategy(opts: {
         const setup = evaluateOriginalSpotScalpingSetup(m, candles1, currentPx);
         if (!setup.ok) {
           evaluationDroppedReasons[m] = `setup_blocked:${setup.reason}`;
-          console.info(JSON.stringify({ tag: "DEBUG_ORIGINAL_SPOT_SETUP_BLOCK", market: m, reason: setup.reason }));
+          console.info(JSON.stringify({
+            tag: "DEBUG_ORIGINAL_SPOT_SETUP_BLOCK",
+            market: m,
+            reason: setup.reason,
+            loop_id: typeof loopId !== 'undefined' ? loopId : Date.now(),
+            evaluation_source: "live_strategy_tick",
+            candles_count: candles1.length,
+            current_price: currentPx,
+            ema50: setup.ema50,
+            ema200: setup.ema200,
+            rsi: setup.rsi,
+            stochK: setup.stochK,
+            stochD: setup.stochD,
+            volumeRatio: setup.volumeRatio,
+            swingLow: setup.swingLow,
+            stopPrice: setup.stopPrice,
+            targetPrice: setup.targetPrice,
+            riskReward: setup.riskReward,
+            safePriceAboveEma200: setup.safePriceAboveEma200,
+            pullbackToEma200: setup.pullbackToEma200,
+            stochOversoldBullishCross: setup.stochOversoldBullishCross,
+            isBullish: setup.isBullish,
+            safe_condition_pass: setup.safe_condition_pass,
+            aggressiveEmaStack: setup.aggressiveEmaStack,
+            aggressivePriceAbove: setup.aggressivePriceAbove,
+            aggressiveRsiOk: setup.aggressiveRsiOk,
+            aggressiveVolumeOk: setup.aggressiveVolumeOk,
+            aggressiveRiskRewardOk: setup.aggressiveRiskRewardOk,
+            aggressive_condition_pass: setup.aggressive_condition_pass,
+            final_reason: setup.reason,
+            failed_conditions: setup.failed_conditions,
+          }));
           return null;
         }
         console.info(JSON.stringify({ tag: "DEBUG_ORIGINAL_SPOT_SETUP_PASS", market: m, mode: setup.mode, rr: setup.riskReward }));

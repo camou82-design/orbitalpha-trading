@@ -1482,9 +1482,23 @@ export function createPaperTradingEngine(opts: {
     candleLow?: number;
     swingLow?: number;
     volumeRatio?: number;
+    // Detailed flags
+    safePriceAboveEma200?: boolean;
+    pullbackToEma200?: boolean;
+    stochOversoldBullishCross?: boolean;
+    isBullish?: boolean;
+    safe_condition_pass?: boolean;
+    aggressiveEmaStack?: boolean;
+    aggressivePriceAbove?: boolean;
+    aggressiveRsiOk?: boolean;
+    aggressiveVolumeOk?: boolean;
+    aggressiveRiskRewardOk?: boolean;
+    aggressive_condition_pass?: boolean;
+    failed_conditions?: string[];
   };
 
   const tick = async () => {
+    const loopId = Date.now();
     const scannerSignals = opts.getScannerSignals();
     emitPaper("DEBUG_PAPER_SIGNAL_HANDOFF", {
       scanner_signals_length: scannerSignals.length,
@@ -1626,8 +1640,9 @@ export function createPaperTradingEngine(opts: {
 
       // [ORIGINAL SETUP] Primary Filter for Paper Trading
       let setupResult: OriginalSpotSetupResult | null = null;
+      let c1: any[] = [];
       try {
-        const c1 = await fetchMinuteCandles(market, 1, 200);
+        c1 = await fetchMinuteCandles(market, 1, 200);
         if (c1.length >= 200) {
           const completed = c1.slice(0, -1);
           const closes = completed.map(c => Number(c.trade_price));
@@ -1658,28 +1673,89 @@ export function createPaperTradingEngine(opts: {
           const safePriceAboveEma200 = px > (ema200 ?? 0);
           const pullbackToEma200 = lows.slice(-20).some(l => l <= (ema200 ?? 0) * 1.015);
           const stochOversoldBullishCross = prevK <= 20 && prevD <= 20 && k > d && prevK <= prevD;
+          const safe_condition_pass = safePriceAboveEma200 && pullbackToEma200 && stochOversoldBullishCross && isBullish;
           
-          if (safePriceAboveEma200 && pullbackToEma200 && stochOversoldBullishCross && isBullish) {
+          const emaStack = (ema50 ?? 0) > (ema200 ?? 0);
+          const priceAbove = px > (ema50 ?? 0) && px > (ema200 ?? 0);
+          const stochReversal = k > prevK && k > 20;
+          const rsiBullish = rsi > 50 || (prevRsi <= 50 && rsi > 50) || rsi > prevRsi;
+          const volSpike = volRatio > 1.0;
+          const aggressive_condition_pass = emaStack && priceAbove && stochReversal && rsiBullish && volSpike;
+
+          if (safe_condition_pass) {
             const stop = swingLow * 0.998;
             const target = px + (px - stop) * 1.5;
-            setupResult = { ok: true, mode: "safe", stop, target, rr: 1.5, reason: "safe_pullback_ema200", ema50: ema50 ?? 0, ema200: ema200 ?? 0, rsi, stochK: k, stochD: d, swingLow, volumeRatio: volRatio };
+            setupResult = { 
+              ok: true, mode: "safe", stop, target, rr: 1.5, reason: "safe_pullback_ema200", 
+              ema50: ema50 ?? 0, ema200: ema200 ?? 0, rsi, stochK: k, stochD: d, swingLow, volumeRatio: volRatio,
+              safePriceAboveEma200, pullbackToEma200, stochOversoldBullishCross, isBullish, safe_condition_pass,
+              aggressiveEmaStack: emaStack, aggressivePriceAbove: priceAbove, aggressiveRsiOk: rsiBullish, aggressiveVolumeOk: volSpike, aggressiveRiskRewardOk: true, aggressive_condition_pass
+            };
+          } else if (aggressive_condition_pass) {
+            const stop = Math.min(Number(lastCandle.low_price), swingLow) * 0.998;
+            const target = px + (px - stop) * 2.0;
+            setupResult = { 
+              ok: true, mode: "aggressive", stop, target, rr: 2.0, reason: "aggressive_trend", 
+              ema50: ema50 ?? 0, ema200: ema200 ?? 0, rsi, stochK: k, stochD: d, swingLow, volumeRatio: volRatio,
+              safePriceAboveEma200, pullbackToEma200, stochOversoldBullishCross, isBullish, safe_condition_pass,
+              aggressiveEmaStack: emaStack, aggressivePriceAbove: priceAbove, aggressiveRsiOk: rsiBullish, aggressiveVolumeOk: volSpike, aggressiveRiskRewardOk: true, aggressive_condition_pass
+            };
           } else {
-            // Aggressive Mode
-            const emaStack = (ema50 ?? 0) > (ema200 ?? 0);
-            const priceAbove = px > (ema50 ?? 0) && px > (ema200 ?? 0);
-            const stochReversal = k > prevK && k > 20;
-            const rsiBullish = rsi > 50 || (prevRsi <= 50 && rsi > 50) || rsi > prevRsi;
-            if (emaStack && priceAbove && stochReversal && rsiBullish && volRatio > 1.0) {
-              const stop = Math.min(Number(lastCandle.low_price), swingLow) * 0.998;
-              const target = px + (px - stop) * 2.0;
-              setupResult = { ok: true, mode: "aggressive", stop, target, rr: 2.0, reason: "aggressive_trend", ema50: ema50 ?? 0, ema200: ema200 ?? 0, rsi, stochK: k, stochD: d, swingLow, volumeRatio: volRatio };
-            }
+            const failed: string[] = [];
+            if (!safePriceAboveEma200) failed.push("safePriceAboveEma200");
+            if (!pullbackToEma200) failed.push("pullbackToEma200");
+            if (!stochOversoldBullishCross) failed.push("stochOversoldBullishCross");
+            if (!isBullish) failed.push("isBullish");
+            if (!emaStack) failed.push("aggressiveEmaStack");
+            if (!priceAbove) failed.push("aggressivePriceAbove");
+            if (!stochReversal) failed.push("stochReversal");
+            if (!rsiBullish) failed.push("rsiBullish");
+            if (!volSpike) failed.push("aggressiveVolumeOk");
+
+            setupResult = {
+              ok: false, mode: "none", stop: 0, target: 0, rr: 0, reason: "setup_conditions_not_met",
+              ema50: ema50 ?? 0, ema200: ema200 ?? 0, rsi, stochK: k, stochD: d, swingLow, volumeRatio: volRatio,
+              safePriceAboveEma200, pullbackToEma200, stochOversoldBullishCross, isBullish, safe_condition_pass,
+              aggressiveEmaStack: emaStack, aggressivePriceAbove: priceAbove, aggressiveRsiOk: rsiBullish, aggressiveVolumeOk: volSpike, aggressiveRiskRewardOk: true, aggressive_condition_pass,
+              failed_conditions: failed
+            };
           }
         }
       } catch (err) {}
 
       if (!setupResult || !setupResult.ok) {
-        emitPaper("DEBUG_ORIGINAL_SPOT_SETUP_BLOCK", { market, ok: false, reason: setupResult?.reason ?? "setup_conditions_not_met" });
+        emitPaper("DEBUG_ORIGINAL_SPOT_SETUP_BLOCK", { 
+          market, 
+          ok: false, 
+          reason: setupResult?.reason ?? "setup_conditions_not_met",
+          loop_id: loopId,
+          evaluation_source: "paper_trading_tick",
+          candles_count: c1.length,
+          current_price: px,
+          ema50: setupResult?.ema50,
+          ema200: setupResult?.ema200,
+          rsi: setupResult?.rsi,
+          stochK: setupResult?.stochK,
+          stochD: setupResult?.stochD,
+          volumeRatio: setupResult?.volumeRatio,
+          swingLow: setupResult?.swingLow,
+          stopPrice: setupResult?.stop,
+          targetPrice: setupResult?.target,
+          riskReward: setupResult?.rr,
+          safePriceAboveEma200: setupResult?.safePriceAboveEma200,
+          pullbackToEma200: setupResult?.pullbackToEma200,
+          stochOversoldBullishCross: setupResult?.stochOversoldBullishCross,
+          isBullish: setupResult?.isBullish,
+          safe_condition_pass: setupResult?.safe_condition_pass,
+          aggressiveEmaStack: setupResult?.aggressiveEmaStack,
+          aggressivePriceAbove: setupResult?.aggressivePriceAbove,
+          aggressiveRsiOk: setupResult?.aggressiveRsiOk,
+          aggressiveVolumeOk: setupResult?.aggressiveVolumeOk,
+          aggressiveRiskRewardOk: setupResult?.aggressiveRiskRewardOk,
+          aggressive_condition_pass: setupResult?.aggressive_condition_pass,
+          final_reason: setupResult?.reason ?? "setup_conditions_not_met",
+          failed_conditions: setupResult?.failed_conditions ?? ["unknown"],
+        });
         continue; 
       }
       emitPaper("DEBUG_ORIGINAL_SPOT_SETUP_PASS", { market, mode: setupResult.mode, reason: setupResult.reason });
