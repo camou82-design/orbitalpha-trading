@@ -2302,6 +2302,11 @@ export function createPaperTradingEngine(opts: {
     const workerSource = workerSnap?.source ?? "none";
     const workerAgeMs = workerUpdatedAt ? Date.now() - Date.parse(workerUpdatedAt) : null;
 
+    const workerStaleLimit = 180000; // 3 minutes
+    const workerSnapshotExists = workerUpdatedAt !== null;
+    const workerStale = workerAgeMs !== null && workerAgeMs > workerStaleLimit;
+    const workerAvailable = workerSnapshotExists && !workerStale;
+
     const universeCount = state.preEntryWatch.size;
     const candidateCount = candidateMarkets.length;
 
@@ -2385,14 +2390,11 @@ export function createPaperTradingEngine(opts: {
 
     const localShadowV2Count = shadowV2.length;
     const workerShadowV2Count = workerShadowItems.length;
-    const workerAvailable = workerShadowV2Count > 0 && workerAgeMs !== null;
-    const workerStaleLimit = 180000; // 3 minutes
-    const workerIsFresh = workerAvailable && workerAgeMs! < workerStaleLimit;
 
     let preferredSource: "worker" | "local" | "none" = "none";
     let preferredItems: any[] = [];
 
-    if (workerIsFresh) {
+    if (workerAvailable) {
       preferredSource = "worker";
       preferredItems = workerShadowItems;
     } else if (LOCAL_SHADOW_ENABLED) {
@@ -2424,6 +2426,19 @@ export function createPaperTradingEngine(opts: {
       degradedReasons.push("ticker_fetch_failed");
     }
 
+    // Worker status overrides for non-local mode
+    if (!LOCAL_SHADOW_ENABLED) {
+      if (!workerSnapshotExists) {
+        statusCode = "degraded";
+        statusMessage = "Worker 데이터 스냅샷 없음";
+        degradedReasons.push("worker_shadow_missing");
+      } else if (workerStale) {
+        statusCode = "stale";
+        statusMessage = "Worker 데이터가 오래됨 (stale)";
+        degradedReasons.push("worker_shadow_stale");
+      }
+    }
+
     const res = {
       mode: "paper_trading",
       updated_at: updatedAt,
@@ -2444,8 +2459,11 @@ export function createPaperTradingEngine(opts: {
       preferred_shadow_v2_count: preferredItems.length,
       local_shadow_v2_enabled: LOCAL_SHADOW_ENABLED,
       local_shadow_v2_count: localShadowV2Count,
+      worker_shadow_v2_snapshot_exists: workerSnapshotExists,
       worker_shadow_v2_available: workerAvailable,
+      worker_shadow_v2_count: workerShadowV2Count,
       worker_shadow_v2_age_ms: workerAgeMs,
+      worker_shadow_v2_stale: workerStale,
       
       degraded_reasons: degradedReasons,
       last_error: null,
@@ -2496,7 +2514,8 @@ export function createPaperTradingEngine(opts: {
         chase_loss_rate: Number(s.chase_loss_rate ?? 0),
         suggested_size_multiplier: Number(s.suggested_size_multiplier ?? 1),
       })),
-      surge_v2_shadow: shadowV2,
+      surge_v2_shadow: preferredItems,
+      local_shadow_v2_items: shadowV2,
       worker_shadow_v2: {
         source: workerSource,
         updated_at: workerUpdatedAt,
