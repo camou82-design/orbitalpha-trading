@@ -4444,6 +4444,7 @@ export function createLiveDataStrategy(opts: {
           filter_pass: Boolean(sig.p.filter_pass),
         });
       }
+      // Surge sources use a separate centralized evaluator (surge-v2), so we bypass the legacy bridged strength floor here.
       if (!isSurgeSource && bridgedStrength < ENTRY_PIPELINE_MID_SCORE_FLOOR) {
         await appendLog({
           company_id: companyIdSchema.parse(opts.companyId),
@@ -4977,6 +4978,7 @@ export function createLiveDataStrategy(opts: {
         emitEval("entry_blocked_signal_strength", { symbol: market, signal_type: "LOW" });
         continue;
       }
+      // Surge sources bypass legacy MID gate checks to delegate score/momentum judgment to the surge-v2 engine.
       if (!isSurgeSource && sigTypeUpper === "MID") {
         const gatePrev = opts.marketState.entryGate(sig.p, marketState);
         const composite = Number(gatePrev.score ?? 0);
@@ -5208,6 +5210,11 @@ export function createLiveDataStrategy(opts: {
               bridge_pass: bridgePass,
               filter_pass: filterPass,
               stale_ok: staleOk,
+              btc_change_24h: btcChange,
+              btc_5m_trend: marketState.btc_5m_trend,
+              btc_15m_trend: marketState.btc_15m_trend,
+              gate_ok_before_surge: gateOk,
+              gate_block_reason_before_surge: detailedReason ?? null,
               decision_action: decision.action,
               decision_reason: decision.reason,
               authority_source: decision.authoritySource,
