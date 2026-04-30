@@ -3796,7 +3796,20 @@ export function createLiveDataStrategy(opts: {
               failed_conditions: setup.failed_conditions,
             }));
           }
-          return null;
+
+          const isSurgeSource = !!((s.p as any).isSurgeSource === true || s.p.source_kind === "scanner_filter_fresh");
+          if (isSurgeSource) {
+            console.info(JSON.stringify({
+              tag: "SURGE_LEGACY_SETUP_BYPASSED_PROOF",
+              market: m,
+              reason: blockReason,
+              source_kind: s.p.source_kind,
+              authority_source: "surge-v2",
+              note: "legacy original spot setup bypassed for surge candidate",
+            }));
+          } else {
+            return null;
+          }
         }
         console.info(JSON.stringify({ tag: "DEBUG_ORIGINAL_SPOT_SETUP_PASS", market: m, mode: setup.mode, rr: setup.riskReward }));
 
@@ -3825,7 +3838,8 @@ export function createLiveDataStrategy(opts: {
         });
 
         const riskReward = Number(setup.riskReward ?? 0);
-        if (!(riskReward > 0)) {
+        const isSurgeSourceFinal = !!((s.p as any).isSurgeSource === true || s.p.source_kind === "scanner_filter_fresh");
+        if (!(riskReward > 0) && !isSurgeSourceFinal) {
           evaluationDroppedReasons[m] = "risk_reward_invalid";
           return null;
         }
