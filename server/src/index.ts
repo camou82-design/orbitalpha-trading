@@ -148,6 +148,10 @@ function isEntrySignalAllowed(payload: unknown, activeMonitorInstanceId?: string
   if (!volume?.passed) return { ok: false, reason: "volume_increase filter not passed" };
   return { ok: true };
 }
+const TRADE_STATUS_CACHE_TTL_MS = 2500;
+const TRADE_STATUS_SLOW_FALLBACK_MS = 3000;
+let tradeStatusCache: { at: number; body: any } | null = null;
+let tradeStatusInFlight: Promise<any> | null = null;
 
 async function main() {
   const env = loadEnv();
@@ -844,38 +848,100 @@ async function main() {
 
   /** 동일 페이로드(account_portfolio 포함) — 레거시 클라이언트가 /account/status 를 호출하는 경우 대비. */
   const buildTradeStatusResponse = async (req: FastifyRequest, route: string) => {
-    const t0 = Date.now();
-    const body = await trade.status();
-    const ms = Date.now() - t0;
-    if (ms >= TRADE_STATUS_SLOW_MS) {
-      req.log.warn(
+    const now = Date.now();
+
+    // 1. Cache hit check
+    if (tradeStatusCache && now - tradeStatusCache.at < TRADE_STATUS_CACHE_TTL_MS) {
+      req.log.info(
         JSON.stringify({
-          tag: "DASHBOARD_TRADE_STATUS_SLOW",
+          tag: "DASHBOARD_TRADE_STATUS_CACHE_HIT",
           endpoint: route,
-          ms,
-          threshold_ms: TRADE_STATUS_SLOW_MS,
+          age_ms: now - tradeStatusCache.at,
         }),
       );
+      return tradeStatusCache.body;
     }
-    if (!body.api_connected) {
-      const egressIp = await getEgressPublicIp();
-      req.log.warn(
-        {
-          route,
-          api_connected: false,
-          account_sync_failure_code: body.account_sync_failure_code,
-          account_sync_failure_message: body.account_sync_failure_message,
-          api_reason: body.api_reason,
-          env_access_key_present: body.env_access_key_present,
-          env_secret_key_present: body.env_secret_key_present,
-          upbit_access_key_masked: body.env_access_key_masked,
-          upbit_access_key_fingerprint: (body as any).env_access_key_fingerprint ?? null,
-          egress_public_ip: egressIp,
-        },
-        "trade_status_account_sync_failed",
+
+    // 2. In-flight deduplication
+    if (tradeStatusInFlight) {
+      req.log.info(
+        JSON.stringify({
+          tag: "DASHBOARD_TRADE_STATUS_IN_FLIGHT_DEDUPED",
+          endpoint: route,
+        }),
       );
+      return tradeStatusInFlight;
     }
-    return body;
+
+    const t0 = Date.now();
+    const calculationPromise = (async () => {
+      try {
+        const body = await trade.status();
+        tradeStatusCache = { at: Date.now(), body };
+        return body;
+      } finally {
+        tradeStatusInFlight = null;
+      }
+    })();
+
+    tradeStatusInFlight = calculationPromise;
+
+    // 3. Last good fallback with timeout
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("TRADE_STATUS_SLOW_FALLBACK")), TRADE_STATUS_SLOW_FALLBACK_MS),
+    );
+
+    try {
+      const body = await Promise.race([calculationPromise, timeoutPromise]);
+      const ms = Date.now() - t0;
+      if (ms >= TRADE_STATUS_SLOW_MS) {
+        req.log.warn(
+          JSON.stringify({
+            tag: "DASHBOARD_TRADE_STATUS_SLOW",
+            endpoint: route,
+            ms,
+            threshold_ms: TRADE_STATUS_SLOW_MS,
+          }),
+        );
+      }
+      if (!body.api_connected) {
+        const egressIp = await getEgressPublicIp();
+        req.log.warn(
+          {
+            route,
+            api_connected: false,
+            account_sync_failure_code: body.account_sync_failure_code,
+            account_sync_failure_message: body.account_sync_failure_message,
+            api_reason: body.api_reason,
+            env_access_key_present: body.env_access_key_present,
+            env_secret_key_present: body.env_secret_key_present,
+            upbit_access_key_masked: body.env_access_key_masked,
+            upbit_access_key_fingerprint: (body as any).env_access_key_fingerprint ?? null,
+            egress_public_ip: egressIp,
+          },
+          "trade_status_account_sync_failed",
+        );
+      }
+      return body;
+    } catch (err: any) {
+      if (err.message === "TRADE_STATUS_SLOW_FALLBACK" && tradeStatusCache) {
+        req.log.warn(
+          JSON.stringify({
+            tag: "DASHBOARD_TRADE_STATUS_FALLBACK_LAST_GOOD",
+            endpoint: route,
+            last_good_age_ms: now - tradeStatusCache.at,
+          }),
+        );
+        return {
+          ...tradeStatusCache.body,
+          degraded: true,
+          degraded_reason: "trade_status_last_good_fallback",
+          last_good_age_ms: now - tradeStatusCache.at,
+        };
+      }
+      // Re-throw if it wasn't a timeout fallback or if we have no cache
+      return calculationPromise;
+    }
   };
 
   app.get("/api/v1/trade/status", async (req) => buildTradeStatusResponse(req, "GET /api/v1/trade/status"));
