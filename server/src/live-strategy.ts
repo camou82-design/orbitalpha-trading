@@ -2104,6 +2104,7 @@ export function createLiveDataStrategy(opts: {
       source_ts: string | null;
       age_seconds: number | null;
     }> = [];
+    const entrySourceKindByMarket = new Map<string, string>();
     for (const s of freshScannerCandidates) {
       if (selectedSourceRows.some((x) => x.market === s.market)) continue;
       selectedSourceRows.push({
@@ -2128,6 +2129,7 @@ export function createLiveDataStrategy(opts: {
     }
     const selectedEntryUniverseSymbols = selectedSourceRows.map((x) => x.market);
     for (const m of selectedSourceRows) {
+      entrySourceKindByMarket.set(m.market, m.source_kind);
       sourceMetaByMarket.set(m.market, { ...m, stale_filtered_before_eval: false });
     }
     const candidateSourceModeRaw = String(process.env.LIVE_SURGE_CANDIDATE_SOURCE ?? "legacy").toLowerCase().trim();
@@ -3509,6 +3511,7 @@ export function createLiveDataStrategy(opts: {
     if (fallbackUsed) {
       for (const m of primary) {
         if (sourceMetaByMarket.has(m)) continue;
+        entrySourceKindByMarket.set(m, "fallback_watch_markets");
         sourceMetaByMarket.set(m, {
           source_kind: "fallback_watch_markets",
           source_ts: null,
@@ -3724,16 +3727,66 @@ export function createLiveDataStrategy(opts: {
           evaluationDroppedReasons[m] = "missing_ticker_price";
           return null;
         }
+        const sourceKindFromPayload = String(s.p.source_kind ?? "");
+        const sourceKindFromMap = String(entrySourceKindByMarket.get(m) ?? sourceMetaByMarket.get(m)?.source_kind ?? "");
+        const isSurgeCandidate =
+          (s.p as any).isSurgeSource === true ||
+          sourceKindFromPayload === "scanner_filter_fresh" ||
+          sourceKindFromMap === "scanner_filter_fresh";
 
         // [ORIGINAL SETUP] Primary Gate Enforcement (Upbit fetch limit is 200)
         const candles1 = await fetchMinuteCandlesCached(m, 1, 200);
-        const setup = evaluateOriginalSpotScalpingSetup(m, candles1, currentPx);
+        let setup: OriginalSpotSetupResult = {
+          ok: true,
+          mode: "none",
+          reason: "surge_v2_entry_path",
+          riskReward: 1,
+          stopPrice: 0,
+          targetPrice: 0,
+          candleLow: 0,
+          swingLow: 0,
+          volumeRatio: Number(s.p.volume_ratio ?? 0),
+        };
+        if (!isSurgeCandidate) {
+          setup = evaluateOriginalSpotScalpingSetup(m, candles1, currentPx);
+        }
 
         // [SURGE SETUP SHADOW EVALUATION]
         let surgeShadowSetup: SurgeEntrySetupResult | undefined;
-        const sourceKind = String(s.p.source_kind ?? "");
-        if (sourceKind === "scanner_filter_fresh" || sourceKind === "scanner_filter") {
+        const sourceKind = sourceKindFromPayload;
+        if (isSurgeCandidate || sourceKind === "scanner_filter" || sourceKind === "scanner_then_filter_pass") {
           surgeShadowSetup = evaluateSurgeEntrySetup(m, candles1, currentPx, s.p);
+          if (isSurgeCandidate) {
+            setup = {
+              ok: true,
+              mode: "none",
+              reason: "surge_v2_entry_path",
+              riskReward: Number(surgeShadowSetup.riskReward ?? 1),
+              stopPrice: Number(surgeShadowSetup.stopPrice ?? 0),
+              targetPrice: Number(surgeShadowSetup.targetPrice ?? 0),
+              candleLow: Number(surgeShadowSetup.stopPrice ?? 0),
+              swingLow: Number(surgeShadowSetup.stopPrice ?? 0),
+              ema50: surgeShadowSetup.ema50,
+              ema200: surgeShadowSetup.ema200,
+              rsi: surgeShadowSetup.rsi,
+              stochK: surgeShadowSetup.stochK,
+              stochD: surgeShadowSetup.stochD,
+              volumeRatio: surgeShadowSetup.volumeRatio,
+              failed_conditions: [],
+            };
+            console.info(
+              JSON.stringify({
+                tag: "SURGE_ENTRY_PATH_SELECTED_PROOF",
+                market: m,
+                source_kind_from_payload: sourceKindFromPayload || null,
+                source_kind_from_map: sourceKindFromMap || null,
+                is_surge_candidate: true,
+                path: "surge-v2",
+                legacy_original_setup_skipped: true,
+                authority_source: "surge-v2",
+              }),
+            );
+          }
           console.info(JSON.stringify({
             tag: "SURGE_ENTRY_SETUP_PROOF",
             market: m,
@@ -3797,7 +3850,7 @@ export function createLiveDataStrategy(opts: {
             }));
           }
 
-          const isSurgeSource = !!((s.p as any).isSurgeSource === true || s.p.source_kind === "scanner_filter_fresh");
+          const isSurgeSource = isSurgeCandidate;
           if (isSurgeSource) {
             console.info(JSON.stringify({
               tag: "SURGE_LEGACY_SETUP_BYPASSED_PROOF",
@@ -3838,7 +3891,7 @@ export function createLiveDataStrategy(opts: {
         });
 
         const riskReward = Number(setup.riskReward ?? 0);
-        const isSurgeSourceFinal = !!((s.p as any).isSurgeSource === true || s.p.source_kind === "scanner_filter_fresh");
+        const isSurgeSourceFinal = isSurgeCandidate;
         if (!(riskReward > 0) && !isSurgeSourceFinal) {
           evaluationDroppedReasons[m] = "risk_reward_invalid";
           return null;
@@ -3863,6 +3916,7 @@ export function createLiveDataStrategy(opts: {
           volumeRatio: setup.volumeRatio,
           setup,
           surge_shadow_setup: surgeShadowSetup,
+          engine_bucket: isSurgeCandidate ? "surge" : "other",
         };
         candidateMetaMap.set(m, meta);
         return meta;
