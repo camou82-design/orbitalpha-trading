@@ -152,6 +152,7 @@ const TRADE_STATUS_CACHE_TTL_MS = 2500;
 const TRADE_STATUS_SLOW_FALLBACK_MS = 3000;
 let tradeStatusCache: { at: number; body: any } | null = null;
 let tradeStatusInFlight: Promise<any> | null = null;
+let tradeStatusInFlightStartedAt: number | null = null;
 
 async function main() {
   const env = loadEnv();
@@ -862,8 +863,35 @@ async function main() {
       return tradeStatusCache.body;
     }
 
-    // 2. In-flight deduplication
+    // 2. In-flight reset/fallback
+    if (tradeStatusInFlight && tradeStatusInFlightStartedAt && now - tradeStatusInFlightStartedAt > 10_000) {
+      req.log.warn(
+        JSON.stringify({
+          tag: "DASHBOARD_TRADE_STATUS_STALE_IN_FLIGHT_RESET",
+          endpoint: route,
+          elapsed_ms: now - tradeStatusInFlightStartedAt,
+        }),
+      );
+      tradeStatusInFlight = null;
+      tradeStatusInFlightStartedAt = null;
+    }
+
     if (tradeStatusInFlight) {
+      if (tradeStatusCache) {
+        req.log.info(
+          JSON.stringify({
+            tag: "DASHBOARD_TRADE_STATUS_IN_FLIGHT_LAST_GOOD_RETURNED",
+            endpoint: route,
+            last_good_age_ms: now - tradeStatusCache.at,
+          }),
+        );
+        return {
+          ...tradeStatusCache.body,
+          degraded: true,
+          degraded_reason: "trade_status_inflight_last_good_fallback",
+          last_good_age_ms: now - tradeStatusCache.at,
+        };
+      }
       req.log.info(
         JSON.stringify({
           tag: "DASHBOARD_TRADE_STATUS_IN_FLIGHT_DEDUPED",
@@ -874,6 +902,7 @@ async function main() {
     }
 
     const t0 = Date.now();
+    tradeStatusInFlightStartedAt = t0;
     const calculationPromise = (async () => {
       try {
         const body = await trade.status();
@@ -881,6 +910,7 @@ async function main() {
         return body;
       } finally {
         tradeStatusInFlight = null;
+        tradeStatusInFlightStartedAt = null;
       }
     })();
 
@@ -935,7 +965,7 @@ async function main() {
         return {
           ...tradeStatusCache.body,
           degraded: true,
-          degraded_reason: "trade_status_last_good_fallback",
+          degraded_reason: "trade_status_inflight_last_good_fallback",
           last_good_age_ms: now - tradeStatusCache.at,
         };
       }

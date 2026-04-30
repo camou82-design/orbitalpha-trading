@@ -376,10 +376,10 @@ export function createPumpScanner(
   const fakeoutStateMap = new Map<string, FakeoutState>();
 
   let isTickInFlight = false;
-  let dynamicCandleTarget = CANDLE_MAX_MARKETS_PER_TICK;
+  let dynamicCandleTarget = Math.min(2, CANDLE_MAX_MARKETS_PER_TICK);
   let consecutiveNormalTicks = 0;
-  const TICK_BUDGET_SECONDS = 180;
-  const CANDLE_FETCH_TIMEOUT_MS = 10_000; // 10s default
+  const TICK_BUDGET_SECONDS = 60;
+  const CANDLE_FETCH_TIMEOUT_MS = 5000;
 
 
   const debugEnabled =
@@ -445,31 +445,25 @@ export function createPumpScanner(
       return { c1: cached.c1, c5: cached.c5 };
     }
     for (let attempt = 1; attempt <= CANDLE_429_MAX_ATTEMPTS; attempt++) {
+      const ctrl = new AbortController();
+      const tid = setTimeout(() => ctrl.abort(), CANDLE_FETCH_TIMEOUT_MS);
       try {
-        const fetchWithTimeout = async () => {
-          const c1Promise = fetchMinuteCandles(market, 1, 30);
-          const c5Promise = fetchMinuteCandles(market, 5, 20);
-          
-          const timeoutPromise = new Promise<never>((_, reject) => 
-            setTimeout(() => reject(new Error("PUMP_SCANNER_CANDLE_TIMEOUT")), CANDLE_FETCH_TIMEOUT_MS)
-          );
-
-          return await Promise.race([
-            Promise.all([c1Promise, c5Promise]),
-            timeoutPromise
-          ]);
-        };
-
-        const [c1, c5] = await fetchWithTimeout();
+        const c1Promise = fetchMinuteCandles(market, 1, 30, ctrl.signal);
+        const c5Promise = fetchMinuteCandles(market, 5, 20, ctrl.signal);
+        const [c1, c5] = await Promise.all([c1Promise, c5Promise]);
+        clearTimeout(tid);
         candleSnapshotCache.set(market, { c1, c5, fetchedAtMs: Date.now() });
         return { c1, c5 };
-      } catch (e) {
-        const status = (e as any)?.status;
-        const msg = e instanceof Error ? e.message : String(e);
-        if (msg === "PUMP_SCANNER_CANDLE_TIMEOUT") {
-          console.warn(JSON.stringify({ tag: "PUMP_SCANNER_CANDLE_TIMEOUT", market, attempt }));
+      } catch (e: any) {
+        clearTimeout(tid);
+        const isTimeout = e.name === "AbortError" || e.message?.includes("timeout") || e.message?.includes("TIMEOUT");
+        if (isTimeout) {
+          console.warn(JSON.stringify({ tag: "PUMP_SCANNER_CANDLE_TIMEOUT_COOLDOWN", market, attempt, cooldown_min: 10 }));
+          market429CooldownUntilMs.set(market, Date.now() + 10 * 60_000);
           return null;
         }
+        const status = e.status;
+        const msg = e.message || String(e);
         const is429 = status === 429 || msg.includes("429");
         if (!is429 || attempt >= CANDLE_429_MAX_ATTEMPTS) return null;
         const backoffMs = CANDLE_429_BASE_DELAY_MS * 2 ** (attempt - 1);

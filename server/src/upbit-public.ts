@@ -110,10 +110,11 @@ function maybeLog429(nowMs: number, key: string, meta: { market: string; unit: 1
   );
 }
 
-async function fetchJson<T>(path: string): Promise<T> {
+async function fetchJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const url = `${UPBIT}${path}`;
   const r = await fetch(url, {
     headers: { Accept: "application/json" },
+    signal,
   });
   if (!r.ok) {
     const text = await r.text();
@@ -223,6 +224,7 @@ export async function fetchMinuteCandles(
   market: string,
   unit: 1 | 5 | 15,
   count: number,
+  signal?: AbortSignal,
 ): Promise<UpbitCandle[]> {
   const validMarkets = await sanitizeKrwMarkets([market]);
   if (validMarkets.length === 0) return [];
@@ -274,7 +276,7 @@ export async function fetchMinuteCandles(
 
       try {
         const path = `/v1/candles/minutes/${unit}?market=${encodeURIComponent(market)}&count=${count}`;
-        const rows = await fetchJson<UpbitCandle[]>(path);
+        const rows = await fetchJson<UpbitCandle[]>(path, signal);
         const value = [...rows].reverse();
         const fetchedAtMs = Date.now();
         candleFailureCountByKey.delete(key);
