@@ -375,6 +375,13 @@ export function createPumpScanner(
   // Fakeout Management
   const fakeoutStateMap = new Map<string, FakeoutState>();
 
+  let isTickInFlight = false;
+  let dynamicCandleTarget = CANDLE_MAX_MARKETS_PER_TICK;
+  let consecutiveNormalTicks = 0;
+  const TICK_BUDGET_SECONDS = 180;
+  const CANDLE_FETCH_TIMEOUT_MS = 10_000; // 10s default
+
+
   const debugEnabled =
     process.env.ORBITALPHA_TRADING_SCANNER_DEBUG === "1" ||
     (process.env.DEBUG_LOG_ENABLED ?? "").toLowerCase() === "true" ||
@@ -439,13 +446,30 @@ export function createPumpScanner(
     }
     for (let attempt = 1; attempt <= CANDLE_429_MAX_ATTEMPTS; attempt++) {
       try {
-        const c1 = await fetchMinuteCandles(market, 1, 30);
-        const c5 = await fetchMinuteCandles(market, 5, 20);
+        const fetchWithTimeout = async () => {
+          const c1Promise = fetchMinuteCandles(market, 1, 30);
+          const c5Promise = fetchMinuteCandles(market, 5, 20);
+          
+          const timeoutPromise = new Promise<never>((_, reject) => 
+            setTimeout(() => reject(new Error("PUMP_SCANNER_CANDLE_TIMEOUT")), CANDLE_FETCH_TIMEOUT_MS)
+          );
+
+          return await Promise.race([
+            Promise.all([c1Promise, c5Promise]),
+            timeoutPromise
+          ]);
+        };
+
+        const [c1, c5] = await fetchWithTimeout();
         candleSnapshotCache.set(market, { c1, c5, fetchedAtMs: Date.now() });
         return { c1, c5 };
       } catch (e) {
         const status = (e as any)?.status;
         const msg = e instanceof Error ? e.message : String(e);
+        if (msg === "PUMP_SCANNER_CANDLE_TIMEOUT") {
+          console.warn(JSON.stringify({ tag: "PUMP_SCANNER_CANDLE_TIMEOUT", market, attempt }));
+          return null;
+        }
         const is429 = status === 429 || msg.includes("429");
         if (!is429 || attempt >= CANDLE_429_MAX_ATTEMPTS) return null;
         const backoffMs = CANDLE_429_BASE_DELAY_MS * 2 ** (attempt - 1);
@@ -456,6 +480,11 @@ export function createPumpScanner(
   };
 
   const tick = async () => {
+    if (isTickInFlight) {
+      console.warn(JSON.stringify({ tag: "PUMP_SCANNER_TICK_SKIPPED_IN_FLIGHT", ts: new Date().toISOString(), in_flight_skipped: true }));
+      return;
+    }
+    isTickInFlight = true;
     try {
       const tickT0 = Date.now();
       const heldMarkets = Array.from(new Set(getHeldMarkets().filter((m) => typeof m === "string" && m.length > 0)));
@@ -564,15 +593,30 @@ export function createPumpScanner(
         if (heldBiasA !== heldBiasB) return heldBiasB - heldBiasA;
         return (momentumScoreByMarket.get(b.market) ?? 0) - (momentumScoreByMarket.get(a.market) ?? 0);
       });
-      const candleTargets = marketsRanked.slice(0, CANDLE_MAX_MARKETS_PER_TICK);
+      const candleTargets = marketsRanked.slice(0, dynamicCandleTarget);
       const tBeforeCandles = Date.now();
       const batches = chunk(candleTargets, CANDLE_BATCH_SIZE);
+
+      let candleTimeouts = 0;
+      let skippedDueToBudget = 0;
+
 
       for (let bi = 0; bi < batches.length; bi++) {
         const batch = batches[bi]!;
         for (const t of batch) {
+          if (Date.now() - tickT0 > TICK_BUDGET_SECONDS * 1000) {
+            console.warn(JSON.stringify({ tag: "PUMP_SCANNER_TICK_BUDGET_EXCEEDED", market: t.market, elapsed_ms: Date.now() - tickT0 }));
+            skippedDueToBudget += 1;
+            continue;
+          }
+
           const candles = await getCandlesSafe(t.market);
           if (!candles) {
+            if (candleSnapshotCache.has(t.market)) {
+              // already warned in getCandlesSafe or it's a 429
+            } else {
+               candleTimeouts += 1;
+            }
             market429CooldownUntilMs.set(t.market, Date.now() + MARKET_429_EXCLUDE_MS);
             continue;
           }
@@ -713,12 +757,17 @@ export function createPumpScanner(
             momentum_considered: momSel.totalConsidered,
             momentum_top_m: MOMENTUM_TOP_M,
             markets_to_score: marketsToScore.length,
-            candle_targets: candleTargets.length,
+            candle_targets_count: candleTargets.length,
+            candle_timeouts: candleTimeouts,
+            skipped_due_to_budget: skippedDueToBudget,
+            in_flight_skipped: false,
+            dynamic_candle_target: dynamicCandleTarget,
             raw_detected_count: rawDetected.length,
             tradable_confirmed_count: tradableCandidates.length,
           }),
         );
-        if (tickTotalMs > LIVE_ENTRY_SIGNAL_STALE_SECONDS_FOR_WARN * 1_000) {
+        const staleThresholdMs = LIVE_ENTRY_SIGNAL_STALE_SECONDS_FOR_WARN * 1_000;
+        if (tickTotalMs > staleThresholdMs) {
           console.warn(
             JSON.stringify({
               tag: "PUMP_SCANNER_TICK_EXCEEDS_STALE_THRESHOLD",
@@ -726,8 +775,21 @@ export function createPumpScanner(
               candle_ms: candleMs,
               stale_threshold_seconds: LIVE_ENTRY_SIGNAL_STALE_SECONDS_FOR_WARN,
               candle_targets_count: candleTargets.length,
+              candle_timeouts: candleTimeouts,
+              skipped_due_to_budget: skippedDueToBudget,
+              in_flight_skipped: false,
+              dynamic_candle_target: dynamicCandleTarget,
             }),
           );
+          // dynamic reduce
+          dynamicCandleTarget = Math.max(2, Math.floor(dynamicCandleTarget * 0.6));
+          consecutiveNormalTicks = 0;
+        } else {
+          consecutiveNormalTicks += 1;
+          if (consecutiveNormalTicks >= 3 && dynamicCandleTarget < CANDLE_MAX_MARKETS_PER_TICK) {
+            dynamicCandleTarget = Math.min(CANDLE_MAX_MARKETS_PER_TICK, dynamicCandleTarget + 1);
+            consecutiveNormalTicks = 0;
+          }
         }
       }
 
@@ -793,6 +855,8 @@ export function createPumpScanner(
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.warn("[pump-scanner] tick_partial_failure", { error: msg });
+    } finally {
+      isTickInFlight = false;
     }
   };
 

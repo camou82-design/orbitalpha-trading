@@ -4700,8 +4700,8 @@ export function createLiveDataStrategy(opts: {
         }
       }
 
-      let entryAllowedByTiming = !lateEntryGuardTriggered;
-      if (btcTierNow === "weak") {
+      let entryAllowedByTiming = isSurgeSource || !lateEntryGuardTriggered;
+      if (btcTierNow === "weak" && !isSurgeSource) {
         if (score < LIVE_WEAK_MARKET_MIN_SCORE) {
           entryAllowedByTiming = false;
           lateEntryGuardTriggered = true;
@@ -4962,8 +4962,10 @@ export function createLiveDataStrategy(opts: {
             btc_tier: btcTierNow,
           }),
         );
-        bumpSkip("late_entry_guard");
-        continue;
+        if (!isSurgeSource) {
+          bumpSkip("late_entry_guard");
+          continue;
+        }
       }
       const sigTypeUpper = (sig.p.signal_type ?? "").toUpperCase();
       if (sigTypeUpper === "LOW") {
@@ -4976,7 +4978,9 @@ export function createLiveDataStrategy(opts: {
           payload: { symbol: market, signal_type: sigTypeUpper, reason: "LOW_never_enters" },
         });
         emitEval("entry_blocked_signal_strength", { symbol: market, signal_type: "LOW" });
-        continue;
+        if (!isSurgeSource) {
+          continue;
+        }
       }
       // Surge sources bypass legacy MID gate checks to delegate score/momentum judgment to the surge-v2 engine.
       if (!isSurgeSource && sigTypeUpper === "MID") {
@@ -5065,7 +5069,9 @@ export function createLiveDataStrategy(opts: {
           message: profileInfo.reason,
           payload: { symbol: market, entry_profile_key, profile_decision: "block" },
         });
-        continue;
+        if (!isSurgeSource) {
+          continue;
+        }
       }
       const openForGate = Object.keys(state.positions).length;
       const minBaseScore = openForGate >= 1 ? 88 : 83;
