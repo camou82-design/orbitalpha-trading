@@ -4488,7 +4488,10 @@ export function createLiveDataStrategy(opts: {
       }
       const sourceKindForJudgment = sourceMetaResolved.source_kind;
       const payloadSourceKind = String(sig?.p?.source_kind ?? "");
+      const candidateMetaFromSetup = candidateMetaMap.get(market);
+      const isSetupTaggedSurge = candidateMetaFromSetup?.engine_bucket === "surge";
       const isSurgeSource =
+        isSetupTaggedSurge ||
         sourceKindForJudgment === "scanner_filter_fresh" ||
         sourceKindForJudgment === "scanner_then_filter_pass" ||
         payloadSourceKind === "scanner_tradable_candidate" ||
@@ -5288,6 +5291,7 @@ export function createLiveDataStrategy(opts: {
         const bridgePass = Boolean(scannerBridgeScore?.pass);
         const surgeSourceKindLog = payloadSourceKind || sourceKindForJudgment;
         if (isSurgeSource) {
+          const surgeSetupFromCandidate = candidateMetaFromSetup?.surge_shadow_setup;
           const decision = evaluateSurgeEntryPipeline({
             market,
             payload: sig.p,
@@ -5302,6 +5306,10 @@ export function createLiveDataStrategy(opts: {
             bridgePass,
             staleOk,
             ageSeconds: sourceMetaResolved.age_seconds,
+            surgeSetupPass: surgeSetupFromCandidate?.ok,
+            surgeSetupScore: surgeSetupFromCandidate?.score,
+            surgeSetupGrade: surgeSetupFromCandidate?.grade,
+            failedSurgeConditions: surgeSetupFromCandidate?.failed_conditions,
           });
 
           console.info(
@@ -5323,6 +5331,11 @@ export function createLiveDataStrategy(opts: {
               btc_15m_trend: marketState.btc_15m_trend,
               gate_ok_before_surge: gateOk,
               gate_block_reason_before_surge: detailedReason ?? null,
+              setup_tagged_surge: isSetupTaggedSurge,
+              surge_setup_pass: surgeSetupFromCandidate?.ok ?? null,
+              surge_setup_score: surgeSetupFromCandidate?.score ?? null,
+              surge_setup_grade: surgeSetupFromCandidate?.grade ?? null,
+              failed_surge_conditions: surgeSetupFromCandidate?.failed_conditions ?? [],
               decision_action: decision.action,
               decision_reason: decision.reason,
               authority_source: decision.authoritySource,

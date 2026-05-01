@@ -30,6 +30,10 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
   bridgePass: boolean;
   staleOk: boolean;
   ageSeconds: number | null;
+  surgeSetupPass?: boolean;
+  surgeSetupScore?: number;
+  surgeSetupGrade?: string;
+  failedSurgeConditions?: string[];
 }>): SurgeEntryDecision {
   const p = (input.payload && typeof input.payload === "object" ? input.payload : {}) as Record<string, unknown>;
   const sourceKind = String(p.source_kind ?? "");
@@ -38,6 +42,12 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
   const breakout = Boolean(p.breakout);
   const closeUpperHold = Boolean(p.close_upper_hold);
   const rise3mPct = num(p.rise_3m_pct ?? p.momentum_3m_pct ?? p.price_change_3m_pct ?? 0);
+  const surgeSetupContext = {
+    surge_setup_pass: input.surgeSetupPass ?? null,
+    surge_setup_score: input.surgeSetupScore ?? null,
+    surge_setup_grade: input.surgeSetupGrade ?? null,
+    failed_surge_conditions: input.failedSurgeConditions ?? [],
+  };
 
   // Market crash guards (moved from live-strategy.ts)
   const btcChange = input.marketState.btc_change_24h;
@@ -51,7 +61,7 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
       action: "reject",
       reason: btcCrashGuard ? "surge_market_crash_guard" : "surge_market_panic_guard",
       authoritySource: "surge-v2",
-      detail: { symbol: input.market, btc_change: btcChange, btc_5m_trend: input.marketState.btc_5m_trend },
+      detail: { symbol: input.market, btc_change: btcChange, btc_5m_trend: input.marketState.btc_5m_trend, ...surgeSetupContext },
     };
   }
 
@@ -60,7 +70,7 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
       action: "reject",
       reason: "blocked_surge_bridge",
       authoritySource: "surge-v2",
-      detail: { symbol: input.market, sub: "bridge_pass_false", source_kind: sourceKind },
+      detail: { symbol: input.market, sub: "bridge_pass_false", source_kind: sourceKind, ...surgeSetupContext },
     };
   }
   if (!filterPass) {
@@ -68,7 +78,7 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
       action: "reject",
       reason: "blocked_surge_filter",
       authoritySource: "surge-v2",
-      detail: { symbol: input.market, sub: "filter_pass_false", source_kind: sourceKind },
+      detail: { symbol: input.market, sub: "filter_pass_false", source_kind: sourceKind, ...surgeSetupContext },
     };
   }
   if (!input.staleOk) {
@@ -76,7 +86,7 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
       action: "reject",
       reason: "blocked_surge_stale",
       authoritySource: "surge-v2",
-      detail: { symbol: input.market, age_seconds: input.ageSeconds, sub: "signal_stale" },
+      detail: { symbol: input.market, age_seconds: input.ageSeconds, sub: "signal_stale", ...surgeSetupContext },
     };
   }
   if (!(input.volumeRatio >= 1.2)) {
@@ -84,7 +94,7 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
       action: "reject",
       reason: "blocked_surge_volume",
       authoritySource: "surge-v2",
-      detail: { symbol: input.market, volume_multiple: input.volumeRatio, required_min: 1.2 },
+      detail: { symbol: input.market, volume_multiple: input.volumeRatio, required_min: 1.2, ...surgeSetupContext },
     };
   }
   if (!(breakout || closeUpperHold)) {
@@ -92,7 +102,7 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
       action: "reject",
       reason: "blocked_surge_structure",
       authoritySource: "surge-v2",
-      detail: { symbol: input.market, breakout, close_upper_hold: closeUpperHold, sub: "need_breakout_or_upper_hold" },
+      detail: { symbol: input.market, breakout, close_upper_hold: closeUpperHold, sub: "need_breakout_or_upper_hold", ...surgeSetupContext },
     };
   }
   const momentumOk = rise3mPct > 0 || scannerScore >= SURGE_MIN_SCANNER_SCORE;
@@ -106,6 +116,7 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
         rise_3m_pct: rise3mPct,
         scanner_score: scannerScore,
         required_rise_or_score: `rise_3m_pct>0 or scanner_score>=${SURGE_MIN_SCANNER_SCORE}`,
+        ...surgeSetupContext,
       },
     };
   }
@@ -116,7 +127,7 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
       action: "reject",
       reason: "blocked_surge_candles",
       authoritySource: "surge-v2",
-      detail: { symbol: input.market, sub: "insufficient_candles", len: c.length },
+      detail: { symbol: input.market, sub: "insufficient_candles", len: c.length, ...surgeSetupContext },
     };
   }
   const completed = c.slice(0, -1);
@@ -136,6 +147,7 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
         symbol: input.market,
         upper_wick_ratio: Number(upperWickRatio.toFixed(4)),
         max: SURGE_CRASH_UPPER_WICK_MAX,
+        ...surgeSetupContext,
       },
     };
   }
@@ -155,6 +167,7 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
             symbol: input.market,
             three_bar_return_pct: Number(ret3barPct.toFixed(2)),
             max_pct: SURGE_CRASH_3BAR_5M_RETURN_MAX_PCT,
+            ...surgeSetupContext,
           },
         };
       }
@@ -167,7 +180,14 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
       action: "reject",
       reason: "blocked_surge_crash_reject",
       authoritySource: "surge-v2",
-      detail: { symbol: input.market, sub: "strong_bearish_last_bar", open, close, range_pct: ((high - low) / open) * 100 },
+      detail: {
+        symbol: input.market,
+        sub: "strong_bearish_last_bar",
+        open,
+        close,
+        range_pct: ((high - low) / open) * 100,
+        ...surgeSetupContext,
+      },
     };
   }
 
@@ -190,6 +210,7 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
       age_seconds: input.ageSeconds,
       upper_wick_ratio: Number(upperWickRatio.toFixed(4)),
       market_state: input.marketState.market_state,
+      ...surgeSetupContext,
     },
   };
 }
