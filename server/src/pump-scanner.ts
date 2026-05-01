@@ -376,6 +376,7 @@ export function createPumpScanner(
   const fakeoutStateMap = new Map<string, FakeoutState>();
 
   let isTickInFlight = false;
+  let lastTickStartedAt = 0;
   let dynamicCandleTarget = Math.min(2, CANDLE_MAX_MARKETS_PER_TICK);
   let consecutiveNormalTicks = 0;
   const TICK_BUDGET_SECONDS = 60;
@@ -475,12 +476,36 @@ export function createPumpScanner(
 
   const tick = async () => {
     if (isTickInFlight) {
-      console.warn(JSON.stringify({ tag: "PUMP_SCANNER_TICK_SKIPPED_IN_FLIGHT", ts: new Date().toISOString(), in_flight_skipped: true }));
-      return;
+      const elapsedSinceStart = Date.now() - lastTickStartedAt;
+      if (elapsedSinceStart > 120_000) {
+        console.warn(
+          JSON.stringify({
+            tag: "PUMP_SCANNER_STALE_IN_FLIGHT_RESET",
+            ts: new Date().toISOString(),
+            elapsed_ms: elapsedSinceStart,
+          }),
+        );
+        isTickInFlight = false;
+      } else {
+        console.warn(
+          JSON.stringify({
+            tag: "PUMP_SCANNER_TICK_SKIPPED_IN_FLIGHT",
+            ts: new Date().toISOString(),
+            in_flight_skipped: true,
+            elapsed_ms: elapsedSinceStart,
+          }),
+        );
+        return;
+      }
     }
     isTickInFlight = true;
+    lastTickStartedAt = Date.now();
+    const tickT0 = lastTickStartedAt;
+    const rawDetected: ScannerRow[] = [];
+    let candleTimeouts = 0;
+    let skippedDueToBudget = 0;
+
     try {
-      const tickT0 = Date.now();
       const heldMarkets = Array.from(new Set(getHeldMarkets().filter((m) => typeof m === "string" && m.length > 0)));
 
       const is429Excluded = (market: string) => {
@@ -577,7 +602,6 @@ export function createPumpScanner(
         return true;
       });
 
-      const rawDetected: ScannerRow[] = [];
       const tradableCandidates: ScannerRow[] = [];
 
       const heldSet = new Set(heldMarkets);
@@ -590,10 +614,6 @@ export function createPumpScanner(
       const candleTargets = marketsRanked.slice(0, dynamicCandleTarget);
       const tBeforeCandles = Date.now();
       const batches = chunk(candleTargets, CANDLE_BATCH_SIZE);
-
-      let candleTimeouts = 0;
-      let skippedDueToBudget = 0;
-
 
       for (let bi = 0; bi < batches.length; bi++) {
         const batch = batches[bi]!;
@@ -848,9 +868,24 @@ export function createPumpScanner(
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      console.warn("[pump-scanner] tick_partial_failure", { error: msg });
+      console.warn("[pump-scanner] tick_partial_failure", { error: msg, tick_id: tickT0 });
     } finally {
       isTickInFlight = false;
+      const elapsed = Date.now() - tickT0;
+      console.info(
+        JSON.stringify({
+          tag: "PUMP_SCANNER_TICK_RELEASED_PROOF",
+          ts: new Date().toISOString(),
+          tick_id: tickT0,
+          elapsed_ms: elapsed,
+          released: true,
+          reason: "normal",
+          raw_detected_count: rawDetected.length,
+          candle_timeouts: candleTimeouts,
+          skipped_due_to_budget: skippedDueToBudget,
+          is_stale_reset: false,
+        }),
+      );
     }
   };
 

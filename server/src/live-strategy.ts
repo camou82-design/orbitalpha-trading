@@ -3250,9 +3250,32 @@ export function createLiveDataStrategy(opts: {
         continue;
       }
 
+      let placeSellOk = false;
+      let placeSellReason = "unknown";
+      if (isSurge) {
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_V2_LIVE_EXIT_EXECUTION_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            reason_exit: reasonExit,
+            ratio,
+            stop_trigger_kind: stopTriggerKind,
+            authority_class: exitAuthorityClass,
+            execution_layer: "live-strategy",
+            place_sell_called: true,
+            place_sell_ok: null,
+            place_sell_reason: "pending",
+          }),
+        );
+      }
       try {
         await opts.trade.placeSell(market, true, ratio);
+        placeSellOk = true;
+        placeSellReason = "success";
       } catch (e) {
+        placeSellOk = false;
+        placeSellReason = e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200);
         const msg = e instanceof Error ? e.message : String(e);
         await appendLog({
           company_id: companyIdSchema.parse(opts.companyId),
@@ -3270,6 +3293,24 @@ export function createLiveDataStrategy(opts: {
           },
         });
         continue;
+      } finally {
+        if (isSurge) {
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_V2_LIVE_EXIT_EXECUTION_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              reason_exit: reasonExit,
+              ratio,
+              stop_trigger_kind: stopTriggerKind,
+              authority_class: exitAuthorityClass,
+              execution_layer: "live-strategy",
+              place_sell_called: true,
+              place_sell_ok: placeSellOk,
+              place_sell_reason: placeSellReason,
+            }),
+          );
+        }
       }
       const after = await opts.trade.status();
       const qtyAfter = Number(after.strategy_positions?.[market]?.qty ?? 0);
@@ -4501,6 +4542,32 @@ export function createLiveDataStrategy(opts: {
         payloadSourceKind === "scanner_then_filter_pass" ||
         SURGE_V2_SOURCE_KINDS.has(sourceKindForJudgment) ||
         SURGE_V2_SOURCE_KINDS.has(payloadSourceKind);
+
+      if (isSurgeSource) {
+        const surgeSourceKindLog = payloadSourceKind || sourceKindForJudgment;
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_ENTRY_PATH_SELECTED_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            source_kind: surgeSourceKindLog,
+            is_setup_tagged_surge: isSetupTaggedSurge,
+            payload_source_kind: payloadSourceKind,
+            source_kind_for_judgment: sourceKindForJudgment,
+            path: "surge-v2",
+          }),
+        );
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_ENTRY_SETUP_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            setup_found: !!candidateMetaFromSetup,
+            setup_bucket: candidateMetaFromSetup?.engine_bucket,
+            surge_shadow_setup: candidateMetaFromSetup?.surge_shadow_setup || null,
+          }),
+        );
+      }
       const scannerBridgeScore = isSurgeSource
         ? computeScannerBridgeScore({
             scannerScore: Number(sig?.p?.scanner_score ?? sig?.p?.signal_score ?? 0),
@@ -5806,8 +5873,18 @@ export function createLiveDataStrategy(opts: {
         ema200: marketMeta?.ema200,
         rsi: marketMeta?.rsi,
         stochD: marketMeta?.stochD,
-        engine_bucket: "surge",
+        engine_bucket: isSurgeSource ? "surge" : "core",
       };
+      console.info(
+        JSON.stringify({
+          tag: "SURGE_V2_POSITION_BUCKET_PROOF",
+          ts: new Date().toISOString(),
+          market,
+          engine_bucket: state.positions[market].engine_bucket,
+          is_surge_source: isSurgeSource,
+          strategy_type: strategyType,
+        }),
+      );
       state.daily.entry_count += 1;
       state.cooldown_until[market] = new Date(Date.now() + (isExceptionMarket ? 28 : 18) * 60_000).toISOString();
       console.info(
