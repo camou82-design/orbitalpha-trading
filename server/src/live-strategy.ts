@@ -1893,6 +1893,19 @@ export function createLiveDataStrategy(opts: {
 
     const scannerFeedRaw = typeof opts.getScannerSignals === "function" ? opts.getScannerSignals() : [];
     const scannerFeed = Array.isArray(scannerFeedRaw) ? scannerFeedRaw : [];
+    // [SURGE-REPAIR] feed 전체의 최신 updated_at을 구해서 각 row의 timestamp fallback으로 활용.
+    // pump-scanner tick이 정상적으로 완료됐지만 개별 row의 updated_at이 tick 실행 시각으로
+    // 찍혀 있어 stale 판단이 오작동하는 경우를 방지한다.
+    const scannerFeedNewestTsMs = scannerFeed.reduce((best, raw) => {
+      const candidates = [
+        typeof raw?.updated_at === "string" ? Date.parse(raw.updated_at) : NaN,
+        typeof raw?.signal_ts === "string" ? Date.parse(raw.signal_ts) : NaN,
+        typeof raw?.captured_at === "string" ? Date.parse(raw.captured_at) : NaN,
+      ];
+      const max = Math.max(...candidates.filter(Number.isFinite));
+      return Number.isFinite(max) && max > best ? max : best;
+    }, 0);
+    const scannerFeedNewestTs = scannerFeedNewestTsMs > 0 ? new Date(scannerFeedNewestTsMs).toISOString() : null;
     const scannerCandidates = scannerFeed
       .map((raw) => {
         const market = String(raw?.market ?? "").toUpperCase();
@@ -1900,7 +1913,10 @@ export function createLiveDataStrategy(opts: {
         const capturedAt = typeof raw?.captured_at === "string" ? raw.captured_at : null;
         const updatedAt = typeof raw?.updated_at === "string" ? raw.updated_at : null;
         const signalTs = typeof raw?.signal_ts === "string" ? raw.signal_ts : null;
-        const sourceTs = scannerSignalTimestamp(raw);
+        // [SURGE-REPAIR] 개별 row timestamp가 없거나 stale이면 feed 전체 최신 ts를 fallback으로 사용.
+        const rawSourceTs = scannerSignalTimestamp(raw);
+        const feedFallbackTs = scannerFeedNewestTs;
+        const sourceTs = resolveFreshestIsoTs([rawSourceTs, feedFallbackTs]);
         const ageSeconds = sourceTs ? Math.max(0, Math.floor((Date.now() - Date.parse(sourceTs)) / 1000)) : null;
         return {
           market,
@@ -2075,6 +2091,24 @@ export function createLiveDataStrategy(opts: {
     }
     const freshScannerCandidates = scannerCandidatesExcludingHeld.filter((x) => x.ageSeconds !== null && x.ageSeconds <= staleThresholdSeconds);
     const staleScannerCandidates = scannerCandidatesExcludingHeld.filter((x) => x.ageSeconds === null || x.ageSeconds > staleThresholdSeconds);
+    // [LIVE_SURGE_SOURCE_REPAIR_PROOF] scanner source 상태 및 repair 결과 진단 로그
+    const newestScannerAgeSeconds = scannerCandidatesExcludingHeld.length > 0
+      ? Math.min(...scannerCandidatesExcludingHeld.map((x) => x.ageSeconds ?? Infinity).filter(Number.isFinite))
+      : null;
+    console.info(
+      JSON.stringify({
+        tag: "LIVE_SURGE_SOURCE_REPAIR_PROOF",
+        ts: new Date().toISOString(),
+        scanner_candidates_count: scannerCandidatesExcludingHeld.length,
+        fresh_scanner_candidates_count: freshScannerCandidates.length,
+        stale_scanner_candidates_count: staleScannerCandidates.length,
+        selected_surge_candidates: freshScannerCandidates.map((x) => x.market).slice(0, 10),
+        selected_source: freshScannerCandidates.length > 0 ? "scanner_filter_fresh" : "fresh_filter_pass_only",
+        newest_scanner_age_seconds: Number.isFinite(newestScannerAgeSeconds ?? NaN) ? newestScannerAgeSeconds : null,
+        stale_threshold_seconds: staleThresholdSeconds,
+        scanner_feed_newest_ts: scannerFeedNewestTs,
+      }),
+    );
     const freshFilterPassCandidates = Array.from(latestAllSignals.entries())
       .map(([market, sig]) => {
         if (!Boolean(sig?.p?.filter_pass) || heldSymbolSet.has(market)) return null;
@@ -5590,8 +5624,52 @@ export function createLiveDataStrategy(opts: {
           strategy_type: strategyType,
         }),
       );
+      // [SURGE_V2_LIVE_ENTRY_EXECUTION_PROOF] placeBuy 직전 실행 연결 확인 로그
+      console.info(
+        JSON.stringify({
+          tag: "SURGE_V2_LIVE_ENTRY_EXECUTION_PROOF",
+          ts: new Date().toISOString(),
+          market,
+          decision_action: "enter",
+          decision_reason: sourceKindForJudgment,
+          order_krw: orderKrw,
+          size_multiplier: isSurgeSource ? surgeMarketSizeMultiplier : lateEntrySizingMultiplier,
+          authority_source: isSurgeSource ? "surge-v2" : "core",
+          execution_layer: "live-strategy",
+          place_buy_called: true,
+          place_buy_ok: null,
+          place_buy_reason: "pending",
+        }),
+      );
       try {
-        await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", signalPayloadForBuy);
+        let placeBuyOk = false;
+        let placeBuyReason = "unknown";
+        try {
+          await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", signalPayloadForBuy);
+          placeBuyOk = true;
+          placeBuyReason = "success";
+        } catch (innerErr) {
+          placeBuyOk = false;
+          placeBuyReason = innerErr instanceof Error ? innerErr.message.slice(0, 200) : String(innerErr).slice(0, 200);
+          throw innerErr;
+        } finally {
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_V2_LIVE_ENTRY_EXECUTION_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              decision_action: "enter",
+              decision_reason: sourceKindForJudgment,
+              order_krw: orderKrw,
+              size_multiplier: isSurgeSource ? surgeMarketSizeMultiplier : lateEntrySizingMultiplier,
+              authority_source: isSurgeSource ? "surge-v2" : "core",
+              execution_layer: "live-strategy",
+              place_buy_called: true,
+              place_buy_ok: placeBuyOk,
+              place_buy_reason: placeBuyReason,
+            }),
+          );
+        }
         console.info(
           JSON.stringify({
             tag: "LIVE_PLACEBUY_RESULT",
