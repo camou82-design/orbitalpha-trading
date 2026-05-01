@@ -3747,6 +3747,11 @@ export function createLiveDataStrategy(opts: {
       Object.values(state.early_positions).filter((p) => p.engine_bucket === "surge").length;
     const paperStatsMap = await loadPaperSurgePatternStats(opts.companyId, opts.serviceId);
 
+    const SURGE_V2_SOURCE_KINDS = new Set<string>([
+      "scanner_filter_fresh",
+      "scanner_tradable_candidate",
+      "scanner_bridge_score_fail",
+    ]);
     const candidateMetaMap = new Map<string, CandidateMeta>();
     const evaluationDroppedReasons: Record<string, string> = {};
     const candidateMeta = (await Promise.all(entryUniverse
@@ -3765,8 +3770,8 @@ export function createLiveDataStrategy(opts: {
         const sourceKindFromMap = String(entrySourceKindByMarket.get(m) ?? sourceMetaByMarket.get(m)?.source_kind ?? "");
         const isSurgeCandidate =
           (s.p as any).isSurgeSource === true ||
-          sourceKindFromPayload === "scanner_filter_fresh" ||
-          sourceKindFromMap === "scanner_filter_fresh";
+          SURGE_V2_SOURCE_KINDS.has(sourceKindFromPayload) ||
+          SURGE_V2_SOURCE_KINDS.has(sourceKindFromMap);
 
         // [ORIGINAL SETUP] Primary Gate Enforcement (Upbit fetch limit is 200)
         const candles1 = await fetchMinuteCandlesCached(m, 1, 200);
@@ -4492,11 +4497,10 @@ export function createLiveDataStrategy(opts: {
       const isSetupTaggedSurge = candidateMetaFromSetup?.engine_bucket === "surge";
       const isSurgeSource =
         isSetupTaggedSurge ||
-        sourceKindForJudgment === "scanner_filter_fresh" ||
         sourceKindForJudgment === "scanner_then_filter_pass" ||
-        payloadSourceKind === "scanner_tradable_candidate" ||
-        payloadSourceKind === "scanner_filter_fresh" ||
-        payloadSourceKind === "scanner_then_filter_pass";
+        payloadSourceKind === "scanner_then_filter_pass" ||
+        SURGE_V2_SOURCE_KINDS.has(sourceKindForJudgment) ||
+        SURGE_V2_SOURCE_KINDS.has(payloadSourceKind);
       const scannerBridgeScore = isSurgeSource
         ? computeScannerBridgeScore({
             scannerScore: Number(sig?.p?.scanner_score ?? sig?.p?.signal_score ?? 0),
@@ -5338,7 +5342,7 @@ export function createLiveDataStrategy(opts: {
               failed_surge_conditions: surgeSetupFromCandidate?.failed_conditions ?? [],
               decision_action: decision.action,
               decision_reason: decision.reason,
-              authority_source: decision.authoritySource,
+              authority_source: "surge-v2",
             }),
           );
 
