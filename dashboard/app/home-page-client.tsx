@@ -1948,7 +1948,7 @@ export default function HomePage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
-        body: JSON.stringify({ enabled, risk_ack: enabled ? true : false }),
+        body: JSON.stringify({ enabled, risk_ack: enabled ? true : false, operatorExplicit: true }),
       });
       if (res.status === 401) {
         router.replace("/login?reason=session_expired");

@@ -1224,7 +1224,7 @@ async function main() {
       reply.code(401);
       return { ok: false, error: "Unauthorized" };
     }
-    const body = (req.body ?? {}) as { enabled?: boolean; risk_ack?: boolean };
+    const body = (req.body ?? {}) as { enabled?: boolean; risk_ack?: boolean; operatorExplicit?: boolean };
     const enabled = body.enabled === true;
     if (enabled && body.risk_ack !== true) {
       reply.code(400);
@@ -1262,7 +1262,8 @@ async function main() {
       reply.code(400);
       return { ok: false, error: cannotEnableReason, can_enable_auto_trade: false, cannot_enable_reason: cannotEnableReason };
     }
-    await trade.setAutoTradeEnabled(enabled, { isOperator: true });
+    const isOperator = body.operatorExplicit === true;
+    await trade.setAutoTradeEnabled(enabled, { isOperator });
     const st = await trade.status();
     return {
       ok: true,
