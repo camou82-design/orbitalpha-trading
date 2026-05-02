@@ -323,6 +323,8 @@ type CandidateMeta = {
   is_relaxed_probe?: boolean;
   softened_reasons?: string[];
   relaxed_multiplier?: number;
+  gate_ok?: boolean;
+  gate_reason?: string;
 };
 
 type SurgeEntrySetupResult = {
@@ -3852,6 +3854,16 @@ export function createLiveDataStrategy(opts: {
           SURGE_V2_SOURCE_KINDS.has(sourceKindFromPayload) ||
           SURGE_V2_SOURCE_KINDS.has(sourceKindFromMap);
 
+        if (isSurgeCandidate) {
+          console.info(JSON.stringify({
+            tag: "SURGE_ENTRY_PATH_SELECTED_PROOF",
+            market: m,
+            source_kind: sourceKindFromPayload || sourceKindFromMap,
+            authority_source: "surge-v2",
+            ts: new Date().toISOString()
+          }));
+        }
+
         // [ORIGINAL SETUP] Primary Gate Enforcement (Upbit fetch limit is 200)
         const candles1 = await fetchMinuteCandlesCached(m, 1, 200);
 
@@ -3922,6 +3934,17 @@ export function createLiveDataStrategy(opts: {
         const sourceKind = sourceKindFromPayload;
         if (isSurgeCandidate || sourceKind === "scanner_filter" || sourceKind === "scanner_then_filter_pass") {
           surgeShadowSetup = evaluateSurgeEntrySetup(m, candles1, currentPx, s.p);
+          
+          console.info(JSON.stringify({
+            tag: "SURGE_ENTRY_SETUP_PROOF",
+            market: m,
+            ok: surgeShadowSetup.ok,
+            score: surgeShadowSetup.score,
+            reason: surgeShadowSetup.reason,
+            failed_conditions: surgeShadowSetup.failed_conditions,
+            is_surge_candidate: isSurgeCandidate
+          }));
+
           if (isSurgeCandidate) {
             setup = {
               ok: true,
@@ -3987,7 +4010,23 @@ export function createLiveDataStrategy(opts: {
         console.info(JSON.stringify({ tag: "DEBUG_ORIGINAL_SPOT_SETUP_PASS", market: m, mode: setup.mode, rr: setup.riskReward }));
 
         const gate = opts.marketState.entryGate(s.p, marketState);
+        let gateOk = gate.ok;
+        let gateReason = gate.reason;
         const score = Number(gate.score ?? 0);
+
+        if (!gateOk && isCoreRelaxedCandidate && score >= 70) {
+          // Soften Score Floor
+          gateOk = true;
+          gateReason = "score_floor_softened";
+          softenedReasons.push("CORE_SCORE_FLOOR_SOFTENED");
+          console.info(JSON.stringify({
+            tag: "CORE_SCORE_FLOOR_SOFTENED_PROOF",
+            market: m,
+            score: score,
+            min_entry_score: marketState.min_entry_score,
+            reason: "core_relaxed_probe_score_floor_softened"
+          }));
+        }
         
         // Calculate diagnostics for quality classification
         const sTs = s.ts ?? null;
@@ -4017,10 +4056,10 @@ export function createLiveDataStrategy(opts: {
           return null;
         }
 
-        // Apply probe multiplier (0.35x - 0.45x) for relaxed core entries
+        // Apply probe multiplier (0.35x) for relaxed core entries
         let relaxedMultiplier = 1.0;
-        if (setup.mode === "relaxed_probe") {
-          relaxedMultiplier = 0.35 + Math.random() * 0.1;
+        if (setup.mode === "relaxed_probe" || softenedReasons.length > 0) {
+          relaxedMultiplier = 0.35; // Fixed conservative base
         }
 
         const meta: CandidateMeta = {
@@ -4047,6 +4086,8 @@ export function createLiveDataStrategy(opts: {
           is_relaxed_probe: setup.mode === "relaxed_probe",
           softened_reasons: softenedReasons,
           relaxed_multiplier: relaxedMultiplier,
+          gate_ok: gateOk,
+          gate_reason: gateReason
         };
         candidateMetaMap.set(m, meta);
         return meta;
@@ -5721,10 +5762,31 @@ export function createLiveDataStrategy(opts: {
         orderKrw = Math.max(minOrderKrw, Math.floor(orderKrw * surgeMarketSizeMultiplier));
       }
 
-      // Core Relaxed Probe Sizing: 0.35x - 0.45x
+      // Core Relaxed Probe Sizing: Fixed multipliers based on softening
       if (metaForGuard?.is_relaxed_probe || metaForGuard?.softened_reasons?.length) {
-        const relaxedMult = metaForGuard?.relaxed_multiplier ?? 1.0;
-        orderKrw = Math.max(minOrderKrw, Math.floor(orderKrw * relaxedMult));
+        let relaxedMult = metaForGuard?.relaxed_multiplier ?? 0.35;
+        if (metaForGuard?.softened_reasons?.includes("CORE_NEAR_HIGH_SOFTENED")) {
+          relaxedMult = Math.min(relaxedMult, 0.25); 
+        }
+        if (metaForGuard?.softened_reasons?.includes("CORE_VOLUME_FADE_SOFTENED")) {
+          relaxedMult = Math.min(relaxedMult, 0.25);
+        }
+        
+        const effectiveOrderKrw = Math.floor(orderKrw * relaxedMult);
+        if (effectiveOrderKrw < minOrderKrw || effectiveOrderKrw < 5000) {
+           console.info(JSON.stringify({
+             tag: "CORE_MIN_ORDER_UNDERFLOW",
+             market,
+             order_krw: effectiveOrderKrw,
+             min_required: Math.max(minOrderKrw, 5000),
+             is_relaxed_probe: true,
+             reason: "relaxed_probe_amount_too_small"
+           }));
+           bumpSkip("order_krw_below_min_relaxed");
+           continue; 
+        }
+
+        orderKrw = effectiveOrderKrw;
         console.info(JSON.stringify({
           tag: "CORE_ENTRY_PROBE_SIZING_PROOF",
           market,
@@ -5859,6 +5921,7 @@ export function createLiveDataStrategy(opts: {
           ts: new Date().toISOString(),
           market,
           decision_action: "enter",
+          decision_mode: isSurgeSource ? "surge" : (metaForGuard?.is_relaxed_probe ? "relaxed_probe" : "normal"),
           decision_reason: sourceKindForJudgment,
           order_krw: orderKrw,
           size_multiplier: isSurgeSource ? surgeMarketSizeMultiplier : lateEntrySizingMultiplier,
@@ -5909,11 +5972,21 @@ export function createLiveDataStrategy(opts: {
           console.info(JSON.stringify({
             tag: "CORE_ENTRY_FINAL_DECISION_PROOF",
             market,
-            decision: "ENTER",
-            is_relaxed_probe: finalMeta?.is_relaxed_probe,
+            engine_bucket: "core",
+            decision_action: "ENTER",
+            decision_mode: finalMeta?.is_relaxed_probe ? "relaxed_probe" : "normal",
+            reject_reason: null,
             softened_reasons: finalMeta?.softened_reasons,
-            multiplier: finalMeta?.relaxed_multiplier,
-            order_krw: orderKrw
+            score: finalMeta?.score,
+            signal_type: sig.p.signal_type,
+            base_gate_ok: finalMeta?.gate_ok,
+            base_gate_return_reason: finalMeta?.gate_reason,
+            original_setup_ok: finalMeta?.setup?.ok,
+            late_entry_guard_triggered: lateEntryGuardTriggered,
+            late_entry_guard_reason: lateEntryGuardReason,
+            order_krw: orderKrw,
+            available_krw: liveOrderAvailableKrw,
+            multiplier: finalMeta?.relaxed_multiplier
           }));
         }
         console.info(
