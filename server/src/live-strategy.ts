@@ -4014,7 +4014,11 @@ export function createLiveDataStrategy(opts: {
         let gateReason = gate.reason;
         const score = Number(gate.score ?? 0);
 
-        if (!gateOk && isCoreRelaxedCandidate && score >= 70) {
+        if (!gateOk && isCoreRelaxedCandidate && score >= 70 && (
+          gateReason === "score_below_threshold" || 
+          gateReason === "score_floor" || 
+          String(gateReason || "").toLowerCase().includes("score")
+        )) {
           // Soften Score Floor
           gateOk = true;
           gateReason = "score_floor_softened";
@@ -4023,6 +4027,7 @@ export function createLiveDataStrategy(opts: {
             tag: "CORE_SCORE_FLOOR_SOFTENED_PROOF",
             market: m,
             score: score,
+            gate_reason_original: gate.reason,
             min_entry_score: marketState.min_entry_score,
             reason: "core_relaxed_probe_score_floor_softened"
           }));
