@@ -159,7 +159,7 @@ type StrategyPosition = {
   target_budget_krw?: number;
   filled_entry_krw?: number;
   /** Original Setup fields */
-  original_setup_mode?: "safe" | "aggressive" | "none";
+  original_setup_mode?: OriginalSetupMode;
   original_setup_reason?: string;
   entry_stop_price?: number;
   entry_target_price?: number;
@@ -173,6 +173,8 @@ type StrategyPosition = {
   stochD?: number;
   volumeRatio?: number;
   engine_bucket?: "surge" | "core" | "legacy";
+  is_relaxed_probe?: boolean;
+  softened_reasons?: string[];
 };
 
 type EarlyEntryPosition = {
@@ -195,7 +197,7 @@ type EarlyEntryPosition = {
   /** 실제 체결된 금액 (수수료 제외 순수 매수액) */
   filled_entry_krw?: number;
   /** Original Setup fields */
-  original_setup_mode?: "safe" | "aggressive" | "none";
+  original_setup_mode?: OriginalSetupMode;
   original_setup_reason?: string;
   entry_stop_price?: number;
   entry_target_price?: number;
@@ -250,7 +252,7 @@ type StrategyTradeRow = {
   realized_partial_profit?: number;
   final_net_pnl_pct?: number;
   /** Original Setup fields */
-  original_setup_mode?: "safe" | "aggressive" | "none";
+  original_setup_mode?: OriginalSetupMode;
   original_setup_reason?: string;
   entry_stop_price?: number;
   entry_target_price?: number;
@@ -263,7 +265,7 @@ type StrategyTradeRow = {
   volumeRatio?: number;
 };
 
-type OriginalSetupMode = "safe" | "aggressive" | "none";
+type OriginalSetupMode = "safe" | "aggressive" | "none" | "relaxed_probe";
 type OriginalSpotSetupResult = {
   ok: boolean;
   mode: OriginalSetupMode;
@@ -317,6 +319,10 @@ type CandidateMeta = {
   risk_tag_multiplier?: number;
   engine_bucket?: "surge" | "other";
   surge_shadow_setup?: SurgeEntrySetupResult;
+  is_core_relaxed_candidate?: boolean;
+  is_relaxed_probe?: boolean;
+  softened_reasons?: string[];
+  relaxed_multiplier?: number;
 };
 
 type SurgeEntrySetupResult = {
@@ -3848,6 +3854,35 @@ export function createLiveDataStrategy(opts: {
 
         // [ORIGINAL SETUP] Primary Gate Enforcement (Upbit fetch limit is 200)
         const candles1 = await fetchMinuteCandlesCached(m, 1, 200);
+
+        // Calculate relaxed criteria components
+        const closes1 = candles1.map(x => Number(x.trade_price ?? 0)).filter(n => n > 0);
+        let recent3mRet: number | null = null;
+        if (closes1.length >= 4) {
+          recent3mRet = ((closes1[closes1.length - 1] / closes1[closes1.length - 4]) - 1) * 100;
+        }
+        let vr1m5: number | null = null;
+        if (candles1.length >= 7) {
+          const last = candles1[candles1.length - 1];
+          const prev5 = candles1.slice(-6, -1);
+          const lastNotional = Number(last.candle_acc_trade_volume ?? 0) * Number(last.trade_price ?? 0);
+          const prevAvg = prev5.reduce((acc, r) => acc + Number(r.candle_acc_trade_volume ?? 0) * Number(r.trade_price ?? 0), 0) / Math.max(1, prev5.length);
+          if (prevAvg > 0) vr1m5 = lastNotional / prevAvg;
+        }
+
+        const scoreForRelaxed = Number(opts.marketState.entryGate(s.p, marketState).score ?? 0);
+        const signalType = String(s.p.signal_type ?? "MID").toUpperCase();
+        const vol = Number(s.p.volume_ratio ?? 0);
+        const btcTier = state.regime?.btc_filter_state ?? "neutral";
+
+        const isCoreRelaxedCandidate = 
+          !isSurgeCandidate &&
+          (scoreForRelaxed >= 70) &&
+          (signalType === "HIGH" || signalType === "MID") &&
+          (vol >= 1.2 || (vr1m5 ?? 0) >= 0.65) &&
+          (recent3mRet === null || recent3mRet >= -1.2) &&
+          (btcTier !== "weak");
+
         let setup: OriginalSpotSetupResult = {
           ok: true,
           mode: "none",
@@ -3859,8 +3894,27 @@ export function createLiveDataStrategy(opts: {
           swingLow: 0,
           volumeRatio: Number(s.p.volume_ratio ?? 0),
         };
+        const softenedReasons: string[] = [];
         if (!isSurgeCandidate) {
           setup = evaluateOriginalSpotScalpingSetup(m, candles1, currentPx);
+          
+          if (!setup.ok && isCoreRelaxedCandidate && setup.reason === "setup_conditions_not_met") {
+            // Soften Original Setup
+            setup = { ...setup, ok: true, mode: "relaxed_probe" };
+            softenedReasons.push("CORE_ORIGINAL_SETUP_SOFTENED");
+            console.info(JSON.stringify({
+              tag: "CORE_ORIGINAL_SETUP_SOFTENED_PROOF",
+              market: m,
+              score: scoreForRelaxed,
+              signal_type: signalType,
+              setup_reason: "setup_conditions_not_met",
+              failed_conditions: setup.failed_conditions,
+              volume_ratio: vol,
+              volume_ratio_1m5: vr1m5,
+              btc_tier: btcTier,
+              reason: "core_relaxed_probe_original_setup_softened"
+            }));
+          }
         }
 
         // [SURGE SETUP SHADOW EVALUATION]
@@ -3886,41 +3940,7 @@ export function createLiveDataStrategy(opts: {
               volumeRatio: surgeShadowSetup.volumeRatio,
               failed_conditions: [],
             };
-            console.info(
-              JSON.stringify({
-                tag: "SURGE_ENTRY_PATH_SELECTED_PROOF",
-                market: m,
-                source_kind_from_payload: sourceKindFromPayload || null,
-                source_kind_from_map: sourceKindFromMap || null,
-                is_surge_candidate: true,
-                path: "surge-v2",
-                legacy_original_setup_skipped: true,
-                authority_source: "surge-v2",
-              }),
-            );
           }
-          console.info(JSON.stringify({
-            tag: "SURGE_ENTRY_SETUP_PROOF",
-            market: m,
-            source_kind: sourceKind,
-            candles_count: candles1.length,
-            current_price: currentPx,
-            volumeRatio: surgeShadowSetup.volumeRatio,
-            momentum_3m_pct: Number(s.p.rise_3m_pct ?? s.p.momentum_3m_pct ?? 0),
-            ema50: surgeShadowSetup.ema50,
-            ema200: surgeShadowSetup.ema200,
-            rsi: surgeShadowSetup.rsi,
-            stochK: surgeShadowSetup.stochK,
-            stochD: surgeShadowSetup.stochD,
-            original_setup_ok: setup.ok,
-            original_failed_conditions: setup.failed_conditions,
-            surge_setup_score: surgeShadowSetup.score,
-            surge_setup_grade: surgeShadowSetup.grade,
-            surge_setup_pass: surgeShadowSetup.ok,
-            failed_surge_conditions: surgeShadowSetup.failed_conditions,
-            evaluation_source: "live_strategy_tick",
-            loop_id: typeof loopId !== 'undefined' ? loopId : Date.now(),
-          }));
         }
 
         if (!setup.ok) {
@@ -3946,18 +3966,6 @@ export function createLiveDataStrategy(opts: {
               stopPrice: setup.stopPrice,
               targetPrice: setup.targetPrice,
               riskReward: setup.riskReward,
-              safePriceAboveEma200: setup.safePriceAboveEma200,
-              pullbackToEma200: setup.pullbackToEma200,
-              stochOversoldBullishCross: setup.stochOversoldBullishCross,
-              isBullish: setup.isBullish,
-              safe_condition_pass: setup.safe_condition_pass,
-              aggressiveEmaStack: setup.aggressiveEmaStack,
-              aggressivePriceAbove: setup.aggressivePriceAbove,
-              aggressiveRsiOk: setup.aggressiveRsiOk,
-              aggressiveVolumeOk: setup.aggressiveVolumeOk,
-              aggressiveRiskRewardOk: setup.aggressiveRiskRewardOk,
-              aggressive_condition_pass: setup.aggressive_condition_pass,
-              final_reason: blockReason,
               failed_conditions: setup.failed_conditions,
             }));
           }
@@ -4009,6 +4017,12 @@ export function createLiveDataStrategy(opts: {
           return null;
         }
 
+        // Apply probe multiplier (0.35x - 0.45x) for relaxed core entries
+        let relaxedMultiplier = 1.0;
+        if (setup.mode === "relaxed_probe") {
+          relaxedMultiplier = 0.35 + Math.random() * 0.1;
+        }
+
         const meta: CandidateMeta = {
           market: m,
           score,
@@ -4029,6 +4043,10 @@ export function createLiveDataStrategy(opts: {
           setup,
           surge_shadow_setup: surgeShadowSetup,
           engine_bucket: isSurgeCandidate ? "surge" : "other",
+          is_core_relaxed_candidate: isCoreRelaxedCandidate,
+          is_relaxed_probe: setup.mode === "relaxed_probe",
+          softened_reasons: softenedReasons,
+          relaxed_multiplier: relaxedMultiplier,
         };
         candidateMetaMap.set(m, meta);
         return meta;
@@ -4851,6 +4869,7 @@ export function createLiveDataStrategy(opts: {
       let lateEntryGuardTriggered = false;
       let lateEntryGuardReason: string | null = null;
       let lateTimingTier: "pass" | "hard_block" | "reduced_size_allowed" = "pass";
+      const metaForGuard = candidateMeta.find((c) => c.market === market);
       const staleLimit = btcTierNow === "weak" ? Math.min(LIVE_ENTRY_SIGNAL_STALE_SECONDS, 180) : LIVE_ENTRY_SIGNAL_STALE_SECONDS;
       const chaseLimit = btcTierNow === "weak" ? LIVE_WEAK_MARKET_MAX_CHASE_PCT : LIVE_MAX_CHASE_FROM_SIGNAL_PCT;
       const chaseSoftCap = chaseLimit * LIVE_LATE_ENTRY_SOFT_CHASE_FRAC;
@@ -4876,34 +4895,70 @@ export function createLiveDataStrategy(opts: {
           volumeFadeTriggered || (volumeRatio1m5 !== null && volumeRatio1m5 < 0.65);
         if (nearHighProblem) {
           const severeNearHigh =
-            distanceFromLocalHighPct !== null && distanceFromLocalHighPct < LIVE_LATE_ENTRY_NEAR_HIGH_HARD_PCT;
-          if (severeNearHigh || !softContextForMicroGuard) {
+            distanceFromLocalHighPct !== null && distanceFromLocalHighPct < 0.12; // 김 사장 지시: 0.12% 미만은 하드 블락
+          
+          const coreRelaxedAllowNearHigh = (metaForGuard?.is_core_relaxed_candidate === true) && 
+                                           (distanceFromLocalHighPct !== null && distanceFromLocalHighPct >= 0.12 && distanceFromLocalHighPct < 0.35);
+
+          if (severeNearHigh || (!softContextForMicroGuard && !coreRelaxedAllowNearHigh)) {
             lateEntryGuardTriggered = true;
             lateTimingTier = "hard_block";
-            lateEntryGuardReason = `too_near_local_high:${distanceFromLocalHighPct!.toFixed(3)}pct<${LIVE_MAX_ENTRY_NEAR_HIGH_PCT}pct`;
+            lateEntryGuardReason = `too_near_local_high:${distanceFromLocalHighPct!.toFixed(3)}pct<0.12pct`;
           } else {
             lateTimingTier = "reduced_size_allowed";
-            lateEntrySizingMultiplier *= LIVE_LATE_ENTRY_SOFT_SIZE_MULT_NEAR_HIGH;
-            lateEntryGuardReason = `too_near_local_high_soft:${distanceFromLocalHighPct!.toFixed(3)}pct<${LIVE_MAX_ENTRY_NEAR_HIGH_PCT}pct`;
+            lateEntrySizingMultiplier *= 0.45; // 김 사장 지시: 0.45 적용
+            lateEntryGuardReason = `too_near_local_high_soft:${distanceFromLocalHighPct!.toFixed(3)}pct<0.35pct`;
+            if (coreRelaxedAllowNearHigh) {
+              metaForGuard?.softened_reasons?.push("CORE_NEAR_HIGH_SOFTENED");
+              console.info(JSON.stringify({
+                tag: "CORE_NEAR_HIGH_SOFTENED_PROOF",
+                market,
+                distance_from_local_high_pct: distanceFromLocalHighPct,
+                original_block_reason: "too_near_local_high",
+                size_multiplier: 0.45,
+                reason: "near_high_softened_to_probe"
+              }));
+            }
           }
         }
         if (!lateEntryGuardTriggered && volFadeProblem) {
-          const severeVol = volumeRatio1m5 !== null && volumeRatio1m5 < LIVE_LATE_ENTRY_VOLUME_HARD_RATIO;
-          if (severeVol || !softContextForMicroGuard) {
+          const severeVol = volumeRatio1m5 !== null && volumeRatio1m5 < 0.35; // 김 사장 지시: 0.35 미만은 하드 블락
+          
+          // 수익률 조건: 1분/3분 동시에 음수면 완화 금지
+          const negativeMomentum = (recent1mRet !== null && recent1mRet < 0) && (recent3mRet !== null && recent3mRet < 0);
+
+          const coreRelaxedAllowVolFade = (metaForGuard?.is_core_relaxed_candidate === true) && 
+                                          (volumeRatio1m5 !== null && volumeRatio1m5 >= 0.35) &&
+                                          !negativeMomentum;
+
+          if (severeVol || (!softContextForMicroGuard && !coreRelaxedAllowVolFade)) {
             lateEntryGuardTriggered = true;
             lateTimingTier = "hard_block";
             lateEntryGuardReason =
               volumeRatio1m5 !== null
-                ? `volume_fade_after_spike:${volumeRatio1m5.toFixed(3)}<0.65`
+                ? `volume_fade_after_spike:${volumeRatio1m5.toFixed(3)}<0.35`
                 : "volume_fade_after_spike";
           } else {
             lateTimingTier = "reduced_size_allowed";
-            lateEntrySizingMultiplier *= LIVE_LATE_ENTRY_SOFT_SIZE_MULT_VOL_FADE;
+            lateEntrySizingMultiplier *= 0.45; // 김 사장 지시: 0.45 적용
             const vr = volumeRatio1m5 !== null ? volumeRatio1m5.toFixed(3) : "na";
             lateEntryGuardReason =
               lateEntryGuardReason !== null
                 ? `${lateEntryGuardReason}|volume_fade_after_spike_soft:${vr}`
                 : `volume_fade_after_spike_soft:${vr}`;
+            if (coreRelaxedAllowVolFade) {
+              metaForGuard?.softened_reasons?.push("CORE_VOLUME_FADE_SOFTENED");
+              console.info(JSON.stringify({
+                tag: "CORE_VOLUME_FADE_SOFTENED_PROOF",
+                market,
+                volume_ratio_1m5: volumeRatio1m5,
+                recent_1m_return_pct: recent1mRet,
+                recent_3m_return_pct: recent3mRet,
+                original_block_reason: "volume_fade_after_spike",
+                size_multiplier: 0.45,
+                reason: "volume_fade_softened_to_probe"
+              }));
+            }
           }
         }
       }
@@ -5470,7 +5525,7 @@ export function createLiveDataStrategy(opts: {
           }
           entryPipelineDetail = { ...decision.detail, entry_pipeline: "surge" };
         } else {
-          const pr = evaluateSpotLongEntryPipeline({
+          let pr = evaluateSpotLongEntryPipeline({
             market,
             payload: sig.p,
             candles5,
@@ -5481,6 +5536,17 @@ export function createLiveDataStrategy(opts: {
             },
             volumeRatio: vol,
           });
+
+          const isCoreRelaxed = (metaForGuard?.is_core_relaxed_candidate === true);
+          if (!pr.ok && isCoreRelaxed) {
+             const message = pr.message || "";
+             if (message === "blocked_rebreak_not_confirmed" || message === "blocked_no_pullback") {
+                // Soften rebreak/pullback rejections for high-quality core candidates
+                pr = { ok: true, detail: { ...pr.detail, softened_gate: true, original_message: message } };
+                metaForGuard?.softened_reasons?.push(`CORE_GATE_SOFTENED:${message}`);
+             }
+          }
+
           if (!pr.ok) {
             console.info(
               JSON.stringify({
@@ -5655,6 +5721,20 @@ export function createLiveDataStrategy(opts: {
         orderKrw = Math.max(minOrderKrw, Math.floor(orderKrw * surgeMarketSizeMultiplier));
       }
 
+      // Core Relaxed Probe Sizing: 0.35x - 0.45x
+      if (metaForGuard?.is_relaxed_probe || metaForGuard?.softened_reasons?.length) {
+        const relaxedMult = metaForGuard?.relaxed_multiplier ?? 1.0;
+        orderKrw = Math.max(minOrderKrw, Math.floor(orderKrw * relaxedMult));
+        console.info(JSON.stringify({
+          tag: "CORE_ENTRY_PROBE_SIZING_PROOF",
+          market,
+          base_order_krw: baseBudget,
+          final_order_krw: orderKrw,
+          relaxed_multiplier: relaxedMult,
+          softened_reasons: metaForGuard?.softened_reasons
+        }));
+      }
+
       const stPos = st.strategy_positions?.[market];
       const investedSoFar = Math.max(0, Number(stPos?.invested_krw_total ?? 0));
       const remainingPerMarket = Math.max(0, ORDER_LIMITS.MAX_STRATEGY_INVESTED_KRW_PER_MARKET - investedSoFar);
@@ -5713,6 +5793,16 @@ export function createLiveDataStrategy(opts: {
         continue;
       }
       if (orderKrw < 5000) {
+        if (!isSurgeSource) {
+          console.info(JSON.stringify({
+            tag: "CORE_MIN_ORDER_UNDERFLOW",
+            market,
+            order_krw: orderKrw,
+            min_required: 5000,
+            is_relaxed_probe: metaForGuard?.is_relaxed_probe,
+            reason: "order_amount_too_small_after_sizing"
+          }));
+        }
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "order_krw_below_min", order_krw: orderKrw });
         bumpSkip("order_krw_below_min");
         emitFinalBlocked("order_krw_below_min", { order_krw: orderKrw });
@@ -5772,6 +5862,8 @@ export function createLiveDataStrategy(opts: {
           decision_reason: sourceKindForJudgment,
           order_krw: orderKrw,
           size_multiplier: isSurgeSource ? surgeMarketSizeMultiplier : lateEntrySizingMultiplier,
+          relaxed_probe: !isSurgeSource && metaForGuard?.is_relaxed_probe,
+          softened_reasons: !isSurgeSource ? metaForGuard?.softened_reasons : [],
           authority_source: isSurgeSource ? "surge-v2" : "core",
           execution_layer: "live-strategy",
           place_buy_called: true,
@@ -5801,6 +5893,8 @@ export function createLiveDataStrategy(opts: {
               decision_reason: sourceKindForJudgment,
               order_krw: orderKrw,
               size_multiplier: isSurgeSource ? surgeMarketSizeMultiplier : lateEntrySizingMultiplier,
+              relaxed_probe: !isSurgeSource && metaForGuard?.is_relaxed_probe,
+              softened_reasons: !isSurgeSource ? metaForGuard?.softened_reasons : [],
               authority_source: isSurgeSource ? "surge-v2" : "core",
               execution_layer: "live-strategy",
               place_buy_called: true,
@@ -5808,6 +5902,19 @@ export function createLiveDataStrategy(opts: {
               place_buy_reason: placeBuyReason,
             }),
           );
+        }
+        
+        const finalMeta = candidateMeta.find(x => x.market === market);
+        if (!isSurgeSource) {
+          console.info(JSON.stringify({
+            tag: "CORE_ENTRY_FINAL_DECISION_PROOF",
+            market,
+            decision: "ENTER",
+            is_relaxed_probe: finalMeta?.is_relaxed_probe,
+            softened_reasons: finalMeta?.softened_reasons,
+            multiplier: finalMeta?.relaxed_multiplier,
+            order_krw: orderKrw
+          }));
         }
         console.info(
           JSON.stringify({
@@ -5890,6 +5997,8 @@ export function createLiveDataStrategy(opts: {
       state.positions[market] = {
         market,
         strategy_type: strategyType,
+        engine_bucket: isSurgeSource ? "surge" : "core",
+        is_relaxed_probe: !isSurgeSource && marketMeta?.is_relaxed_probe === true,
         entry_ts: new Date().toISOString(),
         entry_price: price,
         qty,
@@ -5928,7 +6037,7 @@ export function createLiveDataStrategy(opts: {
         ema200: marketMeta?.ema200,
         rsi: marketMeta?.rsi,
         stochD: marketMeta?.stochD,
-        engine_bucket: isSurgeSource ? "surge" : "core",
+        softened_reasons: !isSurgeSource ? marketMeta?.softened_reasons : [],
       };
       console.info(
         JSON.stringify({
