@@ -1926,7 +1926,9 @@ export default function HomePage() {
   }, [lastClientTradeFailure]);
   const tradeStatusPendingDisplay = useMemo(() => {
     if (trade) return null;
-    if (accountSyncState === "syncing" || accountSyncState === "idle") return "거래 상태 확인 중";
+    // NOTE: If trade status is pending/failing, we MUST NOT default to 'OFF'.
+    // We preserve the last known state and show this label instead.
+    if (accountSyncState === "syncing" || accountSyncState === "idle") return "거래 상태 확인 중...";
     return null;
   }, [trade, accountSyncState]);
   const sessionDelayNotice = useMemo(() => {
