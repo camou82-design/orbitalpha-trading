@@ -535,11 +535,37 @@ export function createTradeControl(
     return conn;
   };
 
-  const setAutoTradeEnabled = async (enabled: boolean) => {
+  const setAutoTradeEnabled = async (enabled: boolean, meta?: { isOperator?: boolean }) => {
+    const isOperator = meta?.isOperator === true;
+    if (!enabled && !isOperator) {
+      console.info(
+        JSON.stringify({
+          tag: "TRADE_CONTROL_DISABLE_REJECTED_NON_OPERATOR",
+          ts: new Date().toISOString(),
+          reason: "Auto-trade disable requires explicit operator action",
+        }),
+      );
+      return;
+    }
+
+    if (isOperator) {
+      console.info(
+        JSON.stringify({
+          tag: "AUTO_TRADE_OPERATOR_TOGGLE_PROOF",
+          ts: new Date().toISOString(),
+          target_state: enabled ? "ON" : "OFF",
+        }),
+      );
+    }
+
     state.autoTradeEnabled = enabled;
     state.autoTradeChangedAt = new Date().toISOString();
     persistAutoTradeState();
-    await log(enabled ? "auto_trade_enabled" : "auto_trade_disabled", { enabled, changed_at: state.autoTradeChangedAt });
+    await log(enabled ? "auto_trade_enabled" : "auto_trade_disabled", { 
+      enabled, 
+      changed_at: state.autoTradeChangedAt, 
+      is_operator: isOperator 
+    });
     await hooks?.onEvent?.({
       timestamp: state.autoTradeChangedAt ?? new Date().toISOString(),
       event_type: enabled ? "auto_trade_enabled" : "auto_trade_disabled",
@@ -547,14 +573,14 @@ export function createTradeControl(
       strategy_type: null,
       market_state: null,
       side: null,
-      reason: enabled ? "ON" : "OFF",
+      reason: isOperator ? (enabled ? "OPERATOR_ON" : "OPERATOR_OFF") : (enabled ? "ON" : "OFF"),
       balance_krw: null,
       position_qty: null,
       avg_buy_price: null,
       current_price: null,
       pnl_net: null,
       pnl_net_pct: null,
-      note: null,
+      note: isOperator ? "operator_action" : null,
     });
   };
 

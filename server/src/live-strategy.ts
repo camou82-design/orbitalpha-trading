@@ -3268,6 +3268,22 @@ export function createLiveDataStrategy(opts: {
             place_sell_reason: "pending",
           }),
         );
+      } else {
+        console.info(
+          JSON.stringify({
+            tag: "CORE_EXIT_FINAL_DECISION_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            reason_exit: reasonExit,
+            ratio,
+            stop_trigger_kind: stopTriggerKind,
+            authority_class: "core",
+            execution_layer: "live-strategy",
+            place_sell_called: true,
+            place_sell_ok: null,
+            place_sell_reason: "pending",
+          }),
+        );
       }
       try {
         await opts.trade.placeSell(market, true, ratio);
@@ -3304,6 +3320,22 @@ export function createLiveDataStrategy(opts: {
               ratio,
               stop_trigger_kind: stopTriggerKind,
               authority_class: exitAuthorityClass,
+              execution_layer: "live-strategy",
+              place_sell_called: true,
+              place_sell_ok: placeSellOk,
+              place_sell_reason: placeSellReason,
+            }),
+          );
+        } else {
+          console.info(
+            JSON.stringify({
+              tag: "CORE_EXIT_FINAL_DECISION_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              reason_exit: reasonExit,
+              ratio,
+              stop_trigger_kind: stopTriggerKind,
+              authority_class: "core",
               execution_layer: "live-strategy",
               place_sell_called: true,
               place_sell_ok: placeSellOk,
@@ -5344,14 +5376,14 @@ export function createLiveDataStrategy(opts: {
         continue;
       }
       if (!gateOk && !strongSymbolOverride) {
-        // Hard bypass for surge sources: Score/Structure rejections move to surge-v2. 
-        // We only honor the gate here if it's a critical block (cooldown, position_exists) that surge-v2 doesn't handle.
-        const isCriticalGateBlock = detailedReason === "cooldown_active" || detailedReason === "position_exists";
-        if (!isSurgeSource || isCriticalGateBlock) {
+        // Surge candidates must bypass the core gate unless it's a hard state block (exists/cooldown).
+        const isHardBlock = detailedReason === "cooldown_active" || detailedReason === "position_exists";
+        if (!isSurgeSource || isHardBlock) {
           emitEval("DEBUG_LIVE_PRECHECK", { return_reason: detailedReason ?? "base_gate_failed" });
           bumpSkip(detailedReason ?? "base_gate_failed");
           continue;
         }
+        // Surge source bypasses core gate for non-hard blocks
       }
 
       let entryPipelineDetail: Record<string, unknown> = {};
@@ -5479,10 +5511,31 @@ export function createLiveDataStrategy(opts: {
               breakout_relaxed: breakoutRelaxed,
               final_block_reason: pr.message,
             });
+            console.info(
+              JSON.stringify({
+                tag: "CORE_ENTRY_FINAL_DECISION_PROOF",
+                ts: new Date().toISOString(),
+                market,
+                decision: "reject",
+                reason: pr.message,
+                detail: pr.detail,
+                authority_source: "core",
+              }),
+            );
             bumpSkip(pr.message);
             continue;
           }
           entryPipelineDetail = pr.detail;
+          console.info(
+            JSON.stringify({
+              tag: "CORE_ENTRY_FINAL_DECISION_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              decision: "allow",
+              detail: entryPipelineDetail,
+              authority_source: "core",
+            }),
+          );
           console.info(
             JSON.stringify({
               tag: "LIVE_ENTRY_PIPELINE_RESULT",
@@ -5708,10 +5761,11 @@ export function createLiveDataStrategy(opts: {
           strategy_type: strategyType,
         }),
       );
-      // [SURGE_V2_LIVE_ENTRY_EXECUTION_PROOF] placeBuy 직전 실행 연결 확인 로그
+      // Entry Execution Proof (Before Call)
+      const preProofTag = isSurgeSource ? "SURGE_V2_LIVE_ENTRY_EXECUTION_PROOF" : "CORE_LIVE_ENTRY_EXECUTION_PROOF";
       console.info(
         JSON.stringify({
-          tag: "SURGE_V2_LIVE_ENTRY_EXECUTION_PROOF",
+          tag: preProofTag,
           ts: new Date().toISOString(),
           market,
           decision_action: "enter",
@@ -5737,9 +5791,10 @@ export function createLiveDataStrategy(opts: {
           placeBuyReason = innerErr instanceof Error ? innerErr.message.slice(0, 200) : String(innerErr).slice(0, 200);
           throw innerErr;
         } finally {
+          const proofTag = isSurgeSource ? "SURGE_V2_LIVE_ENTRY_EXECUTION_PROOF" : "CORE_LIVE_ENTRY_EXECUTION_PROOF";
           console.info(
             JSON.stringify({
-              tag: "SURGE_V2_LIVE_ENTRY_EXECUTION_PROOF",
+              tag: proofTag,
               ts: new Date().toISOString(),
               market,
               decision_action: "enter",

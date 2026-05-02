@@ -1262,7 +1262,7 @@ async function main() {
       reply.code(400);
       return { ok: false, error: cannotEnableReason, can_enable_auto_trade: false, cannot_enable_reason: cannotEnableReason };
     }
-    await trade.setAutoTradeEnabled(enabled);
+    await trade.setAutoTradeEnabled(enabled, { isOperator: true });
     const st = await trade.status();
     return {
       ok: true,
