@@ -593,7 +593,7 @@ const DEBUG_FORCE_BASE_GATE = String(process.env.DEBUG_FORCE_BASE_GATE ?? "").to
 /** 운영에서 `DEBUG_LIVE_ENTRY_POLICY_SNAPSHOT`으로 dist 빌드 정합성 확인. 2=동일심볼은 same_symbol_open_continue_entry_eval 만(레거시 차단 문자열 없음). */
 const LIVE_PRECHECK_EMITTER_REVISION = 2;
 /** 운영에서 dist 실행 코드가 최신인지 확인용(로그에 항상 포함). */
-const LIVE_STRATEGY_TRACE_REVISION = 5;
+const LIVE_STRATEGY_TRACE_REVISION = 6;
 const LIVE_LEGACY_DCA_BUY_ENABLED = String(process.env.LIVE_LEGACY_DCA_BUY_ENABLED ?? "false").toLowerCase() === "true";
 const LIVE_ENTRY_UTILIZATION_TARGET = Math.max(0.05, Math.min(0.98, Number(process.env.LIVE_ENTRY_UTILIZATION_TARGET ?? 0.85)));
 const LIVE_MIN_ENTRY_KRW = Math.max(5_000, Number(process.env.LIVE_MIN_ENTRY_KRW ?? 50_000));
@@ -4038,10 +4038,9 @@ export function createLiveDataStrategy(opts: {
     ]);
     const candidateMetaMap = new Map<string, CandidateMeta>();
     const evaluationDroppedReasons: Record<string, string> = {};
-    const candidateMeta = (
-      await racePhase("candidate_meta_parallel", PHASE_MS.candidate_meta_parallel, () =>
-        Promise.all(
-          entryUniverse.map(async (m) => {
+    const candidateMetaSettled = await racePhase("candidate_meta_parallel", PHASE_MS.candidate_meta_parallel, () =>
+      Promise.allSettled(
+        entryUniverse.map(async (m) => {
         const s = latestAllSignals.get(m);
         if (!s?.p) {
           evaluationDroppedReasons[m] = "missing_signal_payload";
@@ -4070,7 +4069,40 @@ export function createLiveDataStrategy(opts: {
         }
 
         // [ORIGINAL SETUP] Primary Gate Enforcement (Upbit fetch limit is 200)
-        const candles1 = await fetchMinuteCandlesCached(m, 1, 200);
+        let candles1: UpbitCandle[];
+        try {
+          candles1 = await fetchMinuteCandlesCached(m, 1, 200);
+        } catch (e) {
+          if (isLiveTickPhaseTimeout(e) && e.phase.startsWith("fetch_minute_candles:")) {
+            evaluationDroppedReasons[m] = "candle_fetch_timeout";
+            console.info(
+              JSON.stringify({
+                tag: "LIVE_CANDIDATE_META_MARKET_DROPPED_PROOF",
+                ts: new Date().toISOString(),
+                market: m,
+                phase: e.phase,
+                reason: "candle_fetch_timeout",
+                timeout_ms: e.timeout_ms,
+                tick_lease: myLease,
+              }),
+            );
+            return null;
+          }
+          evaluationDroppedReasons[m] = "candle_fetch_error";
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_CANDIDATE_META_MARKET_DROPPED_PROOF",
+              ts: new Date().toISOString(),
+              market: m,
+              phase: "fetch_minute_candles:inner_error",
+              reason: "candle_fetch_error",
+              timeout_ms: null,
+              tick_lease: myLease,
+              error: e instanceof Error ? e.message.slice(0, 240) : String(e).slice(0, 240),
+            }),
+          );
+          return null;
+        }
 
         // Calculate relaxed criteria components
         const closes1 = candles1.map(x => Number(x.trade_price ?? 0)).filter(n => n > 0);
@@ -4341,10 +4373,31 @@ export function createLiveDataStrategy(opts: {
         };
         candidateMetaMap.set(m, meta);
         return meta;
-          }),
-        ),
-      )
-    ).filter((x): x is CandidateMeta => x !== null);
+        }),
+      ),
+    );
+    const candidateMeta = candidateMetaSettled
+      .map((r, idx) => {
+        const m = entryUniverse[idx]!;
+        if (r.status === "rejected") {
+          evaluationDroppedReasons[m] = evaluationDroppedReasons[m] ?? "candidate_meta_unhandled_rejection";
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_CANDIDATE_META_MARKET_DROPPED_PROOF",
+              ts: new Date().toISOString(),
+              market: m,
+              phase: "candidate_meta_parallel_inner_reject",
+              reason: "candidate_meta_unhandled_rejection",
+              timeout_ms: null,
+              tick_lease: myLease,
+              error: r.reason instanceof Error ? r.reason.message.slice(0, 240) : String(r.reason).slice(0, 240),
+            }),
+          );
+          return null;
+        }
+        return r.value;
+      })
+      .filter((x): x is CandidateMeta => x !== null);
 
     console.info(
       JSON.stringify({
