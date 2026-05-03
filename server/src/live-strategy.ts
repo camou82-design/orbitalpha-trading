@@ -509,11 +509,91 @@ async function loadPaperSurgePatternStats(companyId: string, serviceId: string):
   }
 }
 
+/** runTick 내부 `await` 구간별 상한 — 운영에서 env로 조정 가능. */
+const LIVE_TICK_PHASE_MS = {
+  trade_status: Number(process.env.LIVE_TICK_PHASE_MS_TRADE_STATUS ?? 25_000),
+  persist: Number(process.env.LIVE_TICK_PHASE_MS_PERSIST ?? 15_000),
+  read_logs: Number(process.env.LIVE_TICK_PHASE_MS_READ_LOGS ?? 25_000),
+  market_state: Number(process.env.LIVE_TICK_PHASE_MS_MARKET_STATE ?? 45_000),
+  partition_validity: Number(process.env.LIVE_TICK_PHASE_MS_PARTITION ?? 35_000),
+  fetch_tickers: Number(process.env.LIVE_TICK_PHASE_MS_FETCH_TICKERS ?? 75_000),
+  fetch_minute_candles: Number(process.env.LIVE_TICK_PHASE_MS_FETCH_CANDLES ?? 30_000),
+  paper_stats: Number(process.env.LIVE_TICK_PHASE_MS_PAPER_STATS ?? 20_000),
+  candidate_meta_parallel: Number(process.env.LIVE_TICK_PHASE_MS_CANDIDATE_META ?? 240_000),
+} as const;
+
+/** 단일 틱 전체 상한(개별 phase 타임아웃이 빠진 await 방지). */
+const LIVE_TICK_HARD_WALL_MS = Math.max(120_000, Number(process.env.LIVE_TICK_HARD_WALL_MS ?? 600_000));
+
+class LiveTickPhaseTimeoutError extends Error {
+  readonly phase: string;
+  readonly timeout_ms: number;
+  constructor(phase: string, timeout_ms: number) {
+    super(`LIVE_TICK_PHASE_TIMEOUT:${phase}`);
+    this.name = "LiveTickPhaseTimeoutError";
+    this.phase = phase;
+    this.timeout_ms = timeout_ms;
+  }
+}
+
+function isLiveTickPhaseTimeout(err: unknown): err is LiveTickPhaseTimeoutError {
+  return err instanceof LiveTickPhaseTimeoutError;
+}
+
+async function liveTickRacePhase<T>(
+  ctx: { phase: string; tick_lease: number; timeout_ms: number },
+  fn: () => Promise<T>,
+): Promise<T> {
+  const t0 = Date.now();
+  console.info(
+    JSON.stringify({
+      tag: "LIVE_TICK_PHASE_ENTER",
+      ts: new Date().toISOString(),
+      phase: ctx.phase,
+      tick_lease: ctx.tick_lease,
+      timeout_ms: ctx.timeout_ms,
+    }),
+  );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutP = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new LiveTickPhaseTimeoutError(ctx.phase, ctx.timeout_ms)), ctx.timeout_ms);
+  });
+  try {
+    const result = await Promise.race([fn(), timeoutP]);
+    console.info(
+      JSON.stringify({
+        tag: "LIVE_TICK_PHASE_EXIT",
+        ts: new Date().toISOString(),
+        phase: ctx.phase,
+        tick_lease: ctx.tick_lease,
+        elapsed_ms: Date.now() - t0,
+        outcome: "ok",
+      }),
+    );
+    return result;
+  } catch (e) {
+    console.info(
+      JSON.stringify({
+        tag: "LIVE_TICK_PHASE_EXIT",
+        ts: new Date().toISOString(),
+        phase: ctx.phase,
+        tick_lease: ctx.tick_lease,
+        elapsed_ms: Date.now() - t0,
+        outcome: isLiveTickPhaseTimeout(e) ? "timeout" : "error",
+        error: e instanceof Error ? e.message.slice(0, 240) : String(e).slice(0, 240),
+      }),
+    );
+    throw e;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 const DEBUG_FORCE_BASE_GATE = String(process.env.DEBUG_FORCE_BASE_GATE ?? "").toLowerCase() === "true";
 /** 운영에서 `DEBUG_LIVE_ENTRY_POLICY_SNAPSHOT`으로 dist 빌드 정합성 확인. 2=동일심볼은 same_symbol_open_continue_entry_eval 만(레거시 차단 문자열 없음). */
 const LIVE_PRECHECK_EMITTER_REVISION = 2;
 /** 운영에서 dist 실행 코드가 최신인지 확인용(로그에 항상 포함). */
-const LIVE_STRATEGY_TRACE_REVISION = 4;
+const LIVE_STRATEGY_TRACE_REVISION = 5;
 const LIVE_LEGACY_DCA_BUY_ENABLED = String(process.env.LIVE_LEGACY_DCA_BUY_ENABLED ?? "false").toLowerCase() === "true";
 const LIVE_ENTRY_UTILIZATION_TARGET = Math.max(0.05, Math.min(0.98, Number(process.env.LIVE_ENTRY_UTILIZATION_TARGET ?? 0.85)));
 const LIVE_MIN_ENTRY_KRW = Math.max(5_000, Number(process.env.LIVE_MIN_ENTRY_KRW ?? 50_000));
@@ -1776,6 +1856,15 @@ export function createLiveDataStrategy(opts: {
       );
       return false;
     };
+    const PHASE_MS = LIVE_TICK_PHASE_MS;
+    const racePhase = <T>(phase: string, timeout_ms: number, fn: () => Promise<T>) =>
+      liveTickRacePhase({ phase, tick_lease: myLease, timeout_ms }, fn);
+    const raceTradeStatus = (phase: string) =>
+      racePhase(`trade_status:${phase}`, PHASE_MS.trade_status, () => opts.trade.status());
+    const racePersist = (phase: string) => racePhase(`persist:${phase}`, PHASE_MS.persist, () => persist());
+    await liveTickRacePhase(
+      { phase: "tick_hard_wall_clock", tick_lease: myLease, timeout_ms: LIVE_TICK_HARD_WALL_MS },
+      async () => {
     // 운영 최종값 단일화: persisted 값과 무관하게 매 tick env cap으로 재설정.
     state.safety_guard.max_positions = LIVE_MAX_POSITIONS_CAP;
 
@@ -1797,7 +1886,7 @@ export function createLiveDataStrategy(opts: {
       }
     }
 
-    const tstatus = await opts.trade.status();
+    const tstatus = await raceTradeStatus("initial_after_daily_reset");
     const liveTradingOn =
       tstatus.auto_trade_enabled === true &&
       tstatus.live_enabled === true &&
@@ -1866,7 +1955,7 @@ export function createLiveDataStrategy(opts: {
           ledger_reconcile: lr ?? null,
         }),
       );
-      await persist();
+      await racePersist("after_reconcile_actions");
     }
 
     // holdings_universe: 현재 계좌 보유 종목(관리/청산/표시용). discovery/entry_universe/precheck 경로에서는 제외한다.
@@ -1926,8 +2015,8 @@ export function createLiveDataStrategy(opts: {
         stale_filtered_before_eval: boolean;
       }
     >();
-    const logs = await opts.readLogs(220);
-    const marketState = await opts.marketState.evaluate();
+    const logs = await racePhase("read_logs_220", PHASE_MS.read_logs, () => opts.readLogs(220));
+    const marketState = await racePhase("market_state_evaluate", PHASE_MS.market_state, () => opts.marketState.evaluate());
     const conservativeMode = marketState.market_state === "risk_off";
     for (const row of logs) {
       if (row.kind !== "signal" || !row.payload) continue;
@@ -1938,7 +2027,11 @@ export function createLiveDataStrategy(opts: {
       if (!latestByMarket.has(p.data.market)) latestByMarket.set(p.data.market, { ts: row.ts, p: p.data });
     }
 
-    const includeValidity = await partitionKrwMarketsByUpbitValidity(DEBUG_INCLUDE_UNIVERSE_MARKETS);
+    const includeValidity = await racePhase(
+      "partition_validity_include_universe",
+      PHASE_MS.partition_validity,
+      () => partitionKrwMarketsByUpbitValidity(DEBUG_INCLUDE_UNIVERSE_MARKETS),
+    );
     const debugUniverseExtra = includeValidity.skippedBecauseUnknown
       ? [...DEBUG_INCLUDE_UNIVERSE_MARKETS]
       : includeValidity.accepted;
@@ -1952,7 +2045,11 @@ export function createLiveDataStrategy(opts: {
       );
     }
 
-    const logMapValidity = await partitionKrwMarketsByUpbitValidity([...latestAllSignals.keys()]);
+    const logMapValidity = await racePhase(
+      "partition_validity_signal_map_keys",
+      PHASE_MS.partition_validity,
+      () => partitionKrwMarketsByUpbitValidity([...latestAllSignals.keys()]),
+    );
     if (!logMapValidity.skippedBecauseUnknown) {
       const keepLogMarkets = new Set(logMapValidity.accepted);
       for (const k of [...latestAllSignals.keys()]) {
@@ -2027,6 +2124,17 @@ export function createLiveDataStrategy(opts: {
         payload: ScannerFeedSignal;
       } => Boolean(x))
       .sort((a, b) => b.score - a.score);
+
+    console.info(
+      JSON.stringify({
+        tag: "LIVE_TICK_SCANNER_FEED_SNAPSHOT",
+        ts: new Date().toISOString(),
+        tick_lease: myLease,
+        scanner_feed_raw_rows: scannerFeed.length,
+        scanner_candidates_sorted: scannerCandidates.length,
+        scanner_feed_newest_ts: scannerFeedNewestTs,
+      }),
+    );
 
     for (const row of scannerCandidates) {
       const existing = latestAllSignals.get(row.market);
@@ -2487,10 +2595,12 @@ export function createLiveDataStrategy(opts: {
     );
     let tickerRows: Awaited<ReturnType<typeof fetchTickers>> = [];
     try {
-      tickerRows = await fetchTickers(tickerRequestedSymbols, {
-        debugCaller: "live-strategy",
-        signal: tickSignal,
-      });
+      tickerRows = await racePhase("fetch_tickers", PHASE_MS.fetch_tickers, () =>
+        fetchTickers(tickerRequestedSymbols, {
+          debugCaller: "live-strategy",
+          signal: tickSignal,
+        }),
+      );
     } catch (e) {
       const aborted =
         tickSignal.aborted ||
@@ -2539,7 +2649,10 @@ export function createLiveDataStrategy(opts: {
       const key = `${market}:${count}`;
       const hit = cache.get(key);
       if (hit) return hit;
-      const rows = await fetchMinuteCandles(market, unit, count, tickSignal);
+      const candlePhase = `fetch_minute_candles:${market}:u${unit}:n${count}`;
+      const rows = await racePhase(candlePhase, PHASE_MS.fetch_minute_candles, () =>
+        fetchMinuteCandles(market, unit, count, tickSignal),
+      );
       cache.set(key, rows);
       return rows;
     };
@@ -2709,7 +2822,7 @@ export function createLiveDataStrategy(opts: {
           }
         }
         // 승격: normal 포지션으로 이동 (기존 exit 로직 적용)
-        const stNow = await opts.trade.status();
+        const stNow = await raceTradeStatus("early_promote_post_fill");
         const currency = market.replace("KRW-", "");
         const bNow = stNow.balances?.find((x) => x.currency === currency);
         const qty =
@@ -3451,7 +3564,7 @@ export function createLiveDataStrategy(opts: {
           );
         }
       }
-      const after = await opts.trade.status();
+      const after = await raceTradeStatus("exit_after_place_sell");
       const qtyAfter = Number(after.strategy_positions?.[market]?.qty ?? 0);
       const soldQty = Math.max(0, beforeQty - qtyAfter);
       const grossSell = soldQty * now;
@@ -3652,7 +3765,7 @@ export function createLiveDataStrategy(opts: {
           has_open_positions: hasOpenPositions
         }),
       );
-      await persist();
+      await racePersist("early_exit_entry_gate");
       return;
     }
 
@@ -3667,7 +3780,7 @@ export function createLiveDataStrategy(opts: {
           count: state.daily.entry_count
         }),
       );
-      await persist();
+      await racePersist("early_exit_daily_entry_cap");
       return;
     }
     if (state.daily.loss_pct <= -2.5) {
@@ -3690,7 +3803,7 @@ export function createLiveDataStrategy(opts: {
         pnl_net_pct: state.daily.loss_pct,
         note: null,
       });
-      await persist();
+      await racePersist("after_daily_pnl_guard_stop");
       return;
     }
     if (state.safety_guard.consecutive_losses >= 3) {
@@ -3713,7 +3826,7 @@ export function createLiveDataStrategy(opts: {
         pnl_net_pct: null,
         note: null,
       });
-      await persist();
+      await racePersist("after_consecutive_loss_guard_stop");
       return;
     }
     const exceptionSlot = state.regime?.exception_slot_market ?? null;
@@ -3814,7 +3927,7 @@ export function createLiveDataStrategy(opts: {
           max_positions: state.safety_guard.max_positions
         }),
       );
-      await persist();
+      await racePersist("early_exit_max_positions_cap");
       return;
     }
     const openStrategyMarkets = new Set(Object.keys(state.positions));
@@ -3914,7 +4027,9 @@ export function createLiveDataStrategy(opts: {
     const surgeOpenCount =
       Object.values(state.positions).filter((p) => p.engine_bucket === "surge").length +
       Object.values(state.early_positions).filter((p) => p.engine_bucket === "surge").length;
-    const paperStatsMap = await loadPaperSurgePatternStats(opts.companyId, opts.serviceId);
+    const paperStatsMap = await racePhase("paper_surge_pattern_stats_load", PHASE_MS.paper_stats, () =>
+      loadPaperSurgePatternStats(opts.companyId, opts.serviceId),
+    );
 
     const SURGE_V2_SOURCE_KINDS = new Set<string>([
       "scanner_filter_fresh",
@@ -3923,8 +4038,10 @@ export function createLiveDataStrategy(opts: {
     ]);
     const candidateMetaMap = new Map<string, CandidateMeta>();
     const evaluationDroppedReasons: Record<string, string> = {};
-    const candidateMeta = (await Promise.all(entryUniverse
-      .map(async (m) => {
+    const candidateMeta = (
+      await racePhase("candidate_meta_parallel", PHASE_MS.candidate_meta_parallel, () =>
+        Promise.all(
+          entryUniverse.map(async (m) => {
         const s = latestAllSignals.get(m);
         if (!s?.p) {
           evaluationDroppedReasons[m] = "missing_signal_payload";
@@ -4224,7 +4341,9 @@ export function createLiveDataStrategy(opts: {
         };
         candidateMetaMap.set(m, meta);
         return meta;
-      }))
+          }),
+        ),
+      )
     ).filter((x): x is CandidateMeta => x !== null);
 
     console.info(
@@ -5345,7 +5464,7 @@ export function createLiveDataStrategy(opts: {
                 bumpSkip("early_entry_lease_revoked_post_fill");
                 continue;
               }
-              const stEarly = await opts.trade.status();
+              const stEarly = await raceTradeStatus("early_entry_post_buy");
               const currency = market.replace("KRW-", "");
               const bEarly = stEarly.balances?.find((x) => x.currency === currency);
               const qtyEarly = Number(bEarly?.balance ?? 0) + Number(bEarly?.locked ?? 0);
@@ -5705,7 +5824,7 @@ export function createLiveDataStrategy(opts: {
             });
             emitEval(decision.reason, decision.detail);
             emitEval("DEBUG_LIVE_DECISION_LINE", {
-              available_krw: Number((await opts.trade.status()).live_order_available_krw ?? 0),
+              available_krw: Number((await raceTradeStatus("decision_line_surge_reject")).live_order_available_krw ?? 0),
               planned_entry_krw: null,
               entry_score: Number(signalScore.toFixed(2)),
               min_entry_score: marketState.min_entry_score,
@@ -5762,7 +5881,7 @@ export function createLiveDataStrategy(opts: {
             });
             emitEval(pr.message, pr.detail);
             emitEval("DEBUG_LIVE_DECISION_LINE", {
-              available_krw: Number((await opts.trade.status()).live_order_available_krw ?? 0),
+              available_krw: Number((await raceTradeStatus("decision_line_core_pipeline_reject")).live_order_available_krw ?? 0),
               planned_entry_krw: null,
               entry_score: Number(signalScore.toFixed(2)),
               min_entry_score: marketState.min_entry_score,
@@ -5821,7 +5940,7 @@ export function createLiveDataStrategy(opts: {
         });
         emitEval("blocked_trend_filter", { symbol: market, sub: "candles_fetch_failed" });
         emitEval("DEBUG_LIVE_DECISION_LINE", {
-          available_krw: Number((await opts.trade.status()).live_order_available_krw ?? 0),
+          available_krw: Number((await raceTradeStatus("decision_line_candles_fetch_failed")).live_order_available_krw ?? 0),
           planned_entry_krw: null,
           entry_score: Number(signalScore.toFixed(2)),
           min_entry_score: marketState.min_entry_score,
@@ -5834,7 +5953,7 @@ export function createLiveDataStrategy(opts: {
         continue;
       }
 
-      const st = await opts.trade.status();
+      const st = await raceTradeStatus("entry_precheck_existing_holdings");
       const currency = market.replace("KRW-", "");
       const bExist = st.balances?.find((x) => x.currency === currency);
       const existingQty = Number(bExist?.balance ?? 0) + Number(bExist?.locked ?? 0);
@@ -6258,13 +6377,13 @@ export function createLiveDataStrategy(opts: {
             note: e instanceof Error ? e.message : "buy_failed",
           });
         }
-        await persist();
+        await racePersist("after_place_buy_failure_guard");
         bumpSkip("order_failed");
         emitFinalBlocked("order_failed", { order_krw: orderKrw });
         continue;
       }
       const price = priceBy.get(market) ?? 0;
-      const st2 = await opts.trade.status();
+      const st2 = await raceTradeStatus("post_core_buy_balance_snap");
       const bFill = st2.balances?.find((x) => x.currency === currency);
       const qty = Number(bFill?.balance ?? 0) + Number(bFill?.locked ?? 0);
       const strategyPositionExistsBefore = Boolean(state.positions[market]);
@@ -6453,13 +6572,26 @@ export function createLiveDataStrategy(opts: {
         }),
       );
     }
-    await persist();
-    } catch (e) {
-      const aborted =
+    await racePersist("tick_tail_before_return");
+      },
+    );
+    } catch (e: unknown) {
+      if (isLiveTickPhaseTimeout(e)) {
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_TICK_PHASE_TIMEOUT_HALT",
+            ts: new Date().toISOString(),
+            phase: e.phase,
+            timeout_ms: e.timeout_ms,
+            tick_lease: myLease,
+            note: "race_timer_won_underlying_await_may_still_pending_finally_runs",
+          }),
+        );
+      } else if (
         tickSignal.aborted ||
         (e instanceof DOMException && e.name === "AbortError") ||
-        (e instanceof Error && e.name === "AbortError");
-      if (aborted) {
+        (e instanceof Error && e.name === "AbortError")
+      ) {
         console.info(
           JSON.stringify({
             tag: "LIVE_TICK_ABORTED",
