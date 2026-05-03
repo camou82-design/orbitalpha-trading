@@ -1076,6 +1076,8 @@ export default function HomePage() {
   const [sessionUserId, setSessionUserId] = useState<string | null>(null);
   const [sessionPanelWarning, setSessionPanelWarning] = useState<{ code: string; message: string } | null>(null);
   const [autoTradeEnabled, setAutoTradeEnabled] = useState(false);
+  const [lastKnownAutoTradeEnabled, setLastKnownAutoTradeEnabled] = useState<boolean | null>(null);
+  const [autoTradeStatusConfirmedSource, setAutoTradeStatusConfirmedSource] = useState<"server" | "session" | "uncertain">("uncertain");
   const [autoTradeChangedAt, setAutoTradeChangedAt] = useState<string | null>(null);
   const [toggleBusy, setToggleBusy] = useState(false);
   const [canEnableAutoTrade, setCanEnableAutoTrade] = useState(false);
@@ -1304,9 +1306,35 @@ export default function HomePage() {
             setAuthState("ok");
             setCurrentSession(session);
             setSessionUserId(session.user_id ?? null);
-            if (typeof session.auto_trade_enabled === "boolean") {
-              setAutoTradeEnabled(session.auto_trade_enabled);
+
+            const payloadVal = session.auto_trade_enabled;
+            if (typeof payloadVal === "boolean") {
+              const prev = autoTradeEnabled;
+              setAutoTradeEnabled(payloadVal);
+              setLastKnownAutoTradeEnabled(payloadVal);
+              setAutoTradeStatusConfirmedSource("session");
               setAutoTradeChangedAt(typeof session.auto_trade_changed_at === "string" ? session.auto_trade_changed_at : null);
+
+              if (prev !== payloadVal) {
+                devLog({
+                  tag: "AUTO_TRADE_STATUS_POLLING_GAP_PROTECTION_PROOF",
+                  source: "session_poll",
+                  prev_state: prev,
+                  next_state: payloadVal,
+                  action: "update",
+                  reason: "session_payload_confirmed"
+                });
+              }
+            } else {
+              devLog({
+                tag: "AUTO_TRADE_STATUS_POLLING_GAP_PROTECTION_PROOF",
+                source: "session_poll",
+                prev_state: autoTradeEnabled,
+                next_candidate: payloadVal,
+                action: "preserve",
+                reason: payloadVal === null ? "session_payload_null" : "session_payload_missing"
+              });
+              // Do NOT setAutoTradeEnabled(false) here. Maintain last known.
             }
           },
           onErr: (e) => {
@@ -1314,6 +1342,14 @@ export default function HomePage() {
             const msg = e instanceof Error ? e.message : "session_fetch_failed";
             setSessionPanelWarning({ code: "session_fetch_failed", message: msg.slice(0, 180) });
             setAuthState((prev) => (prev === "loading" ? "ok" : prev));
+
+            devLog({
+              tag: "DASHBOARD_TRADE_STATUS_401_PRESERVE_LAST_KNOWN_AUTO_TRADE",
+              error: msg,
+              last_known: lastKnownAutoTradeEnabled,
+              current_ui_state: autoTradeEnabled
+            });
+            setAutoTradeStatusConfirmedSource("uncertain");
           },
         },
       );
@@ -1329,39 +1365,75 @@ export default function HomePage() {
         const tradePollRes = await fetchTradeStatusDetailed(apiBase, { signal: ctrl.signal, timeoutMs: 6000, cacheBust: ts });
         if (cancelled) return;
         const t = tradePollRes.payload;
-        if (t) {
-          setIfChanged(
-            "trade",
-            t as TradeStatus,
-            setTrade,
-            (p) => ({
-              api_connected: (p as TradeStatus).api_connected,
-              live_enabled: (p as TradeStatus).live_enabled,
-              auto_trade_enabled: (p as TradeStatus).auto_trade_enabled,
-              recovery_ready: (p as TradeStatus).recovery_ready,
-              total_krw: (p as TradeStatus).total_krw,
-              krw_available: (p as TradeStatus).krw_available,
-              reserved_krw: (p as TradeStatus).reserved_krw,
-              strategy_allocated_krw: (p as TradeStatus).strategy_allocated_krw,
-              pump_paper_allocated_krw: (p as TradeStatus).pump_paper_allocated_krw,
-              open_positions_count: (() => {
-                const rec = asRecord(p);
-                const pos = rec.strategy_positions;
-                if (!pos || typeof pos !== "object") return 0;
-                return Object.values(pos as Record<string, unknown>).filter((v) => Number(asRecord(v).qty ?? 0) > 0).length;
-              })(),
-              balances_len: Array.isArray((p as TradeStatus).balances) ? (p as TradeStatus).balances.length : 0,
-            }),
-          );
-          setLastClientTradeFailure(null);
-          const p = t as TradeStatus;
-          if (p.api_connected) setAccountSyncState("ok");
-          else if (p.env_access_key_present && p.env_secret_key_present) setAccountSyncState("error");
-          else setAccountSyncState("ok");
-          setAuthState((prev) => (prev === "loading" ? "ok" : prev));
-        } else if (tradePollRes.failureCode) {
-          setLastClientTradeFailure({ code: tradePollRes.failureCode, message: tradePollRes.failureMessage ?? "" });
-        }
+          if (t) {
+            const castT = t as TradeStatus;
+            setIfChanged(
+              "trade",
+              castT,
+              setTrade,
+              (p) => ({
+                api_connected: (p as TradeStatus).api_connected,
+                live_enabled: (p as TradeStatus).live_enabled,
+                auto_trade_enabled: (p as TradeStatus).auto_trade_enabled,
+                recovery_ready: (p as TradeStatus).recovery_ready,
+                total_krw: (p as TradeStatus).total_krw,
+                krw_available: (p as TradeStatus).krw_available,
+                reserved_krw: (p as TradeStatus).reserved_krw,
+                strategy_allocated_krw: (p as TradeStatus).strategy_allocated_krw,
+                pump_paper_allocated_krw: (p as TradeStatus).pump_paper_allocated_krw,
+                open_positions_count: (() => {
+                  const rec = asRecord(p);
+                  const pos = rec.strategy_positions;
+                  if (!pos || typeof pos !== "object") return 0;
+                  return Object.values(pos as Record<string, unknown>).filter((v) => Number(asRecord(v).qty ?? 0) > 0).length;
+                })(),
+                balances_len: Array.isArray((p as TradeStatus).balances) ? (p as TradeStatus).balances.length : 0,
+              }),
+            );
+
+            const serverVal = castT.auto_trade_enabled;
+            if (typeof serverVal === "boolean") {
+              const prev = autoTradeEnabled;
+              setAutoTradeEnabled(serverVal);
+              setLastKnownAutoTradeEnabled(serverVal);
+              setAutoTradeStatusConfirmedSource("server");
+              if (prev !== serverVal) {
+                devLog({
+                  tag: "AUTO_TRADE_STATUS_POLLING_GAP_PROTECTION_PROOF",
+                  source: "trade_poll",
+                  prev_state: prev,
+                  next_state: serverVal,
+                  action: "update",
+                  reason: "server_payload_confirmed"
+                });
+              }
+            } else {
+              devLog({
+                tag: "AUTO_TRADE_STATUS_POLLING_GAP_PROTECTION_PROOF",
+                source: "trade_poll",
+                prev_state: autoTradeEnabled,
+                next_candidate: serverVal,
+                action: "preserve",
+                reason: serverVal === null ? "server_payload_null" : "server_payload_missing"
+              });
+            }
+
+            setLastClientTradeFailure(null);
+            const p = t as TradeStatus;
+            if (p.api_connected) setAccountSyncState("ok");
+            else if (p.env_access_key_present && p.env_secret_key_present) setAccountSyncState("error");
+            else setAccountSyncState("ok");
+            setAuthState((prev) => (prev === "loading" ? "ok" : prev));
+          } else if (tradePollRes.failureCode) {
+            setLastClientTradeFailure({ code: tradePollRes.failureCode, message: tradePollRes.failureMessage ?? "" });
+            devLog({
+              tag: "DASHBOARD_TRADE_STATUS_401_PRESERVE_LAST_KNOWN_AUTO_TRADE",
+              error: tradePollRes.failureCode,
+              last_known: lastKnownAutoTradeEnabled,
+              current_ui_state: autoTradeEnabled
+            });
+            setAutoTradeStatusConfirmedSource("uncertain");
+          }
       } finally {
         window.clearTimeout(tid);
         pollInFlightRef.current.delete(slotKey);
@@ -1956,7 +2028,10 @@ export default function HomePage() {
       }
       const body = await res.json();
       if (!res.ok) throw new Error(body?.error ?? "자동매매 상태 변경 실패");
-      setAutoTradeEnabled(Boolean(body.auto_trade_enabled));
+      const nextVal = Boolean(body.auto_trade_enabled);
+      setAutoTradeEnabled(nextVal);
+      setLastKnownAutoTradeEnabled(nextVal);
+      setAutoTradeStatusConfirmedSource("server");
       setAutoTradeChangedAt(typeof body.auto_trade_changed_at === "string" ? body.auto_trade_changed_at : null);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "toggle failed");
@@ -2169,15 +2244,39 @@ export default function HomePage() {
           >
             <div style={{ display: "flex", gap: "0.8rem", flexWrap: "wrap", fontSize: "0.78rem", color: UI.muted }}>
               <span>API <strong style={{ color: trade?.api_connected ? UI.pass : UI.watch }}>{accountSyncState === "syncing" ? "동기화중" : trade?.api_connected ? "연결됨" : "미연결"}</strong></span>
-              <span>자동매매 <strong style={{ color: autoTradeEnabled ? UI.pass : UI.watch }}>{autoTradeEnabled ? "ON" : "OFF"}</strong></span>
+              <span>
+                자동매매{" "}
+                <strong
+                  style={{
+                    color: autoTradeStatusConfirmedSource === "uncertain" ? UI.muted : autoTradeEnabled ? UI.pass : UI.watch,
+                  }}
+                >
+                  {(() => {
+                    const status = autoTradeEnabled ? "ON" : "OFF";
+                    if (autoTradeStatusConfirmedSource === "uncertain") {
+                      return `[${status}] 확인불가`;
+                    }
+                    return status;
+                  })()}
+                </strong>
+              </span>
               <span>계좌보호 <strong style={{ color: strategy?.safety_guard_state === "자동정지" ? UI.watch : UI.body }}>{strategy?.safety_guard_state ?? "-"}</strong></span>
               <span>실거래 <strong style={{ color: trade?.api_connected ? UI.pass : UI.watch }}>{tradeReadyLabel}</strong></span>
             </div>
             <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
               <button
                 type="button"
-                onClick={() => void onToggleAutoTrade(!autoTradeEnabled)}
-                disabled={toggleBusy || (!autoTradeEnabled && !canEnableAutoTrade)}
+                onClick={() => {
+                  devLog({
+                    tag: "AUTO_TRADE_DISPLAY_SOURCE_PROOF",
+                    current_enabled: autoTradeEnabled,
+                    confirmed_source: autoTradeStatusConfirmedSource,
+                    last_known: lastKnownAutoTradeEnabled,
+                    is_uncertain: autoTradeStatusConfirmedSource === "uncertain"
+                  });
+                  void onToggleAutoTrade(!autoTradeEnabled);
+                }}
+                disabled={toggleBusy || (!autoTradeEnabled && !canEnableAutoTrade) || autoTradeStatusConfirmedSource === "uncertain"}
                 style={{
                   borderRadius: 999,
                   border: `1px solid ${UI.borderSoft}`,
@@ -2186,13 +2285,17 @@ export default function HomePage() {
                   fontSize: "0.72rem",
                   fontWeight: 700,
                   padding: "0.2rem 0.65rem",
-                  cursor: toggleBusy ? "not-allowed" : "pointer",
-                  opacity: toggleBusy ? 0.6 : 1,
+                  cursor: toggleBusy || autoTradeStatusConfirmedSource === "uncertain" ? "not-allowed" : "pointer",
+                  opacity: toggleBusy || autoTradeStatusConfirmedSource === "uncertain" ? 0.6 : 1,
                 }}
               >
                 자동매매 {autoTradeEnabled ? "OFF" : "ON"}
               </button>
-              {!autoTradeEnabled && !canEnableAutoTrade ? (
+              {autoTradeStatusConfirmedSource === "uncertain" ? (
+                <div style={{ fontSize: "0.7rem", color: UI.watch, textAlign: "right" }}>
+                  세션 만료 / 서버 자동매매 상태 확인불가 / 서버 상태 유지 중
+                </div>
+              ) : !autoTradeEnabled && !canEnableAutoTrade ? (
                 <div style={{ fontSize: "0.7rem", color: UI.watch }}>ON 불가: {cannotEnableReason ?? "조건 미충족"}</div>
               ) : null}
               {!autoTradeEnabled && canEnableAutoTrade && sessionDelayNotice ? (

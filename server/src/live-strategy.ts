@@ -1718,32 +1718,14 @@ export function createLiveDataStrategy(opts: {
     if (tradeStatusEntryBlocked) {
       console.info(
         JSON.stringify({
-          tag: "DEBUG_LIVE_LOOP_SKIP",
-          reason: "trade_status_guard",
+          tag: "DEBUG_LIVE_EARLY_EXIT_PROOF",
+          ts: new Date().toISOString(),
           stage: "before_signal_load",
+          reason: "trade_status_guard_entry_blocked",
           auto_trade_enabled: Boolean(tstatus.auto_trade_enabled),
           api_connected: Boolean(tstatus.api_connected),
           live_enabled: Boolean(tstatus.live_enabled),
-        }),
-      );
-      console.info(
-        JSON.stringify({
-          tag: "DEBUG_LIVE_EXIT_MANAGEMENT_CONTINUES",
-          ts: new Date().toISOString(),
-          stage: "before_signal_load_trade_status_guard",
-          reason: "entry_blocked_trade_status_guard",
-          entry_blocked: true,
-          exit_management_continues: hasOpenPositions,
-          message: "auto_trade_off_entry_disabled_exit_still_active",
-          open_positions: Object.keys(state.positions).length,
-          early_positions: Object.keys(state.early_positions).length,
-          watch_markets_count: null,
-          signal_map_count: null,
-          markets_with_filter_pass_count: null,
-          base_entry_universe_count: null,
-          entry_universe_count: null,
-          symbol: null,
-          note: "entry blocked only; continue exit/position management flow",
+          has_open_positions: hasOpenPositions
         }),
       );
     }
@@ -3542,26 +3524,15 @@ export function createLiveDataStrategy(opts: {
     if (!entryAllowed) {
       console.info(
         JSON.stringify({
-          tag: "DEBUG_LIVE_SURGE_DISABLED_BY_LIVE_MODE",
+          tag: "DEBUG_LIVE_EARLY_EXIT_PROOF",
           ts: new Date().toISOString(),
-          auto_trade_enabled: Boolean(tstatus.auto_trade_enabled),
-          live_enabled: Boolean(tstatus.live_enabled),
-          api_connected: Boolean(tstatus.api_connected),
-          reason: "live_trading_off",
-        }),
-      );
-      console.info(
-        JSON.stringify({
-          tag: "DEBUG_LIVE_ENTRY_BLOCKED",
-          ts: new Date().toISOString(),
-          reason: entryBlockedBySafety ? "entry_blocked_safety_guard_stopped" : "entry_blocked_trade_status_guard",
+          stage: "entry_gate_check",
+          reason: entryBlockedBySafety ? "safety_guard_stopped" : "trade_status_guard",
           auto_trade_enabled: Boolean(tstatus.auto_trade_enabled),
           api_connected: Boolean(tstatus.api_connected),
           live_enabled: Boolean(tstatus.live_enabled),
           safety_guard_state: state.safety_guard.state,
-          safety_guard_reason: state.safety_guard.reason,
-          exit_management_continues: hasOpenPositions,
-          message: "auto_trade_off_entry_disabled_exit_still_active",
+          has_open_positions: hasOpenPositions
         }),
       );
       await persist();
@@ -3570,6 +3541,15 @@ export function createLiveDataStrategy(opts: {
 
     // entries
     if (state.daily.entry_count >= 6) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_LIVE_EARLY_EXIT_PROOF",
+          ts: new Date().toISOString(),
+          stage: "daily_count_cap",
+          reason: "daily_entry_count_limit_reached",
+          count: state.daily.entry_count
+        }),
+      );
       await persist();
       return;
     }
@@ -3709,33 +3689,15 @@ export function createLiveDataStrategy(opts: {
     if (openCount >= state.safety_guard.max_positions) {
       console.info(
         JSON.stringify({
-          tag: "DEBUG_POSITION_CAP_STATE",
+          tag: "DEBUG_LIVE_EARLY_EXIT_PROOF",
           ts: new Date().toISOString(),
-          open_positions: openCount,
-          max_positions: state.safety_guard.max_positions,
-          open_position_symbols: Object.keys(state.positions),
-          entry_universe_count: null,
-          filter_pass_count: filterPassCount,
-          requested_symbols: tickerRequestedSymbols.slice(0, 20),
-          note: "max_positions reached; precheck loop skipped",
+          stage: "position_cap_check",
+          reason: "max_positions_reached",
+          open_count: openCount,
+          max_positions: state.safety_guard.max_positions
         }),
       );
       await persist();
-      console.info(
-        JSON.stringify({
-          tag: "DEBUG_LIVE_EARLY_EXIT",
-          ts: new Date().toISOString(),
-          stage: "after_base_entry_universe",
-          reason: "max_positions_reached",
-          watch_markets_count: watchMarkets.length,
-          signal_map_count: signalMapCount,
-          markets_with_filter_pass_count: filterPassCount,
-          base_entry_universe_count: baseEntryUniverse.length,
-          entry_universe_count: null,
-          symbol: null,
-          note: "open positions already at cap",
-        }),
-      );
       return;
     }
     const openStrategyMarkets = new Set(Object.keys(state.positions));
@@ -3882,7 +3844,18 @@ export function createLiveDataStrategy(opts: {
           if (prevAvg > 0) vr1m5 = lastNotional / prevAvg;
         }
 
-        const scoreForRelaxed = Number(opts.marketState.entryGate(s.p, marketState).score ?? 0);
+        const gate = opts.marketState.entryGate(s.p, marketState);
+        const scoreForRelaxed = Number(gate.score ?? 0);
+        console.info(
+          JSON.stringify({
+            tag: "DEBUG_LIVE_BASE_GATE_RESULT",
+            ts: new Date().toISOString(),
+            market: m,
+            score: scoreForRelaxed,
+            gate_ok: gate.ok,
+            reason: gate.reason
+          })
+        );
         const signalType = String(s.p.signal_type ?? "MID").toUpperCase();
         const vol = Number(s.p.volume_ratio ?? 0);
         const btcTier = state.regime?.btc_filter_state ?? "neutral";
@@ -4009,7 +3982,6 @@ export function createLiveDataStrategy(opts: {
         }
         console.info(JSON.stringify({ tag: "DEBUG_ORIGINAL_SPOT_SETUP_PASS", market: m, mode: setup.mode, rr: setup.riskReward }));
 
-        const gate = opts.marketState.entryGate(s.p, marketState);
         let gateOk = gate.ok;
         let gateReason = gate.reason;
         const score = Number(gate.score ?? 0);
