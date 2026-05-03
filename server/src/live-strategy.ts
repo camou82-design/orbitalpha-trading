@@ -1566,6 +1566,11 @@ export function createLiveDataStrategy(opts: {
   };
 
   let runTickInFlight = false;
+  /** 단조 증가; 틱 시작 시점의 lease id (주문 실행 권한 판별). */
+  let liveTickLeaseSeq = 0;
+  /** 현재 유효 lease — 스테일 감지 시 증가시켜 진행 중 틱은 주문 권한 상실. */
+  let liveTickValidLease = 0;
+  let liveTickAbort: AbortController | null = null;
   const setupBlockLogDeduper = new LogDeduper(3000, 60_000);
 
   const persist = async () => {
@@ -1690,44 +1695,87 @@ export function createLiveDataStrategy(opts: {
   };
 
   let lastTickStartedAt = 0;
+  const STALE_LIVE_TICK_MS = 120_000;
+
   const runTick = async () => {
     const nowMs = Date.now();
     if (runTickInFlight) {
       const elapsed = nowMs - lastTickStartedAt;
-      console.info(JSON.stringify({ 
-        tag: "LIVE_TICK_SKIPPED_IN_FLIGHT", 
-        ts: new Date().toISOString(),
-        elapsed_ms: elapsed,
-        note: elapsed > 120_000 ? "stale_in_flight_detected_resetting" : "in_flight"
-      }));
-      // 2분 이상 걸리면 강제 리셋 (Deadlock 방지)
-      if (elapsed > 120_000) {
-        runTickInFlight = false;
-      } else {
-        return;
+      const stale = elapsed > STALE_LIVE_TICK_MS;
+      console.info(
+        JSON.stringify({
+          tag: "LIVE_TICK_SKIPPED_IN_FLIGHT",
+          ts: new Date().toISOString(),
+          elapsed_ms: elapsed,
+          note: stale ? "stale_in_flight_lease_revoke_and_abort" : "in_flight",
+        }),
+      );
+      if (stale) {
+        liveTickValidLease += 1;
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_TICK_STALE_IN_FLIGHT",
+            ts: new Date().toISOString(),
+            elapsed_ms: elapsed,
+            note: "abort_requested_no_overlap_new_tick_starts_only_after_finally",
+            valid_lease: liveTickValidLease,
+          }),
+        );
+        try {
+          liveTickAbort?.abort();
+        } catch {
+          /* ignore */
+        }
       }
+      return;
     }
+
+    const tickAbort = new AbortController();
+    liveTickAbort = tickAbort;
+    const tickSignal = tickAbort.signal;
+    const myLease = (liveTickLeaseSeq += 1);
+    liveTickValidLease = myLease;
+
+    const leaseOk = () => myLease === liveTickValidLease && !tickSignal.aborted;
+
     runTickInFlight = true;
     lastTickStartedAt = Date.now();
-    const loopId = Date.now();
-    
-    // Periodically log age proof
+
     const ageInterval = setInterval(() => {
-      if (!runTickInFlight) {
+      if (!runTickInFlight || myLease !== liveTickValidLease) {
         clearInterval(ageInterval);
         return;
       }
-      console.info(JSON.stringify({
-        tag: "LIVE_TICK_IN_FLIGHT_AGE_PROOF",
-        started_at: new Date(lastTickStartedAt).toISOString(),
-        elapsed_ms: Date.now() - lastTickStartedAt,
-        phase: "execution_loop",
-        current_market: "global",
-        reason: "long_running_tick_monitored"
-      }));
+      console.info(
+        JSON.stringify({
+          tag: "LIVE_TICK_IN_FLIGHT_AGE_PROOF",
+          ts: new Date().toISOString(),
+          tick_lease: myLease,
+          started_at: new Date(lastTickStartedAt).toISOString(),
+          elapsed_ms: Date.now() - lastTickStartedAt,
+          phase: "execution_loop",
+          current_market: "global",
+          reason: "long_running_tick_monitored",
+        }),
+      );
     }, 15_000);
 
     try {
+    const loopId = Date.now();
+    const assertLiveOrderAuthority = (phase: string): boolean => {
+      if (leaseOk()) return true;
+      console.info(
+        JSON.stringify({
+          tag: "LIVE_TICK_ORDER_AUTH_BLOCKED",
+          ts: new Date().toISOString(),
+          phase,
+          tick_lease: myLease,
+          valid_lease: liveTickValidLease,
+          signal_aborted: tickSignal.aborted,
+        }),
+      );
+      return false;
+    };
     // 운영 최종값 단일화: persisted 값과 무관하게 매 tick env cap으로 재설정.
     state.safety_guard.max_positions = LIVE_MAX_POSITIONS_CAP;
 
@@ -2439,19 +2487,38 @@ export function createLiveDataStrategy(opts: {
     );
     let tickerRows: Awaited<ReturnType<typeof fetchTickers>> = [];
     try {
-      tickerRows = await fetchTickers(tickerRequestedSymbols, { debugCaller: "live-strategy" });
+      tickerRows = await fetchTickers(tickerRequestedSymbols, {
+        debugCaller: "live-strategy",
+        signal: tickSignal,
+      });
     } catch (e) {
+      const aborted =
+        tickSignal.aborted ||
+        (e instanceof DOMException && e.name === "AbortError") ||
+        (e instanceof Error && e.name === "AbortError");
       console.info(
         JSON.stringify({
-          tag: "DEBUG_TICKER_FETCH_ERROR",
+          tag: aborted ? "DEBUG_TICKER_FETCH_ABORTED" : "DEBUG_TICKER_FETCH_ERROR",
           ts: new Date().toISOString(),
           stage: "after_scanner_before_tickers",
-          reason: "fetch_tickers_throw",
+          reason: aborted ? "fetch_tickers_aborted" : "fetch_tickers_throw",
           error_message: e instanceof Error ? e.message : String(e),
           requested_symbols: tickerRequestedSymbols.slice(0, 30),
         }),
       );
       throw e;
+    }
+    if (!leaseOk()) {
+      console.info(
+        JSON.stringify({
+          tag: "LIVE_TICK_LEASE_REVOKED_SHORT_CIRCUIT",
+          ts: new Date().toISOString(),
+          stage: "after_ticker_fetch",
+          tick_lease: myLease,
+          valid_lease: liveTickValidLease,
+        }),
+      );
+      return;
     }
     console.info(
       JSON.stringify({
@@ -2472,7 +2539,7 @@ export function createLiveDataStrategy(opts: {
       const key = `${market}:${count}`;
       const hit = cache.get(key);
       if (hit) return hit;
-      const rows = await fetchMinuteCandles(market, unit, count);
+      const rows = await fetchMinuteCandles(market, unit, count, tickSignal);
       cache.set(key, rows);
       return rows;
     };
@@ -2614,20 +2681,29 @@ export function createLiveDataStrategy(opts: {
         const promoteFillKrw = Math.max(0, Math.floor(targetBudget - filledSoFar));
         if (promoteFillKrw >= UPBIT_MIN_ORDER_KRW) {
           try {
-            console.info(
-              JSON.stringify({
-                tag: "LIVE_PLACEBUY_ATTEMPT",
-                ts: new Date().toISOString(),
-                market,
-                path: "early_promote_fill",
-                order_krw: promoteFillKrw,
-                strategy_type: "momentum",
-              }),
-            );
-            await opts.trade.placeBuy(market, true, promoteFillKrw, "momentum", "strategy", {
-              __early_promote_fill: true,
-              __early_promote_fill_krw: promoteFillKrw,
-            });
+            if (!assertLiveOrderAuthority("early_promote_before_attempt")) {
+              /* revoked — no fill; keep early position state */
+            } else {
+              console.info(
+                JSON.stringify({
+                  tag: "LIVE_PLACEBUY_ATTEMPT",
+                  ts: new Date().toISOString(),
+                  market,
+                  path: "early_promote_fill",
+                  order_krw: promoteFillKrw,
+                  strategy_type: "momentum",
+                  tick_lease: myLease,
+                }),
+              );
+              if (!assertLiveOrderAuthority("early_promote_before_placebuy")) {
+                /* race: lease revoked between logs */
+              } else {
+                await opts.trade.placeBuy(market, true, promoteFillKrw, "momentum", "strategy", {
+                  __early_promote_fill: true,
+                  __early_promote_fill_krw: promoteFillKrw,
+                });
+              }
+            }
           } catch {
             // keep running with current size if promote fill fails
           }
@@ -5242,56 +5318,76 @@ export function createLiveDataStrategy(opts: {
               path: "early_entry",
               order_krw: earlyOrderKrw,
               strategy_type: "momentum",
+              tick_lease: myLease,
             }),
           );
-          try {
-            await opts.trade.placeBuy(market, true, earlyOrderKrw, "momentum", "strategy", {
-              ...sig.p,
-              __early_entry: true,
-              __early_entry_size_ratio: LIVE_EARLY_ENTRY_SIZE_RATIO,
-            });
-            const stEarly = await opts.trade.status();
-            const currency = market.replace("KRW-", "");
-            const bEarly = stEarly.balances?.find((x) => x.currency === currency);
-            const qtyEarly = Number(bEarly?.balance ?? 0) + Number(bEarly?.locked ?? 0);
-            state.early_positions[market] = {
-              market,
-              entry_ts: new Date().toISOString(),
-              entry_price: currentPrice,
-              qty: qtyEarly,
-              order_krw: earlyOrderKrw,
-              signal_ts: signalTs,
-              signal_strength: sig.p.signal_type ?? "MID",
-              entry_recent_high: Number(localHigh ?? currentPrice),
-              entry_volume_ratio_1m5: Number(volumeRatio1m5 ?? 0),
-              promoted: false,
-              target_budget_krw: Math.floor(baseBudget),
-              filled_entry_krw: earlyOrderKrw,
-              engine_bucket: "surge",
-            };
-            console.info(
-              JSON.stringify({
-                tag: "DEBUG_LIVE_EARLY_ENTRY_FILLED",
-                ts: new Date().toISOString(),
-                symbol: market,
-                near_high_pct: distanceFromLocalHighPct,
-                volume_ratio: volumeRatio1m5,
-                seconds_since_signal: secondsSinceSignal,
-                early_entry_allowed: true,
-                early_entry_reason: "filled",
-                size_ratio: LIVE_EARLY_ENTRY_SIZE_RATIO,
+          if (!assertLiveOrderAuthority("early_entry_before_placebuy")) {
+            /* lease lost — fall through to normal path */
+          } else {
+            try {
+              await opts.trade.placeBuy(market, true, earlyOrderKrw, "momentum", "strategy", {
+                ...sig.p,
+                __early_entry: true,
+                __early_entry_size_ratio: LIVE_EARLY_ENTRY_SIZE_RATIO,
+              });
+              if (!leaseOk()) {
+                console.info(
+                  JSON.stringify({
+                    tag: "LIVE_EARLY_ENTRY_STATE_SKIPPED_LEASE_REVOKED",
+                    ts: new Date().toISOString(),
+                    symbol: market,
+                    order_krw: earlyOrderKrw,
+                    tick_lease: myLease,
+                    valid_lease: liveTickValidLease,
+                    note: "exchange_call_returned_strategy_bookkeeping_skipped",
+                  }),
+                );
+                bumpSkip("early_entry_lease_revoked_post_fill");
+                continue;
+              }
+              const stEarly = await opts.trade.status();
+              const currency = market.replace("KRW-", "");
+              const bEarly = stEarly.balances?.find((x) => x.currency === currency);
+              const qtyEarly = Number(bEarly?.balance ?? 0) + Number(bEarly?.locked ?? 0);
+              state.early_positions[market] = {
+                market,
+                entry_ts: new Date().toISOString(),
+                entry_price: currentPrice,
+                qty: qtyEarly,
                 order_krw: earlyOrderKrw,
-                filled_qty: qtyEarly,
-                filled_price: currentPrice,
-              }),
-            );
-            if (liveTradingOn) {
-              surgeRemainingForTickKrw = Math.max(0, surgeRemainingForTickKrw - earlyOrderKrw);
+                signal_ts: signalTs,
+                signal_strength: sig.p.signal_type ?? "MID",
+                entry_recent_high: Number(localHigh ?? currentPrice),
+                entry_volume_ratio_1m5: Number(volumeRatio1m5 ?? 0),
+                promoted: false,
+                target_budget_krw: Math.floor(baseBudget),
+                filled_entry_krw: earlyOrderKrw,
+                engine_bucket: "surge",
+              };
+              console.info(
+                JSON.stringify({
+                  tag: "DEBUG_LIVE_EARLY_ENTRY_FILLED",
+                  ts: new Date().toISOString(),
+                  symbol: market,
+                  near_high_pct: distanceFromLocalHighPct,
+                  volume_ratio: volumeRatio1m5,
+                  seconds_since_signal: secondsSinceSignal,
+                  early_entry_allowed: true,
+                  early_entry_reason: "filled",
+                  size_ratio: LIVE_EARLY_ENTRY_SIZE_RATIO,
+                  order_krw: earlyOrderKrw,
+                  filled_qty: qtyEarly,
+                  filled_price: currentPrice,
+                }),
+              );
+              if (liveTradingOn) {
+                surgeRemainingForTickKrw = Math.max(0, surgeRemainingForTickKrw - earlyOrderKrw);
+              }
+              bumpSkip("early_entry_filled");
+              continue; // do not run normal entry in same tick for same symbol
+            } catch {
+              // fall through to normal path; early is best-effort scout slot
             }
-            bumpSkip("early_entry_filled");
-            continue; // do not run normal entry in same tick for same symbol
-          } catch {
-            // fall through to normal path; early is best-effort scout slot
           }
         }
       }
@@ -5960,6 +6056,11 @@ export function createLiveDataStrategy(opts: {
           filter_pass: Boolean(sig.p.filter_pass),
         }),
       );
+      if (!assertLiveOrderAuthority("core_entry_before_attempt")) {
+        bumpSkip("tick_lease_revoked");
+        emitFinalBlocked("tick_lease_revoked", { order_krw: orderKrw });
+        continue;
+      }
       console.info(
         JSON.stringify({
           tag: "LIVE_PLACEBUY_ATTEMPT",
@@ -5968,6 +6069,7 @@ export function createLiveDataStrategy(opts: {
           path: isSurgeSource ? "surge_normal" : "normal",
           order_krw: orderKrw,
           strategy_type: strategyType,
+          tick_lease: myLease,
         }),
       );
       // Entry Execution Proof (Before Call)
@@ -5995,6 +6097,9 @@ export function createLiveDataStrategy(opts: {
         let placeBuyOk = false;
         let placeBuyReason = "unknown";
         try {
+          if (!leaseOk()) {
+            throw new Error("TICK_LEASE_REVOKED");
+          }
           await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", signalPayloadForBuy);
           placeBuyOk = true;
           placeBuyReason = "success";
@@ -6023,7 +6128,27 @@ export function createLiveDataStrategy(opts: {
             }),
           );
         }
-        
+
+        if (!leaseOk()) {
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_PLACEBUY_RESULT",
+              ts: new Date().toISOString(),
+              market,
+              ok: false,
+              path: isSurgeSource ? "surge_normal" : "normal",
+              order_krw: orderKrw,
+              strategy_type: strategyType,
+              error: "tick_lease_revoked_after_exchange_call",
+              tick_lease: myLease,
+              valid_lease: liveTickValidLease,
+            }),
+          );
+          bumpSkip("tick_lease_revoked_post_fill");
+          emitFinalBlocked("tick_lease_revoked_post_fill", { order_krw: orderKrw });
+          continue;
+        }
+
         const finalMeta = candidateMeta.find(x => x.market === market);
         if (!isSurgeSource) {
           console.info(JSON.stringify({
@@ -6055,6 +6180,7 @@ export function createLiveDataStrategy(opts: {
             path: isSurgeSource ? "surge_normal" : "normal",
             order_krw: orderKrw,
             strategy_type: strategyType,
+            tick_lease: myLease,
           }),
         );
         if (liveTradingOn) {
@@ -6079,6 +6205,25 @@ export function createLiveDataStrategy(opts: {
         emitEval("entry_opened", { symbol: market, order_krw: orderKrw });
         selectedCount += 1;
       } catch (e) {
+        if (e instanceof Error && e.message === "TICK_LEASE_REVOKED") {
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_PLACEBUY_RESULT",
+              ts: new Date().toISOString(),
+              market,
+              ok: false,
+              path: isSurgeSource ? "surge_normal" : "normal",
+              order_krw: orderKrw,
+              strategy_type: strategyType,
+              error: "tick_lease_revoked_pre_exchange",
+              tick_lease: myLease,
+              valid_lease: liveTickValidLease,
+            }),
+          );
+          bumpSkip("tick_lease_revoked");
+          emitFinalBlocked("tick_lease_revoked", { order_krw: orderKrw });
+          continue;
+        }
         console.info(
           JSON.stringify({
             tag: "LIVE_PLACEBUY_RESULT",
@@ -6310,16 +6455,36 @@ export function createLiveDataStrategy(opts: {
     }
     await persist();
     } catch (e) {
-      console.info(
-        JSON.stringify({
-          tag: "DEBUG_LIVE_TICK_ERROR",
-          ts: new Date().toISOString(),
-          error: e instanceof Error ? e.message : String(e),
-          stack: e instanceof Error ? String(e.stack ?? "").slice(0, 800) : null,
-        }),
-      );
+      const aborted =
+        tickSignal.aborted ||
+        (e instanceof DOMException && e.name === "AbortError") ||
+        (e instanceof Error && e.name === "AbortError");
+      if (aborted) {
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_TICK_ABORTED",
+            ts: new Date().toISOString(),
+            tick_lease: myLease,
+            error: e instanceof Error ? e.message : String(e),
+          }),
+        );
+      } else {
+        console.info(
+          JSON.stringify({
+            tag: "DEBUG_LIVE_TICK_ERROR",
+            ts: new Date().toISOString(),
+            tick_lease: myLease,
+            error: e instanceof Error ? e.message : String(e),
+            stack: e instanceof Error ? String(e.stack ?? "").slice(0, 800) : null,
+          }),
+        );
+      }
     } finally {
+      clearInterval(ageInterval);
       runTickInFlight = false;
+      if (liveTickAbort === tickAbort) {
+        liveTickAbort = null;
+      }
     }
   };
 

@@ -47,10 +47,30 @@ export type FetchTickersOptions = {
   parallelTickerBatches?: number;
   /** DEBUG_LIVE_DATA_SOURCE / DEBUG_TICKER_RATE_LIMIT 로깅용 호출자 라벨. */
   debugCaller?: string;
+  /** 라이브 틱 취소 시 진행 중인 ticker 배치가 길게 붙잡히지 않도록 전달. */
+  signal?: AbortSignal;
 };
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  if (!signal) return sleep(ms);
+  if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      signal.removeEventListener("abort", onAbort);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 // 캔들 REST 과호출/429 완화를 위한 공용 캐시/쿨다운 (프로세스 내).
@@ -475,20 +495,21 @@ function chunk<T>(arr: T[], size: number): T[][] {
   return out;
 }
 
-async function fetchTickerBatchGroup(group: string[]): Promise<UpbitTicker[]> {
+async function fetchTickerBatchGroup(group: string[], signal?: AbortSignal): Promise<UpbitTicker[]> {
   const out: UpbitTicker[] = [];
   for (let attempt = 1; attempt <= Math.max(1, TICKER_429_MAX_ATTEMPTS); attempt++) {
     try {
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
       const rows: UpbitTicker[] = [];
       const q = encodeURIComponent(group.join(","));
       try {
-        rows.push(...(await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${q}`)));
+        rows.push(...(await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${q}`, signal)));
       } catch (batchErr) {
         if (!is404MarketError(batchErr)) throw batchErr;
         for (const market of group) {
           try {
             const sq = encodeURIComponent(market);
-            const one = await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${sq}`);
+            const one = await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${sq}`, signal);
             rows.push(...one);
           } catch (singleErr) {
             if (is404MarketError(singleErr)) {
@@ -511,6 +532,7 @@ async function fetchTickerBatchGroup(group: string[]): Promise<UpbitTicker[]> {
       out.push(...mapped);
       break;
     } catch (e) {
+      if (signal?.aborted || (e instanceof DOMException && e.name === "AbortError")) throw e;
       const status = e instanceof UpbitHttpError ? e.status : undefined;
       const is429 = status === 429 || (e instanceof Error && e.message.includes("429"));
       if (is429) {
@@ -546,7 +568,7 @@ async function fetchTickerBatchGroup(group: string[]): Promise<UpbitTicker[]> {
         break;
       }
       const retryDelay = TICKER_429_RETRY_DELAY_MS * attempt;
-      await sleep(retryDelay);
+      await sleepAbortable(retryDelay, signal);
     }
   }
   return out;
@@ -608,11 +630,13 @@ export async function fetchTickers(markets: string[], opts?: FetchTickersOptions
   const batchDelayMs = opts?.batchDelayMs ?? TICKER_BATCH_DELAY_MS;
   const parallelTickerBatches = Math.max(1, Math.min(20, opts?.parallelTickerBatches ?? 1));
   const batches = chunk(needFetch, batchSize);
+  const tickSignal = opts?.signal;
 
   const out: UpbitTicker[] = [...cachedOut];
   for (let i = 0; i < batches.length; i += parallelTickerBatches) {
+    if (tickSignal?.aborted) throw new DOMException("Aborted", "AbortError");
     const slice = batches.slice(i, i + parallelTickerBatches);
-    const results = await Promise.all(slice.map((g) => fetchTickerBatchGroup(g)));
+    const results = await Promise.all(slice.map((g) => fetchTickerBatchGroup(g, tickSignal)));
     for (const r of results) {
       for (const t of r) {
         const now = Date.now();
@@ -628,7 +652,7 @@ export async function fetchTickers(markets: string[], opts?: FetchTickersOptions
       out.push(...r);
     }
     if (i + parallelTickerBatches < batches.length) {
-      await sleep(Math.max(0, batchDelayMs));
+      await sleepAbortable(Math.max(0, batchDelayMs), tickSignal);
     }
   }
 
