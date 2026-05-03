@@ -347,6 +347,7 @@ type SurgeEntrySetupResult = {
   overextended?: boolean;
   wickOk?: boolean;
   rrOk?: boolean;
+  probe_allowed?: boolean;
 };
 
 type PaperSurgePatternStats = {
@@ -1128,10 +1129,10 @@ function evaluateOriginalSpotScalpingSetup(
 
   const prevRsi = rsiValues[lastIdx - 1] ?? 0;
 
-  // 1. 안전형 조건
+  // 1. 안전형 조건 (Pullback Reversal)
   const safePriceAboveEma200 = currentPrice > ema200Last || Number(lastCandle.trade_price) > ema200Last;
   const pullbackToEma200 = lows.slice(-20).some(l => l <= ema200Last * 1.015);
-  const stochOversoldBullishCross = prevK <= 20 && prevD <= 20 && k > d && prevK <= prevD;
+  const stochOversoldBullishCross = prevK <= 25 && prevD <= 25 && k > d; // 20->25로 약간 완화, prevK<=prevD 삭제
   const safe_condition_pass = safePriceAboveEma200 && pullbackToEma200 && stochOversoldBullishCross && isBullish;
 
   if (safe_condition_pass) {
@@ -1153,12 +1154,12 @@ function evaluateOriginalSpotScalpingSetup(
     }
   }
 
-  // 2. 공격형 조건
+  // 2. 공격형 조건 (Trend / Early Surge)
   const aggressiveEmaStack = ema50Last > ema200Last;
   const aggressivePriceAbove = currentPrice > ema50Last && currentPrice > ema200Last;
-  const stochReversal = k > prevK && k > 20;
-  const rsiBullish = rsi > 50 || (prevRsi <= 50 && rsi > 50) || rsi > prevRsi;
-  const volSpike = volRatio > 1.0;
+  const stochReversal = (k > prevK && k > 20) || (k > d && k > 40); // 추세 추종 시에는 굳이 침체권일 필요 없음
+  const rsiBullish = rsi > 45 || (prevRsi <= 50 && rsi > 50) || rsi > prevRsi; // 50->45 완화
+  const volSpike = volRatio > 0.95; // 1.0->0.95 완화
   const aggressiveRiskRewardOk = true; // RR checked inside
   const aggressive_condition_pass = aggressiveEmaStack && aggressivePriceAbove && stochReversal && rsiBullish && volSpike;
 
@@ -1284,6 +1285,14 @@ function evaluateSurgeEntrySetup(
   
   const grade = score >= 90 ? "S" : score >= 80 ? "A" : score >= 70 ? "B" : "F";
 
+  // [SURGE PROBE DOWNGRADE] Grade A인데 low_momentum 하나만 남은 경우 probe 허용
+  let probeAllowed = false;
+  if (!pass && grade === "A" && failed.length === 1 && failed[0] === "low_momentum") {
+    if (!failed.includes("upper_wick_rejection") && !failed.includes("no_breakout_or_ema_support")) {
+      probeAllowed = true;
+    }
+  }
+
   // Indicators for logging
   const ema50 = emaLast(closes, 50) ?? 0;
   const ema200 = emaLast(closes, 200) ?? 0;
@@ -1295,10 +1304,10 @@ function evaluateSurgeEntrySetup(
   const d = stoch.d[lastIdx] ?? 0;
 
   return {
-    ok: pass,
+    ok: pass || probeAllowed,
     score,
     grade,
-    reason: pass ? "surge_setup_passed" : "surge_setup_failed",
+    reason: pass ? "surge_setup_passed" : (probeAllowed ? "surge_probe_downgrade_allowed" : "surge_setup_failed"),
     failed_conditions: failed,
     ema50,
     ema200,
@@ -1314,6 +1323,7 @@ function evaluateSurgeEntrySetup(
     overextended,
     wickOk,
     rrOk,
+    probe_allowed: probeAllowed
   };
 }
 
@@ -1679,13 +1689,44 @@ export function createLiveDataStrategy(opts: {
     return (closeHold && closeHold.passed === false) || volume < 0.75;
   };
 
+  let lastTickStartedAt = 0;
   const runTick = async () => {
+    const nowMs = Date.now();
     if (runTickInFlight) {
-      console.info(JSON.stringify({ tag: "LIVE_TICK_SKIPPED_IN_FLIGHT", ts: new Date().toISOString() }));
-      return;
+      const elapsed = nowMs - lastTickStartedAt;
+      console.info(JSON.stringify({ 
+        tag: "LIVE_TICK_SKIPPED_IN_FLIGHT", 
+        ts: new Date().toISOString(),
+        elapsed_ms: elapsed,
+        note: elapsed > 120_000 ? "stale_in_flight_detected_resetting" : "in_flight"
+      }));
+      // 2분 이상 걸리면 강제 리셋 (Deadlock 방지)
+      if (elapsed > 120_000) {
+        runTickInFlight = false;
+      } else {
+        return;
+      }
     }
     runTickInFlight = true;
+    lastTickStartedAt = Date.now();
     const loopId = Date.now();
+    
+    // Periodically log age proof
+    const ageInterval = setInterval(() => {
+      if (!runTickInFlight) {
+        clearInterval(ageInterval);
+        return;
+      }
+      console.info(JSON.stringify({
+        tag: "LIVE_TICK_IN_FLIGHT_AGE_PROOF",
+        started_at: new Date(lastTickStartedAt).toISOString(),
+        elapsed_ms: Date.now() - lastTickStartedAt,
+        phase: "execution_loop",
+        current_market: "global",
+        reason: "long_running_tick_monitored"
+      }));
+    }, 15_000);
+
     try {
     // 운영 최종값 단일화: persisted 값과 무관하게 매 tick env cap으로 재설정.
     state.safety_guard.max_positions = LIVE_MAX_POSITIONS_CAP;
@@ -3738,6 +3779,15 @@ export function createLiveDataStrategy(opts: {
       }),
     );
 
+    // [MONITOR] Loop Phase Log
+    console.info(JSON.stringify({
+      tag: "LIVE_TICK_IN_FLIGHT_AGE_PROOF",
+      started_at: new Date(lastTickStartedAt).toISOString(),
+      elapsed_ms: Date.now() - lastTickStartedAt,
+      phase: "universe_filtered",
+      reason: "pipeline_checkpoint"
+    }));
+
     const strategyUsableKrwForAlloc = Math.max(
       0,
       Number(tstatus.strategy_available_krw ?? tstatus.live_order_available_krw ?? tstatus.krw_available ?? 0),
@@ -3846,27 +3896,34 @@ export function createLiveDataStrategy(opts: {
 
         const gate = opts.marketState.entryGate(s.p, marketState);
         const scoreForRelaxed = Number(gate.score ?? 0);
-        console.info(
-          JSON.stringify({
-            tag: "DEBUG_LIVE_BASE_GATE_RESULT",
-            ts: new Date().toISOString(),
-            market: m,
-            score: scoreForRelaxed,
-            gate_ok: gate.ok,
-            reason: gate.reason
-          })
-        );
         const signalType = String(s.p.signal_type ?? "MID").toUpperCase();
         const vol = Number(s.p.volume_ratio ?? 0);
         const btcTier = state.regime?.btc_filter_state ?? "neutral";
 
-        const isCoreRelaxedCandidate = 
-          !isSurgeCandidate &&
-          (scoreForRelaxed >= 70) &&
-          (signalType === "HIGH" || signalType === "MID") &&
-          (vol >= 1.2 || (vr1m5 ?? 0) >= 0.65) &&
-          (recent3mRet === null || recent3mRet >= -1.2) &&
-          (btcTier !== "weak");
+        const isCoreRelaxedCandidate = (() => {
+          if (isSurgeCandidate) return false;
+          if (scoreForRelaxed < 70) {
+            console.info(JSON.stringify({ tag: "CORE_RELAXED_CANDIDATE_REJECTED_PROOF", market: m, score: scoreForRelaxed, signal_type: signalType, volume_ratio: vol, vr1m5, btcTier, reject_reason: "score_too_low" }));
+            return false;
+          }
+          if (signalType !== "HIGH" && signalType !== "MID") {
+            console.info(JSON.stringify({ tag: "CORE_RELAXED_CANDIDATE_REJECTED_PROOF", market: m, score: scoreForRelaxed, signal_type: signalType, volume_ratio: vol, vr1m5, btcTier, reject_reason: "signal_type_low" }));
+            return false;
+          }
+          if (!(vol >= 1.2 || (vr1m5 ?? 0) >= 0.65)) {
+            console.info(JSON.stringify({ tag: "CORE_RELAXED_CANDIDATE_REJECTED_PROOF", market: m, score: scoreForRelaxed, signal_type: signalType, volume_ratio: vol, vr1m5, btcTier, reject_reason: "volume_insufficient" }));
+            return false;
+          }
+          if (recent3mRet !== null && recent3mRet < -1.2) {
+            console.info(JSON.stringify({ tag: "CORE_RELAXED_CANDIDATE_REJECTED_PROOF", market: m, score: scoreForRelaxed, signal_type: signalType, volume_ratio: vol, vr1m5, btcTier, reject_reason: "recent_3m_return_negative" }));
+            return false;
+          }
+          if (btcTier === "weak") {
+            console.info(JSON.stringify({ tag: "CORE_RELAXED_CANDIDATE_REJECTED_PROOF", market: m, score: scoreForRelaxed, signal_type: signalType, volume_ratio: vol, vr1m5, btcTier, reject_reason: "btc_tier_weak" }));
+            return false;
+          }
+          return true;
+        })();
 
         let setup: OriginalSpotSetupResult = {
           ok: true,
@@ -3919,9 +3976,32 @@ export function createLiveDataStrategy(opts: {
           }));
 
           if (isSurgeCandidate) {
+            const probeAllowed = !!surgeShadowSetup.probe_allowed;
+            if (!surgeShadowSetup.ok && probeAllowed) {
+               console.info(JSON.stringify({
+                  tag: "SURGE_PROBE_CANDIDATE_PROOF",
+                  market: m,
+                  surge_score: surgeShadowSetup.score,
+                  grade: surgeShadowSetup.grade,
+                  failed_conditions: surgeShadowSetup.failed_conditions,
+                  probe_allowed: true,
+                  reason: "grade_A_low_momentum_only"
+               }));
+            } else if (!surgeShadowSetup.ok) {
+               console.info(JSON.stringify({
+                  tag: "SURGE_PROBE_CANDIDATE_PROOF",
+                  market: m,
+                  surge_score: surgeShadowSetup.score,
+                  grade: surgeShadowSetup.grade,
+                  failed_conditions: surgeShadowSetup.failed_conditions,
+                  probe_allowed: false,
+                  probe_reject_reason: surgeShadowSetup.grade !== "A" ? "grade_not_A" : "multiple_failed_conditions"
+               }));
+            }
+
             setup = {
-              ok: true,
-              mode: "none",
+              ok: surgeShadowSetup.ok,
+              mode: probeAllowed ? "relaxed_probe" : "none",
               reason: "surge_v2_entry_path",
               riskReward: Number(surgeShadowSetup.riskReward ?? 1),
               stopPrice: Number(surgeShadowSetup.stopPrice ?? 0),
@@ -3934,7 +4014,7 @@ export function createLiveDataStrategy(opts: {
               stochK: surgeShadowSetup.stochK,
               stochD: surgeShadowSetup.stochD,
               volumeRatio: surgeShadowSetup.volumeRatio,
-              failed_conditions: [],
+              failed_conditions: surgeShadowSetup.failed_conditions,
             };
           }
         }

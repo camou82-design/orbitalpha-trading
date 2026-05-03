@@ -112,9 +112,9 @@ const CANDLE_429_MAX_ATTEMPTS = Math.max(1, Number(process.env.PUMP_SCANNER_CAND
 const CANDLE_429_BASE_DELAY_MS = Math.max(500, Number(process.env.PUMP_SCANNER_CANDLE_429_BASE_DELAY_MS ?? 1_500));
 const CANDLE_SNAPSHOT_CACHE_TTL_MS = Math.max(1_000, Number(process.env.PUMP_SCANNER_CANDLE_CACHE_TTL_MS ?? 120_000));
 /** 알트 전수 티커 조회: 배치 크기·병렬·지연 (기본 대폭 축소 → tick 단축). 429 시 parallel↓·delay↑. */
-const PUMP_TICKER_BATCH_SIZE = Math.max(1, Math.min(120, Number(process.env.PUMP_SCANNER_TICKER_BATCH_SIZE ?? 80)));
-const PUMP_TICKER_BATCH_DELAY_MS = Math.max(0, Number(process.env.PUMP_SCANNER_TICKER_BATCH_DELAY_MS ?? 0));
-const PUMP_TICKER_PARALLEL = Math.max(1, Math.min(8, Number(process.env.PUMP_SCANNER_TICKER_PARALLEL ?? 3)));
+const PUMP_TICKER_BATCH_SIZE = Math.max(1, Math.min(120, Number(process.env.PUMP_SCANNER_TICKER_BATCH_SIZE ?? 30)));
+const PUMP_TICKER_BATCH_DELAY_MS = Math.max(0, Number(process.env.PUMP_SCANNER_TICKER_BATCH_DELAY_MS ?? 150));
+const PUMP_TICKER_PARALLEL = Math.max(1, Math.min(8, Number(process.env.PUMP_SCANNER_TICKER_PARALLEL ?? 2)));
 const PUMP_TIMING_LOG = (process.env.PUMP_SCANNER_TIMING_LOG ?? "1").toLowerCase() !== "0";
 /** 1차 선진입: 분봉 거래량 배수(직전 20봉 대비) 최소 — 기본 1.2 */
 const PUMP_EARLY_VOLUME_RATIO_MIN = Math.max(1.0, Number(process.env.PUMP_SCANNER_EARLY_VOLUME_RATIO_MIN ?? 1.2));

@@ -377,7 +377,14 @@ async function main() {
   const trade = createTradeControl(env, {
     onEvent: (row) => opLog.event(row),
     assertBuyGate: async (ctx) => {
-      const snap = await marketFilter.evaluate();
+      let snap;
+      try {
+        snap = marketFilter.status() || await marketFilter.evaluate();
+      } catch (e) {
+        snap = marketFilter.status();
+        if (!snap) throw new Error(`market_filter_failed_and_no_fallback: ${String(e)}`);
+        app.log.warn({ tag: "MARKET_FILTER_FALLBACK_USED", err: String(e) }, "market filter failed, using fallback status");
+      }
       const r = assertOrderBuyAllowed(snap, {
         kind: ctx.isAdditionalBuy ? "add_to_position" : "new_entry",
         signalPayload: ctx.signalPayload,

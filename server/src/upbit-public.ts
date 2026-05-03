@@ -110,17 +110,27 @@ function maybeLog429(nowMs: number, key: string, meta: { market: string; unit: 1
   );
 }
 
-async function fetchJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+async function fetchJson<T>(path: string, signal?: AbortSignal, timeoutMs = 8000): Promise<T> {
   const url = `${UPBIT}${path}`;
-  const r = await fetch(url, {
-    headers: { Accept: "application/json" },
-    signal,
-  });
-  if (!r.ok) {
-    const text = await r.text();
-    throw new UpbitHttpError(`Upbit ${path} → ${r.status}: ${text.slice(0, 200)}`, r.status, path);
+  const ctrl = new AbortController();
+  const tid = setTimeout(() => ctrl.abort(), timeoutMs);
+  if (signal) {
+    signal.addEventListener("abort", () => ctrl.abort());
   }
-  return r.json() as Promise<T>;
+
+  try {
+    const r = await fetch(url, {
+      headers: { Accept: "application/json" },
+      signal: ctrl.signal,
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      throw new UpbitHttpError(`Upbit ${path} → ${r.status}: ${text.slice(0, 200)}`, r.status, path);
+    }
+    return (await r.json()) as Promise<T>;
+  } finally {
+    clearTimeout(tid);
+  }
 }
 
 function is404MarketError(err: unknown): boolean {
@@ -400,11 +410,11 @@ function numTradePrice(v: unknown): number {
   return Number.isFinite(p) && p > 0 ? p : 0;
 }
 
-const TICKER_MAX_MARKETS_PER_TICK = Number(process.env.UPBIT_TICKER_MAX_MARKETS_PER_TICK ?? 15);
-const TICKER_BATCH_SIZE = Number(process.env.UPBIT_TICKER_BATCH_SIZE ?? 5);
-const TICKER_BATCH_DELAY_MS = Number(process.env.UPBIT_TICKER_BATCH_DELAY_MS ?? 1_800); // 배치 간 간격
+const TICKER_MAX_MARKETS_PER_TICK = Number(process.env.UPBIT_TICKER_MAX_MARKETS_PER_TICK ?? 25);
+const TICKER_BATCH_SIZE = Number(process.env.UPBIT_TICKER_BATCH_SIZE ?? 15);
+const TICKER_BATCH_DELAY_MS = Number(process.env.UPBIT_TICKER_BATCH_DELAY_MS ?? 400); // 배치 간 간격 대폭 축소
 const TICKER_429_MAX_ATTEMPTS = Number(process.env.UPBIT_TICKER_429_MAX_ATTEMPTS ?? 1); // 기본: 재시도 없음(429 과호출 방지)
-const TICKER_429_RETRY_DELAY_MS = Number(process.env.UPBIT_TICKER_429_RETRY_DELAY_MS ?? 5_000); // 재시도 시 최소 대기
+const TICKER_429_RETRY_DELAY_MS = Number(process.env.UPBIT_TICKER_429_RETRY_DELAY_MS ?? 3_000); // 재시도 시 최소 대기
 
 // ticker REST 과호출/429 완화를 위한 공용 캐시/쿨다운 (프로세스 내).
 const TICKER_CACHE_TTL_MS = Number(process.env.UPBIT_TICKER_CACHE_TTL_MS ?? 12_000); // 8~15s 권장

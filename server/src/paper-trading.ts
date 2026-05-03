@@ -1521,6 +1521,7 @@ export function createPaperTradingEngine(opts: {
     overextended?: boolean;
     wickOk?: boolean;
     rrOk?: boolean;
+    probe_allowed?: boolean;
   };
 
   /**
@@ -1590,6 +1591,14 @@ export function createPaperTradingEngine(opts: {
     
     const grade = score >= 90 ? "S" : score >= 80 ? "A" : score >= 70 ? "B" : "F";
 
+    // [SURGE PROBE DOWNGRADE] Grade A인데 low_momentum 하나만 남은 경우 probe 허용
+    let probeAllowed = false;
+    if (!pass && grade === "A" && failed.length === 1 && failed[0] === "low_momentum") {
+      if (!failed.includes("upper_wick_rejection") && !failed.includes("no_breakout_or_ema_support")) {
+        probeAllowed = true;
+      }
+    }
+
     const ema50 = emaLast(closes, 50) ?? 0;
     const ema200 = emaLast(closes, 200) ?? 0;
     const rsiValues = calculateRsi(closes, 14);
@@ -1600,10 +1609,26 @@ export function createPaperTradingEngine(opts: {
     const d = stoch.d[lastIdx] ?? 0;
 
     return {
-      ok: pass, score, grade, reason: pass ? "surge_setup_passed" : "surge_setup_failed",
-      failed_conditions: failed, ema50, ema200, rsi, stochK: k, stochD: d, volumeRatio: volRatio,
-      stopPrice, targetPrice, riskReward: risk > 0 ? (targetPrice - currentPx) / risk : 0,
-      priceAboveEma20, highReclaim, overextended, wickOk, rrOk,
+      ok: pass || probeAllowed, 
+      score, 
+      grade, 
+      reason: pass ? "surge_setup_passed" : (probeAllowed ? "surge_probe_downgrade_allowed" : "surge_setup_failed"),
+      failed_conditions: failed, 
+      ema50, 
+      ema200, 
+      rsi, 
+      stochK: k, 
+      stochD: d, 
+      volumeRatio: volRatio,
+      stopPrice, 
+      targetPrice, 
+      riskReward: risk > 0 ? (targetPrice - currentPx) / risk : 0,
+      priceAboveEma20, 
+      highReclaim, 
+      overextended, 
+      wickOk, 
+      rrOk,
+      probe_allowed: probeAllowed,
     };
   }
 
