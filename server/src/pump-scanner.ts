@@ -9,6 +9,7 @@ import {
   type UpbitCandle,
   type UpbitTicker,
 } from "./upbit-public.js";
+import { surgeCandidatesRuntimePath } from "./runtime-paths.js";
 
 type ScannerRow = {
   rank: number;
@@ -402,11 +403,34 @@ export function createPumpScanner(
   const baseDir = path.join(tradingDataRoot(), "scanner");
   const perfFile = path.join(baseDir, "pump_scanner_performance.json");
   const snapFile = path.join(baseDir, "pump_scanner_snapshot.json");
+  const surgeCandidatesPath = surgeCandidatesRuntimePath();
 
   const persist = async () => {
     await fs.mkdir(baseDir, { recursive: true });
     await fs.writeFile(perfFile, JSON.stringify(state.perf.slice(-5000), null, 2), "utf8");
-    await fs.writeFile(snapFile, JSON.stringify({ updated_at: state.updatedAt, rows: state.rows }, null, 2), "utf8");
+    const snapData = { updated_at: state.updatedAt, rows: state.rows };
+    await fs.writeFile(snapFile, JSON.stringify(snapData, null, 2), "utf8");
+    
+    // [SURGE-REPAIR] live-strategy (shadow/external mode) expects surge-candidates.json
+    try {
+      const dir = path.dirname(surgeCandidatesPath);
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(surgeCandidatesPath, JSON.stringify({
+        kind: "surge_candidates_live",
+        updated_at: state.updatedAt,
+        items: state.rows.map(r => ({
+          market: r.market,
+          scanner_score: r.score,
+          volume_multiple: r.volume_multiple,
+          breakout: r.breakout,
+          close_upper_hold: r.close_upper_hold,
+          signal_ts: r.updated_at,
+          source_kind: "scanner_tradable_candidate"
+        }))
+      }, null, 2), "utf8");
+    } catch (e) {
+      console.warn("[pump-scanner] surge-candidates.json persist failed", e);
+    }
   };
 
   const updatePending = (priceBy: Map<string, number>) => {
@@ -513,7 +537,15 @@ export function createPumpScanner(
         return until > 0 && Date.now() < until;
       };
 
-      const baseTickers = await fetchTickers([...BASE_MARKETS]);
+      let baseTickers: UpbitTicker[] = [];
+      try {
+        baseTickers = await fetchTickers([...BASE_MARKETS]);
+      } catch (e) {
+        console.warn(JSON.stringify({
+          tag: "PUMP_SCANNER_BASE_TICKER_FETCH_FAILED",
+          error: e instanceof Error ? e.message : String(e)
+        }));
+      }
       const tAfterBaseTickers = Date.now();
       const btc = baseTickers.find((t) => t.market === "KRW-BTC");
       const btcDropPenalty = btc && (btc.signed_change_rate ?? 0) < -0.01 ? 8 : 0;
@@ -545,14 +577,31 @@ export function createPumpScanner(
         }
         altMarkets = altValidity.accepted;
       }
-      const tickers = await fetchTickers(altMarkets, {
-        ...pumpAltTickerOptsBase,
-        maxMarkets: altMarkets.length,
-      });
+      let tickers: UpbitTicker[] = [];
+      try {
+        tickers = await fetchTickers(altMarkets, {
+          ...pumpAltTickerOptsBase,
+          maxMarkets: altMarkets.length,
+        });
+      } catch (e) {
+        console.warn(JSON.stringify({
+          tag: "PUMP_SCANNER_ALT_TICKER_FETCH_FAILED",
+          error: e instanceof Error ? e.message : String(e)
+        }));
+      }
       const tAfterAltTickers = Date.now();
       const fetchedAltSet = new Set(tickers.map((t) => t.market));
       const heldMissingFromTicker = heldMarkets.filter((m) => !BASE_MARKET_SET.has(m) && !fetchedAltSet.has(m) && !is429Excluded(m));
-      const heldExtraTickers = await fetchTickers(heldMissingFromTicker);
+      
+      let heldExtraTickers: UpbitTicker[] = [];
+      try {
+        heldExtraTickers = heldMissingFromTicker.length > 0 ? await fetchTickers(heldMissingFromTicker) : [];
+      } catch (e) {
+        console.warn(JSON.stringify({
+          tag: "PUMP_SCANNER_HELD_TICKER_FETCH_FAILED",
+          error: e instanceof Error ? e.message : String(e)
+        }));
+      }
       const tAfterHeldExtraTickers = Date.now();
 
       const momSel = selectMomentumTopM(tickers, {
@@ -779,6 +828,18 @@ export function createPumpScanner(
             raw_detected_count: rawDetected.length,
             tradable_confirmed_count: tradableCandidates.length,
           }),
+        );
+
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_SURGE_SOURCE_REPAIR_PROOF",
+            ts: new Date().toISOString(),
+            fresh_scanner_candidates_count: tradableCandidates.length,
+            raw_detected_count: rawDetected.length,
+            newest_scanner_updated_at: state.updatedAt,
+            candle_targets: candleTargets.length,
+            ticker_returned: tickers.length,
+          })
         );
         const staleThresholdMs = LIVE_ENTRY_SIGNAL_STALE_SECONDS_FOR_WARN * 1_000;
         if (tickTotalMs > staleThresholdMs) {

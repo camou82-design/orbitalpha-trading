@@ -325,6 +325,7 @@ type CandidateMeta = {
   relaxed_multiplier?: number;
   gate_ok?: boolean;
   gate_reason?: string;
+  real_signal_present: boolean;
 };
 
 type SurgeEntrySetupResult = {
@@ -2083,6 +2084,17 @@ export function createLiveDataStrategy(opts: {
           }),
         );
 
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_TICK_PHASE_EXIT",
+            ts: new Date().toISOString(),
+            phase: "market_state_evaluate",
+            tick_lease: myLease,
+            outcome: "fallback_used",
+            fallback_source: useNeutralSafe ? "neutral_safe" : "risk_off_safe"
+          })
+        );
+
         if (!useNeutralSafe) {
           console.info(
             JSON.stringify({
@@ -2213,6 +2225,64 @@ export function createLiveDataStrategy(opts: {
         scanner_feed_newest_ts: scannerFeedNewestTs,
       }),
     );
+
+    // [SURGE-BRIDGE-REPAIR] If in shadow/external mode, merge candidates from surge-candidates.json
+    let scannerRuntimeModeRaw = String(process.env.LIVE_SCANNER_RUNTIME_MODE ?? "legacy").toLowerCase().trim();
+    if (scannerRuntimeModeRaw === "shadow" || scannerRuntimeModeRaw === "external") {
+      const shadow = loadSurgeCandidatesShadow();
+      if (shadow && shadow.items.length > 0) {
+        console.info(JSON.stringify({
+          tag: "LIVE_SURGE_SOURCE_REPAIR_PROOF",
+          ts: new Date().toISOString(),
+          stage: "merging_external_shadow_candidates",
+          external_count: shadow.items.length,
+          updated_at: shadow.updated_at
+        }));
+        
+        for (const item of shadow.items) {
+           const existingIdx = scannerCandidates.findIndex(c => c.market === item.market);
+           const wrappedItem = {
+              market: item.market,
+              score: Number(item.scanner_score ?? 0),
+              volumeMultiple: Number(item.volume_multiple ?? 0),
+              breakout: Boolean(item.filter_pass), // item.filter_pass is breakout && close_upper_hold
+              closeUpperHold: true, // simplified for shadow merge
+              rise3mPct: 0, 
+              capturedAt: shadow.updated_at,
+              updatedAt: shadow.updated_at,
+              signalTs: item.signal_ts,
+              sourceTs: item.signal_ts || shadow.updated_at,
+              ageSeconds: item.age_seconds,
+              payload: {
+                 v: 2,
+                 market: item.market,
+                 score: Number(item.scanner_score ?? 0),
+                 signal_score: Number(item.scanner_score ?? 0),
+                 volume_ratio: Number(item.volume_multiple ?? 0),
+                 volume_multiple: Number(item.volume_multiple ?? 0),
+                 breakout: true, 
+                 close_upper_hold: true,
+                 filter_pass: true,
+                 source_kind: item.source_kind || "scanner_tradable_candidate",
+                 reason: "scanner_external_bridge",
+                 updated_at: shadow.updated_at,
+                 signal_ts: item.signal_ts
+              } as any
+           };
+           
+           if (existingIdx >= 0) {
+              const existing = scannerCandidates[existingIdx]!;
+              const existingTs = existing.sourceTs ? Date.parse(existing.sourceTs) : 0;
+              const newTs = wrappedItem.sourceTs ? Date.parse(wrappedItem.sourceTs) : 0;
+              if (newTs >= existingTs) {
+                 scannerCandidates[existingIdx] = wrappedItem;
+              }
+           } else {
+              scannerCandidates.push(wrappedItem);
+           }
+        }
+      }
+    }
 
     for (const row of scannerCandidates) {
       const existing = latestAllSignals.get(row.market);
@@ -2436,7 +2506,7 @@ export function createLiveDataStrategy(opts: {
       candidateSourceModeRaw === "file" || candidateSourceModeRaw === "shadow" || candidateSourceModeRaw === "legacy"
         ? (candidateSourceModeRaw as "legacy" | "shadow" | "file")
         : "legacy";
-    const scannerRuntimeModeRaw = String(process.env.LIVE_SCANNER_RUNTIME_MODE ?? "legacy").toLowerCase().trim();
+    scannerRuntimeModeRaw = String(process.env.LIVE_SCANNER_RUNTIME_MODE ?? "legacy").toLowerCase().trim();
     const scannerRuntimeMode =
       scannerRuntimeModeRaw === "legacy" || scannerRuntimeModeRaw === "shadow" || scannerRuntimeModeRaw === "external"
         ? scannerRuntimeModeRaw
@@ -2694,8 +2764,20 @@ export function createLiveDataStrategy(opts: {
           requested_symbols: tickerRequestedSymbols.slice(0, 30),
         }),
       );
-      throw e;
+      // [ISOLATION] Do not rethrow to prevent tick halt. tickerRows will be empty.
     }
+    
+    console.info(
+      JSON.stringify({
+        tag: "DEBUG_TICKER_FETCH_DONE",
+        ts: new Date().toISOString(),
+        stage: "after_scanner_after_tickers",
+        requested_count: tickerRequestedSymbols.length,
+        ticker_rows_count: tickerRows.length,
+        ticker_symbols: tickerRows.map((r) => r.market).slice(0, 20),
+      }),
+    );
+
     if (!leaseOk()) {
       console.info(
         JSON.stringify({
@@ -2708,16 +2790,6 @@ export function createLiveDataStrategy(opts: {
       );
       return;
     }
-    console.info(
-      JSON.stringify({
-        tag: "DEBUG_TICKER_FETCH_DONE",
-        ts: new Date().toISOString(),
-        stage: "after_scanner_after_tickers",
-        requested_count: tickerRequestedSymbols.length,
-        ticker_rows_count: tickerRows.length,
-        ticker_symbols: tickerRows.map((r) => r.market).slice(0, 20),
-      }),
-    );
     const priceBy = new Map(tickerRows.map((r) => [r.market, r.trade_price]));
     const changeRateBy = new Map(tickerRows.map((r) => [r.market, Number(r.signed_change_rate ?? 0)]));
     const minute1CandleCache = new Map<string, UpbitCandle[]>();
@@ -4119,20 +4191,37 @@ export function createLiveDataStrategy(opts: {
     const candidateMetaSettled = await racePhase("candidate_meta_parallel", PHASE_MS.candidate_meta_parallel, () =>
       Promise.allSettled(
         entryUniverse.map(async (m) => {
-        const s = latestAllSignals.get(m);
-        if (!s?.p) {
+        let s = latestAllSignals.get(m);
+        const isFallbackSource = (entrySourceKindByMarket.get(m) === "fallback_watch_markets") || (sourceMetaByMarket.get(m)?.source_kind === "fallback_watch_markets");
+        const realSignalPresent = !!s?.p;
+
+        if (!realSignalPresent && !isFallbackSource) {
           evaluationDroppedReasons[m] = "missing_signal_payload";
           return null;
         }
+
+        // [DIAGNOSTIC-REPAIR] If signal is missing but it's a fallback market, we continue with real_signal_present: false.
+        // We use a safe empty payload object for downstream logic to avoid crashes, but strictly block entry.
+        const effectivePayload = s?.p || {
+          v: 2,
+          market: m,
+          signal_type: "MID",
+          signal_reason: "fallback_watch_market_diagnostic",
+          filter_pass: false,
+          filters: [],
+          volume_ratio: 0,
+          signal_score: 0,
+          source_kind: "fallback_watch_markets",
+        };
         const currentPx = priceBy.get(m) ?? 0;
         if (!(currentPx > 0)) {
           evaluationDroppedReasons[m] = "missing_ticker_price";
           return null;
         }
-        const sourceKindFromPayload = String(s.p.source_kind ?? "");
+        const sourceKindFromPayload = String(effectivePayload.source_kind ?? "");
         const sourceKindFromMap = String(entrySourceKindByMarket.get(m) ?? sourceMetaByMarket.get(m)?.source_kind ?? "");
         const isSurgeCandidate =
-          (s.p as any).isSurgeSource === true ||
+          (effectivePayload as any).isSurgeSource === true ||
           SURGE_V2_SOURCE_KINDS.has(sourceKindFromPayload) ||
           SURGE_V2_SOURCE_KINDS.has(sourceKindFromMap);
 
@@ -4145,6 +4234,16 @@ export function createLiveDataStrategy(opts: {
             ts: new Date().toISOString()
           }));
         }
+
+        console.info(JSON.stringify({
+          tag: "SURGE_ENTRY_PIPELINE_PROOF",
+          ts: new Date().toISOString(),
+          market: m,
+          stage: "candidate_meta_eval_start",
+          source_kind: sourceKindFromPayload || sourceKindFromMap,
+          has_signal: realSignalPresent,
+          price: currentPx
+        }));
 
         // [ORIGINAL SETUP] Primary Gate Enforcement (Upbit fetch limit is 200)
         let candles1: UpbitCandle[];
@@ -4197,10 +4296,10 @@ export function createLiveDataStrategy(opts: {
           if (prevAvg > 0) vr1m5 = lastNotional / prevAvg;
         }
 
-        const gate = opts.marketState.entryGate(s.p, marketState);
+        const gate = opts.marketState.entryGate(effectivePayload, marketState);
         const scoreForRelaxed = Number(gate.score ?? 0);
-        const signalType = String(s.p.signal_type ?? "MID").toUpperCase();
-        const vol = Number(s.p.volume_ratio ?? 0);
+        const signalType = String(effectivePayload.signal_type ?? "MID").toUpperCase();
+        const vol = Number(effectivePayload.volume_ratio ?? 0);
         const btcTier = state.regime?.btc_filter_state ?? "neutral";
 
         const isCoreRelaxedCandidate = (() => {
@@ -4237,7 +4336,7 @@ export function createLiveDataStrategy(opts: {
           targetPrice: 0,
           candleLow: 0,
           swingLow: 0,
-          volumeRatio: Number(s.p.volume_ratio ?? 0),
+          volumeRatio: Number(effectivePayload.volume_ratio ?? 0),
         };
         const softenedReasons: string[] = [];
         if (!isSurgeCandidate) {
@@ -4266,7 +4365,7 @@ export function createLiveDataStrategy(opts: {
         let surgeShadowSetup: SurgeEntrySetupResult | undefined;
         const sourceKind = sourceKindFromPayload;
         if (isSurgeCandidate || sourceKind === "scanner_filter" || sourceKind === "scanner_then_filter_pass") {
-          surgeShadowSetup = evaluateSurgeEntrySetup(m, candles1, currentPx, s.p);
+          surgeShadowSetup = evaluateSurgeEntrySetup(m, candles1, currentPx, effectivePayload);
           
           console.info(JSON.stringify({
             tag: "SURGE_ENTRY_SETUP_PROOF",
@@ -4355,7 +4454,7 @@ export function createLiveDataStrategy(opts: {
               tag: "SURGE_LEGACY_SETUP_BYPASSED_PROOF",
               market: m,
               reason: blockReason,
-              source_kind: s.p.source_kind,
+              source_kind: effectivePayload.source_kind,
               authority_source: "surge-v2",
               note: "legacy original spot setup bypassed for surge candidate",
             }));
@@ -4365,11 +4464,11 @@ export function createLiveDataStrategy(opts: {
         }
         console.info(JSON.stringify({ tag: "DEBUG_ORIGINAL_SPOT_SETUP_PASS", market: m, mode: setup.mode, rr: setup.riskReward }));
 
-        let gateOk = gate.ok;
-        let gateReason = gate.reason;
+        let gateOk = realSignalPresent ? gate.ok : false;
+        let gateReason = realSignalPresent ? gate.reason : "missing_real_signal_payload";
         const score = Number(gate.score ?? 0);
 
-        if (!gateOk && isCoreRelaxedCandidate && score >= 70 && (
+        if (gateOk && isCoreRelaxedCandidate && score >= 70 && (
           gateReason === "score_below_threshold" || 
           gateReason === "score_floor" || 
           String(gateReason || "").toLowerCase().includes("score")
@@ -4389,7 +4488,7 @@ export function createLiveDataStrategy(opts: {
         }
         
         // Calculate diagnostics for quality classification
-        const sTs = s.ts ?? null;
+        const sTs = s?.ts ?? null;
         const ageSec = sTs ? Math.max(0, Math.floor((Date.now() - Date.parse(sTs)) / 1000)) : null;
         
         let lHigh: number | null = null;
@@ -4405,7 +4504,7 @@ export function createLiveDataStrategy(opts: {
           score,
           secondsSinceSignal: ageSec,
           distanceFromLocalHighPct: distHighPct,
-          volumeRatio: Number(s.p.volume_ratio ?? 0),
+          volumeRatio: Number(effectivePayload.volume_ratio ?? 0),
           btcTier,
         });
 
@@ -4447,7 +4546,8 @@ export function createLiveDataStrategy(opts: {
           softened_reasons: softenedReasons,
           relaxed_multiplier: relaxedMultiplier,
           gate_ok: gateOk,
-          gate_reason: gateReason
+          gate_reason: gateReason,
+          real_signal_present: realSignalPresent,
         };
         candidateMetaMap.set(m, meta);
         return meta;
@@ -4477,6 +4577,9 @@ export function createLiveDataStrategy(opts: {
       })
       .filter((x): x is CandidateMeta => x !== null);
 
+    const realSignalMetaCount = candidateMeta.filter(m => m.real_signal_present).length;
+    const fallbackMetaCount = candidateMeta.length - realSignalMetaCount;
+
     console.info(
       JSON.stringify({
         tag: "SURGE_ENTRY_PIPELINE_PROOF",
@@ -4484,6 +4587,8 @@ export function createLiveDataStrategy(opts: {
         stage: "entry_evaluation_done",
         entry_universe_count: entryUniverse.length,
         candidate_meta_count: candidateMeta.length,
+        real_signal_meta_count: realSignalMetaCount,
+        fallback_meta_count: fallbackMetaCount,
         dropped_count: Object.keys(evaluationDroppedReasons).length,
         dropped_reasons: evaluationDroppedReasons,
       }),
@@ -4880,6 +4985,18 @@ export function createLiveDataStrategy(opts: {
           entry_universe_includes_symbol: true,
         }),
       );
+      
+      const candidateMetaFromSetup = candidateMetaMap.get(market);
+      const realSignalPresent = !!candidateMetaFromSetup?.real_signal_present;
+      if (!realSignalPresent) {
+        emitEval("DEBUG_LIVE_PRECHECK", { 
+          return_reason: "missing_real_signal", 
+          note: "fallback_market_diagnostic_only",
+          source_kind: sourceMeta?.source_kind ?? null
+        });
+        bumpSkip("missing_real_signal");
+        continue;
+      }
       if (Object.keys(state.positions).length >= state.safety_guard.max_positions) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "max_positions_reached" });
         bumpSkip("max_positions_reached");
@@ -5008,7 +5125,6 @@ export function createLiveDataStrategy(opts: {
       }
       const sourceKindForJudgment = sourceMetaResolved.source_kind;
       const payloadSourceKind = String(sig?.p?.source_kind ?? "");
-      const candidateMetaFromSetup = candidateMetaMap.get(market);
       const isSetupTaggedSurge = candidateMetaFromSetup?.engine_bucket === "surge";
       const isSurgeSource =
         isSetupTaggedSurge ||
@@ -5476,24 +5592,26 @@ export function createLiveDataStrategy(opts: {
         const weakOk = !weakTier || (score >= LIVE_WEAK_MARKET_MIN_SCORE && (volumeRatio1m5 ?? 0) >= Math.max(LIVE_EARLY_ENTRY_MIN_VOLUME_RATIO, 1.45));
 
         const earlyAllowed =
-          notAlready && earlySlotOk && weakOk && secondsFreshOk && nearHighOk && volOk && scoreOk && currentPrice > 0 && localHigh !== null;
-        const rawEarlyReason = !notAlready
-          ? "position_exists"
-          : !earlySlotOk
-            ? "base_gate_failed"
-            : !weakOk
-              ? "market_risk_off"
-              : !secondsFreshOk
-                ? "timing_late"
-                : !nearHighOk
-                  ? "near_high_entry"
-                  : !volOk
-                    ? "volume_faded"
-                    : !scoreOk
-                      ? "base_gate_failed"
-                      : currentPrice <= 0
+          realSignalPresent && notAlready && earlySlotOk && weakOk && secondsFreshOk && nearHighOk && volOk && scoreOk && currentPrice > 0 && localHigh !== null;
+        const rawEarlyReason = !realSignalPresent
+          ? "missing_real_signal"
+          : !notAlready
+            ? "position_exists"
+            : !earlySlotOk
+              ? "base_gate_failed"
+              : !weakOk
+                ? "market_risk_off"
+                : !secondsFreshOk
+                  ? "timing_late"
+                  : !nearHighOk
+                    ? "near_high_entry"
+                    : !volOk
+                      ? "volume_faded"
+                      : !scoreOk
                         ? "base_gate_failed"
-                        : "none";
+                        : currentPrice <= 0
+                          ? "base_gate_failed"
+                          : "none";
         const earlyDecision = earlyAllowed ? "enter" : "block";
         const earlyBlockReason = earlyAllowed ? null : stdBlockReason(rawEarlyReason);
 
