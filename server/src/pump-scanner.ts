@@ -418,6 +418,7 @@ export function createPumpScanner(
       await fs.writeFile(surgeCandidatesPath, JSON.stringify({
         kind: "surge_candidates_live",
         updated_at: state.updatedAt,
+        scanner_status: (state as any).lastReleaseReason || "unknown",
         items: state.rows.map(r => ({
           market: r.market,
           scanner_score: r.score,
@@ -463,7 +464,7 @@ export function createPumpScanner(
     state.pending = state.pending.filter((p) => !(p.done3 && p.done5 && p.done10));
   };
 
-  const getCandlesSafe = async (market: string): Promise<{ c1: UpbitCandle[]; c5: UpbitCandle[] } | null> => {
+  const getCandlesSafe = async (market: string, signal?: AbortSignal): Promise<{ c1: UpbitCandle[]; c5: UpbitCandle[] } | null> => {
     const cached = candleSnapshotCache.get(market);
     const now = Date.now();
     if (cached && now - cached.fetchedAtMs < CANDLE_SNAPSHOT_CACHE_TTL_MS) {
@@ -472,15 +473,17 @@ export function createPumpScanner(
     for (let attempt = 1; attempt <= CANDLE_429_MAX_ATTEMPTS; attempt++) {
       const ctrl = new AbortController();
       const tid = setTimeout(() => ctrl.abort(), CANDLE_FETCH_TIMEOUT_MS);
+      
+      // Link external signal to internal abort controller
+      const onAbort = () => ctrl.abort();
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+
       try {
         const c1Promise = fetchMinuteCandles(market, 1, 30, ctrl.signal);
         const c5Promise = fetchMinuteCandles(market, 5, 20, ctrl.signal);
         const [c1, c5] = await Promise.all([c1Promise, c5Promise]);
-        clearTimeout(tid);
-        candleSnapshotCache.set(market, { c1, c5, fetchedAtMs: Date.now() });
         return { c1, c5 };
       } catch (e: any) {
-        clearTimeout(tid);
         const isTimeout = e.name === "AbortError" || e.message?.includes("timeout") || e.message?.includes("TIMEOUT");
         if (isTimeout) {
           console.warn(JSON.stringify({ tag: "PUMP_SCANNER_CANDLE_TIMEOUT_COOLDOWN", market, attempt, cooldown_min: 10 }));
@@ -493,6 +496,9 @@ export function createPumpScanner(
         if (!is429 || attempt >= CANDLE_429_MAX_ATTEMPTS) return null;
         const backoffMs = CANDLE_429_BASE_DELAY_MS * 2 ** (attempt - 1);
         await sleep(backoffMs);
+      } finally {
+        clearTimeout(tid);
+        if (signal) signal.removeEventListener("abort", onAbort);
       }
     }
     return null;
@@ -507,6 +513,7 @@ export function createPumpScanner(
             tag: "PUMP_SCANNER_STALE_IN_FLIGHT_RESET",
             ts: new Date().toISOString(),
             elapsed_ms: elapsedSinceStart,
+            reset_at: new Date().toISOString(),
           }),
         );
         isTickInFlight = false;
@@ -528,6 +535,8 @@ export function createPumpScanner(
     const rawDetected: ScannerRow[] = [];
     let candleTimeouts = 0;
     let skippedDueToBudget = 0;
+    let releaseReason = "normal";
+    const tickAbort = new AbortController();
 
     try {
       const heldMarkets = Array.from(new Set(getHeldMarkets().filter((m) => typeof m === "string" && m.length > 0)));
@@ -539,7 +548,7 @@ export function createPumpScanner(
 
       let baseTickers: UpbitTicker[] = [];
       try {
-        baseTickers = await fetchTickers([...BASE_MARKETS]);
+        baseTickers = await fetchTickers([...BASE_MARKETS], { signal: tickAbort.signal });
       } catch (e) {
         console.warn(JSON.stringify({
           tag: "PUMP_SCANNER_BASE_TICKER_FETCH_FAILED",
@@ -582,6 +591,7 @@ export function createPumpScanner(
         tickers = await fetchTickers(altMarkets, {
           ...pumpAltTickerOptsBase,
           maxMarkets: altMarkets.length,
+          signal: tickAbort.signal,
         });
       } catch (e) {
         console.warn(JSON.stringify({
@@ -595,7 +605,7 @@ export function createPumpScanner(
       
       let heldExtraTickers: UpbitTicker[] = [];
       try {
-        heldExtraTickers = heldMissingFromTicker.length > 0 ? await fetchTickers(heldMissingFromTicker) : [];
+        heldExtraTickers = heldMissingFromTicker.length > 0 ? await fetchTickers(heldMissingFromTicker, { signal: tickAbort.signal }) : [];
       } catch (e) {
         console.warn(JSON.stringify({
           tag: "PUMP_SCANNER_HELD_TICKER_FETCH_FAILED",
@@ -669,11 +679,13 @@ export function createPumpScanner(
         for (const t of batch) {
           if (Date.now() - tickT0 > TICK_BUDGET_SECONDS * 1000) {
             console.warn(JSON.stringify({ tag: "PUMP_SCANNER_TICK_BUDGET_EXCEEDED", market: t.market, elapsed_ms: Date.now() - tickT0 }));
-            skippedDueToBudget += 1;
-            continue;
+            skippedDueToBudget += (marketsRanked.length - rawDetected.length);
+            releaseReason = "budget_exceeded";
+            tickAbort.abort();
+            break;
           }
 
-          const candles = await getCandlesSafe(t.market);
+          const candles = await getCandlesSafe(t.market, tickAbort.signal);
           if (!candles) {
             if (candleSnapshotCache.has(t.market)) {
               // already warned in getCandlesSafe or it's a 429
@@ -781,6 +793,7 @@ export function createPumpScanner(
             });
           }
         }
+        if (releaseReason === "budget_exceeded") break;
         if (bi < batches.length - 1) {
           await sleep(CANDLE_BATCH_DELAY_MS);
         }
@@ -929,19 +942,31 @@ export function createPumpScanner(
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      console.warn("[pump-scanner] tick_partial_failure", { error: msg, tick_id: tickT0 });
+      if (msg.includes("Aborted") || msg.includes("AbortError")) {
+        releaseReason = "aborted";
+      } else {
+        console.warn("[pump-scanner] tick_partial_failure", { error: msg, tick_id: tickT0 });
+        releaseReason = "error";
+      }
     } finally {
+      tickAbort.abort(); // Cleanup any pending fetches
       isTickInFlight = false;
       const elapsed = Date.now() - tickT0;
+      
+      // Ensure state is updated even if budget was exceeded or error occurred
+      state.updatedAt = new Date().toISOString();
+      (state as any).lastReleaseReason = releaseReason;
+      
       console.info(
         JSON.stringify({
           tag: "PUMP_SCANNER_TICK_RELEASED_PROOF",
-          ts: new Date().toISOString(),
+          ts: state.updatedAt,
           tick_id: tickT0,
           elapsed_ms: elapsed,
           released: true,
-          reason: "normal",
+          reason: releaseReason,
           raw_detected_count: rawDetected.length,
+          tradable_candidates_count: state.rows.length,
           candle_timeouts: candleTimeouts,
           skipped_due_to_budget: skippedDueToBudget,
           is_stale_reset: false,
