@@ -326,6 +326,8 @@ type CandidateMeta = {
   gate_ok?: boolean;
   gate_reason?: string;
   real_signal_present: boolean;
+  is_fresh_signal?: boolean;
+  is_watch_candidate?: boolean;
 };
 
 type SurgeEntrySetupResult = {
@@ -483,6 +485,8 @@ type PersistedState = {
 
 const MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX"] as const;
 const LEADER_MARKETS = new Set<string>(MARKETS as unknown as string[]);
+/** BTC/ETH/XRP/TRX 에는 composite 게이트 우회(strong_symbol_override) 적용 금지 */
+const NO_STRONG_SYMBOL_OVERRIDE_MARKETS = new Set<string>(["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"]);
 const EXISTING_POSITION_MIN_KRW = Math.max(
   1000,
   Number(process.env.LIVE_EXISTING_POSITION_MIN_KRW ?? 5000),
@@ -2497,6 +2501,33 @@ export function createLiveDataStrategy(opts: {
       }
     }
     const selectedEntryUniverseSymbols = selectedSourceRows.map((x) => x.market);
+    const filterPassVsSelectedExplain: Record<string, string> = {};
+    for (const m of filterPassCandidatesExcludingHeld) {
+      if (selectedEntryUniverseSymbols.includes(m)) continue;
+      const sig = latestAllSignals.get(m);
+      const ts = sig ? signalCandidateTimestamp(sig) : null;
+      const ageSec = ts ? Math.max(0, Math.floor((Date.now() - Date.parse(ts)) / 1000)) : null;
+      if (ageSec === null || ageSec > staleThresholdSeconds) {
+        filterPassVsSelectedExplain[m] = `stale_or_missing_age(age=${ageSec},threshold=${staleThresholdSeconds})`;
+      } else if (freshScannerCandidates.some((x) => x.market === m)) {
+        filterPassVsSelectedExplain[m] = `fresh_scanner_but_not_ranked_top_${LIVE_ENTRY_UNIVERSE_TOP_N}`;
+      } else if (freshFilterPassCandidates.some((x) => x.market === m)) {
+        filterPassVsSelectedExplain[m] = `fresh_filter_pass_but_not_ranked_top_${LIVE_ENTRY_UNIVERSE_TOP_N}`;
+      } else {
+        filterPassVsSelectedExplain[m] = "not_in_fresh_scanner_or_fresh_filter_pass_streams";
+      }
+    }
+    console.info(
+      JSON.stringify({
+        tag: "ENTRY_PIPELINE_FILTER_PASS_VS_SELECTED_PRIMARY",
+        ts: new Date().toISOString(),
+        filter_pass_excluding_held_count: filterPassCandidatesExcludingHeld.length,
+        selected_primary_count: selectedEntryUniverseSymbols.length,
+        top_n: LIVE_ENTRY_UNIVERSE_TOP_N,
+        filter_pass_not_selected_explain: filterPassVsSelectedExplain,
+        selected_symbols: selectedEntryUniverseSymbols,
+      }),
+    );
     for (const m of selectedSourceRows) {
       entrySourceKindByMarket.set(m.market, m.source_kind);
       sourceMetaByMarket.set(m.market, { ...m, stale_filtered_before_eval: false });
@@ -2725,6 +2756,25 @@ export function createLiveDataStrategy(opts: {
         base_input_symbols: baseInputSymbols.slice(0, 20),
         held_extra_symbols: heldExtraSymbols.slice(0, 20),
         ticker_requested_symbols: tickerRequestedSymbols.slice(0, 20),
+        realtime_symbol_roles: tickerRequestedSymbols.slice(0, 40).map((m) => {
+          let realtime_display_kind:
+            | "fresh_signal_primary_selected"
+            | "exception_slot_augment"
+            | "debug_universe_extra"
+            | "display_augment_held_or_btc_anchor"
+            | "watch_fallback_discovery_primary"
+            | "watch_list_only_no_fresh_selection"
+            | "other";
+          if (selectedEntryUniverseSymbols.includes(m)) realtime_display_kind = "fresh_signal_primary_selected";
+          else if (exceptionSlotMarket === m) realtime_display_kind = "exception_slot_augment";
+          else if (debugUniverseExtra.includes(m)) realtime_display_kind = "debug_universe_extra";
+          else if (heldExtraSymbols.includes(m)) realtime_display_kind = "display_augment_held_or_btc_anchor";
+          else if (fallbackUsedForPrimary && watchMarketsExcludingHeld.includes(m))
+            realtime_display_kind = "watch_fallback_discovery_primary";
+          else if (watchMarkets.includes(m)) realtime_display_kind = "watch_list_only_no_fresh_selection";
+          else realtime_display_kind = "other";
+          return { market: m, realtime_display_kind };
+        }),
         filter_pass_symbols: filterPassCandidates.slice(0, 20),
         watch_markets_symbols: watchMarkets.slice(0, 20),
         held_symbols: Array.from(heldSymbolSet).slice(0, 20),
@@ -2947,6 +2997,22 @@ export function createLiveDataStrategy(opts: {
             if (!assertLiveOrderAuthority("early_promote_before_attempt")) {
               /* revoked — no fill; keep early position state */
             } else {
+              console.info(
+                JSON.stringify({
+                  tag: "LIVE_PLACEBUY_ATTEMPT_FINAL_GATE",
+                  ts: new Date().toISOString(),
+                  market,
+                  path: "early_promote_fill",
+                  final_block_reason: null,
+                  preclearance_snapshot: {
+                    promote_fill_krw: promoteFillKrw,
+                    breakout_promote: breakoutNow,
+                    held_seconds: heldSec,
+                    pnl_gross_pct: pnlGross,
+                  },
+                  tick_lease: myLease,
+                }),
+              );
               console.info(
                 JSON.stringify({
                   tag: "LIVE_PLACEBUY_ATTEMPT",
@@ -4003,12 +4069,13 @@ export function createLiveDataStrategy(opts: {
         stage: "initial_discovery",
         primary_source: fallbackUsed ? "watch_markets_fallback" : "filter_pass_fresh",
         filter_pass_count: filterPassCandidatesExcludingHeld.length,
-        filter_pass_symbols: filterPassCandidatesExcludingHeld.slice(0, 15),
+        filter_pass_symbols: filterPassCandidatesExcludingHeld.slice(0, 20),
         watch_markets_count: watchMarkets.length,
-        watch_markets_top: watchMarkets.slice(0, 10),
+        watch_markets_top: watchMarkets.slice(0, 15),
         fallback_used: fallbackUsed,
         base_entry_universe_count: baseEntryUniverseInput.length,
-        base_entry_universe_symbols: baseEntryUniverseInput.slice(0, 25),
+        base_entry_universe_symbols: baseEntryUniverseInput.slice(0, 30),
+        note: fallbackUsed ? "USING_WATCH_MARKETS_FALLBACK_SOURCE" : "USING_FRESH_SIGNAL_SOURCE",
       }),
     );
     console.info(
@@ -4115,6 +4182,33 @@ export function createLiveDataStrategy(opts: {
         entry_universe_count: entryUniverse.length,
         dropped_count: Object.keys(universeDroppedReasons).length,
         dropped_reasons: universeDroppedReasons,
+        discrepancy_filter_pass_vs_universe: filterPassCandidatesExcludingHeld.filter(m => !entryUniverse.includes(m)).slice(0, 20),
+        note: "discrepancy_usually_due_to_universe_top_n_cap_or_held_exclusion",
+      }),
+    );
+
+    const filterPassVsEntryUniverseExplain: Record<string, string> = {};
+    for (const m of filterPassCandidates) {
+      if (entryUniverse.includes(m)) continue;
+      if (universeDroppedReasons[m]) {
+        filterPassVsEntryUniverseExplain[m] = `removed_at_universe_filter:${universeDroppedReasons[m]}`;
+      } else if (!baseEntryUniverseInput.includes(m)) {
+        filterPassVsEntryUniverseExplain[m] = filterPassCandidatesExcludingHeld.includes(m)
+          ? filterPassVsSelectedExplain[m] ?? "filter_pass_not_in_base_entry_input_unknown"
+          : "held_or_blocked_so_not_in_primary_discovery_streams";
+      } else {
+        filterPassVsEntryUniverseExplain[m] = "unexpected_filter_pass_vs_entry_universe_gap";
+      }
+    }
+    console.info(
+      JSON.stringify({
+        tag: "ENTRY_PIPELINE_FILTER_PASS_VS_ENTRY_UNIVERSE",
+        ts: new Date().toISOString(),
+        filter_pass_total_count: filterPassCandidates.length,
+        entry_universe_count: entryUniverse.length,
+        filter_pass_missing_from_entry_universe_explain: filterPassVsEntryUniverseExplain,
+        entry_universe_symbols: entryUniverse,
+        base_entry_universe_symbols: baseEntryUniverseInput.slice(0, 30),
       }),
     );
 
@@ -4302,30 +4396,7 @@ export function createLiveDataStrategy(opts: {
         const vol = Number(effectivePayload.volume_ratio ?? 0);
         const btcTier = state.regime?.btc_filter_state ?? "neutral";
 
-        const isCoreRelaxedCandidate = (() => {
-          if (isSurgeCandidate) return false;
-          if (scoreForRelaxed < 70) {
-            console.info(JSON.stringify({ tag: "CORE_RELAXED_CANDIDATE_REJECTED_PROOF", market: m, score: scoreForRelaxed, signal_type: signalType, volume_ratio: vol, vr1m5, btcTier, reject_reason: "score_too_low" }));
-            return false;
-          }
-          if (signalType !== "HIGH" && signalType !== "MID") {
-            console.info(JSON.stringify({ tag: "CORE_RELAXED_CANDIDATE_REJECTED_PROOF", market: m, score: scoreForRelaxed, signal_type: signalType, volume_ratio: vol, vr1m5, btcTier, reject_reason: "signal_type_low" }));
-            return false;
-          }
-          if (!(vol >= 1.2 || (vr1m5 ?? 0) >= 0.65)) {
-            console.info(JSON.stringify({ tag: "CORE_RELAXED_CANDIDATE_REJECTED_PROOF", market: m, score: scoreForRelaxed, signal_type: signalType, volume_ratio: vol, vr1m5, btcTier, reject_reason: "volume_insufficient" }));
-            return false;
-          }
-          if (recent3mRet !== null && recent3mRet < -1.2) {
-            console.info(JSON.stringify({ tag: "CORE_RELAXED_CANDIDATE_REJECTED_PROOF", market: m, score: scoreForRelaxed, signal_type: signalType, volume_ratio: vol, vr1m5, btcTier, reject_reason: "recent_3m_return_negative" }));
-            return false;
-          }
-          if (btcTier === "weak") {
-            console.info(JSON.stringify({ tag: "CORE_RELAXED_CANDIDATE_REJECTED_PROOF", market: m, score: scoreForRelaxed, signal_type: signalType, volume_ratio: vol, vr1m5, btcTier, reject_reason: "btc_tier_weak" }));
-            return false;
-          }
-          return true;
-        })();
+        const isCoreRelaxedCandidate = false; // [HARDENED] No hardcoded symbol-based relaxation allowed
 
         let setup: OriginalSpotSetupResult = {
           ok: true,
@@ -4401,10 +4472,14 @@ export function createLiveDataStrategy(opts: {
                }));
             }
 
+            const surgeReasonCanonical =
+              surgeShadowSetup.reason === "surge_setup_passed"
+                ? "surge_v2_entry_path"
+                : `surge_v2:${surgeShadowSetup.reason}`;
             setup = {
               ok: surgeShadowSetup.ok,
               mode: probeAllowed ? "relaxed_probe" : "none",
-              reason: "surge_v2_entry_path",
+              reason: surgeReasonCanonical,
               riskReward: Number(surgeShadowSetup.riskReward ?? 1),
               stopPrice: Number(surgeShadowSetup.stopPrice ?? 0),
               targetPrice: Number(surgeShadowSetup.targetPrice ?? 0),
@@ -4424,7 +4499,7 @@ export function createLiveDataStrategy(opts: {
         if (!setup.ok) {
           const blockReason = setup.reason ?? "setup_conditions_not_met";
           const dedupeKey = `DEBUG_ORIGINAL_SPOT_SETUP_BLOCK|live_strategy_tick|${m}|${blockReason}|live`;
-          evaluationDroppedReasons[m] = `setup_blocked:${blockReason}`;
+          evaluationDroppedReasons[m] = `setup_blocked:${blockReason}${setup.failed_conditions?.length ? ': ' + setup.failed_conditions.join(',') : ''}`;
           if (setupBlockLogDeduper.shouldLog(dedupeKey)) {
             console.info(JSON.stringify({
               tag: "DEBUG_ORIGINAL_SPOT_SETUP_BLOCK",
@@ -4445,6 +4520,36 @@ export function createLiveDataStrategy(opts: {
               targetPrice: setup.targetPrice,
               riskReward: setup.riskReward,
               failed_conditions: setup.failed_conditions,
+              setup_conditions_breakdown:
+                blockReason === "setup_conditions_not_met"
+                  ? {
+                      failed_conditions: setup.failed_conditions ?? [],
+                      safe_flags: {
+                        safePriceAboveEma200: setup.safePriceAboveEma200 ?? null,
+                        pullbackToEma200: setup.pullbackToEma200 ?? null,
+                        stochOversoldBullishCross: setup.stochOversoldBullishCross ?? null,
+                        isBullish: setup.isBullish ?? null,
+                        safe_condition_pass: setup.safe_condition_pass ?? null,
+                      },
+                      aggressive_flags: {
+                        aggressiveEmaStack: setup.aggressiveEmaStack ?? null,
+                        aggressivePriceAbove: setup.aggressivePriceAbove ?? null,
+                        aggressiveRsiOk: setup.aggressiveRsiOk ?? null,
+                        aggressiveVolumeOk: setup.aggressiveVolumeOk ?? null,
+                        aggressive_condition_pass: setup.aggressive_condition_pass ?? null,
+                      },
+                    }
+                  : null,
+              surge_v2_breakdown:
+                typeof blockReason === "string" && blockReason.startsWith("surge_v2") && surgeShadowSetup
+                  ? {
+                      surge_shadow_reason: surgeShadowSetup.reason,
+                      surge_shadow_grade: surgeShadowSetup.grade,
+                      surge_shadow_score: surgeShadowSetup.score,
+                      failed_conditions: surgeShadowSetup.failed_conditions ?? [],
+                      probe_allowed: surgeShadowSetup.probe_allowed,
+                    }
+                  : null,
             }));
           }
 
@@ -4454,15 +4559,30 @@ export function createLiveDataStrategy(opts: {
               tag: "SURGE_LEGACY_SETUP_BYPASSED_PROOF",
               market: m,
               reason: blockReason,
+              surge_shadow_reason: surgeShadowSetup?.reason ?? null,
+              surge_shadow_failed_conditions: surgeShadowSetup?.failed_conditions ?? null,
+              surge_shadow_grade: surgeShadowSetup?.grade ?? null,
+              surge_shadow_probe_allowed: surgeShadowSetup?.probe_allowed ?? null,
               source_kind: effectivePayload.source_kind,
               authority_source: "surge-v2",
-              note: "legacy original spot setup bypassed for surge candidate",
+              note:
+                "surge candidate continues pipeline despite primary setup block branch; downstream surge-v2 gates apply",
             }));
           } else {
             return null;
           }
         }
-        console.info(JSON.stringify({ tag: "DEBUG_ORIGINAL_SPOT_SETUP_PASS", market: m, mode: setup.mode, rr: setup.riskReward }));
+        console.info(
+          JSON.stringify({
+            tag: "DEBUG_ORIGINAL_SPOT_SETUP_PASS",
+            market: m,
+            setup_ok: setup.ok,
+            mode: setup.mode,
+            rr: setup.riskReward,
+            setup_reason: setup.reason,
+            surge_continue_despite_primary_setup_fail: isSurgeCandidate && !setup.ok,
+          }),
+        );
 
         let gateOk = realSignalPresent ? gate.ok : false;
         let gateReason = realSignalPresent ? gate.reason : "missing_real_signal_payload";
@@ -4521,6 +4641,9 @@ export function createLiveDataStrategy(opts: {
           relaxedMultiplier = 0.35; // Fixed conservative base
         }
 
+        const isFreshSignal = realSignalPresent && !isFallbackSource;
+        const isWatchCandidate = isFallbackSource;
+
         const meta: CandidateMeta = {
           market: m,
           score,
@@ -4548,7 +4671,21 @@ export function createLiveDataStrategy(opts: {
           gate_ok: gateOk,
           gate_reason: gateReason,
           real_signal_present: realSignalPresent,
+          is_fresh_signal: isFreshSignal,
+          is_watch_candidate: isWatchCandidate,
         };
+
+        console.info(JSON.stringify({
+          tag: "DEBUG_CANDIDATE_META_SETTLED_PROOF",
+          market: m,
+          is_fresh_signal: isFreshSignal,
+          is_watch_candidate: isWatchCandidate,
+          gate_ok: gateOk,
+          gate_reason: gateReason,
+          setup_mode: setup.mode,
+          source_kind: effectivePayload.source_kind
+        }));
+
         candidateMetaMap.set(m, meta);
         return meta;
         }),
@@ -4589,8 +4726,23 @@ export function createLiveDataStrategy(opts: {
         candidate_meta_count: candidateMeta.length,
         real_signal_meta_count: realSignalMetaCount,
         fallback_meta_count: fallbackMetaCount,
+        fresh_signal_meta_count: candidateMeta.filter(m => m.is_fresh_signal).length,
+        watch_candidate_meta_count: candidateMeta.filter(m => m.is_watch_candidate).length,
         dropped_count: Object.keys(evaluationDroppedReasons).length,
         dropped_reasons: evaluationDroppedReasons,
+        candidate_meta_dropout_detail: entryUniverse.map((sym) => ({
+          market: sym,
+          outcome: candidateMeta.some((c) => c.market === sym) ? "kept" : "dropped",
+          drop_reason: evaluationDroppedReasons[sym] ?? null,
+        })),
+        market_block_summary: (() => {
+          const stats: Record<string, number> = {};
+          Object.values(evaluationDroppedReasons).forEach(r => {
+            const base = r.split(':')[0];
+            stats[base!] = (stats[base!] ?? 0) + 1;
+          });
+          return stats;
+        })(),
       }),
     );
     const capPlan = computeTargetPositionBudget({
@@ -4950,6 +5102,33 @@ export function createLiveDataStrategy(opts: {
         );
       };
 
+      /** trade_status 조회 전 precheck 단계 차단 — LIVE_PLACEBUY 직전 최종 차단 사유(market 단위) */
+      const logPlacebuyFinalGateBlocked = (finalReason: string, extra?: Record<string, unknown>) => {
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_PLACEBUY_ATTEMPT_FINAL_GATE",
+            ts: new Date().toISOString(),
+            market,
+            path: "precheck_before_trade_status",
+            final_block_reason: finalReason,
+            blocked_before_placebuy: true,
+            tick_lease: myLease,
+            ...extra,
+          }),
+        );
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_ENTRY_FINAL_BLOCKED",
+            ts: new Date().toISOString(),
+            market,
+            final_reason: finalReason,
+            order_precheck_ok: false,
+            trade_status_snapshot: "not_fetched_at_precheck_stage",
+            ...extra,
+          }),
+        );
+      };
+
       // precheck 루프 진입 강제 로그 (이게 없으면 entryUniverse가 비었거나 루프 전에서 끊긴 것)
       const sigPre = latestAllSignals.get(market);
       const sourceMeta = sourceMetaByMarket.get(market);
@@ -4971,6 +5150,7 @@ export function createLiveDataStrategy(opts: {
         }),
       );
       const acctSnap = accountHoldSnapshot[market];
+      const candidateMetaFromSetup = candidateMetaMap.get(market);
       console.info(
         JSON.stringify({
           tag: "DEBUG_LIVE_SYMBOL_EVAL_START",
@@ -4983,10 +5163,12 @@ export function createLiveDataStrategy(opts: {
           account_existing_value_krw: acctSnap?.value_krw ?? 0,
           account_meaningful_hold: acctSnap?.meaningful ?? false,
           entry_universe_includes_symbol: true,
+          is_fresh_signal: candidateMetaFromSetup?.is_fresh_signal ?? false,
+          is_watch_candidate: candidateMetaFromSetup?.is_watch_candidate ?? false,
+          source_kind: sourceMeta?.source_kind ?? null,
+          age_seconds: sourceMeta?.age_seconds ?? null,
         }),
       );
-      
-      const candidateMetaFromSetup = candidateMetaMap.get(market);
       const realSignalPresent = !!candidateMetaFromSetup?.real_signal_present;
       if (!realSignalPresent) {
         emitEval("DEBUG_LIVE_PRECHECK", { 
@@ -4994,11 +5176,13 @@ export function createLiveDataStrategy(opts: {
           note: "fallback_market_diagnostic_only",
           source_kind: sourceMeta?.source_kind ?? null
         });
+        logPlacebuyFinalGateBlocked("missing_real_signal", { note: "fallback_market_diagnostic_only", source_kind: sourceMeta?.source_kind ?? null });
         bumpSkip("missing_real_signal");
         continue;
       }
       if (Object.keys(state.positions).length >= state.safety_guard.max_positions) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "max_positions_reached" });
+        logPlacebuyFinalGateBlocked("max_positions_reached", { open_count: Object.keys(state.positions).length, max_positions: state.safety_guard.max_positions });
         bumpSkip("max_positions_reached");
         console.info(
           JSON.stringify({
@@ -5031,6 +5215,7 @@ export function createLiveDataStrategy(opts: {
       const cool = state.cooldown_until[market];
       if (cool && Date.now() < Date.parse(cool)) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "cooldown_active", cooldown_until: cool });
+        logPlacebuyFinalGateBlocked("cooldown_active", { cooldown_until: cool });
         console.info(
           JSON.stringify({
             tag: "DEBUG_LIVE_REENTRY_BLOCKED",
@@ -5087,6 +5272,7 @@ export function createLiveDataStrategy(opts: {
       }
       if ((state.daily.stop_by_market[market] ?? 0) >= 2) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "stop_count_limit_reached" });
+        logPlacebuyFinalGateBlocked("stop_count_limit_reached", { stop_count: state.daily.stop_by_market[market] });
         bumpSkip("stop_count_limit_reached");
         continue;
       }
@@ -5105,6 +5291,7 @@ export function createLiveDataStrategy(opts: {
           return_reason: String(missingDetail.primary_reason ?? "signal_missing"),
           signal_missing_detail: true,
         });
+        logPlacebuyFinalGateBlocked(String(missingDetail.primary_reason ?? "signal_missing"), { ...missingDetail });
         bumpSkip(String(missingDetail.primary_reason ?? "signal_missing"));
         continue;
       }
@@ -5226,6 +5413,7 @@ export function createLiveDataStrategy(opts: {
           },
         });
         emitEval("blocked_low_signal", { signal_strength_score: bridgedStrength, reason: scannerBridgeScore?.reason ?? "legacy_low_signal" });
+        logPlacebuyFinalGateBlocked("blocked_low_signal", { signal_strength_score: bridgedStrength, floor: ENTRY_PIPELINE_MID_SCORE_FLOOR, reason: scannerBridgeScore?.reason ?? "legacy_low_signal" });
         continue;
       }
       // Late-entry diagnostics & guard (entry timing)
@@ -5257,6 +5445,7 @@ export function createLiveDataStrategy(opts: {
           payload: { symbol: market, market_state: marketState.market_state, note: "non_surge_source_block" },
         });
         emitEval("entry_skipped_risk_off", { symbol: market, market_state: marketState.market_state, source_kind: sourceKindForJudgment });
+        logPlacebuyFinalGateBlocked("entry_skipped_risk_off", { market_state: marketState.market_state, source_kind: sourceKindForJudgment });
         bumpSkip("entry_skipped_risk_off");
         continue;
       }
@@ -5658,6 +5847,7 @@ export function createLiveDataStrategy(opts: {
                 reason: "surge_remaining_below_min_order",
               }),
             );
+            logPlacebuyFinalGateBlocked("surge_remaining_below_min_order", { surge_remaining: surgeRemainingForTickKrw, min_order: surgeMinOrderKrw });
             bumpSkip("surge_remaining_below_min_order");
             continue;
           }
@@ -5676,6 +5866,23 @@ export function createLiveDataStrategy(opts: {
               path: "early_entry",
               order_krw: earlyOrderKrw,
               score: Math.round(score),
+            }),
+          );
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_PLACEBUY_ATTEMPT_FINAL_GATE",
+              ts: new Date().toISOString(),
+              market,
+              path: "early_entry",
+              final_block_reason: null,
+              preclearance_snapshot: {
+                order_krw: earlyOrderKrw,
+                score,
+                seconds_since_signal: secondsSinceSignal,
+                near_high_pct: distanceFromLocalHighPct,
+                volume_ratio_1m5: volumeRatio1m5,
+              },
+              tick_lease: myLease,
             }),
           );
           console.info(
@@ -5911,7 +6118,12 @@ export function createLiveDataStrategy(opts: {
         breakout_relaxed: breakoutRelaxed,
         early_surge_ok: earlySurgeOk,
       });
-      const strongSymbolOverride = signalScore >= 80 && rel >= 0.5 && vol >= 1.05 && trendOk;
+      const strongSymbolOverride =
+        !NO_STRONG_SYMBOL_OVERRIDE_MARKETS.has(market) &&
+        signalScore >= 80 &&
+        rel >= 0.5 &&
+        vol >= 1.05 &&
+        trendOk;
       let detailedReason: string | null = null;
       if (!gateOk) {
         if (signalTypeLow || signalScore < minBaseScore) detailedReason = "score_below_threshold";
@@ -6228,6 +6440,18 @@ export function createLiveDataStrategy(opts: {
       const emitFinalBlocked = (finalReason: string, extra?: Record<string, unknown>) => {
         console.info(
           JSON.stringify({
+            tag: "LIVE_PLACEBUY_ATTEMPT_FINAL_GATE",
+            ts: new Date().toISOString(),
+            market,
+            path: isSurgeSource ? "surge_normal" : "normal",
+            final_block_reason: finalReason,
+            blocked_before_placebuy: true,
+            tick_lease: myLease,
+            ...extra,
+          }),
+        );
+        console.info(
+          JSON.stringify({
             tag: "LIVE_ENTRY_FINAL_BLOCKED",
             ts: new Date().toISOString(),
             market,
@@ -6431,6 +6655,30 @@ export function createLiveDataStrategy(opts: {
       }
       console.info(
         JSON.stringify({
+          tag: "LIVE_PLACEBUY_ATTEMPT_FINAL_GATE",
+          ts: new Date().toISOString(),
+          market,
+          path: isSurgeSource ? "surge_normal" : "normal",
+          final_block_reason: null,
+          preclearance_snapshot: {
+            order_krw: orderKrw,
+            strategy_type: strategyType,
+            is_surge_source: isSurgeSource,
+            strong_symbol_override_applied: strongSymbolOverride,
+            base_gate_blocked_detail: detailedReason,
+            gate_ok_effective: gateOk || strongSymbolOverride,
+            late_entry_guard_reason: lateEntryGuardReason,
+            meta_gate_reason: metaForGuard?.gate_reason ?? null,
+            meta_setup_ok: metaForGuard?.setup?.ok ?? null,
+            meta_setup_reason: metaForGuard?.setupReason ?? null,
+            is_fresh_signal: metaForGuard?.is_fresh_signal ?? null,
+            is_watch_candidate: metaForGuard?.is_watch_candidate ?? null,
+          },
+          tick_lease: myLease,
+        }),
+      );
+      console.info(
+        JSON.stringify({
           tag: "LIVE_PLACEBUY_ATTEMPT",
           ts: new Date().toISOString(),
           market,
@@ -6438,6 +6686,19 @@ export function createLiveDataStrategy(opts: {
           order_krw: orderKrw,
           strategy_type: strategyType,
           tick_lease: myLease,
+          diagnostic: {
+            is_fresh_signal: metaForGuard?.is_fresh_signal,
+            is_watch_candidate: metaForGuard?.is_watch_candidate,
+            market_state: marketState.market_state,
+            btc_tier: btcTierNow,
+            score,
+            volume_ratio: volumeRatio,
+            age_seconds: secondsSinceSignal,
+            timing_state: timingState,
+            volume_state: volumeState,
+            size_multiplier: isSurgeSource ? surgeMarketSizeMultiplier : lateEntrySizingMultiplier,
+            relaxed_probe: !isSurgeSource && metaForGuard?.is_relaxed_probe,
+          }
         }),
       );
       // Entry Execution Proof (Before Call)
