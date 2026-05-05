@@ -593,7 +593,7 @@ const DEBUG_FORCE_BASE_GATE = String(process.env.DEBUG_FORCE_BASE_GATE ?? "").to
 /** 운영에서 `DEBUG_LIVE_ENTRY_POLICY_SNAPSHOT`으로 dist 빌드 정합성 확인. 2=동일심볼은 same_symbol_open_continue_entry_eval 만(레거시 차단 문자열 없음). */
 const LIVE_PRECHECK_EMITTER_REVISION = 2;
 /** 운영에서 dist 실행 코드가 최신인지 확인용(로그에 항상 포함). */
-const LIVE_STRATEGY_TRACE_REVISION = 6;
+const LIVE_STRATEGY_TRACE_REVISION = 7;
 const LIVE_LEGACY_DCA_BUY_ENABLED = String(process.env.LIVE_LEGACY_DCA_BUY_ENABLED ?? "false").toLowerCase() === "true";
 const LIVE_ENTRY_UTILIZATION_TARGET = Math.max(0.05, Math.min(0.98, Number(process.env.LIVE_ENTRY_UTILIZATION_TARGET ?? 0.85)));
 const LIVE_MIN_ENTRY_KRW = Math.max(5_000, Number(process.env.LIVE_MIN_ENTRY_KRW ?? 50_000));
@@ -1648,6 +1648,8 @@ export function createLiveDataStrategy(opts: {
   let runTickInFlight = false;
   /** 단조 증가; 틱 시작 시점의 lease id (주문 실행 권한 판별). */
   let liveTickLeaseSeq = 0;
+  let lastGoodMarketState: Awaited<ReturnType<MarketStateApi["evaluate"]>> | null = null;
+  let lastGoodMarketStateAt: number = 0;
   /** 현재 유효 lease — 스테일 감지 시 증가시켜 진행 중 틱은 주문 권한 상실. */
   let liveTickValidLease = 0;
   let liveTickAbort: AbortController | null = null;
@@ -2016,7 +2018,60 @@ export function createLiveDataStrategy(opts: {
       }
     >();
     const logs = await racePhase("read_logs_220", PHASE_MS.read_logs, () => opts.readLogs(220));
-    const marketState = await racePhase("market_state_evaluate", PHASE_MS.market_state, () => opts.marketState.evaluate());
+
+    let marketState: Awaited<ReturnType<MarketStateApi["evaluate"]>>;
+    try {
+      marketState = await racePhase("market_state_evaluate", PHASE_MS.market_state, () => opts.marketState.evaluate());
+      lastGoodMarketState = marketState;
+      lastGoodMarketStateAt = Date.now();
+    } catch (e) {
+      const cacheAgeMs = lastGoodMarketStateAt > 0 ? Date.now() - lastGoodMarketStateAt : Infinity;
+      const useCache = lastGoodMarketState && cacheAgeMs < 10 * 60 * 1000;
+      if (useCache) {
+        marketState = lastGoodMarketState!;
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_MARKET_STATE_FALLBACK_USED",
+            ts: new Date().toISOString(),
+            reason: isLiveTickPhaseTimeout(e) ? "timeout" : "error",
+            cache_age_ms: cacheAgeMs,
+            fallback_market_state: marketState.market_state,
+            fallback_min_entry_score: marketState.min_entry_score,
+            tick_lease: myLease,
+          }),
+        );
+      } else {
+        marketState = {
+          market_state: "risk_off",
+          min_entry_score: 99,
+          market_bonus: -10,
+          btc_5m_trend: "down",
+          btc_15m_trend: "down",
+        };
+        if (!lastGoodMarketState) {
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_MARKET_STATE_UNAVAILABLE_ENTRY_BLOCKED",
+              ts: new Date().toISOString(),
+              tick_lease: myLease,
+            }),
+          );
+        } else {
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_MARKET_STATE_FALLBACK_USED",
+              ts: new Date().toISOString(),
+              reason: isLiveTickPhaseTimeout(e) ? "timeout" : "error",
+              cache_age_ms: cacheAgeMs,
+              fallback_market_state: marketState.market_state,
+              fallback_min_entry_score: marketState.min_entry_score,
+              tick_lease: myLease,
+              note: "cache_too_old_using_safe_fallback",
+            }),
+          );
+        }
+      }
+    }
     const conservativeMode = marketState.market_state === "risk_off";
     for (const row of logs) {
       if (row.kind !== "signal" || !row.payload) continue;
