@@ -593,7 +593,7 @@ const DEBUG_FORCE_BASE_GATE = String(process.env.DEBUG_FORCE_BASE_GATE ?? "").to
 /** 운영에서 `DEBUG_LIVE_ENTRY_POLICY_SNAPSHOT`으로 dist 빌드 정합성 확인. 2=동일심볼은 same_symbol_open_continue_entry_eval 만(레거시 차단 문자열 없음). */
 const LIVE_PRECHECK_EMITTER_REVISION = 2;
 /** 운영에서 dist 실행 코드가 최신인지 확인용(로그에 항상 포함). */
-const LIVE_STRATEGY_TRACE_REVISION = 7;
+const LIVE_STRATEGY_TRACE_REVISION = 8;
 const LIVE_LEGACY_DCA_BUY_ENABLED = String(process.env.LIVE_LEGACY_DCA_BUY_ENABLED ?? "false").toLowerCase() === "true";
 const LIVE_ENTRY_UTILIZATION_TARGET = Math.max(0.05, Math.min(0.98, Number(process.env.LIVE_ENTRY_UTILIZATION_TARGET ?? 0.85)));
 const LIVE_MIN_ENTRY_KRW = Math.max(5_000, Number(process.env.LIVE_MIN_ENTRY_KRW ?? 50_000));
@@ -2027,46 +2027,69 @@ export function createLiveDataStrategy(opts: {
     } catch (e) {
       const cacheAgeMs = lastGoodMarketStateAt > 0 ? Date.now() - lastGoodMarketStateAt : Infinity;
       const useCache = lastGoodMarketState && cacheAgeMs < 10 * 60 * 1000;
+      const isTimeout = isLiveTickPhaseTimeout(e);
+
       if (useCache) {
         marketState = lastGoodMarketState!;
         console.info(
           JSON.stringify({
-            tag: "LIVE_MARKET_STATE_FALLBACK_USED",
+            tag: "LIVE_MARKET_STATE_FAST_FALLBACK_USED",
             ts: new Date().toISOString(),
-            reason: isLiveTickPhaseTimeout(e) ? "timeout" : "error",
+            source: "last_good",
+            min_entry_score: marketState.min_entry_score,
+            market_state: marketState.market_state,
+            reason: isTimeout ? "timeout" : "error",
             cache_age_ms: cacheAgeMs,
-            fallback_market_state: marketState.market_state,
-            fallback_min_entry_score: marketState.min_entry_score,
             tick_lease: myLease,
           }),
         );
       } else {
-        marketState = {
-          market_state: "risk_off",
-          min_entry_score: 99,
-          market_bonus: -10,
-          btc_5m_trend: "down",
-          btc_15m_trend: "down",
-        };
-        if (!lastGoodMarketState) {
+        // 캐시가 없거나 너무 오래됨 -> logs 기반으로 neutral_safe 시도 (완전 risk_off로 막기 전에)
+        const recentSignals = (logs || []).filter((l) => l.kind === "signal" && l.payload);
+        const highSignals = recentSignals.filter((l) => signalStrengthScore(l.payload) >= 70).length;
+        const lowSignals = recentSignals.filter((l) => signalStrengthScore(l.payload) < 55).length;
+        
+        // 최근 신호가 활발하고 강한 신호가 어느 정도 있으면 neutral_safe 적용
+        const useNeutralSafe = highSignals >= 3 && highSignals > lowSignals;
+        
+        marketState = useNeutralSafe 
+          ? {
+              market_state: "neutral",
+              min_entry_score: 82, // 약간 보수적인 neutral
+              market_bonus: 0,
+              btc_5m_trend: "flat",
+              btc_15m_trend: "flat",
+            }
+          : {
+              market_state: "risk_off",
+              min_entry_score: 99,
+              market_bonus: -10,
+              btc_5m_trend: "down",
+              btc_15m_trend: "down",
+            };
+
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_MARKET_STATE_FAST_FALLBACK_USED",
+            ts: new Date().toISOString(),
+            source: useNeutralSafe ? "neutral_safe" : "risk_off_safe",
+            min_entry_score: marketState.min_entry_score,
+            market_state: marketState.market_state,
+            reason: isTimeout ? "timeout_and_no_cache" : "error_and_no_cache",
+            cache_age_ms: cacheAgeMs,
+            tick_lease: myLease,
+            high_signals: highSignals,
+            low_signals: lowSignals,
+          }),
+        );
+
+        if (!useNeutralSafe) {
           console.info(
             JSON.stringify({
               tag: "LIVE_MARKET_STATE_UNAVAILABLE_ENTRY_BLOCKED",
               ts: new Date().toISOString(),
               tick_lease: myLease,
-            }),
-          );
-        } else {
-          console.info(
-            JSON.stringify({
-              tag: "LIVE_MARKET_STATE_FALLBACK_USED",
-              ts: new Date().toISOString(),
-              reason: isLiveTickPhaseTimeout(e) ? "timeout" : "error",
-              cache_age_ms: cacheAgeMs,
-              fallback_market_state: marketState.market_state,
-              fallback_min_entry_score: marketState.min_entry_score,
-              tick_lease: myLease,
-              note: "cache_too_old_using_safe_fallback",
+              reason: "no_valid_market_state_and_weak_signals",
             }),
           );
         }

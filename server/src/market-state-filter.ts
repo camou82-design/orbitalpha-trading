@@ -86,20 +86,67 @@ export function createMarketStateFilter(args: {
   const state: { latest: MarketStateSnapshot | null } = { latest: null };
 
   const evaluate = async () => {
-    const c5 = await fetchMinuteCandles("KRW-BTC", 5, 50);
-    const c15 = await fetchMinuteCandles("KRW-BTC", 15, 50);
+    const t0 = Date.now();
+
+    const wrap = async <T>(name: string, p: Promise<T>): Promise<T> => {
+      const start = Date.now();
+      try {
+        const res = await p;
+        const end = Date.now();
+        console.info(
+          JSON.stringify({
+            tag: "MARKET_STATE_EVALUATE_PHASE_PROOF",
+            ts: new Date().toISOString(),
+            phase: name,
+            elapsed_ms: end - start,
+            outcome: "ok",
+          }),
+        );
+        return res;
+      } catch (e) {
+        console.error(
+          JSON.stringify({
+            tag: "MARKET_STATE_EVALUATE_PHASE_PROOF",
+            ts: new Date().toISOString(),
+            phase: name,
+            elapsed_ms: Date.now() - start,
+            outcome: "error",
+            error: e instanceof Error ? e.message : String(e),
+          }),
+        );
+        throw e;
+      }
+    };
+
+    const [c5, c15, logs] = await Promise.all([
+      wrap("btc_5m", fetchMinuteCandles("KRW-BTC", 5, 50)),
+      wrap("btc_15m", fetchMinuteCandles("KRW-BTC", 15, 50)),
+      wrap("read_logs", args.readLogs(150)),
+    ]);
+
+    const t1 = Date.now();
+    if (t1 - t0 > 15000) {
+      console.warn(
+        JSON.stringify({
+          tag: "MARKET_STATE_EVALUATE_TIMEOUT_CAUSE_PROOF",
+          ts: new Date().toISOString(),
+          elapsed_ms: t1 - t0,
+          reason: "slow_io_parallel_total_exceeded_15s",
+        }),
+      );
+    }
+
     const closes5 = c5.map((c) => c.trade_price);
     const closes15 = c15.map((c) => c.trade_price);
     const btc5 = trendByEma(closes5, 5, 13);
     const btc15 = trendByEma(closes15, 4, 10);
-    const r5 = closes5.length > 6 ? ((closes5[closes5.length - 1]! / closes5[closes5.length - 6]!) - 1) * 100 : 0;
-    const r15 = closes15.length > 2 ? ((closes15[closes15.length - 1]! / closes15[closes15.length - 2]!) - 1) * 100 : 0;
+    const r5 = closes5.length > 6 ? (closes5[closes5.length - 1]! / closes5[closes5.length - 6]! - 1) * 100 : 0;
+    const r15 = closes15.length > 2 ? (closes15[closes15.length - 1]! / closes15[closes15.length - 2]! - 1) * 100 : 0;
     const recent3 = closes5.slice(-3);
     const flowUp = recent3.length === 3 && recent3[2]! >= recent3[1]! && recent3[1]! >= recent3[0]!;
     const flowDown = recent3.length === 3 && recent3[2]! <= recent3[1]! && recent3[1]! <= recent3[0]!;
     const sharpDrop = r5 <= -1.4 || r15 <= -2.2;
 
-    const logs = await args.readLogs(150);
     const latestBy = new Map<string, unknown>();
     for (const row of logs) {
       if (row.kind !== "signal" || !row.payload) continue;
