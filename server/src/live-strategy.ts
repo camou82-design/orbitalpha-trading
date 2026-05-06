@@ -312,6 +312,8 @@ type CandidateMeta = {
   targetPrice: number;
   candleLow: number;
   swingLow: number;
+  candle_source?: "live_fetch" | "last_good_cache";
+  candle_cache_age_ms?: number | null;
   ema50?: number;
   ema200?: number;
   rsi?: number;
@@ -494,6 +496,22 @@ const LEADER_MARKETS = new Set<string>(MARKETS as unknown as string[]);
 const CORE_TREND_ENTRY_MARKETS = new Set<string>(MARKETS as unknown as string[]);
 /** BTC/ETH/XRP/TRX 에는 composite 게이트 우회(strong_symbol_override) 적용 금지 */
 const NO_STRONG_SYMBOL_OVERRIDE_MARKETS = new Set<string>(["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"]);
+/** candle_fetch_timeout 반복 시 last_good cache fallback 허용 대상(주문 예외 아님; 캔들만 제한적으로 대체) */
+const CORE_MAJOR_MARKETS = new Set<string>(["KRW-BTC", "KRW-ETH"]);
+
+const LIVE_LAST_GOOD_CANDLE_MAX_AGE_MS = (() => {
+  const raw = process.env.LIVE_LAST_GOOD_CANDLE_MAX_AGE_MS;
+  const n = raw === undefined || raw === "" ? 120_000 : Number(raw);
+  return Number.isFinite(n) ? Math.max(30_000, Math.min(10 * 60_000, Math.floor(n))) : 120_000;
+})();
+
+type LastGoodCandleCacheRow = {
+  ts_ms: number;
+  rows: UpbitCandle[];
+  unit: 1 | 5;
+  count: number;
+};
+const lastGoodMinuteCandleCache = new Map<string, LastGoodCandleCacheRow>();
 const EXISTING_POSITION_MIN_KRW = Math.max(
   1000,
   Number(process.env.LIVE_EXISTING_POSITION_MIN_KRW ?? 5000),
@@ -4545,23 +4563,100 @@ export function createLiveDataStrategy(opts: {
 
         // [ORIGINAL SETUP] Primary Gate Enforcement (Upbit fetch limit is 200)
         let candles1: UpbitCandle[];
+        let candle_source: "live_fetch" | "last_good_cache" = "live_fetch";
+        let candle_cache_age_ms: number | null = null;
+        const candleFetchT0 = Date.now();
         try {
-          candles1 = await fetchMinuteCandlesCached(m, 1, 200);
+          const unit = 1 as const;
+          const count = 200;
+          const key = `${m}:u${unit}:n${count}`;
+          const timeoutMs = PHASE_MS.fetch_minute_candles;
+
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_CANDIDATE_CANDLE_FETCH_START",
+              ts: new Date().toISOString(),
+              market: m,
+              timeframe: `${unit}m`,
+              timeout_ms: timeoutMs,
+              source: "live_fetch",
+              cache_age_ms: null,
+            }),
+          );
+
+          candles1 = await fetchMinuteCandlesCached(m, unit, count);
+
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_CANDIDATE_CANDLE_FETCH_DONE",
+              ts: new Date().toISOString(),
+              market: m,
+              timeframe: `${unit}m`,
+              timeout_ms: timeoutMs,
+              elapsed_ms: Date.now() - candleFetchT0,
+              source: "live_fetch",
+              cache_age_ms: null,
+              rows: candles1.length,
+            }),
+          );
+
+          lastGoodMinuteCandleCache.set(key, { ts_ms: Date.now(), rows: candles1, unit, count });
         } catch (e) {
           if (isLiveTickPhaseTimeout(e) && e.phase.startsWith("fetch_minute_candles:")) {
-            evaluationDroppedReasons[m] = "candle_fetch_timeout";
+            const unit = 1 as const;
+            const count = 200;
+            const key = `${m}:u${unit}:n${count}`;
+            const lastGood = lastGoodMinuteCandleCache.get(key);
+            const cacheAgeMs = lastGood?.ts_ms ? Date.now() - lastGood.ts_ms : Infinity;
+
             console.info(
               JSON.stringify({
-                tag: "LIVE_CANDIDATE_META_MARKET_DROPPED_PROOF",
+                tag: "LIVE_CANDIDATE_CANDLE_FETCH_TIMEOUT",
                 ts: new Date().toISOString(),
                 market: m,
-                phase: e.phase,
-                reason: "candle_fetch_timeout",
+                timeframe: `${unit}m`,
                 timeout_ms: e.timeout_ms,
-                tick_lease: myLease,
+                elapsed_ms: Date.now() - candleFetchT0,
+                source: "live_fetch",
+                cache_age_ms: Number.isFinite(cacheAgeMs) ? cacheAgeMs : null,
+                phase: e.phase,
               }),
             );
-            return null;
+
+            // Core majors only: allow evaluation using last_good candle cache when it's fresh enough.
+            if (CORE_MAJOR_MARKETS.has(m) && lastGood?.rows?.length && cacheAgeMs <= LIVE_LAST_GOOD_CANDLE_MAX_AGE_MS) {
+              candles1 = lastGood.rows;
+              candle_source = "last_good_cache";
+              candle_cache_age_ms = cacheAgeMs;
+              console.info(
+                JSON.stringify({
+                  tag: "LIVE_CANDIDATE_CANDLE_FETCH_DONE",
+                  ts: new Date().toISOString(),
+                  market: m,
+                  timeframe: `${unit}m`,
+                  timeout_ms: e.timeout_ms,
+                  elapsed_ms: 0,
+                  source: "last_good_cache",
+                  cache_age_ms: cacheAgeMs,
+                  rows: candles1.length,
+                }),
+              );
+            } else {
+              evaluationDroppedReasons[m] = "candle_fetch_timeout";
+              console.info(
+                JSON.stringify({
+                  tag: "LIVE_CANDIDATE_META_MARKET_DROPPED_PROOF",
+                  ts: new Date().toISOString(),
+                  market: m,
+                  phase: e.phase,
+                  reason: "candle_fetch_timeout",
+                  timeout_ms: e.timeout_ms,
+                  tick_lease: myLease,
+                  candidate_meta_missing_reason: "candle_fetch_timeout",
+                }),
+              );
+              return null;
+            }
           }
           evaluationDroppedReasons[m] = "candle_fetch_error";
           console.info(
@@ -4622,7 +4717,32 @@ export function createLiveDataStrategy(opts: {
             setup.reason === "setup_conditions_not_met" &&
             CORE_TREND_ENTRY_MARKETS.has(m) &&
             realSignalPresent &&
-            !isFallbackSource
+            !isFallbackSource &&
+            candle_source !== "live_fetch"
+          ) {
+            console.info(
+              JSON.stringify({
+                tag: "CORE_TREND_ENTRY_SETUP_REJECT",
+                ts: new Date().toISOString(),
+                market: m,
+                source_kind: sourceKindFromPayload || sourceKindFromMap,
+                candle_source,
+                candle_cache_age_ms,
+                reason: "candles_fallback_blocked",
+                core_trend_entry_pass: false,
+                core_trend_reject_reason: "candles_fallback_blocked",
+                stoch_assist_score: 0,
+                stoch_assist_pass: false,
+                failed_conditions: ["candles_fallback_blocked"],
+              }),
+            );
+          } else if (
+            !setup.ok &&
+            setup.reason === "setup_conditions_not_met" &&
+            CORE_TREND_ENTRY_MARKETS.has(m) &&
+            realSignalPresent &&
+            !isFallbackSource &&
+            candle_source === "live_fetch"
           ) {
             const trendSetup = evaluateCoreTrendEntrySetup(m, candles1, currentPx, effectivePayload);
             if (trendSetup.ok) {
@@ -4634,6 +4754,8 @@ export function createLiveDataStrategy(opts: {
                   ts: new Date().toISOString(),
                   market: m,
                   source_kind: sourceKindFromPayload || sourceKindFromMap,
+                  candle_source,
+                  candle_cache_age_ms,
                   volume_ratio: vol,
                   risk_reward: trendSetup.riskReward,
                   core_trend_entry_pass: Boolean(trendSetup.core_trend_entry_pass),
@@ -4648,6 +4770,9 @@ export function createLiveDataStrategy(opts: {
                   tag: "CORE_TREND_ENTRY_SETUP_REJECT",
                   ts: new Date().toISOString(),
                   market: m,
+                  source_kind: sourceKindFromPayload || sourceKindFromMap,
+                  candle_source,
+                  candle_cache_age_ms,
                   reason: trendSetup.reason,
                   core_trend_entry_pass: trendSetup.core_trend_entry_pass ?? false,
                   core_trend_reject_reason: trendSetup.core_trend_reject_reason ?? trendSetup.reason,
@@ -4903,6 +5028,8 @@ export function createLiveDataStrategy(opts: {
           targetPrice: setup.targetPrice ?? 0,
           candleLow: setup.candleLow ?? 0,
           swingLow: setup.swingLow ?? 0,
+          candle_source,
+          candle_cache_age_ms,
           ema50: setup.ema50,
           ema200: setup.ema200,
           rsi: setup.rsi,
@@ -7005,6 +7132,8 @@ export function createLiveDataStrategy(opts: {
             meta_gate_reason: metaForGuard?.gate_reason ?? null,
             meta_setup_ok: metaForGuard?.setup?.ok ?? null,
             meta_setup_reason: metaForGuard?.setupReason ?? null,
+            candle_source: metaForGuard?.candle_source ?? null,
+            candle_cache_age_ms: metaForGuard?.candle_cache_age_ms ?? null,
             is_fresh_signal: metaForGuard?.is_fresh_signal ?? null,
             is_watch_candidate: metaForGuard?.is_watch_candidate ?? null,
           },
@@ -7026,6 +7155,8 @@ export function createLiveDataStrategy(opts: {
               : metaForGuard?.setupReason === "CORE_TREND_ENTRY"
                 ? "CORE_TREND_ENTRY"
                 : "CORE_SPOT_DEFAULT",
+            candle_source: metaForGuard?.candle_source ?? null,
+            candle_cache_age_ms: metaForGuard?.candle_cache_age_ms ?? null,
             is_fresh_signal: metaForGuard?.is_fresh_signal,
             is_watch_candidate: metaForGuard?.is_watch_candidate,
             market_state: marketState.market_state,
