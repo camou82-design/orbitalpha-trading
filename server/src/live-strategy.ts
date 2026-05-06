@@ -294,6 +294,11 @@ type OriginalSpotSetupResult = {
   aggressiveRiskRewardOk?: boolean;
   aggressive_condition_pass?: boolean;
   failed_conditions?: string[];
+  /** CORE_TREND_ENTRY 전용 — original aggressive_* 의미와 분리 */
+  stoch_assist_pass?: boolean;
+  stoch_assist_score?: number;
+  core_trend_entry_pass?: boolean;
+  core_trend_reject_reason?: string | null;
 };
 
 type CandidateMeta = {
@@ -485,6 +490,8 @@ type PersistedState = {
 
 const MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX"] as const;
 const LEADER_MARKETS = new Set<string>(MARKETS as unknown as string[]);
+/** 코어 현물: original 반등형 대신 CORE_TREND_ENTRY(추세 지속·소액 probe) 경로 후보 */
+const CORE_TREND_ENTRY_MARKETS = new Set<string>(MARKETS as unknown as string[]);
 /** BTC/ETH/XRP/TRX 에는 composite 게이트 우회(strong_symbol_override) 적용 금지 */
 const NO_STRONG_SYMBOL_OVERRIDE_MARKETS = new Set<string>(["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"]);
 const EXISTING_POSITION_MIN_KRW = Math.max(
@@ -650,6 +657,22 @@ const LIVE_ENTRY_UNIVERSE_TOP_N = (() => {
   const raw = process.env.LIVE_ENTRY_UNIVERSE_TOP_N;
   const n = raw === undefined || raw === "" ? 5 : Number(raw);
   return Number.isFinite(n) ? Math.max(1, Math.min(12, Math.floor(n))) : 5;
+})();
+/** CORE_TREND_ENTRY 전용 소액 probe 배수 (기존 relaxed_probe 0.35와 별도) */
+const LIVE_CORE_TREND_PROBE_MULTIPLIER = (() => {
+  const raw = process.env.LIVE_CORE_TREND_PROBE_MULTIPLIER;
+  const n = raw === undefined || raw === "" ? 0.22 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0.08, Math.min(0.4, n)) : 0.22;
+})();
+const LIVE_CORE_TREND_MIN_VOLUME_RATIO = (() => {
+  const raw = process.env.LIVE_CORE_TREND_MIN_VOLUME_RATIO;
+  const n = raw === undefined || raw === "" ? 1.02 : Number(raw);
+  return Number.isFinite(n) ? Math.max(1.0, Math.min(2.5, n)) : 1.02;
+})();
+const LIVE_CORE_TREND_RSI_CAP = (() => {
+  const raw = process.env.LIVE_CORE_TREND_RSI_CAP;
+  const n = raw === undefined || raw === "" ? 72 : Number(raw);
+  return Number.isFinite(n) ? Math.max(60, Math.min(85, Math.floor(n))) : 72;
 })();
 const LIVE_MAX_CHASE_FROM_SIGNAL_PCT = (() => {
   const raw = process.env.LIVE_MAX_CHASE_FROM_SIGNAL_PCT;
@@ -1291,6 +1314,185 @@ function evaluateOriginalSpotScalpingSetup(
     safePriceAboveEma200, pullbackToEma200, stochOversoldBullishCross, isBullish, safe_condition_pass,
     aggressiveEmaStack, aggressivePriceAbove, aggressiveRsiOk: rsiBullish, aggressiveVolumeOk: volSpike, aggressiveRiskRewardOk, aggressive_condition_pass,
     failed_conditions: failed,
+  };
+}
+
+/**
+ * 코어 현물(BTC/ETH/SOL/XRP/TRX) 전용 추세 지속형 진입 평가.
+ * 반등형 original setup과 달리 stoch 눌림목 교차는 필수가 아니며 보조 점수로만 반영한다.
+ * fresh signal + 비-fallback 에서만 호출될 것(호출부에서 보장).
+ */
+function evaluateCoreTrendEntrySetup(
+  market: string,
+  candles1: UpbitCandle[],
+  currentPrice: number,
+  payload: { volume_ratio?: number },
+): OriginalSpotSetupResult {
+  void market;
+  const coreReject = (
+    reason: string,
+    partial: Partial<OriginalSpotSetupResult> & { stoch_assist_score?: number },
+  ): OriginalSpotSetupResult => {
+    const sas = partial.stoch_assist_score ?? 0;
+    return {
+      ...partial,
+      ok: false,
+      mode: "none",
+      reason,
+      core_trend_entry_pass: false,
+      core_trend_reject_reason: reason,
+      stoch_assist_score: sas,
+      stoch_assist_pass: sas >= 1,
+    };
+  };
+
+  if (candles1.length < 200) {
+    const r = `core_trend_insufficient_candles:${candles1.length}<200`;
+    return coreReject(r, {});
+  }
+  const completed = candles1.slice(0, -1);
+  const closes = completed.map((c) => Number(c.trade_price));
+  const highs = completed.map((c) => Number(c.high_price));
+  const lows = completed.map((c) => Number(c.low_price));
+  const ema50Last = emaLast(closes, 50);
+  const ema200Last = emaLast(closes, 200);
+  if (ema50Last === null || ema200Last === null) {
+    return coreReject("core_trend_ema_not_ready", {});
+  }
+
+  const rsiValues = calculateRsi(closes, 14);
+  const stoch = calculateStochRsi(rsiValues, 14, 3, 3);
+  const lastIdx = closes.length - 1;
+  const rsi = rsiValues[lastIdx] ?? 0;
+  const k = stoch.k[lastIdx] ?? 0;
+  const d = stoch.d[lastIdx] ?? 0;
+  const prevK = stoch.k[lastIdx - 1] ?? 0;
+  const prevD = stoch.d[lastIdx - 1] ?? 0;
+
+  let stochAssistScore = 0;
+  if (prevK <= 30 && prevD <= 30 && k > d) stochAssistScore += 1;
+  if ((k > prevK && k > 20) || (k > d && k > 35)) stochAssistScore += 1;
+
+  const volPayload = Number(payload.volume_ratio ?? 0);
+  if (volPayload < LIVE_CORE_TREND_MIN_VOLUME_RATIO) {
+    return coreReject("core_trend_volume_ratio_low", {
+      ema50: ema50Last,
+      ema200: ema200Last,
+      rsi,
+      stochK: k,
+      stochD: d,
+      volumeRatio: volPayload,
+      stoch_assist_score: stochAssistScore,
+      failed_conditions: [`payload_volume_ratio_${volPayload.toFixed(3)}<${LIVE_CORE_TREND_MIN_VOLUME_RATIO}`],
+    });
+  }
+
+  if (rsi >= LIVE_CORE_TREND_RSI_CAP) {
+    return coreReject("core_trend_rsi_overheated", {
+      ema50: ema50Last,
+      ema200: ema200Last,
+      rsi,
+      stochK: k,
+      stochD: d,
+      volumeRatio: volPayload,
+      stoch_assist_score: stochAssistScore,
+      failed_conditions: [`rsi_${rsi.toFixed(1)}>=${LIVE_CORE_TREND_RSI_CAP}`],
+    });
+  }
+
+  const priceAbove200 = currentPrice > ema200Last;
+  const recoveryStack = ema50Last > ema200Last && currentPrice > ema50Last && currentPrice >= ema200Last * 0.998;
+  if (!priceAbove200 && !recoveryStack) {
+    return coreReject("core_trend_below_ema_stack", {
+      ema50: ema50Last,
+      ema200: ema200Last,
+      rsi,
+      stochK: k,
+      stochD: d,
+      volumeRatio: volPayload,
+      stoch_assist_score: stochAssistScore,
+      failed_conditions: ["not_above_ema200_and_not_recovery_stack"],
+    });
+  }
+
+  const candleFail: string[] = [];
+  for (let i = Math.max(0, lastIdx - 2); i <= lastIdx; i++) {
+    const row = completed[i];
+    if (!row) continue;
+    const o = Number(row.opening_price ?? 0);
+    const c = Number(row.trade_price ?? 0);
+    const h = Number(row.high_price ?? 0);
+    const low = Number(row.low_price ?? 0);
+    if (o > 0 && c / o - 1 < -0.018) candleFail.push(`bar_${i}_drop_steep`);
+    const rng = Math.max(1e-9, h - low);
+    const upWick = (h - c) / rng;
+    if (upWick > 0.52) candleFail.push(`bar_${i}_upper_wick_heavy`);
+  }
+  if (candleFail.length > 0) {
+    return coreReject("core_trend_recent_candle_guard", {
+      ema50: ema50Last,
+      ema200: ema200Last,
+      rsi,
+      stochK: k,
+      stochD: d,
+      volumeRatio: volPayload,
+      stoch_assist_score: stochAssistScore,
+      failed_conditions: candleFail,
+    });
+  }
+
+  const recentLows = lows.slice(-10);
+  const swingLow = Math.min(...recentLows);
+  const lastCandle = completed[lastIdx]!;
+  const candleLow = Number(lastCandle.low_price);
+  const stopPrice = Math.min(swingLow, ema200Last * 0.995, candleLow) * 0.998;
+  const risk = currentPrice - stopPrice;
+  if (!(risk > 0)) {
+    return coreReject("core_trend_stop_invalid", {
+      ema50: ema50Last,
+      ema200: ema200Last,
+      rsi,
+      stochK: k,
+      stochD: d,
+      volumeRatio: volPayload,
+      stoch_assist_score: stochAssistScore,
+      failed_conditions: ["risk_nonpositive"],
+    });
+  }
+  const targetPrice = currentPrice + risk * 1.35;
+  const rr = (targetPrice - currentPrice) / risk;
+  if (rr < 1.15) {
+    return coreReject("core_trend_rr_weak", {
+      ema50: ema50Last,
+      ema200: ema200Last,
+      rsi,
+      stochK: k,
+      stochD: d,
+      volumeRatio: volPayload,
+      stoch_assist_score: stochAssistScore,
+      failed_conditions: [`rr_${rr.toFixed(3)}<1.15`],
+    });
+  }
+
+  return {
+    ok: true,
+    mode: "relaxed_probe",
+    reason: "CORE_TREND_ENTRY",
+    ema50: ema50Last,
+    ema200: ema200Last,
+    rsi,
+    stochK: k,
+    stochD: d,
+    volumeRatio: volPayload,
+    stopPrice,
+    targetPrice,
+    riskReward: rr,
+    candleLow,
+    swingLow,
+    core_trend_entry_pass: true,
+    core_trend_reject_reason: null,
+    stoch_assist_score: stochAssistScore,
+    stoch_assist_pass: stochAssistScore >= 1,
   };
 }
 
@@ -3005,6 +3207,7 @@ export function createLiveDataStrategy(opts: {
                   path: "early_promote_fill",
                   final_block_reason: null,
                   candidate_meta_missing_reason: null,
+                  entry_mode: "EARLY_PROMOTE_FILL",
                   preclearance_snapshot: {
                     promote_fill_krw: promoteFillKrw,
                     breakout_promote: breakoutNow,
@@ -4413,7 +4616,49 @@ export function createLiveDataStrategy(opts: {
         const softenedReasons: string[] = [];
         if (!isSurgeCandidate) {
           setup = evaluateOriginalSpotScalpingSetup(m, candles1, currentPx);
-          
+
+          if (
+            !setup.ok &&
+            setup.reason === "setup_conditions_not_met" &&
+            CORE_TREND_ENTRY_MARKETS.has(m) &&
+            realSignalPresent &&
+            !isFallbackSource
+          ) {
+            const trendSetup = evaluateCoreTrendEntrySetup(m, candles1, currentPx, effectivePayload);
+            if (trendSetup.ok) {
+              setup = trendSetup;
+              softenedReasons.push("CORE_TREND_ENTRY_PROBE");
+              console.info(
+                JSON.stringify({
+                  tag: "CORE_TREND_ENTRY_SETUP_PASS",
+                  ts: new Date().toISOString(),
+                  market: m,
+                  source_kind: sourceKindFromPayload || sourceKindFromMap,
+                  volume_ratio: vol,
+                  risk_reward: trendSetup.riskReward,
+                  core_trend_entry_pass: Boolean(trendSetup.core_trend_entry_pass),
+                  core_trend_reject_reason: trendSetup.core_trend_reject_reason ?? null,
+                  stoch_assist_score: trendSetup.stoch_assist_score ?? 0,
+                  stoch_assist_pass: trendSetup.stoch_assist_pass ?? false,
+                }),
+              );
+            } else {
+              console.info(
+                JSON.stringify({
+                  tag: "CORE_TREND_ENTRY_SETUP_REJECT",
+                  ts: new Date().toISOString(),
+                  market: m,
+                  reason: trendSetup.reason,
+                  core_trend_entry_pass: trendSetup.core_trend_entry_pass ?? false,
+                  core_trend_reject_reason: trendSetup.core_trend_reject_reason ?? trendSetup.reason,
+                  stoch_assist_score: trendSetup.stoch_assist_score ?? 0,
+                  stoch_assist_pass: trendSetup.stoch_assist_pass ?? false,
+                  failed_conditions: trendSetup.failed_conditions ?? [],
+                }),
+              );
+            }
+          }
+
           if (!setup.ok && isCoreRelaxedCandidate && setup.reason === "setup_conditions_not_met") {
             // Soften Original Setup
             setup = { ...setup, ok: true, mode: "relaxed_probe" };
@@ -4636,10 +4881,12 @@ export function createLiveDataStrategy(opts: {
           return null;
         }
 
-        // Apply probe multiplier (0.35x) for relaxed core entries
+        // Apply probe multiplier — CORE_TREND_ENTRY 는 별도 소액 배수
         let relaxedMultiplier = 1.0;
-        if (setup.mode === "relaxed_probe" || softenedReasons.length > 0) {
-          relaxedMultiplier = 0.35; // Fixed conservative base
+        if (setup.reason === "CORE_TREND_ENTRY") {
+          relaxedMultiplier = LIVE_CORE_TREND_PROBE_MULTIPLIER;
+        } else if (setup.mode === "relaxed_probe" || softenedReasons.length > 0) {
+          relaxedMultiplier = 0.35;
         }
 
         const isFreshSignal = realSignalPresent && !isFallbackSource;
@@ -4666,7 +4913,7 @@ export function createLiveDataStrategy(opts: {
           surge_shadow_setup: surgeShadowSetup,
           engine_bucket: isSurgeCandidate ? "surge" : "other",
           is_core_relaxed_candidate: isCoreRelaxedCandidate,
-          is_relaxed_probe: setup.mode === "relaxed_probe",
+          is_relaxed_probe: setup.mode === "relaxed_probe" || setup.reason === "CORE_TREND_ENTRY",
           softened_reasons: softenedReasons,
           relaxed_multiplier: relaxedMultiplier,
           gate_ok: gateOk,
@@ -5109,12 +5356,16 @@ export function createLiveDataStrategy(opts: {
         const candidate_meta_missing_reason =
           merged.candidate_meta_missing_reason !== undefined ? merged.candidate_meta_missing_reason : null;
         delete merged.candidate_meta_missing_reason;
+        const entry_mode_precheck =
+          typeof merged.entry_mode === "string" ? (merged.entry_mode as string) : "PRECHECK_BLOCKED";
+        delete merged.entry_mode;
         console.info(
           JSON.stringify({
             tag: "LIVE_PLACEBUY_ATTEMPT_FINAL_GATE",
             ts: new Date().toISOString(),
             market,
             path: "precheck_before_trade_status",
+            entry_mode: entry_mode_precheck,
             final_block_reason: finalReason,
             candidate_meta_missing_reason,
             blocked_before_placebuy: true,
@@ -5129,6 +5380,7 @@ export function createLiveDataStrategy(opts: {
             market,
             final_reason: finalReason,
             candidate_meta_missing_reason,
+            entry_mode: entry_mode_precheck,
             order_precheck_ok: false,
             trade_status_snapshot: "not_fetched_at_precheck_stage",
             ...merged,
@@ -5935,6 +6187,7 @@ export function createLiveDataStrategy(opts: {
               path: "early_entry",
               final_block_reason: null,
               candidate_meta_missing_reason: null,
+              entry_mode: "EARLY_ENTRY",
               preclearance_snapshot: {
                 order_krw: earlyOrderKrw,
                 score,
@@ -6502,12 +6755,20 @@ export function createLiveDataStrategy(opts: {
         const candidate_meta_missing_reason =
           mergedFb.candidate_meta_missing_reason !== undefined ? mergedFb.candidate_meta_missing_reason : null;
         delete mergedFb.candidate_meta_missing_reason;
+        const entry_mode_blocked =
+          typeof mergedFb.entry_mode === "string"
+            ? (mergedFb.entry_mode as string)
+            : isSurgeSource
+              ? "SURGE_V2"
+              : "CORE_SPOT_DEFAULT";
+        delete mergedFb.entry_mode;
         console.info(
           JSON.stringify({
             tag: "LIVE_PLACEBUY_ATTEMPT_FINAL_GATE",
             ts: new Date().toISOString(),
             market,
             path: isSurgeSource ? "surge_normal" : "normal",
+            entry_mode: entry_mode_blocked,
             final_block_reason: finalReason,
             candidate_meta_missing_reason,
             blocked_before_placebuy: true,
@@ -6532,6 +6793,7 @@ export function createLiveDataStrategy(opts: {
             order_precheck_ok: false,
             final_reason: finalReason,
             candidate_meta_missing_reason,
+            entry_mode: entry_mode_blocked,
             auto_trade_enabled: Boolean(st.auto_trade_enabled),
             live_enabled: Boolean(st.live_enabled),
             api_connected: Boolean(st.api_connected),
@@ -6727,6 +6989,11 @@ export function createLiveDataStrategy(opts: {
           path: isSurgeSource ? "surge_normal" : "normal",
           final_block_reason: null,
           candidate_meta_missing_reason: null,
+          entry_mode: isSurgeSource
+            ? "SURGE_V2"
+            : metaForGuard?.setupReason === "CORE_TREND_ENTRY"
+              ? "CORE_TREND_ENTRY"
+              : "CORE_SPOT_DEFAULT",
           preclearance_snapshot: {
             order_krw: orderKrw,
             strategy_type: strategyType,
@@ -6754,6 +7021,11 @@ export function createLiveDataStrategy(opts: {
           strategy_type: strategyType,
           tick_lease: myLease,
           diagnostic: {
+            entry_mode: isSurgeSource
+              ? "SURGE_V2"
+              : metaForGuard?.setupReason === "CORE_TREND_ENTRY"
+                ? "CORE_TREND_ENTRY"
+                : "CORE_SPOT_DEFAULT",
             is_fresh_signal: metaForGuard?.is_fresh_signal,
             is_watch_candidate: metaForGuard?.is_watch_candidate,
             market_state: marketState.market_state,
