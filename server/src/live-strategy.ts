@@ -6945,18 +6945,43 @@ export function createLiveDataStrategy(opts: {
         },
       });
       if (isExceptionMarket && !exception) {
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "exception_not_selected" });
-        logPlacebuyFinalGateBlocked("exception_not_selected", {
-          entry_mode: isSurgeSource
-            ? "SURGE_V2"
-            : candidateMetaFromSetup?.setupReason === "CORE_TREND_ENTRY"
-              ? "CORE_TREND_ENTRY"
-              : "CORE_SPOT_DEFAULT",
-          base_gate_ok: gateOk,
-          base_gate_blocked_detail: !gateOk && !strongSymbolOverride ? (detailedReason ?? "base_gate_failed") : null,
-        });
-        bumpSkip("exception_not_selected");
-        continue;
+        const baseGateBlockedDetailForBypass =
+          !gateOk && !strongSymbolOverride ? (detailedReason ?? "base_gate_failed") : null;
+        const surgeExceptionSelectionBypass =
+          isSurgeSource &&
+          !!candidateMetaFromSetup &&
+          !candidateMetaEvalDropReason &&
+          gateOk === true &&
+          baseGateBlockedDetailForBypass === null;
+
+        if (surgeExceptionSelectionBypass) {
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_EXCEPTION_SELECTION_BYPASS_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              entry_mode: "SURGE_V2",
+              base_gate_ok: gateOk,
+              base_gate_blocked_detail: null,
+              candidate_meta_present: true,
+              candidate_meta_missing_reason: null,
+              reason: "surge_v2_base_gate_passed_exception_not_selected_bypassed",
+            }),
+          );
+        } else {
+          emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "exception_not_selected" });
+          logPlacebuyFinalGateBlocked("exception_not_selected", {
+            entry_mode: isSurgeSource
+              ? "SURGE_V2"
+              : candidateMetaFromSetup?.setupReason === "CORE_TREND_ENTRY"
+                ? "CORE_TREND_ENTRY"
+                : "CORE_SPOT_DEFAULT",
+            base_gate_ok: gateOk,
+            base_gate_blocked_detail: baseGateBlockedDetailForBypass,
+          });
+          bumpSkip("exception_not_selected");
+          continue;
+        }
       }
       if (!gateOk && !strongSymbolOverride) {
         // Surge candidates must bypass the core gate unless it's a hard state block (exists/cooldown).
