@@ -499,6 +499,12 @@ const NO_STRONG_SYMBOL_OVERRIDE_MARKETS = new Set<string>(["KRW-BTC", "KRW-ETH",
 /** candle_fetch_timeout 반복 시 last_good cache fallback 허용 대상(주문 예외 아님; 캔들만 제한적으로 대체) */
 const CORE_MAJOR_MARKETS = new Set<string>(["KRW-BTC", "KRW-ETH"]);
 
+const LIVE_CORE_ENTRY_RESERVE_SLOTS = (() => {
+  const raw = process.env.LIVE_CORE_ENTRY_RESERVE_SLOTS;
+  const n = raw === undefined || raw === "" ? 2 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0, Math.min(2, Math.floor(n))) : 2;
+})();
+
 const LIVE_LAST_GOOD_CANDLE_MAX_AGE_MS = (() => {
   const raw = process.env.LIVE_LAST_GOOD_CANDLE_MAX_AGE_MS;
   const n = raw === undefined || raw === "" ? 120_000 : Number(raw);
@@ -2719,6 +2725,70 @@ export function createLiveDataStrategy(opts: {
         });
         if (selectedSourceRows.length >= LIVE_ENTRY_UNIVERSE_TOP_N) break;
       }
+    }
+
+    // CORE reserve slots: ensure core fresh_filter_pass candidates aren't crowded out by low-score scanner candidates.
+    // Not a per-symbol exception buy: the reserve applies to MARKETS 기반 CORE_TREND_ENTRY 후보군 전체.
+    if (LIVE_CORE_ENTRY_RESERVE_SLOTS > 0) {
+      const selectedBefore = selectedSourceRows.map((x) => x.market);
+      const replacedSymbols: string[] = [];
+      const reservedSymbols: string[] = [];
+      const coreReserveCandidates = freshFilterPassCandidates.filter((f) => {
+        if (!CORE_TREND_ENTRY_MARKETS.has(f.market)) return false;
+        const sig = latestAllSignals.get(f.market);
+        if (String(sig?.p?.source_kind ?? "") === "fallback_watch_markets") return false;
+        if (heldSymbolSet.has(f.market)) return false;
+        if (f.ageSeconds === null || f.ageSeconds > staleThresholdSeconds) return false;
+        return true;
+      });
+      const desired = Math.min(LIVE_ENTRY_UNIVERSE_TOP_N, LIVE_CORE_ENTRY_RESERVE_SLOTS, coreReserveCandidates.length);
+      for (const f of coreReserveCandidates.slice(0, desired)) {
+        if (selectedSourceRows.some((x) => x.market === f.market)) continue;
+
+        // Prefer dropping scanner-derived rows (often includes scanner_bridge_score_fail) over fresh_filter_pass rows.
+        let dropIdx = -1;
+        for (let i = selectedSourceRows.length - 1; i >= 0; i--) {
+          const row = selectedSourceRows[i]!;
+          if (row.source_kind === "scanner_filter_fresh" && !CORE_TREND_ENTRY_MARKETS.has(row.market)) {
+            dropIdx = i;
+            break;
+          }
+        }
+        if (dropIdx < 0) {
+          for (let i = selectedSourceRows.length - 1; i >= 0; i--) {
+            const row = selectedSourceRows[i]!;
+            if (!CORE_TREND_ENTRY_MARKETS.has(row.market)) {
+              dropIdx = i;
+              break;
+            }
+          }
+        }
+        if (dropIdx < 0) break;
+
+        const dropped = selectedSourceRows[dropIdx]!;
+        replacedSymbols.push(dropped.market);
+        reservedSymbols.push(f.market);
+        selectedSourceRows.splice(dropIdx, 1, {
+          market: f.market,
+          source_kind: "fresh_filter_pass",
+          source_ts: f.sourceTs,
+          age_seconds: f.ageSeconds,
+        });
+      }
+
+      const selectedAfter = selectedSourceRows.map((x) => x.market);
+      console.info(
+        JSON.stringify({
+          tag: "CORE_ENTRY_RESERVE_SLOT_PROOF",
+          ts: new Date().toISOString(),
+          reserve_slots: LIVE_CORE_ENTRY_RESERVE_SLOTS,
+          reserved_symbols: reservedSymbols,
+          replaced_symbols: replacedSymbols,
+          reason: "ensure_core_fresh_filter_pass_not_crowded_out",
+          selected_before: selectedBefore,
+          selected_after: selectedAfter,
+        }),
+      );
     }
     const selectedEntryUniverseSymbols = selectedSourceRows.map((x) => x.market);
     const filterPassVsSelectedExplain: Record<string, string> = {};
@@ -6067,7 +6137,19 @@ export function createLiveDataStrategy(opts: {
           const coreRelaxedAllowNearHigh = (metaForGuard?.is_core_relaxed_candidate === true) && 
                                            (distanceFromLocalHighPct !== null && distanceFromLocalHighPct >= 0.12 && distanceFromLocalHighPct < 0.35);
 
-          if (severeNearHigh || (!softContextForMicroGuard && !coreRelaxedAllowNearHigh)) {
+          const coreTrendNearHighSoftAllowed =
+            metaForGuard?.setupReason === "CORE_TREND_ENTRY" &&
+            metaForGuard?.candle_source === "live_fetch" &&
+            Number(metaForGuard?.riskReward ?? 0) >= 1.15 &&
+            Number(metaForGuard?.volumeRatio ?? 0) >= LIVE_CORE_TREND_MIN_VOLUME_RATIO &&
+            Number(metaForGuard?.stopPrice ?? 0) > 0;
+
+          if (severeNearHigh && coreTrendNearHighSoftAllowed) {
+            // CORE_TREND_ENTRY 후보는 near-high를 “소액 probe”로 낮추되, 다른 위험 신호는 기존 hard block 유지.
+            lateTimingTier = "reduced_size_allowed";
+            lateEntrySizingMultiplier *= 0.45;
+            lateEntryGuardReason = `CORE_TREND_NEAR_HIGH_SOFT_GUARD:${distanceFromLocalHighPct!.toFixed(3)}pct<0.12pct`;
+          } else if (severeNearHigh || (!softContextForMicroGuard && !coreRelaxedAllowNearHigh)) {
             lateEntryGuardTriggered = true;
             lateTimingTier = "hard_block";
             lateEntryGuardReason = `too_near_local_high:${distanceFromLocalHighPct!.toFixed(3)}pct<0.12pct`;
@@ -6435,6 +6517,18 @@ export function createLiveDataStrategy(opts: {
           }),
         );
         if (!isSurgeSource) {
+          if (
+            metaForGuard?.setupReason === "CORE_TREND_ENTRY" &&
+            typeof lateEntryGuardReason === "string" &&
+            lateEntryGuardReason.startsWith("too_near_local_high:")
+          ) {
+            logPlacebuyFinalGateBlocked("core_trend_late_guard:too_near_local_high", {
+              entry_mode: "CORE_TREND_ENTRY",
+              late_entry_guard_reason: lateEntryGuardReason,
+              candle_source: metaForGuard?.candle_source ?? null,
+              candle_cache_age_ms: metaForGuard?.candle_cache_age_ms ?? null,
+            });
+          }
           bumpSkip("late_entry_guard");
           continue;
         }
