@@ -513,6 +513,19 @@ const LIVE_LAST_GOOD_CANDLE_MAX_AGE_MS = (() => {
   return Number.isFinite(n) ? Math.max(30_000, Math.min(10 * 60_000, Math.floor(n))) : 120_000;
 })();
 
+const LIVE_CANDIDATE_CANDLE_FETCH_CONCURRENCY = (() => {
+  const raw = process.env.LIVE_CANDIDATE_CANDLE_FETCH_CONCURRENCY;
+  const n = raw === undefined || raw === "" ? 2 : Number(raw);
+  return Number.isFinite(n) ? Math.max(1, Math.min(3, Math.floor(n))) : 2;
+})();
+
+const LIVE_CANDIDATE_CANDLE_FETCH_TIMEOUT_MS = (() => {
+  const raw = process.env.LIVE_CANDIDATE_CANDLE_FETCH_TIMEOUT_MS;
+  const n = raw === undefined || raw === "" ? 9_000 : Number(raw);
+  // Keep this short to avoid holding the whole tick; candidate_meta can drop per-market.
+  return Number.isFinite(n) ? Math.max(3_000, Math.min(15_000, Math.floor(n))) : 9_000;
+})();
+
 type LastGoodCandleCacheRow = {
   ts_ms: number;
   rows: UpbitCandle[];
@@ -3200,6 +3213,163 @@ export function createLiveDataStrategy(opts: {
       cache.set(key, rows);
       return rows;
     };
+
+    // candidate_meta candle fetch limiter (to avoid hammering Upbit with 1m/200 in parallel)
+    const candleFetchLimiter = (() => {
+      const concurrency = LIVE_CANDIDATE_CANDLE_FETCH_CONCURRENCY;
+      let active = 0;
+      const queue: Array<() => void> = [];
+      const pump = () => {
+        while (active < concurrency && queue.length > 0) {
+          const next = queue.shift();
+          if (next) next();
+        }
+      };
+      return async <T>(fn: () => Promise<T>): Promise<T> => {
+        if (active >= concurrency) {
+          await new Promise<void>((resolve) => queue.push(resolve));
+        }
+        active += 1;
+        try {
+          return await fn();
+        } finally {
+          active -= 1;
+          pump();
+        }
+      };
+    })();
+
+    const isAbortLike = (e: unknown): boolean => {
+      if (tickSignal.aborted) return true;
+      if (e instanceof DOMException && e.name === "AbortError") return true;
+      if (e instanceof Error && e.name === "AbortError") return true;
+      const msg = e instanceof Error ? e.message : String(e);
+      return typeof msg === "string" && msg.toLowerCase().includes("aborted");
+    };
+
+    const fetchCandidateMetaCandles1m200 = async (
+      market: string,
+    ): Promise<{ rows: UpbitCandle[]; candle_source: "live_fetch" | "last_good_cache"; cache_age_ms: number | null }> => {
+      const unit = 1 as const;
+      const count = 200 as const;
+      const key = `${market}:u${unit}:n${count}`;
+      const timeoutMs = Math.min(PHASE_MS.fetch_minute_candles, LIVE_CANDIDATE_CANDLE_FETCH_TIMEOUT_MS);
+      const t0 = Date.now();
+
+      console.info(
+        JSON.stringify({
+          tag: "LIVE_CANDIDATE_CANDLE_FETCH_START",
+          ts: new Date().toISOString(),
+          market,
+          timeframe: `${unit}m`,
+          timeout_ms: timeoutMs,
+          source: "live_fetch",
+          cache_age_ms: null,
+        }),
+      );
+
+      try {
+        const rows = await candleFetchLimiter(async () => {
+          const phase = `candidate_meta_fetch_minute_candles:${market}:u${unit}:n${count}`;
+          const fetched = await racePhase(phase, timeoutMs, () => fetchMinuteCandles(market, unit, count, tickSignal));
+          minute1CandleCache.set(`${market}:${count}`, fetched);
+          return fetched;
+        });
+
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_CANDIDATE_CANDLE_FETCH_DONE",
+            ts: new Date().toISOString(),
+            market,
+            timeframe: `${unit}m`,
+            timeout_ms: timeoutMs,
+            elapsed_ms: Date.now() - t0,
+            source: "live_fetch",
+            cache_age_ms: null,
+            rows: rows.length,
+          }),
+        );
+
+        lastGoodMinuteCandleCache.set(key, { ts_ms: Date.now(), rows, unit, count });
+        return { rows, candle_source: "live_fetch", cache_age_ms: null };
+      } catch (e) {
+        // Abort is its own class of drop reason (do not mix with candle_fetch_error)
+        if (isAbortLike(e)) {
+          const phase = isLiveTickPhaseTimeout(e) ? e.phase : "candidate_meta_fetch_minute_candles:aborted";
+          const abort_reason = tickSignal.aborted
+            ? "tick_abort_signal"
+            : e instanceof Error && e.name === "AbortError"
+              ? "abort_error"
+              : "aborted_message";
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_CANDIDATE_CANDLE_FETCH_ABORTED",
+              ts: new Date().toISOString(),
+              market,
+              phase,
+              elapsed_ms: Date.now() - t0,
+              abort_reason,
+            }),
+          );
+          throw e;
+        }
+
+        if (isLiveTickPhaseTimeout(e) && e.phase.startsWith("candidate_meta_fetch_minute_candles:")) {
+          const lastGood = lastGoodMinuteCandleCache.get(key);
+          const cacheAgeMs = lastGood?.ts_ms ? Date.now() - lastGood.ts_ms : Infinity;
+
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_CANDIDATE_CANDLE_FETCH_TIMEOUT",
+              ts: new Date().toISOString(),
+              market,
+              timeframe: `${unit}m`,
+              timeout_ms: e.timeout_ms,
+              elapsed_ms: Date.now() - t0,
+              source: "live_fetch",
+              cache_age_ms: Number.isFinite(cacheAgeMs) ? cacheAgeMs : null,
+              phase: e.phase,
+            }),
+          );
+
+          // Core majors only: allow evaluation using last_good candle cache when it's fresh enough.
+          if (CORE_MAJOR_MARKETS.has(market) && lastGood?.rows?.length && cacheAgeMs <= LIVE_LAST_GOOD_CANDLE_MAX_AGE_MS) {
+            const rows = lastGood.rows;
+            console.info(
+              JSON.stringify({
+                tag: "LIVE_CANDIDATE_CANDLE_FETCH_FALLBACK_USED",
+                ts: new Date().toISOString(),
+                market,
+                cache_age_ms: cacheAgeMs,
+                rows: rows.length,
+                original_error: "timeout",
+                original_timeout_ms: e.timeout_ms,
+                candle_source: "last_good_cache",
+              }),
+            );
+            console.info(
+              JSON.stringify({
+                tag: "LIVE_CANDIDATE_CANDLE_FETCH_DONE",
+                ts: new Date().toISOString(),
+                market,
+                timeframe: `${unit}m`,
+                timeout_ms: e.timeout_ms,
+                elapsed_ms: 0,
+                source: "last_good_cache",
+                cache_age_ms: cacheAgeMs,
+                rows: rows.length,
+              }),
+            );
+            // IMPORTANT: fallback success must not fall through into candle_fetch_error drop.
+            return { rows, candle_source: "last_good_cache", cache_age_ms: cacheAgeMs };
+          }
+
+          throw e;
+        }
+
+        throw e;
+      }
+    };
     const btcChange = Number(changeRateBy.get("KRW-BTC") ?? 0);
     const btcTier: "strong" | "neutral" | "weak" =
       conservativeMode || btcChange <= -0.004 ? "weak" : btcChange >= 0.002 ? "strong" : "neutral";
@@ -4686,101 +4856,52 @@ export function createLiveDataStrategy(opts: {
         }));
 
         // [ORIGINAL SETUP] Primary Gate Enforcement (Upbit fetch limit is 200)
+        // candidate_meta candle fetch is concurrency-limited + short-timeout; fallback success must NEVER re-drop as candle_fetch_error.
         let candles1: UpbitCandle[];
         let candle_source: "live_fetch" | "last_good_cache" = "live_fetch";
         let candle_cache_age_ms: number | null = null;
-        const candleFetchT0 = Date.now();
         try {
-          const unit = 1 as const;
-          const count = 200;
-          const key = `${m}:u${unit}:n${count}`;
-          const timeoutMs = PHASE_MS.fetch_minute_candles;
-
-          console.info(
-            JSON.stringify({
-              tag: "LIVE_CANDIDATE_CANDLE_FETCH_START",
-              ts: new Date().toISOString(),
-              market: m,
-              timeframe: `${unit}m`,
-              timeout_ms: timeoutMs,
-              source: "live_fetch",
-              cache_age_ms: null,
-            }),
-          );
-
-          candles1 = await fetchMinuteCandlesCached(m, unit, count);
-
-          console.info(
-            JSON.stringify({
-              tag: "LIVE_CANDIDATE_CANDLE_FETCH_DONE",
-              ts: new Date().toISOString(),
-              market: m,
-              timeframe: `${unit}m`,
-              timeout_ms: timeoutMs,
-              elapsed_ms: Date.now() - candleFetchT0,
-              source: "live_fetch",
-              cache_age_ms: null,
-              rows: candles1.length,
-            }),
-          );
-
-          lastGoodMinuteCandleCache.set(key, { ts_ms: Date.now(), rows: candles1, unit, count });
+          const fetched = await fetchCandidateMetaCandles1m200(m);
+          candles1 = fetched.rows;
+          candle_source = fetched.candle_source;
+          candle_cache_age_ms = fetched.cache_age_ms;
         } catch (e) {
-          if (isLiveTickPhaseTimeout(e) && e.phase.startsWith("fetch_minute_candles:")) {
-            const unit = 1 as const;
-            const count = 200;
-            const key = `${m}:u${unit}:n${count}`;
-            const lastGood = lastGoodMinuteCandleCache.get(key);
-            const cacheAgeMs = lastGood?.ts_ms ? Date.now() - lastGood.ts_ms : Infinity;
-
+          if (isAbortLike(e)) {
+            evaluationDroppedReasons[m] = "candle_fetch_aborted";
             console.info(
               JSON.stringify({
-                tag: "LIVE_CANDIDATE_CANDLE_FETCH_TIMEOUT",
+                tag: "LIVE_CANDIDATE_META_MARKET_DROPPED_PROOF",
                 ts: new Date().toISOString(),
                 market: m,
-                timeframe: `${unit}m`,
-                timeout_ms: e.timeout_ms,
-                elapsed_ms: Date.now() - candleFetchT0,
-                source: "live_fetch",
-                cache_age_ms: Number.isFinite(cacheAgeMs) ? cacheAgeMs : null,
-                phase: e.phase,
+                phase: isLiveTickPhaseTimeout(e) ? e.phase : "candidate_meta_fetch_minute_candles:aborted",
+                reason: "candle_fetch_aborted",
+                timeout_ms: isLiveTickPhaseTimeout(e) ? e.timeout_ms : null,
+                tick_lease: myLease,
+                candidate_meta_missing_reason: "candle_fetch_aborted",
+                abort_reason: tickSignal.aborted
+                  ? "tick_abort_signal"
+                  : e instanceof Error && e.name === "AbortError"
+                    ? "abort_error"
+                    : "aborted_message",
               }),
             );
-
-            // Core majors only: allow evaluation using last_good candle cache when it's fresh enough.
-            if (CORE_MAJOR_MARKETS.has(m) && lastGood?.rows?.length && cacheAgeMs <= LIVE_LAST_GOOD_CANDLE_MAX_AGE_MS) {
-              candles1 = lastGood.rows;
-              candle_source = "last_good_cache";
-              candle_cache_age_ms = cacheAgeMs;
-              console.info(
-                JSON.stringify({
-                  tag: "LIVE_CANDIDATE_CANDLE_FETCH_DONE",
-                  ts: new Date().toISOString(),
-                  market: m,
-                  timeframe: `${unit}m`,
-                  timeout_ms: e.timeout_ms,
-                  elapsed_ms: 0,
-                  source: "last_good_cache",
-                  cache_age_ms: cacheAgeMs,
-                  rows: candles1.length,
-                }),
-              );
-            } else {
-              evaluationDroppedReasons[m] = "candle_fetch_timeout";
-              console.info(
-                JSON.stringify({
-                  tag: "LIVE_CANDIDATE_META_MARKET_DROPPED_PROOF",
-                  ts: new Date().toISOString(),
-                  market: m,
-                  phase: e.phase,
-                  reason: "candle_fetch_timeout",
-                  timeout_ms: e.timeout_ms,
-                  tick_lease: myLease,
-                  candidate_meta_missing_reason: "candle_fetch_timeout",
-                }),
-              );
-              return null;
-            }
+            return null;
+          }
+          if (isLiveTickPhaseTimeout(e) && e.phase.startsWith("candidate_meta_fetch_minute_candles:")) {
+            evaluationDroppedReasons[m] = "candle_fetch_timeout";
+            console.info(
+              JSON.stringify({
+                tag: "LIVE_CANDIDATE_META_MARKET_DROPPED_PROOF",
+                ts: new Date().toISOString(),
+                market: m,
+                phase: e.phase,
+                reason: "candle_fetch_timeout",
+                timeout_ms: e.timeout_ms,
+                tick_lease: myLease,
+                candidate_meta_missing_reason: "candle_fetch_timeout",
+              }),
+            );
+            return null;
           }
           evaluationDroppedReasons[m] = "candle_fetch_error";
           console.info(
@@ -4788,10 +4909,11 @@ export function createLiveDataStrategy(opts: {
               tag: "LIVE_CANDIDATE_META_MARKET_DROPPED_PROOF",
               ts: new Date().toISOString(),
               market: m,
-              phase: "fetch_minute_candles:inner_error",
+              phase: "candidate_meta_fetch_minute_candles:inner_error",
               reason: "candle_fetch_error",
               timeout_ms: null,
               tick_lease: myLease,
+              candidate_meta_missing_reason: "candle_fetch_error",
               error: e instanceof Error ? e.message.slice(0, 240) : String(e).slice(0, 240),
             }),
           );
