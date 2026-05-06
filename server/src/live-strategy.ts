@@ -6753,6 +6753,15 @@ export function createLiveDataStrategy(opts: {
       });
       if (isExceptionMarket && !exception) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "exception_not_selected" });
+        logPlacebuyFinalGateBlocked("exception_not_selected", {
+          entry_mode: isSurgeSource
+            ? "SURGE_V2"
+            : candidateMetaFromSetup?.setupReason === "CORE_TREND_ENTRY"
+              ? "CORE_TREND_ENTRY"
+              : "CORE_SPOT_DEFAULT",
+          base_gate_ok: gateOk,
+          base_gate_blocked_detail: !gateOk && !strongSymbolOverride ? (detailedReason ?? "base_gate_failed") : null,
+        });
         bumpSkip("exception_not_selected");
         continue;
       }
@@ -6772,7 +6781,22 @@ export function createLiveDataStrategy(opts: {
           bumpSkip(detailedReason ?? "base_gate_failed");
           continue;
         }
-        // Surge source bypasses core gate for non-hard blocks
+        // Surge source bypasses core gate for non-hard blocks: 반드시 최종 게이트(soft bypass) 로그를 남긴다.
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_PLACEBUY_ATTEMPT_FINAL_GATE",
+            ts: new Date().toISOString(),
+            market,
+            path: "preorder_base_gate_soft_bypass",
+            entry_mode: "SURGE_V2",
+            final_block_reason: null,
+            candidate_meta_missing_reason: null,
+            blocked_before_placebuy: false,
+            tick_lease: myLease,
+            base_gate_soft_bypass: true,
+            base_gate_blocked_detail: detailedReason ?? "base_gate_failed",
+          }),
+        );
       }
 
       let entryPipelineDetail: Record<string, unknown> = {};
