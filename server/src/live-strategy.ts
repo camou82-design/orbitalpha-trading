@@ -281,6 +281,8 @@ type OriginalSpotSetupResult = {
   stochK?: number;
   stochD?: number;
   volumeRatio?: number;
+  effective_volume_threshold?: number;
+  volume_relaxed_applied?: boolean;
   // Detailed flags
   safePriceAboveEma200?: boolean;
   pullbackToEma200?: boolean;
@@ -693,6 +695,16 @@ const LIVE_CORE_TREND_MIN_VOLUME_RATIO = (() => {
   const n = raw === undefined || raw === "" ? 1.02 : Number(raw);
   return Number.isFinite(n) ? Math.max(1.0, Math.min(2.5, n)) : 1.02;
 })();
+
+// CORE_TREND_ENTRY major-only volume relax (keep global default unchanged).
+const LIVE_CORE_TREND_MAJOR_MIN_VOLUME_RATIO = (() => {
+  const raw = process.env.LIVE_CORE_TREND_MAJOR_MIN_VOLUME_RATIO;
+  const n = raw === undefined || raw === "" ? 0.78 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0.65, Math.min(1.02, n)) : 0.78;
+})();
+
+/** volume relax 적용 대상은 메이저 5종으로 고정 (CORE_TREND_ENTRY_MARKETS 확장 시에도 안전) */
+const CORE_TREND_VOLUME_RELAX_MARKETS = new Set<string>(["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX"]);
 const LIVE_CORE_TREND_RSI_CAP = (() => {
   const raw = process.env.LIVE_CORE_TREND_RSI_CAP;
   const n = raw === undefined || raw === "" ? 72 : Number(raw);
@@ -1351,8 +1363,15 @@ function evaluateCoreTrendEntrySetup(
   candles1: UpbitCandle[],
   currentPrice: number,
   payload: { volume_ratio?: number },
+  ctx?: {
+    allow_major_volume_relax?: boolean;
+    source_kind?: string;
+    candle_source?: "live_fetch" | "last_good_cache";
+    market_state?: string | null;
+  },
 ): OriginalSpotSetupResult {
   void market;
+  const originalRequiredVolumeRatio = LIVE_CORE_TREND_MIN_VOLUME_RATIO;
   const coreReject = (
     reason: string,
     partial: Partial<OriginalSpotSetupResult> & { stoch_assist_score?: number },
@@ -1367,6 +1386,9 @@ function evaluateCoreTrendEntrySetup(
       core_trend_reject_reason: reason,
       stoch_assist_score: sas,
       stoch_assist_pass: sas >= 1,
+      effective_volume_threshold:
+        partial.effective_volume_threshold !== undefined ? partial.effective_volume_threshold : originalRequiredVolumeRatio,
+      volume_relaxed_applied: Boolean(partial.volume_relaxed_applied ?? false),
     };
   };
 
@@ -1398,18 +1420,6 @@ function evaluateCoreTrendEntrySetup(
   if ((k > prevK && k > 20) || (k > d && k > 35)) stochAssistScore += 1;
 
   const volPayload = Number(payload.volume_ratio ?? 0);
-  if (volPayload < LIVE_CORE_TREND_MIN_VOLUME_RATIO) {
-    return coreReject("core_trend_volume_ratio_low", {
-      ema50: ema50Last,
-      ema200: ema200Last,
-      rsi,
-      stochK: k,
-      stochD: d,
-      volumeRatio: volPayload,
-      stoch_assist_score: stochAssistScore,
-      failed_conditions: [`payload_volume_ratio_${volPayload.toFixed(3)}<${LIVE_CORE_TREND_MIN_VOLUME_RATIO}`],
-    });
-  }
 
   if (rsi >= LIVE_CORE_TREND_RSI_CAP) {
     return coreReject("core_trend_rsi_overheated", {
@@ -1498,6 +1508,48 @@ function evaluateCoreTrendEntrySetup(
     });
   }
 
+  // Volume gate: keep global default; allow major-only relax when all caller preconditions are met.
+  let effectiveRequiredVolumeRatio = originalRequiredVolumeRatio;
+  let volumeRelaxedApplied = false;
+  const allowMajorVolumeRelax =
+    Boolean(ctx?.allow_major_volume_relax) && CORE_TREND_VOLUME_RELAX_MARKETS.has(market) && LIVE_CORE_TREND_MAJOR_MIN_VOLUME_RATIO < originalRequiredVolumeRatio;
+  if (volPayload < originalRequiredVolumeRatio) {
+    if (allowMajorVolumeRelax && volPayload >= LIVE_CORE_TREND_MAJOR_MIN_VOLUME_RATIO) {
+      effectiveRequiredVolumeRatio = LIVE_CORE_TREND_MAJOR_MIN_VOLUME_RATIO;
+      volumeRelaxedApplied = true;
+      console.info(
+        JSON.stringify({
+          tag: "CORE_TREND_VOLUME_RELAX_PROOF",
+          ts: new Date().toISOString(),
+          market,
+          payload_volume_ratio: volPayload,
+          required_volume_ratio: effectiveRequiredVolumeRatio,
+          original_required_volume_ratio: originalRequiredVolumeRatio,
+          relaxed_applied: true,
+          source_kind: ctx?.source_kind ?? null,
+          candle_source: ctx?.candle_source ?? null,
+          risk_reward: rr,
+          rsi,
+          market_state: ctx?.market_state ?? null,
+          entry_mode: "CORE_TREND_ENTRY",
+        }),
+      );
+    } else {
+      return coreReject("core_trend_volume_ratio_low", {
+        ema50: ema50Last,
+        ema200: ema200Last,
+        rsi,
+        stochK: k,
+        stochD: d,
+        volumeRatio: volPayload,
+        stoch_assist_score: stochAssistScore,
+        effective_volume_threshold: originalRequiredVolumeRatio,
+        volume_relaxed_applied: false,
+        failed_conditions: [`payload_volume_ratio_${volPayload.toFixed(3)}<${originalRequiredVolumeRatio}`],
+      });
+    }
+  }
+
   return {
     ok: true,
     mode: "relaxed_probe",
@@ -1517,6 +1569,8 @@ function evaluateCoreTrendEntrySetup(
     core_trend_reject_reason: null,
     stoch_assist_score: stochAssistScore,
     stoch_assist_pass: stochAssistScore >= 1,
+    effective_volume_threshold: effectiveRequiredVolumeRatio,
+    volume_relaxed_applied: volumeRelaxedApplied,
   };
 }
 
@@ -4814,7 +4868,20 @@ export function createLiveDataStrategy(opts: {
             !isFallbackSource &&
             candle_source === "live_fetch"
           ) {
-            const trendSetup = evaluateCoreTrendEntrySetup(m, candles1, currentPx, effectivePayload);
+            const allowMajorVolumeRelax =
+              CORE_TREND_ENTRY_MARKETS.has(m) &&
+              CORE_TREND_VOLUME_RELAX_MARKETS.has(m) &&
+              realSignalPresent &&
+              !isFallbackSource &&
+              candle_source === "live_fetch" &&
+              !isSurgeCandidate &&
+              marketState.market_state !== "risk_off";
+            const trendSetup = evaluateCoreTrendEntrySetup(m, candles1, currentPx, effectivePayload, {
+              allow_major_volume_relax: allowMajorVolumeRelax,
+              source_kind: sourceKindFromPayload || sourceKindFromMap,
+              candle_source,
+              market_state: marketState.market_state,
+            });
             if (trendSetup.ok) {
               setup = trendSetup;
               softenedReasons.push("CORE_TREND_ENTRY_PROBE");
@@ -4827,6 +4894,8 @@ export function createLiveDataStrategy(opts: {
                   candle_source,
                   candle_cache_age_ms,
                   volume_ratio: vol,
+                  effective_volume_threshold: trendSetup.effective_volume_threshold ?? LIVE_CORE_TREND_MIN_VOLUME_RATIO,
+                  volume_relaxed_applied: Boolean(trendSetup.volume_relaxed_applied ?? false),
                   risk_reward: trendSetup.riskReward,
                   core_trend_entry_pass: Boolean(trendSetup.core_trend_entry_pass),
                   core_trend_reject_reason: trendSetup.core_trend_reject_reason ?? null,
@@ -4844,6 +4913,8 @@ export function createLiveDataStrategy(opts: {
                   candle_source,
                   candle_cache_age_ms,
                   reason: trendSetup.reason,
+                  effective_volume_threshold: trendSetup.effective_volume_threshold ?? LIVE_CORE_TREND_MIN_VOLUME_RATIO,
+                  volume_relaxed_applied: Boolean(trendSetup.volume_relaxed_applied ?? false),
                   core_trend_entry_pass: trendSetup.core_trend_entry_pass ?? false,
                   core_trend_reject_reason: trendSetup.core_trend_reject_reason ?? trendSetup.reason,
                   stoch_assist_score: trendSetup.stoch_assist_score ?? 0,
