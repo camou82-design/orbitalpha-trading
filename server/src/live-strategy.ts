@@ -6533,6 +6533,24 @@ export function createLiveDataStrategy(opts: {
           continue;
         }
       }
+
+      // late guard 통과 이후: 어떤 이유로든 주문 시도/차단 로그가 유실되지 않도록 "pre-order gate" 진입 로그를 남긴다.
+      console.info(
+        JSON.stringify({
+          tag: "LIVE_PREORDER_GATE_CHECK",
+          ts: new Date().toISOString(),
+          market,
+          entry_mode: isSurgeSource
+            ? "SURGE_V2"
+            : metaForGuard?.setupReason === "CORE_TREND_ENTRY"
+              ? "CORE_TREND_ENTRY"
+              : "CORE_SPOT_DEFAULT",
+          candle_source: metaForGuard?.candle_source ?? null,
+          candle_cache_age_ms: metaForGuard?.candle_cache_age_ms ?? null,
+          late_entry_guard_reason: lateEntryGuardReason,
+          late_entry_sizing_multiplier: Number(lateEntrySizingMultiplier.toFixed(4)),
+        }),
+      );
       const sigTypeUpper = (sig.p.signal_type ?? "").toUpperCase();
       if (sigTypeUpper === "LOW") {
         await appendLog({
@@ -6743,6 +6761,14 @@ export function createLiveDataStrategy(opts: {
         const isHardBlock = detailedReason === "cooldown_active" || detailedReason === "position_exists";
         if (!isSurgeSource || isHardBlock) {
           emitEval("DEBUG_LIVE_PRECHECK", { return_reason: detailedReason ?? "base_gate_failed" });
+          logPlacebuyFinalGateBlocked("base_gate_fail", {
+            entry_mode: isSurgeSource
+              ? "SURGE_V2"
+              : candidateMetaFromSetup?.setupReason === "CORE_TREND_ENTRY"
+                ? "CORE_TREND_ENTRY"
+                : "CORE_SPOT_DEFAULT",
+            base_gate_blocked_detail: detailedReason ?? "base_gate_failed",
+          });
           bumpSkip(detailedReason ?? "base_gate_failed");
           continue;
         }
