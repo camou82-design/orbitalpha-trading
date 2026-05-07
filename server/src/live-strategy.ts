@@ -2170,9 +2170,77 @@ export function createLiveDataStrategy(opts: {
     const PHASE_MS = LIVE_TICK_PHASE_MS;
     const racePhase = <T>(phase: string, timeout_ms: number, fn: () => Promise<T>) =>
       liveTickRacePhase({ phase, tick_lease: myLease, timeout_ms }, fn);
-    const raceTradeStatus = (phase: string) =>
-      racePhase(`trade_status:${phase}`, PHASE_MS.trade_status, () => opts.trade.status());
+    let lastGoodTradeStatus: TradeStatus | null = null;
+    let lastGoodTradeStatusAtMs = 0;
+    const safeDegradedTradeStatus = (): TradeStatus => ({
+      auto_trade_enabled: false,
+      api_connected: false,
+      live_enabled: false,
+      balances: [],
+      ledger_reconcile: null,
+      strategy_positions: {},
+      legacy_positions: {},
+      krw_available: 0,
+      live_order_available_krw: 0,
+      strategy_available_krw: 0,
+    });
+    const raceTradeStatusSafe = async (phase: string): Promise<TradeStatus> => {
+      try {
+        const st = await racePhase(`trade_status:${phase}`, PHASE_MS.trade_status, () => opts.trade.status());
+        if (st && typeof st === "object") {
+          lastGoodTradeStatus = st;
+          lastGoodTradeStatusAtMs = Date.now();
+        }
+        return st;
+      } catch (e) {
+        const now = Date.now();
+        const cacheAgeMs = lastGoodTradeStatusAtMs > 0 ? now - lastGoodTradeStatusAtMs : Infinity;
+        const useCache = lastGoodTradeStatus && cacheAgeMs < 30_000;
+        const fallback = useCache ? lastGoodTradeStatus! : safeDegradedTradeStatus();
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_TRADE_STATUS_FALLBACK_USED",
+            ts: new Date().toISOString(),
+            phase,
+            reason: isLiveTickPhaseTimeout(e) ? "timeout" : "error",
+            cache_used: useCache,
+            cache_age_ms: useCache ? cacheAgeMs : null,
+            api_connected: Boolean((fallback as any).api_connected),
+            live_enabled: Boolean((fallback as any).live_enabled),
+            auto_trade_enabled: Boolean((fallback as any).auto_trade_enabled),
+          }),
+        );
+        return fallback;
+      }
+    };
+    // Backward-compatible alias for the rest of the tick code.
+    const raceTradeStatus = (phase: string) => raceTradeStatusSafe(phase);
     const racePersist = (phase: string) => racePhase(`persist:${phase}`, PHASE_MS.persist, () => persist());
+
+    let lastGoodLogs: SignalLogEntry[] = [];
+    let lastGoodLogsAtMs = 0;
+    let logsRefreshInFlight: Promise<void> | null = null;
+    const requestLogsRefreshNonBlocking = () => {
+      const now = Date.now();
+      if (logsRefreshInFlight) return;
+      if (lastGoodLogsAtMs > 0 && now - lastGoodLogsAtMs < 12_000) return;
+      logsRefreshInFlight = (async () => {
+        try {
+          const rows = await liveTickRacePhase(
+            { phase: "read_logs_220_background", tick_lease: myLease, timeout_ms: Math.max(300, Math.min(1200, PHASE_MS.read_logs)) },
+            () => opts.readLogs(220),
+          );
+          if (Array.isArray(rows)) {
+            lastGoodLogs = rows;
+            lastGoodLogsAtMs = Date.now();
+          }
+        } catch {
+          // ignore
+        } finally {
+          logsRefreshInFlight = null;
+        }
+      })();
+    };
     await liveTickRacePhase(
       { phase: "tick_hard_wall_clock", tick_lease: myLease, timeout_ms: LIVE_TICK_HARD_WALL_MS },
       async () => {
@@ -2197,13 +2265,12 @@ export function createLiveDataStrategy(opts: {
       }
     }
 
-    const tstatus = await raceTradeStatus("initial_after_daily_reset");
-    const liveTradingOn =
-      tstatus.auto_trade_enabled === true &&
-      tstatus.live_enabled === true &&
-      tstatus.api_connected === true;
+    const tstatus = await raceTradeStatusSafe("initial_after_daily_reset");
+    const allowEntry =
+      tstatus.auto_trade_enabled === true && tstatus.live_enabled === true && tstatus.api_connected === true;
+    const liveTradingOn = allowEntry;
     const hasOpenPositions = Object.keys(state.positions).length > 0 || Object.keys(state.early_positions).length > 0;
-    const tradeStatusEntryBlocked = !liveTradingOn;
+    const tradeStatusEntryBlocked = !allowEntry;
     if (tradeStatusEntryBlocked) {
       console.info(
         JSON.stringify({
@@ -2217,6 +2284,18 @@ export function createLiveDataStrategy(opts: {
           has_open_positions: hasOpenPositions
         }),
       );
+      if (tstatus.auto_trade_enabled === true && tstatus.live_enabled === true && tstatus.api_connected === false) {
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_TRADE_STATUS_GUARD_DEGRADED_ALLOWED",
+            ts: new Date().toISOString(),
+            stage: "before_signal_load",
+            reason: "api_disconnected_but_keep_tick_running",
+            entry_blocked: true,
+            exit_management_continues: hasOpenPositions,
+          }),
+        );
+      }
     }
 
     // 계좌 실물 + trade-control ledger 기준으로 persisted 전략 상태를 정리 (수동 청산·외부 매도 후 유령 슬롯 방지).
@@ -2363,7 +2442,28 @@ export function createLiveDataStrategy(opts: {
         stale_filtered_before_eval: boolean;
       }
     >();
-    const logs = await racePhase("read_logs_220", PHASE_MS.read_logs, () => opts.readLogs(220));
+    requestLogsRefreshNonBlocking();
+    const logs = lastGoodLogs.length > 0 ? lastGoodLogs : [];
+    if (logs.length === 0) {
+      console.info(
+        JSON.stringify({
+          tag: "LIVE_LOG_READ_SKIPPED_FOR_TRADE_LOOP",
+          ts: new Date().toISOString(),
+          reason: "no_last_good_logs_available",
+          last_good_age_ms: lastGoodLogsAtMs > 0 ? Date.now() - lastGoodLogsAtMs : null,
+        }),
+      );
+    } else {
+      console.info(
+        JSON.stringify({
+          tag: "LIVE_LOG_READ_SKIPPED_FOR_TRADE_LOOP",
+          ts: new Date().toISOString(),
+          reason: "using_last_good_logs_snapshot",
+          last_good_age_ms: Date.now() - lastGoodLogsAtMs,
+          logs_len: logs.length,
+        }),
+      );
+    }
 
     let marketState: Awaited<ReturnType<MarketStateApi["evaluate"]>>;
     try {
@@ -3604,7 +3704,7 @@ export function createLiveDataStrategy(opts: {
         // 승격: normal 포지션으로 이동 (기존 exit 로직 적용)
         const stNow = await raceTradeStatus("early_promote_post_fill");
         const currency = market.replace("KRW-", "");
-        const bNow = stNow.balances?.find((x) => x.currency === currency);
+        const bNow = stNow.balances?.find((x: any) => x.currency === currency);
         const qty =
           bNow !== undefined ? Number(bNow.balance ?? 0) + Number(bNow.locked ?? 0) : Number(ep.qty ?? 0);
         state.positions[market] = {
@@ -6796,7 +6896,7 @@ export function createLiveDataStrategy(opts: {
               }
               const stEarly = await raceTradeStatus("early_entry_post_buy");
               const currency = market.replace("KRW-", "");
-              const bEarly = stEarly.balances?.find((x) => x.currency === currency);
+      const bEarly = stEarly.balances?.find((x: any) => x.currency === currency);
               const qtyEarly = Number(bEarly?.balance ?? 0) + Number(bEarly?.locked ?? 0);
               state.early_positions[market] = {
                 market,
@@ -7382,7 +7482,7 @@ export function createLiveDataStrategy(opts: {
 
       const st = await raceTradeStatus("entry_precheck_existing_holdings");
       const currency = market.replace("KRW-", "");
-      const bExist = st.balances?.find((x) => x.currency === currency);
+      const bExist = st.balances?.find((x: any) => x.currency === currency);
       const existingQty = Number(bExist?.balance ?? 0) + Number(bExist?.locked ?? 0);
       const markPrice = Number(priceBy.get(market) ?? 0);
       const existingValueKrw = existingQty > 0 && markPrice > 0 ? existingQty * markPrice : 0;
@@ -7947,7 +8047,7 @@ export function createLiveDataStrategy(opts: {
       }
       const price = priceBy.get(market) ?? 0;
       const st2 = await raceTradeStatus("post_core_buy_balance_snap");
-      const bFill = st2.balances?.find((x) => x.currency === currency);
+      const bFill = st2.balances?.find((x: any) => x.currency === currency);
       const qty = Number(bFill?.balance ?? 0) + Number(bFill?.locked ?? 0);
       const strategyPositionExistsBefore = Boolean(state.positions[market]);
       const marketMeta = candidateMeta.find(x => x.market === market);

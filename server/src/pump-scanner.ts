@@ -548,7 +548,12 @@ export function createPumpScanner(
 
       let baseTickers: UpbitTicker[] = [];
       try {
-        baseTickers = await fetchTickers([...BASE_MARKETS], { signal: tickAbort.signal });
+        baseTickers = await fetchTickers([...BASE_MARKETS], {
+          debugCaller: "pump-scanner:ticker_base",
+          signal: tickAbort.signal,
+          batchTimeoutMs: Math.max(800, Number(process.env.PUMP_SCANNER_TICKER_BATCH_TIMEOUT_MS ?? 3500)),
+          totalTimeoutMs: Math.max(1000, Number(process.env.PUMP_SCANNER_TICKER_BASE_TOTAL_TIMEOUT_MS ?? 7000)),
+        });
       } catch (e) {
         console.warn(JSON.stringify({
           tag: "PUMP_SCANNER_BASE_TICKER_FETCH_FAILED",
@@ -591,7 +596,10 @@ export function createPumpScanner(
         tickers = await fetchTickers(altMarkets, {
           ...pumpAltTickerOptsBase,
           maxMarkets: altMarkets.length,
+          debugCaller: "pump-scanner:ticker_alt",
           signal: tickAbort.signal,
+          batchTimeoutMs: Math.max(800, Number(process.env.PUMP_SCANNER_TICKER_BATCH_TIMEOUT_MS ?? 3500)),
+          totalTimeoutMs: Math.max(1000, Number(process.env.PUMP_SCANNER_TICKER_ALT_TOTAL_TIMEOUT_MS ?? 12_000)),
         });
       } catch (e) {
         console.warn(JSON.stringify({
@@ -599,13 +607,35 @@ export function createPumpScanner(
           error: e instanceof Error ? e.message : String(e)
         }));
       }
+      if (tickers.length === 0) {
+        console.warn(
+          JSON.stringify({
+            tag: "PUMP_SCANNER_TICK_BUDGET_DROPPED_PROOF",
+            ts: new Date().toISOString(),
+            phase: "ticker_alt_returned_zero",
+            ticker_returned: 0,
+            alt_market_count: altMarkets.length,
+            elapsed_ms: Date.now() - tickT0,
+            action: "release_tick_early",
+          }),
+        );
+        return;
+      }
       const tAfterAltTickers = Date.now();
       const fetchedAltSet = new Set(tickers.map((t) => t.market));
       const heldMissingFromTicker = heldMarkets.filter((m) => !BASE_MARKET_SET.has(m) && !fetchedAltSet.has(m) && !is429Excluded(m));
       
       let heldExtraTickers: UpbitTicker[] = [];
       try {
-        heldExtraTickers = heldMissingFromTicker.length > 0 ? await fetchTickers(heldMissingFromTicker, { signal: tickAbort.signal }) : [];
+        heldExtraTickers =
+          heldMissingFromTicker.length > 0
+            ? await fetchTickers(heldMissingFromTicker, {
+                debugCaller: "pump-scanner:ticker_held_extra",
+                signal: tickAbort.signal,
+                batchTimeoutMs: Math.max(800, Number(process.env.PUMP_SCANNER_TICKER_BATCH_TIMEOUT_MS ?? 3500)),
+                totalTimeoutMs: Math.max(1000, Number(process.env.PUMP_SCANNER_TICKER_HELD_TOTAL_TIMEOUT_MS ?? 5000)),
+              })
+            : [];
       } catch (e) {
         console.warn(JSON.stringify({
           tag: "PUMP_SCANNER_HELD_TICKER_FETCH_FAILED",

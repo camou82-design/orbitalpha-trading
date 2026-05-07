@@ -49,6 +49,10 @@ export type FetchTickersOptions = {
   debugCaller?: string;
   /** 라이브 틱 취소 시 진행 중인 ticker 배치가 길게 붙잡히지 않도록 전달. */
   signal?: AbortSignal;
+  /** 각 ticker 배치(Upbit /v1/ticker 호출 단위)의 하드 타임아웃(ms). */
+  batchTimeoutMs?: number;
+  /** 전체 fetchTickers 호출의 하드 예산(ms). 초과 시 남은 배치는 드랍하고 현재까지 결과만 반환. */
+  totalTimeoutMs?: number;
 };
 
 function sleep(ms: number): Promise<void> {
@@ -134,9 +138,8 @@ async function fetchJson<T>(path: string, signal?: AbortSignal, timeoutMs = 8000
   const url = `${UPBIT}${path}`;
   const ctrl = new AbortController();
   const tid = setTimeout(() => ctrl.abort(), timeoutMs);
-  if (signal) {
-    signal.addEventListener("abort", () => ctrl.abort());
-  }
+  const onAbort = () => ctrl.abort();
+  if (signal) signal.addEventListener("abort", onAbort, { once: true });
 
   try {
     const r = await fetch(url, {
@@ -150,6 +153,7 @@ async function fetchJson<T>(path: string, signal?: AbortSignal, timeoutMs = 8000
     return (await r.json()) as Promise<T>;
   } finally {
     clearTimeout(tid);
+    if (signal) signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -495,21 +499,32 @@ function chunk<T>(arr: T[], size: number): T[][] {
   return out;
 }
 
-async function fetchTickerBatchGroup(group: string[], signal?: AbortSignal): Promise<UpbitTicker[]> {
+async function fetchTickerBatchGroup(args: {
+  group: string[];
+  signal?: AbortSignal;
+  batchTimeoutMs?: number;
+  debugCaller?: string;
+}): Promise<UpbitTicker[]> {
+  const { group, signal, batchTimeoutMs, debugCaller } = args;
   const out: UpbitTicker[] = [];
+  const batchT0 = Date.now();
+  const batchCtrl = new AbortController();
+  const onAbort = () => batchCtrl.abort();
+  if (signal) signal.addEventListener("abort", onAbort, { once: true });
+  const tid = setTimeout(() => batchCtrl.abort(), Math.max(200, batchTimeoutMs ?? 8000));
   for (let attempt = 1; attempt <= Math.max(1, TICKER_429_MAX_ATTEMPTS); attempt++) {
     try {
-      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      if (batchCtrl.signal.aborted) throw new DOMException("Aborted", "AbortError");
       const rows: UpbitTicker[] = [];
       const q = encodeURIComponent(group.join(","));
       try {
-        rows.push(...(await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${q}`, signal)));
+        rows.push(...(await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${q}`, batchCtrl.signal)));
       } catch (batchErr) {
         if (!is404MarketError(batchErr)) throw batchErr;
         for (const market of group) {
           try {
             const sq = encodeURIComponent(market);
-            const one = await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${sq}`, signal);
+            const one = await fetchJson<UpbitTicker[]>(`/v1/ticker?markets=${sq}`, batchCtrl.signal);
             rows.push(...one);
           } catch (singleErr) {
             if (is404MarketError(singleErr)) {
@@ -532,7 +547,22 @@ async function fetchTickerBatchGroup(group: string[], signal?: AbortSignal): Pro
       out.push(...mapped);
       break;
     } catch (e) {
-      if (signal?.aborted || (e instanceof DOMException && e.name === "AbortError")) throw e;
+      if (batchCtrl.signal.aborted || (e instanceof DOMException && e.name === "AbortError")) {
+        if (String(debugCaller ?? "").includes("pump")) {
+          console.info(
+            JSON.stringify({
+              tag: "PUMP_SCANNER_FETCH_BATCH_TIMEOUT_PROOF",
+              ts: new Date().toISOString(),
+              markets_count: group.length,
+              sample: group.slice(0, 12),
+              elapsed_ms: Date.now() - batchT0,
+              timeout_ms: Math.max(200, batchTimeoutMs ?? 8000),
+              attempt,
+            }),
+          );
+        }
+        break;
+      }
       const status = e instanceof UpbitHttpError ? e.status : undefined;
       const is429 = status === 429 || (e instanceof Error && e.message.includes("429"));
       if (is429) {
@@ -568,9 +598,11 @@ async function fetchTickerBatchGroup(group: string[], signal?: AbortSignal): Pro
         break;
       }
       const retryDelay = TICKER_429_RETRY_DELAY_MS * attempt;
-      await sleepAbortable(retryDelay, signal);
+      await sleepAbortable(retryDelay, batchCtrl.signal);
     }
   }
+  clearTimeout(tid);
+  if (signal) signal.removeEventListener("abort", onAbort);
   return out;
 }
 
@@ -631,12 +663,34 @@ export async function fetchTickers(markets: string[], opts?: FetchTickersOptions
   const parallelTickerBatches = Math.max(1, Math.min(20, opts?.parallelTickerBatches ?? 1));
   const batches = chunk(needFetch, batchSize);
   const tickSignal = opts?.signal;
+  const totalTimeoutMs = opts?.totalTimeoutMs ?? null;
+  const batchTimeoutMs = opts?.batchTimeoutMs ?? null;
 
   const out: UpbitTicker[] = [...cachedOut];
   for (let i = 0; i < batches.length; i += parallelTickerBatches) {
     if (tickSignal?.aborted) throw new DOMException("Aborted", "AbortError");
+    if (totalTimeoutMs !== null && Date.now() - now0 > totalTimeoutMs) {
+      if (String(opts?.debugCaller ?? "").includes("pump")) {
+        console.info(
+          JSON.stringify({
+            tag: "PUMP_SCANNER_TICK_BUDGET_DROPPED_PROOF",
+            ts: new Date().toISOString(),
+            phase: "fetch_tickers_total_budget",
+            elapsed_ms: Date.now() - now0,
+            total_timeout_ms: totalTimeoutMs,
+            fetched_so_far: out.length,
+            remaining_batches: Math.max(0, Math.ceil((batches.length - i) / parallelTickerBatches)),
+          }),
+        );
+      }
+      break;
+    }
     const slice = batches.slice(i, i + parallelTickerBatches);
-    const results = await Promise.all(slice.map((g) => fetchTickerBatchGroup(g, tickSignal)));
+    const results = await Promise.all(
+      slice.map((g) =>
+        fetchTickerBatchGroup({ group: g, signal: tickSignal, batchTimeoutMs: batchTimeoutMs ?? undefined, debugCaller: opts?.debugCaller }),
+      ),
+    );
     for (const r of results) {
       for (const t of r) {
         const now = Date.now();
