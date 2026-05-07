@@ -2690,8 +2690,8 @@ export function createLiveDataStrategy(opts: {
               market: item.market,
               score: Number(item.scanner_score ?? 0),
               volumeMultiple: Number(item.volume_multiple ?? 0),
-              breakout: Boolean(item.filter_pass), // item.filter_pass is breakout && close_upper_hold
-              closeUpperHold: true, // simplified for shadow merge
+              breakout: Boolean(item.filter_pass), // best-effort: treat filter_pass as composite breakout+close hold
+              closeUpperHold: Boolean(item.filter_pass),
               rise3mPct: 0, 
               capturedAt: shadow.updated_at,
               updatedAt: shadow.updated_at,
@@ -2705,9 +2705,9 @@ export function createLiveDataStrategy(opts: {
                  signal_score: Number(item.scanner_score ?? 0),
                  volume_ratio: Number(item.volume_multiple ?? 0),
                  volume_multiple: Number(item.volume_multiple ?? 0),
-                 breakout: true, 
-                 close_upper_hold: true,
-                 filter_pass: true,
+                 breakout: Boolean(item.filter_pass),
+                 close_upper_hold: Boolean(item.filter_pass),
+                 filter_pass: Boolean(item.filter_pass),
                  source_kind: item.source_kind || "scanner_tradable_candidate",
                  reason: "scanner_external_bridge",
                  updated_at: shadow.updated_at,
@@ -5001,33 +5001,45 @@ export function createLiveDataStrategy(opts: {
       Number(tstatus.strategy_available_krw ?? tstatus.live_order_available_krw ?? tstatus.krw_available ?? 0),
     );
 
+    // Account-wide equity & cap policy (SURGE_V2 / spot live entry).
+    // - Total equity = KRW cash(total) + all coin evaluated value (mark price; fallback avg if missing).
+    // - Cap ratio is fixed at 50%.
+    // - "Used" includes: evaluated value of in-scope holdings (managed + passive holdings shown/managed by the engine) + pending/reserved buy KRW.
+    const reservedKrw = Math.max(0, Number((tstatus as any).reserved_krw ?? 0));
+    let accountSpotHoldingsValueKrw = 0;
+    for (const b of Array.isArray(tstatus.balances) ? tstatus.balances : []) {
+      const currency = String(b.currency ?? "").toUpperCase();
+      if (!currency || currency === "KRW") continue;
+      const mk = `KRW-${currency}`;
+      const qty = Number(b.balance ?? 0) + Number(b.locked ?? 0);
+      const px = Number(priceBy.get(mk) ?? b.avg_buy_price ?? 0);
+      if (qty > 0 && px > 0) accountSpotHoldingsValueKrw += qty * px;
+    }
+    const portfolioEquityKrwRaw = Number((tstatus as any)?.account_portfolio?.total_evaluated_krw ?? NaN);
+    const fallbackEquityKrw = Math.max(0, Number((tstatus as any).total_krw ?? 0)) + Math.max(0, accountSpotHoldingsValueKrw);
+    const totalLiveCapitalKrw = Math.floor(Number.isFinite(portfolioEquityKrwRaw) && portfolioEquityKrwRaw > 0 ? portfolioEquityKrwRaw : fallbackEquityKrw);
+    const surgeCapitalLimitKrw = Math.floor(totalLiveCapitalKrw * SURGE_LIVE_CAPITAL_RATIO);
+    const surgeUsedCapitalKrw = Math.max(0, accountSpotHoldingsValueKrw) + reservedKrw;
+    const surgeCapitalRemainingKrw = Math.max(0, surgeCapitalLimitKrw - surgeUsedCapitalKrw);
+    let surgeRemainingForTickKrw = surgeCapitalRemainingKrw;
+
     let liveOpenPositionValueKrw = 0;
     let earlyOpenPositionValueKrw = 0;
-    let surgeUsedCapitalKrw = 0;
+    let surgeManagedMarkValueKrw = 0;
     for (const p of Object.values(state.positions)) {
       const mk = p.market;
       const px = priceBy.get(mk) ?? p.entry_price;
       const val = p.qty * px;
       liveOpenPositionValueKrw += val;
-      if (p.engine_bucket === "surge") {
-        surgeUsedCapitalKrw += Math.max(val, Number(p.filled_entry_krw ?? p.order_krw ?? 0));
-      }
+      if (p.engine_bucket === "surge") surgeManagedMarkValueKrw += Math.max(0, val);
     }
-
     for (const p of Object.values(state.early_positions)) {
       const mk = p.market;
       const px = priceBy.get(mk) ?? p.entry_price;
       const markValue = p.qty * px;
       earlyOpenPositionValueKrw += markValue;
-      if (p.engine_bucket === "surge") {
-        surgeUsedCapitalKrw += Math.max(markValue, Number(p.filled_entry_krw ?? p.order_krw ?? 0));
-      }
+      if (p.engine_bucket === "surge") surgeManagedMarkValueKrw += Math.max(0, markValue);
     }
-
-    const totalLiveCapitalKrw = Math.floor(strategyUsableKrwForAlloc + liveOpenPositionValueKrw + earlyOpenPositionValueKrw);
-    const surgeCapitalLimitKrw = Math.floor(totalLiveCapitalKrw * SURGE_LIVE_CAPITAL_RATIO);
-    const surgeCapitalRemainingKrw = Math.max(0, surgeCapitalLimitKrw - surgeUsedCapitalKrw);
-    let surgeRemainingForTickKrw = surgeCapitalRemainingKrw;
 
     console.info(
       JSON.stringify({
@@ -5037,9 +5049,14 @@ export function createLiveDataStrategy(opts: {
         surgeCapitalLimitKrw,
         surgeUsedCapitalKrw,
         surgeCapitalRemainingKrw,
+        used_holdings_value_krw: Math.floor(accountSpotHoldingsValueKrw),
+        reserved_krw: Math.floor(reservedKrw),
+        equity_source:
+          Number.isFinite(portfolioEquityKrwRaw) && portfolioEquityKrwRaw > 0 ? "account_portfolio.total_evaluated_krw" : "fallback(total_krw+holdings)",
         strategyUsableKrwForAlloc,
         liveOpenPositionValueKrw,
         earlyOpenPositionValueKrw,
+        surge_managed_mark_value_krw: Math.floor(surgeManagedMarkValueKrw),
       })
     );
 
@@ -7208,6 +7225,97 @@ export function createLiveDataStrategy(opts: {
           strong_symbol_override: strongSymbolOverride,
         },
       });
+
+      // SURGE_V2 hardening: scanner-derived discovery is NOT a buy-allow condition.
+      // Enforce hard blocks for scanner-only scenarios and known filter failures.
+      if (isSurgeSource) {
+        const scannerSource = String(payloadSourceKind || sourceKindForJudgment || "");
+        const isScannerDerived =
+          scannerSource.includes("scanner") ||
+          scannerSource.includes("scanner_filter_fresh") ||
+          scannerSource.includes("scanner_tradable_candidate") ||
+          scannerSource.includes("scanner_bridge_score_fail");
+
+        if (isScannerDerived && filterPassCount === 0) {
+          emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "surge_scanner_only_filter_pass_count_zero" });
+          logPlacebuyFinalGateBlocked("surge_scanner_only_filter_pass_count_zero", {
+            entry_mode: "SURGE_V2",
+            filter_pass_count: filterPassCount,
+            scanner_source: scannerSource,
+          });
+          bumpSkip("surge_scanner_only_filter_pass_count_zero");
+          continue;
+        }
+
+        if (!filterPass) {
+          emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "surge_filter_pass_required" });
+          logPlacebuyFinalGateBlocked("surge_filter_pass_required", {
+            entry_mode: "SURGE_V2",
+            filter_pass: filterPass,
+            scanner_source: scannerSource,
+          });
+          bumpSkip("surge_filter_pass_required");
+          continue;
+        }
+
+        const filtersArr = Array.isArray(sig.p.filters) ? (sig.p.filters as Array<{ id?: unknown; passed?: unknown }>) : [];
+        const failedFilterIds = new Set(
+          filtersArr
+            .filter((f) => f && f.passed === false)
+            .map((f) => String(f.id ?? ""))
+            .filter((x) => x.length > 0),
+        );
+        const volumeIncreaseFailed = failedFilterIds.has("volume_increase");
+        const boxBreakoutFailed = failedFilterIds.has("box_breakout");
+        const closeUpperHoldFailed = failedFilterIds.has("volume_spike_close_fail");
+
+        if (volumeIncreaseFailed && boxBreakoutFailed) {
+          emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "surge_scanner_volume_and_breakout_failed" });
+          logPlacebuyFinalGateBlocked("surge_scanner_volume_and_breakout_failed", {
+            entry_mode: "SURGE_V2",
+            failed_filters: [...failedFilterIds],
+            scanner_source: scannerSource,
+          });
+          bumpSkip("surge_scanner_volume_and_breakout_failed");
+          continue;
+        }
+
+        if (closeUpperHoldFailed) {
+          emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "surge_scanner_close_upper_hold_failed" });
+          logPlacebuyFinalGateBlocked("surge_scanner_close_upper_hold_failed", {
+            entry_mode: "SURGE_V2",
+            failed_filters: [...failedFilterIds],
+            scanner_source: scannerSource,
+          });
+          bumpSkip("surge_scanner_close_upper_hold_failed");
+          continue;
+        }
+
+        const setupFailed = (candidateMetaFromSetup?.surge_shadow_setup?.failed_conditions ?? []).map((x: any) => String(x ?? ""));
+        const hardSetupFails = ["volume_spike_close_fail", "high_rejected", "retest_fail", "volume_fade"];
+        const hitHardSetupFail = hardSetupFails.find((k) => setupFailed.some((s) => s.includes(k)));
+        if (hitHardSetupFail) {
+          emitEval("DEBUG_LIVE_PRECHECK", { return_reason: `surge_setup_failed:${hitHardSetupFail}` });
+          logPlacebuyFinalGateBlocked(`surge_setup_failed:${hitHardSetupFail}`, {
+            entry_mode: "SURGE_V2",
+            failed_surge_conditions: setupFailed,
+            scanner_source: scannerSource,
+          });
+          bumpSkip(`surge_setup_failed:${hitHardSetupFail}`);
+          continue;
+        }
+
+        if (volumeState === "faded") {
+          emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "surge_volume_fade_hard_block" });
+          logPlacebuyFinalGateBlocked("surge_volume_fade_hard_block", {
+            entry_mode: "SURGE_V2",
+            volume_state: volumeState,
+            scanner_source: scannerSource,
+          });
+          bumpSkip("surge_volume_fade_hard_block");
+          continue;
+        }
+      }
       if (isExceptionMarket && !exception) {
         const baseGateBlockedDetailForBypass =
           !gateOk && !strongSymbolOverride ? (detailedReason ?? "base_gate_failed") : null;
@@ -7216,6 +7324,9 @@ export function createLiveDataStrategy(opts: {
           !!candidateMetaFromSetup &&
           !candidateMetaEvalDropReason &&
           gateOk === true &&
+          filterPass === true &&
+          Number(candidateMetaFromSetup?.stopPrice ?? 0) > 0 &&
+          Number(candidateMetaFromSetup?.riskReward ?? 0) > 0 &&
           baseGateBlockedDetailForBypass === null;
 
         if (surgeExceptionSelectionBypass) {
@@ -7628,6 +7739,73 @@ export function createLiveDataStrategy(opts: {
       const remainingPerMarket = Math.max(0, ORDER_LIMITS.MAX_STRATEGY_INVESTED_KRW_PER_MARKET - investedSoFar);
       orderKrw = Math.min(orderKrw, remainingPerMarket);
       orderKrw = Math.min(orderKrw, surgeRemainingForTickKrw, liveOrderAvailableKrw, LIVE_MAX_ENTRY_KRW);
+
+      // Required pre-order snapshot log (must exist before any new entry attempt).
+      // Note: `LIVE_PREORDER_GATE_CHECK` earlier is the pipeline entry log; this one is the final "preorder allowed?" snapshot.
+      {
+        const requiredCapitalKrw = Math.floor(orderKrw);
+        const capRemainingKrw = Math.floor(Math.max(0, surgeCapitalLimitKrw - surgeUsedCapitalKrw));
+        const projectedUsedKrw = Math.floor(surgeUsedCapitalKrw + requiredCapitalKrw);
+        const finalAllowed = !(surgeCapitalLimitKrw > 0 && projectedUsedKrw > surgeCapitalLimitKrw);
+        const scannerSource = String(payloadSourceKind || sourceKindForJudgment || "");
+        const stopPrice = isSurgeSource ? Number(metaForGuard?.stopPrice ?? 0) : null;
+        const riskReward = isSurgeSource ? Number(metaForGuard?.riskReward ?? 0) : null;
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_PREORDER_GATE_CHECK",
+            ts: new Date().toISOString(),
+            market,
+            totalEquity: Math.floor(totalLiveCapitalKrw),
+            surgeCapAmount: Math.floor(surgeCapitalLimitKrw),
+            usedCapitalIncludingPassive: Math.floor(surgeUsedCapitalKrw),
+            pendingBuyReserved: Math.floor(reservedKrw),
+            requiredCapital: requiredCapitalKrw,
+            capRemaining: capRemainingKrw,
+            filter_pass: Boolean(sig?.p?.filter_pass),
+            base_gate_ok: gateOk,
+            scanner_source: scannerSource,
+            stopPrice,
+            riskReward,
+            final_preorder_allowed: finalAllowed,
+            block_reason: finalAllowed ? null : "capital_cap_exceeded",
+          }),
+        );
+      }
+
+      // Capital cap gate (account-wide equity based).
+      // Block *before* placing new order if (used + requiredCapital) exceeds the fixed 50% cap.
+      if (liveTradingOn && orderKrw > 0) {
+        const requiredCapitalKrw = Math.floor(orderKrw);
+        const projectedUsedKrw = Math.floor(surgeUsedCapitalKrw + requiredCapitalKrw);
+        if (surgeCapitalLimitKrw > 0 && projectedUsedKrw > surgeCapitalLimitKrw) {
+          const tag = isSurgeSource ? "SURGE_CAP_EXCEEDED_BLOCK" : "SPOT_CAP_EXCEEDED_BLOCK";
+          console.info(
+            JSON.stringify({
+              tag,
+              ts: new Date().toISOString(),
+              market,
+              stage: "LIVE_PREORDER_GATE_CHECK",
+              entry_mode: isSurgeSource ? "SURGE_V2" : "CORE_SPOT_DEFAULT",
+              required_capital_krw: requiredCapitalKrw,
+              used_capital_krw: Math.floor(surgeUsedCapitalKrw),
+              projected_used_capital_krw: projectedUsedKrw,
+              cap_limit_krw: Math.floor(surgeCapitalLimitKrw),
+              total_equity_krw: Math.floor(totalLiveCapitalKrw),
+              reserved_krw: Math.floor(reservedKrw),
+            }),
+          );
+          bumpSkip("capital_cap_exceeded");
+          emitFinalBlocked("capital_cap_exceeded", {
+            required_capital_krw: requiredCapitalKrw,
+            used_capital_krw: Math.floor(surgeUsedCapitalKrw),
+            projected_used_capital_krw: projectedUsedKrw,
+            cap_limit_krw: Math.floor(surgeCapitalLimitKrw),
+            total_equity_krw: Math.floor(totalLiveCapitalKrw),
+            reserved_krw: Math.floor(reservedKrw),
+          });
+          continue;
+        }
+      }
 
       const gateScore = Number(opts.marketState.entryGate(sig.p, marketState).score ?? 0);
       emitEval("DEBUG_LIVE_ORDER_SIZING", {
