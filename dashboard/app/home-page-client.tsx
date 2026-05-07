@@ -128,7 +128,8 @@ function singleFailedFilterId(parsed: NonNullable<ReturnType<typeof parseSignalP
   return failed.length === 1 ? failed[0]!.id : null;
 }
 
-const DASHBOARD_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"] as const;
+const CORE_WATCH_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX", "KRW-DOGE"] as const;
+const DASHBOARD_MARKETS = CORE_WATCH_MARKETS;
 const UPBIT_FEE_RATE = 0.0005;
 
 /** API 구버전 대비 — 서버 `volume-thresholds`와 동기 */
@@ -1972,6 +1973,29 @@ export default function HomePage() {
     return map;
   }, [holdingCards]);
 
+  const managedMarketSet = useMemo(() => {
+    const out = new Set<string>();
+    for (const [m, meta] of Object.entries(trade?.strategy_positions ?? {})) {
+      if (!m.startsWith("KRW-")) continue;
+      if (Number((meta as { qty?: unknown } | null | undefined)?.qty ?? 0) > 0) out.add(m);
+    }
+    for (const [m, pos] of Object.entries(strategy?.open_positions ?? {})) {
+      if (!m.startsWith("KRW-")) continue;
+      if (Number((pos as { remaining_qty?: unknown } | null | undefined)?.remaining_qty ?? 0) > 0) out.add(m);
+    }
+    return out;
+  }, [trade, strategy]);
+
+  const passiveHoldingCards = useMemo(
+    () => holdingCards.filter((h) => h.qty > 0 && !managedMarketSet.has(h.market)),
+    [holdingCards, managedMarketSet],
+  );
+
+  const managedHoldingCards = useMemo(
+    () => holdingCards.filter((h) => h.qty > 0 && managedMarketSet.has(h.market)),
+    [holdingCards, managedMarketSet],
+  );
+
   const paperSummary = useMemo<PaperPanelSummary>(() => toPaperPanelSummary(paper), [paper]);
   const liveOperatingCapital = useMemo(() => deriveLiveOperatingCapital(trade), [trade]);
 
@@ -2007,6 +2031,27 @@ export default function HomePage() {
     if (trade?.api_connected) return "API 연결됨 · 승인 필요";
     return "API 확인 필요";
   }, [trade, accountSyncState]);
+
+  const liveCapitalCapSummary = useMemo(() => {
+    const totalEquity =
+      assetSummary.kpi === "ready"
+        ? Number(assetSummary.totalAssets)
+        : Math.max(0, Number(trade?.account_portfolio?.total_evaluated_krw ?? accountTotalEquity ?? 0));
+    const surgeCapAmount = Math.floor(totalEquity * 0.5);
+    const pendingBuyReserved = Math.max(0, Number(trade?.reserved_krw ?? 0));
+    const holdingsEval = Math.max(0, totalEquity - Math.max(0, Number(trade?.account_portfolio?.krw_total_krw ?? trade?.total_krw ?? trade?.krw_available ?? 0)));
+    const usedCapitalIncludingPassive = Math.max(0, holdingsEval + pendingBuyReserved);
+    const capRemaining = Math.max(0, surgeCapAmount - usedCapitalIncludingPassive);
+    const allowed = surgeCapAmount > 0 ? usedCapitalIncludingPassive < surgeCapAmount : false;
+    return {
+      totalEquity,
+      surgeCapAmount,
+      usedCapitalIncludingPassive,
+      pendingBuyReserved,
+      capRemaining,
+      allowed,
+    };
+  }, [assetSummary, trade, accountTotalEquity]);
 
   const accountSyncFailureDisplay = useMemo(() => {
     if (trade?.api_connected) return null;
@@ -2438,204 +2483,278 @@ export default function HomePage() {
           </div>
         </section>
 
+        <section
+          style={{
+            background: UI.cardBg,
+            border: `1px solid ${UI.border}`,
+            borderRadius: 12,
+            padding: "0.85rem 1rem",
+            marginBottom: "0.95rem",
+            boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.32)",
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+            <div>
+              <div style={{ fontSize: "0.92rem", color: UI.title, fontWeight: 900, letterSpacing: "0.02em" }}>자금 cap 상태 (SURGE 50%)</div>
+              <div style={{ fontSize: "0.72rem", color: UI.mutedSoft, marginTop: 3 }}>
+                기존 보유분도 50% cap 계산에 포함됨
+              </div>
+            </div>
+            <div
+              style={{
+                fontSize: "0.76rem",
+                color: liveCapitalCapSummary.capRemaining >= 5000 ? UI.pass : UI.watch,
+                fontWeight: 900,
+              }}
+            >
+              {liveCapitalCapSummary.capRemaining >= 5000 ? "신규 매수 여지 있음" : "cap 여지 부족"}
+            </div>
+          </div>
+          <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 8, fontSize: "0.78rem" }}>
+            <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.65rem 0.75rem" }}>
+              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", fontWeight: 700 }}>totalEquity</div>
+              <div style={{ color: UI.title, fontWeight: 900, fontSize: "1.05rem" }}>{Math.round(liveCapitalCapSummary.totalEquity).toLocaleString()}</div>
+            </div>
+            <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.65rem 0.75rem" }}>
+              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", fontWeight: 700 }}>surgeCapAmount (50%)</div>
+              <div style={{ color: UI.title, fontWeight: 900, fontSize: "1.05rem" }}>{Math.round(liveCapitalCapSummary.surgeCapAmount).toLocaleString()}</div>
+            </div>
+            <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.65rem 0.75rem" }}>
+              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", fontWeight: 700 }}>usedCapitalIncludingPassive</div>
+              <div style={{ color: UI.title, fontWeight: 900, fontSize: "1.05rem" }}>{Math.round(liveCapitalCapSummary.usedCapitalIncludingPassive).toLocaleString()}</div>
+            </div>
+            <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.65rem 0.75rem" }}>
+              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", fontWeight: 700 }}>pendingBuyReserved</div>
+              <div style={{ color: UI.title, fontWeight: 900, fontSize: "1.05rem" }}>{Math.round(liveCapitalCapSummary.pendingBuyReserved).toLocaleString()}</div>
+            </div>
+            <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.65rem 0.75rem" }}>
+              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", fontWeight: 700 }}>capRemaining</div>
+              <div style={{ color: liveCapitalCapSummary.capRemaining >= 5000 ? UI.pass : UI.watch, fontWeight: 900, fontSize: "1.05rem" }}>
+                {Math.round(liveCapitalCapSummary.capRemaining).toLocaleString()}
+              </div>
+            </div>
+          </div>
+        </section>
+
         <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>
-          계좌 보유 종목 (Account Holdings)
+          주요 감시 종목
         </section>
-        <section
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
-            gap: "0.9rem",
-            marginBottom: "1.15rem",
-          }}
-        >
-          {holdingCards.map((h) => {
-            const pnlColor = h.netPnl > 0 ? "#22c55e" : h.netPnl < 0 ? "#ef4444" : UI.muted;
-            const retColor = h.netRet > 0 ? "#22c55e" : h.netRet < 0 ? "#ef4444" : UI.muted;
-            const hasHolding = h.qty > 0;
-            const latest = latestByMarket[h.market] ?? null;
-            const entries = Number((trade?.strategy_positions?.[h.market]?.entries as number | undefined) ?? 0);
-            const orderLimits = trade?.order_limits ?? marketState?.order_limits ?? ORDER_LIMITS;
-            const additionalBuyStatus = formatAdditionalBuyStatus({
-              hasHolding,
-              apiConnected: Boolean(trade?.api_connected),
-              autoTradeEnabled,
-              safetyStop: strategy?.safety_guard_state === "자동정지",
-              marketState,
-              orderLimits,
-              stepKrw: Number(trade?.test_order_krw ?? 5000),
-              signalPayload: latest?.entry?.payload,
-              strategyQty: h.strategyQty,
-              legacyQty: h.legacyQty,
-              entries,
-              investedKrw: h.strategyInvestedKrw,
-              legacyDcaCount: h.legacyDcaCount,
-              legacyDcaMax: h.legacyDcaMax,
-              legacyDcaAvailable: h.legacyDcaAvailable,
-              legacyDcaKrw: h.legacyDcaKrwTotal,
-            });
-            return (
-              <article
-                key={`asset-${h.market}`}
-                style={{
-                  background: UI.cardBg,
-                  border: hasHolding ? `1px solid ${UI.border}` : `1px solid ${UI.borderSoft}`,
-                  borderRadius: 12,
-                  padding: "0.75rem 0.85rem",
-                  boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.24)",
-                  opacity: hasHolding ? 1 : 0.9,
-                }}
-              >
-                <div style={{ fontSize: "1.02rem", color: UI.title, fontWeight: 900, letterSpacing: "0.02em", marginBottom: 8 }}>{h.currency}</div>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 6, fontSize: "0.8rem" }}>
-                  <span style={{ color: UI.mutedSoft }}>보유수량</span>
-                  <strong style={{ color: UI.body }}>{h.qty.toLocaleString(undefined, { maximumFractionDigits: 8 })}</strong>
-                  <span style={{ color: UI.mutedSoft }}>평균매수가</span>
-                  <strong style={{ color: UI.body }}>{h.avg > 0 ? h.avg.toLocaleString() : "-"}</strong>
-                  <span style={{ color: UI.mutedSoft }}>순수익률</span>
-                  <strong style={{ color: retColor, fontWeight: 800 }}>{h.evalAmount > 0 ? `${h.netRet.toFixed(2)}%` : "-"}</strong>
-                  <span style={{ color: UI.mutedSoft }}>탈출 정책</span>
-                  <strong style={{ color: UI.body }}>회복·익절 우선</strong>
-                </div>
-                <div style={{ marginTop: 8, fontSize: "0.72rem", color: UI.mutedSoft, lineHeight: 1.3 }}>
-                  추가매수(전략·레거시): <strong style={{ color: UI.body }}>{additionalBuyStatus}</strong>
-                </div>
-                <details style={{ marginTop: 6 }}>
-                  <summary style={{ cursor: "pointer", color: UI.muted, fontSize: "0.72rem" }}>상세</summary>
-                  <div style={{ marginTop: 6, display: "grid", gridTemplateColumns: "1fr auto", gap: 6, fontSize: "0.76rem" }}>
-                    <span style={{ color: UI.mutedSoft }}>평가금액</span>
-                    <strong style={{ color: UI.body }}>{h.evalAmount > 0 ? Math.round(h.evalAmount).toLocaleString() : "-"}</strong>
-                    <span style={{ color: UI.mutedSoft }}>순평가손익</span>
-                    <strong style={{ color: pnlColor }}>{h.evalAmount > 0 ? Math.round(h.netPnl).toLocaleString() : "-"}</strong>
-                    <span style={{ color: UI.mutedSoft }}>기존 보유 수량</span>
-                    <strong style={{ color: UI.body }}>{h.legacyQty.toLocaleString(undefined, { maximumFractionDigits: 8 })}</strong>
-                    <span style={{ color: UI.mutedSoft }}>기존 보유 평균단가</span>
-                    <strong style={{ color: UI.body }}>{h.legacyAvg > 0 ? h.legacyAvg.toLocaleString() : "-"}</strong>
-                    <span style={{ color: UI.mutedSoft }}>신규 전략 수량</span>
-                    <strong style={{ color: UI.body }}>{h.strategyQty.toLocaleString(undefined, { maximumFractionDigits: 8 })}</strong>
-                    <span style={{ color: UI.mutedSoft }}>신규 전략 평균단가</span>
-                    <strong style={{ color: UI.body }}>{h.strategyAvg > 0 ? h.strategyAvg.toLocaleString() : "-"}</strong>
-                    <span style={{ color: UI.mutedSoft }}>물타기 횟수</span>
-                    <strong style={{ color: UI.body }}>{h.legacyDcaCount}/{h.legacyDcaMax}</strong>
-                    <span style={{ color: UI.mutedSoft }}>다음 물타기 가능</span>
-                    <strong style={{ color: h.legacyDcaAvailable ? UI.pass : UI.watch }}>
-                      {h.legacyDcaAvailable ? "가능" : "잠금"}
-                      {h.legacyNextDcaAt ? ` (${formatTsLocal(h.legacyNextDcaAt)})` : ""}
-                    </strong>
-                    <span style={{ color: UI.mutedSoft }}>탈출 목표 상태</span>
-                    <strong style={{ color: UI.body }}>{h.legacyExitStatus}</strong>
-                    <span style={{ color: UI.mutedSoft }}>기존 보유 손절</span>
-                    <strong style={{ color: UI.body }}>{h.legacyStopLossDisabled ? "비활성" : "활성"}</strong>
-                    <span style={{ color: UI.mutedSoft }}>전략 유형</span>
-                    <strong style={{ color: UI.body }}>{h.strategyType === "momentum" ? "급등형" : "안정형"}</strong>
-                    <span style={{ color: UI.mutedSoft }}>현재 순이익률</span>
-                    <strong style={{ color: h.currentNetPnlPct >= 0 ? UI.pass : UI.watch }}>{h.currentNetPnlPct.toFixed(2)}%</strong>
-                    <span style={{ color: UI.mutedSoft }}>브레이크이븐</span>
-                    <strong style={{ color: UI.body }}>{h.breakevenArmed ? "활성" : "대기"}</strong>
-                    <span style={{ color: UI.mutedSoft }}>1차 익절</span>
-                    <strong style={{ color: UI.body }}>{h.partialTpDone ? "완료" : "미완료"}</strong>
-                    <span style={{ color: UI.mutedSoft }}>트레일링 기준가</span>
-                    <strong style={{ color: UI.body }}>{h.trailingStopPrice > 0 ? Math.round(h.trailingStopPrice).toLocaleString() : "-"}</strong>
-                    <span style={{ color: UI.mutedSoft }}>전략 누적 매수 KRW</span>
-                    <strong style={{ color: UI.body }}>
-                      {Math.round(h.strategyInvestedKrw).toLocaleString()} / {ORDER_LIMITS.MAX_STRATEGY_INVESTED_KRW_PER_MARKET.toLocaleString()}
-                    </strong>
-                    <span style={{ color: UI.mutedSoft }}>레거시 DCA 누적 KRW</span>
-                    <strong style={{ color: UI.body }}>
-                      {Math.round(h.legacyDcaKrwTotal).toLocaleString()} / {ORDER_LIMITS.MAX_LEGACY_DCA_KRW_PER_MARKET.toLocaleString()}
-                    </strong>
-                    <span style={{ color: UI.mutedSoft }}>참고 손실률 필드(즉시청산 미사용)</span>
-                    <strong style={{ color: UI.body }}>{h.stopLossPct.toFixed(1)}%</strong>
-                  </div>
-                </details>
-              </article>
-            );
-          })}
-        </section>
-
-        <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>보유 종목 모니터</section>
-        <section
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
-            gap: "0.8rem",
-            marginBottom: "1rem",
-          }}
-        >
-          {displayMarkets.map((market) => {
-            const latest = latestByMarket[market];
-            const parsed = latest?.parsed;
-            const tone = getCardTone(parsed);
-            const holdingQty = holdingQtyByMarket[market] ?? 0;
-            const hasHolding = holdingQty > 0;
-
-            const statusLabel = hasHolding
-              ? tone === "pass"
-                ? "보유중"
-                : "보유 + 신호약함"
-              : tone === "fail"
-                ? "탈락"
-                : "미보유";
-
-            const statusColor =
-              tone === "pass" ? UI.pass : tone === "near" ? UI.watch : tone === "fail" ? UI.fail : UI.muted;
-
-            const failReason = tone === "fail" || tone === "near" ? getCardFailReason(parsed) : "—";
-            const volumeRatio = getCardVolumeRatio(parsed);
+        <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(210px, 1fr))", gap: "0.8rem", marginBottom: "1rem" }}>
+          {CORE_WATCH_MARKETS.map((market) => {
             const short = market.replace("KRW-", "");
-            const latestTs = latest?.entry?.ts ? formatTsLocal(latest.entry.ts) : "-";
-
+            const mp = Number(trade?.mark_prices?.[market] ?? 0);
+            const hasMark = Number.isFinite(mp) && mp > 0;
             return (
               <article
-                key={market}
+                key={`core-watch-${market}`}
                 style={{
                   background: UI.cardBg,
-                  border: `1px solid ${tone === "pass" ? "#2dd4bf88" : tone === "near" ? "#f59e0b99" : tone === "fail" ? "#ef444499" : UI.border
-                    }`,
+                  border: `1px solid ${UI.border}`,
                   borderRadius: 12,
                   padding: "0.72rem 0.8rem",
-                  minHeight: 100,
-                  boxShadow: tone === "pass"
-                    ? "0 0 0 1px #075985 inset, 0 0 13px #0284c722"
-                    : tone === "near"
-                      ? "0 0 0 1px #9a3412 inset, 0 0 10px #f59e0b1a"
-                      : tone === "fail"
-                        ? "0 0 0 1px #7f1d1d inset, 0 0 9px #ef44441a"
-                        : "0 0 0 1px #1b3558 inset",
+                  boxShadow: "0 0 0 1px #1b3558 inset",
                 }}
               >
-                <div style={{ height: 1, marginBottom: 6, background: "linear-gradient(90deg, #3b82f6, transparent)" }} />
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 7 }}>
-                  <strong style={{ fontSize: "1.08rem", color: UI.title, fontWeight: 900, letterSpacing: "0.02em" }}>{short}</strong>
-                  <span
-                    style={{
-                      fontSize: "0.8rem",
-                      padding: "0.18rem 0.55rem",
-                      borderRadius: 999,
-                      background: tone === "pass" ? UI.passBg : tone === "near" ? UI.watchBg : tone === "fail" ? UI.failBg : "#e2e8f0",
-                      color: statusColor,
-                      fontWeight: 700,
-                      border: `1px solid ${tone === "pass" ? "#0369a1" : tone === "near" ? "#b45309" : tone === "fail" ? "#b91c1c" : "#64748b"}`,
-                    }}
-                  >
-                    {statusLabel}
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                  <strong style={{ fontSize: "1.05rem", color: UI.title, fontWeight: 900 }}>{short}</strong>
+                  <span style={{ fontSize: "0.68rem", color: UI.watch, border: `1px solid ${UI.watch}`, padding: "0.1rem 0.45rem", borderRadius: 999, fontWeight: 800 }}>
+                    CORE WATCH
                   </span>
                 </div>
-                <div style={{ color: UI.mutedSoft, fontSize: "0.68rem", fontWeight: 700, letterSpacing: "0.03em", marginBottom: 2 }}>핵심 사유</div>
-                <div style={{ color: UI.body, fontSize: "0.8rem", lineHeight: 1.3, minHeight: 30, fontWeight: 700 }}>
-                  {tone === "none" ? "핵심: 데이터 없음" : `핵심: ${failReason}`}
+                <div style={{ fontSize: "0.72rem", color: UI.mutedSoft, marginBottom: 2 }}>감시 전용 (시장 기준/감시용)</div>
+                <div style={{ marginTop: 8, fontSize: "0.72rem", color: UI.mutedSoft, fontWeight: 700 }}>현재가</div>
+                <div style={{ fontSize: "1.02rem", color: UI.title, fontWeight: 900 }}>
+                  {hasMark ? Math.round(mp).toLocaleString() : "—"}
                 </div>
-                <div style={{ marginTop: 8, color: UI.mutedSoft, fontSize: "0.7rem", fontWeight: 700, letterSpacing: "0.03em" }}>VOLUME RATIO</div>
-                <div style={{ color: UI.title, fontSize: "0.94rem", fontWeight: 800 }}>volume_ratio {volumeRatio}</div>
-                <div style={{ marginTop: 6, color: UI.mutedSoft, fontSize: "0.7rem", fontWeight: 700, letterSpacing: "0.03em" }}>신호 강도</div>
-                <div style={{ color: tone === "pass" ? UI.pass : tone === "near" ? UI.watch : UI.fail, fontSize: "0.9rem", fontWeight: 800 }}>
-                  {getSignalStrength(parsed)}
-                </div>
-                <div style={{ marginTop: 4, color: UI.mutedSoft, fontSize: "0.73rem", fontWeight: 600 }}>신호 {latestTs}</div>
               </article>
             );
           })}
         </section>
+
+        <section
+          style={{
+            background: UI.cardBg,
+            border: `1px solid ${UI.border}`,
+            borderRadius: 12,
+            padding: "0.8rem 1rem",
+            marginBottom: "0.9rem",
+            boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.32)",
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.55rem" }}>
+            <div style={{ fontSize: "0.9rem", color: UI.title, fontWeight: 800, letterSpacing: "0.02em" }}>급등주 자동매매 후보</div>
+            <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>갱신 {scanner?.updated_at ? formatTsLocal(scanner.updated_at) : "-"}</div>
+          </div>
+          <div style={{ fontSize: "0.72rem", color: UI.mutedSoft, marginTop: -4, marginBottom: 12, lineHeight: 1.4 }}>
+            scanner fresh는 “발견” 조건이며, 진입 허가는 filter_pass 및 자금 cap 등 게이트를 통과해야 합니다.
+          </div>
+          {scannerItemsExcludingHeld.after.length ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "38px 88px 58px 74px 74px 74px 90px 74px 74px 1fr",
+                  gap: 8,
+                  alignItems: "center",
+                  padding: "0 0.45rem",
+                  fontSize: "0.66rem",
+                  color: UI.mutedSoft,
+                }}
+              >
+                <span>#</span>
+                <span>코인</span>
+                <span>점수</span>
+                <span>filter_pass</span>
+                <span>base_gate</span>
+                <span>stopPrice</span>
+                <span>riskReward</span>
+                <span>cap</span>
+                <span>상태</span>
+                <span>메모</span>
+              </div>
+              {scannerItemsExcludingHeld.after.map((it) => {
+                const filterPass = Boolean(it.breakout) && Boolean(it.close_upper_hold);
+                const capOk = liveCapitalCapSummary.capRemaining >= 5000;
+                const stopPrice = null; // server log 기반 값(이번 UI 분리 작업에서는 표시만 준비)
+                const riskReward = null; // server log 기반 값(이번 UI 분리 작업에서는 표시만 준비)
+                const baseGateOk = null; // server log 기반 값(이번 UI 분리 작업에서는 표시만 준비)
+                const blockedReason = !filterPass
+                  ? "진입 차단"
+                  : !capOk
+                    ? "50% cap 차단"
+                    : stopPrice === 0
+                      ? "손절가 없음 차단"
+                      : null;
+                const statusLabel = blockedReason ? "차단" : "가능";
+                const statusColor = blockedReason ? UI.fail : UI.pass;
+                return (
+                  <div
+                    key={`surge-candidate-${it.rank}-${it.market}`}
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "38px 88px 58px 74px 74px 74px 90px 74px 74px 1fr",
+                      gap: 8,
+                      alignItems: "center",
+                      padding: "0.35rem 0.45rem",
+                      border: "1px solid #28456f",
+                      borderRadius: 6,
+                      fontSize: "0.76rem",
+                      background: UI.cardSoftBg,
+                    }}
+                  >
+                    <strong style={{ color: UI.title }}>#{it.rank}</strong>
+                    <strong style={{ color: UI.title }}>{it.market.replace("KRW-", "")}</strong>
+                    <span style={{ color: it.score >= 80 ? "#22c55e" : it.score >= 65 ? "#f59e0b" : UI.body, fontWeight: 800 }}>{it.score.toFixed(1)}</span>
+                    <span style={{ color: filterPass ? UI.pass : UI.fail, fontWeight: 900 }}>{filterPass ? "true" : "false"}</span>
+                    <span style={{ color: UI.mutedSoft }}>{baseGateOk === null ? "-" : baseGateOk ? "true" : "false"}</span>
+                    <span style={{ color: UI.mutedSoft }}>{stopPrice === null ? "-" : stopPrice === 0 ? "0" : String(stopPrice)}</span>
+                    <span style={{ color: UI.mutedSoft }}>{riskReward === null ? "-" : String(riskReward)}</span>
+                    <span style={{ color: capOk ? UI.pass : UI.fail, fontWeight: 900 }}>{capOk ? "OK" : "BLOCK"}</span>
+                    <span style={{ color: statusColor, fontWeight: 900 }}>{statusLabel}</span>
+                    <span style={{ color: blockedReason ? UI.fail : UI.mutedSoft, fontWeight: 700 }}>
+                      {blockedReason ?? "—"}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>급등주 후보 없음</p>
+          )}
+        </section>
+
+        <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>
+          기존 보유 종목
+        </section>
+        <div style={{ fontSize: "0.74rem", color: UI.mutedSoft, marginTop: -2, marginBottom: 10 }}>
+          <strong style={{ color: UI.watch }}>기존 보유 / 자동매매 관리 아님</strong> · SURGE_V2는 기존 보유 종목을 강제청산하지 않습니다. (단, 자금 cap 계산에는 포함)
+        </div>
+        {passiveHoldingCards.length === 0 ? (
+          <section style={{ marginBottom: "1rem", padding: "1rem", background: UI.cardSoftBg, borderRadius: 12, border: `1px dashed ${UI.borderSoft}`, color: UI.muted }}>
+            표시할 기존 보유 종목이 없습니다.
+          </section>
+        ) : (
+          <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: "0.9rem", marginBottom: "1.15rem" }}>
+            {passiveHoldingCards.map((h) => {
+              const pnlColor = h.netPnl > 0 ? "#22c55e" : h.netPnl < 0 ? "#ef4444" : UI.muted;
+              const retColor = h.netRet > 0 ? "#22c55e" : h.netRet < 0 ? "#ef4444" : UI.muted;
+              return (
+                <article
+                  key={`passive-${h.market}`}
+                  style={{
+                    background: UI.cardBg,
+                    border: `1px solid ${UI.borderSoft}`,
+                    borderRadius: 12,
+                    padding: "0.75rem 0.85rem",
+                    boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.24)",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                    <div style={{ fontSize: "1.02rem", color: UI.title, fontWeight: 900, letterSpacing: "0.02em" }}>{h.currency}</div>
+                    <span style={{ fontSize: "0.68rem", color: UI.muted, border: `1px solid ${UI.borderSoft}`, padding: "0.1rem 0.45rem", borderRadius: 999, fontWeight: 800 }}>
+                      기존 보유
+                    </span>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 6, fontSize: "0.8rem" }}>
+                    <span style={{ color: UI.mutedSoft }}>보유수량</span>
+                    <strong style={{ color: UI.body }}>{h.qty.toLocaleString(undefined, { maximumFractionDigits: 8 })}</strong>
+                    <span style={{ color: UI.mutedSoft }}>평균매수가</span>
+                    <strong style={{ color: UI.body }}>{h.avg > 0 ? h.avg.toLocaleString() : "-"}</strong>
+                    <span style={{ color: UI.mutedSoft }}>순수익률</span>
+                    <strong style={{ color: retColor, fontWeight: 800 }}>{h.evalAmount > 0 ? `${h.netRet.toFixed(2)}%` : "-"}</strong>
+                    <span style={{ color: UI.mutedSoft }}>순평가손익</span>
+                    <strong style={{ color: pnlColor }}>{h.evalAmount > 0 ? Math.round(h.netPnl).toLocaleString() : "-"}</strong>
+                  </div>
+                </article>
+              );
+            })}
+          </section>
+        )}
+
+        <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>
+          자동매매 관리 포지션
+        </section>
+        {managedHoldingCards.length === 0 ? (
+          <section style={{ marginBottom: "1rem", padding: "1rem", background: UI.cardSoftBg, borderRadius: 12, border: `1px dashed ${UI.borderSoft}`, color: UI.muted }}>
+            현재 자동매매 관리 포지션 없음
+          </section>
+        ) : (
+          <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: "0.9rem", marginBottom: "1.15rem" }}>
+            {managedHoldingCards.map((h) => {
+              const pnlColor = h.netPnl > 0 ? "#22c55e" : h.netPnl < 0 ? "#ef4444" : UI.muted;
+              const retColor = h.netRet > 0 ? "#22c55e" : h.netRet < 0 ? "#ef4444" : UI.muted;
+              return (
+                <article
+                  key={`managed-${h.market}`}
+                  style={{
+                    background: UI.cardBg,
+                    border: `1px solid ${UI.border}`,
+                    borderRadius: 12,
+                    padding: "0.75rem 0.85rem",
+                    boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.24)",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                    <div style={{ fontSize: "1.02rem", color: UI.title, fontWeight: 900, letterSpacing: "0.02em" }}>{h.currency}</div>
+                    <span style={{ fontSize: "0.68rem", color: UI.pass, border: `1px solid ${UI.pass}`, padding: "0.1rem 0.45rem", borderRadius: 999, fontWeight: 900 }}>
+                      managed
+                    </span>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 6, fontSize: "0.8rem" }}>
+                    <span style={{ color: UI.mutedSoft }}>보유수량</span>
+                    <strong style={{ color: UI.body }}>{h.qty.toLocaleString(undefined, { maximumFractionDigits: 8 })}</strong>
+                    <span style={{ color: UI.mutedSoft }}>평균매수가</span>
+                    <strong style={{ color: UI.body }}>{h.avg > 0 ? h.avg.toLocaleString() : "-"}</strong>
+                    <span style={{ color: UI.mutedSoft }}>순수익률</span>
+                    <strong style={{ color: retColor, fontWeight: 800 }}>{h.evalAmount > 0 ? `${h.netRet.toFixed(2)}%` : "-"}</strong>
+                    <span style={{ color: UI.mutedSoft }}>순평가손익</span>
+                    <strong style={{ color: pnlColor }}>{h.evalAmount > 0 ? Math.round(h.netPnl).toLocaleString() : "-"}</strong>
+                  </div>
+                </article>
+              );
+            })}
+          </section>
+        )}
 
         <section
           style={{
