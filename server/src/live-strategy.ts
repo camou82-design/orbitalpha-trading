@@ -5989,7 +5989,20 @@ export function createLiveDataStrategy(opts: {
       }),
     );
 
-    for (const market of entryUniverse) {
+    for (const marketRaw of entryUniverse) {
+      const market = typeof marketRaw === "string" ? marketRaw.trim() : "";
+      if (!/^KRW-[A-Z0-9]{2,}$/.test(market)) {
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_BAD_MARKET_CODE_DROPPED",
+            ts: new Date().toISOString(),
+            market_raw: marketRaw ?? null,
+            market_normalized: market,
+            reason: "invalid_market_code_format",
+          }),
+        );
+        continue;
+      }
       if (scannedCount === 0) {
         console.info(
           JSON.stringify({
@@ -6621,7 +6634,10 @@ export function createLiveDataStrategy(opts: {
           } else if (severeNearHigh || (!softContextForMicroGuard && !coreRelaxedAllowNearHigh)) {
             lateEntryGuardTriggered = true;
             lateTimingTier = "hard_block";
-            lateEntryGuardReason = `too_near_local_high:${distanceFromLocalHighPct!.toFixed(3)}pct<0.12pct`;
+            const threshold = severeNearHigh ? 0.12 : LIVE_MAX_ENTRY_NEAR_HIGH_PCT;
+            lateEntryGuardReason = severeNearHigh
+              ? `too_near_local_high:${distanceFromLocalHighPct!.toFixed(3)}pct<${threshold.toFixed(2)}pct`
+              : `too_near_local_high:${distanceFromLocalHighPct!.toFixed(3)}pct<${threshold.toFixed(2)}pct(soft_context=false)`;
           } else {
             lateTimingTier = "reduced_size_allowed";
             lateEntrySizingMultiplier *= 0.45; // 김 사장 지시: 0.45 적용
@@ -6654,7 +6670,9 @@ export function createLiveDataStrategy(opts: {
             lateTimingTier = "hard_block";
             lateEntryGuardReason =
               volumeRatio1m5 !== null
-                ? `volume_fade_after_spike:${volumeRatio1m5.toFixed(3)}<0.35`
+                ? severeVol
+                  ? `volume_fade_after_spike:${volumeRatio1m5.toFixed(3)}<0.35`
+                  : `volume_fade_after_spike:${volumeRatio1m5.toFixed(3)}<0.65(soft_context=false)`
                 : "volume_fade_after_spike";
           } else {
             lateTimingTier = "reduced_size_allowed";
