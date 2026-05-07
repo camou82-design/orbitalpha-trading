@@ -24,20 +24,39 @@ export function evaluateSurgeExit(pos: any, currentPx: number): SurgeExitDecisio
   const holdMinutes = (Date.now() - entryTs) / 60000;
   const partialTpDone = pos.partial_tp_done || false;
   let runnerTrailActive = pos.runner_trail_active || false;
+  const marketState = String(pos.market_state ?? pos.market_state_at_entry ?? pos.market_state_at_exit ?? "");
+  const btcTier = String(pos.btc_tier ?? pos.btc_tier_at_entry ?? pos.btc_tier_at_exit ?? "");
+  const volatilityPct = Number(pos.volatility_pct ?? pos.volatility_pct_at_entry ?? pos.volatility_pct_at_exit ?? 0);
 
   // B. Runner Conversion Status Check (State update, not an exit)
   if (maxPnlPct >= 3.0) {
     runnerTrailActive = true;
   }
 
-  // 1. Emergency Stop (First minute, <= -1.2%)
-  if (holdMinutes < 1 && pnlPct <= -1.2) {
-    return { action: "sell", reason: "surge_emergency_stop_first_minute", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
-  }
+  // 1. Stop-loss policy (banded soft/hard)
+  // - pnl <= -2.0%: hard stop
+  // - -1.2%~-1.8%: soft/hard depending on market state & volatility
+  const hardStopPct = -2.0;
+  const bandSoftFloorPct = -1.2;
+  const bandHardFloorPct = -1.8;
+  const highVol = Number.isFinite(volatilityPct) && volatilityPct >= 3.2;
+  const weakMarket = marketState === "risk_off" || btcTier === "weak";
 
-  // 2. Hard Stop (>= 1 minute, <= -0.9%)
-  if (holdMinutes >= 1 && pnlPct <= -0.9) {
-    return { action: "sell", reason: "surge_hard_stop", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+  if (pnlPct <= hardStopPct) {
+    return { action: "sell", reason: "stop_loss_reached_hard", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+  }
+  if (pnlPct <= bandHardFloorPct) {
+    return { action: "sell", reason: "stop_loss_reached_band_hard", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+  }
+  if (pnlPct <= bandSoftFloorPct) {
+    const hardInBand = weakMarket || highVol || holdMinutes < 1.0;
+    return {
+      action: "sell",
+      reason: hardInBand ? "stop_loss_reached_band_hard_ctx" : "stop_loss_reached_band_soft",
+      ratio: 1,
+      runnerTrailActive,
+      authoritySource: "surge-v2",
+    };
   }
 
   // 3. Force Take Profit (>= +10%)

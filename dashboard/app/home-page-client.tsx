@@ -341,6 +341,7 @@ type StrategyStatus = {
       remaining_qty: number;
     }
   >;
+  early_positions?: Record<string, unknown>;
 };
 
 /** 감시·카드에 쓸 마켓: 기본 4종 + (실제 보유·전략/레거시/오픈포지션 마켓). slice(4) 제한 없음. */
@@ -1086,6 +1087,7 @@ export default function HomePage() {
   const [strategy, setStrategy] = useState<StrategyStatus | null>(null);
   const [scanner, setScanner] = useState<PumpScannerStatus | null>(null);
   const [paper, setPaper] = useState<PaperStatus | null>(null);
+  const [accountHoldings, setAccountHoldings] = useState<{ used_slots?: number; holdings?: Array<Record<string, unknown>> } | null>(null);
   const [paperPanelError, setPaperPanelError] = useState<string | null>(null);
   const [marketState, setMarketState] = useState<MarketStateStatus | null>(null);
   const [accountSyncState, setAccountSyncState] = useState<"idle" | "syncing" | "ok" | "error" | "failed">("idle");
@@ -1222,6 +1224,7 @@ export default function HomePage() {
     trade,
     strategy,
     scanner,
+    accountHoldings,
     accountPortfolioForKpi: (v) => accountPortfolioForKpi(v as TradeStatus["account_portfolio"]),
   });
 
@@ -1526,6 +1529,34 @@ export default function HomePage() {
           });
         },
         15_000,
+        30_000,
+      );
+
+      scheduleLoop(
+        "account_holdings",
+        async () => {
+          const ts = Date.now();
+          await pollJson<{ used_slots?: number; holdings?: Array<Record<string, unknown>> }>(
+            "account_holdings",
+            `/api/v1/account/holdings?_=${ts}`,
+            {
+              timeoutMs: 9000,
+              onOk: (h) => {
+                if (cancelled) return;
+                setIfChanged(
+                  "account_holdings",
+                  h,
+                  setAccountHoldings,
+                  (x) => ({
+                    used_slots: Number(asRecord(x).used_slots ?? 0),
+                    holdings_len: asArray(asRecord(x).holdings).length,
+                  }),
+                );
+              },
+            },
+          );
+        },
+        12_000,
         30_000,
       );
 

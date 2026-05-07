@@ -139,6 +139,11 @@ type StrategyPosition = {
   reason_enter: string;
   signal_strength: string;
   volume_ratio: number;
+  entry_origin?: "auto_trade" | "external";
+  entry_mode?: "SURGE_V2" | "CORE";
+  market_state_at_entry?: "risk_on" | "neutral" | "risk_off";
+  btc_tier_at_entry?: "strong" | "neutral" | "weak";
+  volatility_pct_at_entry?: number;
   position_stage?: "early_candidate" | "early_active" | "normal_active" | "scaled_out_partial" | "cooldown" | "closed";
   partial_tp_done: boolean;
   max_pnl_pct: number;
@@ -185,6 +190,11 @@ type EarlyEntryPosition = {
   order_krw: number;
   signal_ts: string | null;
   signal_strength: string;
+  entry_origin?: "auto_trade" | "external";
+  entry_mode?: "SURGE_V2" | "CORE";
+  market_state_at_entry?: "risk_on" | "neutral" | "risk_off";
+  btc_tier_at_entry?: "strong" | "neutral" | "weak";
+  volatility_pct_at_entry?: number;
   /** early entry 당시 최근 로컬 고점(돌파 기준) */
   entry_recent_high: number;
   /** early entry 당시 volume ratio(1m notional / prev5 avg) */
@@ -2041,6 +2051,7 @@ export function createLiveDataStrategy(opts: {
       total_asset_pnl: null,
       files: { trades: tradesFile, daily: dailyFile },
       open_positions: state.positions,
+      early_positions: state.early_positions,
       safety_guard_state: state.safety_guard.state,
       safety_guard_reason: state.safety_guard.reason,
       order_fail_count_today: state.safety_guard.order_fail_count_today,
@@ -2249,6 +2260,16 @@ export function createLiveDataStrategy(opts: {
     if (reconcileActions.length > 0) {
       console.info(
         JSON.stringify({
+          tag: "SPOT_MANAGED_POSITION_SYNC_PROOF",
+          ts: new Date().toISOString(),
+          actions: reconcileActions,
+          ledger_reconcile: lr ?? null,
+          strategy_positions_count: Object.keys(state.positions).length,
+          early_positions_count: Object.keys(state.early_positions).length,
+        }),
+      );
+      console.info(
+        JSON.stringify({
           tag: "DEBUG_LIVE_STATE_RECONCILE_RESULT",
           ts: new Date().toISOString(),
           actions: reconcileActions,
@@ -2268,6 +2289,33 @@ export function createLiveDataStrategy(opts: {
       })
       .filter((x): x is string => Boolean(x) && String(x).startsWith("KRW-"));
     const heldSymbolSet = new Set<string>([...heldSymbols, ...Object.keys(state.positions)]);
+
+    {
+      const managedSet = new Set<string>([...Object.keys(state.positions), ...Object.keys(state.early_positions)]);
+      const passive = heldSymbols.filter((m) => !managedSet.has(m));
+      console.info(
+        JSON.stringify({
+          tag: "SPOT_ACCOUNT_HOLDING_CLASSIFICATION_PROOF",
+          ts: new Date().toISOString(),
+          held_count: heldSymbols.length,
+          managed_count: managedSet.size,
+          passive_count: passive.length,
+          managed_markets: [...managedSet].slice(0, 25),
+          passive_markets: passive.slice(0, 25),
+        }),
+      );
+      console.info(
+        JSON.stringify({
+          tag: "SPOT_SLOT_USAGE_RECONCILE_PROOF",
+          ts: new Date().toISOString(),
+          used_slots: Object.keys(state.positions).length + Object.keys(state.early_positions).length,
+          used_slots_normal: Object.keys(state.positions).length,
+          used_slots_early: Object.keys(state.early_positions).length,
+          held_count: heldSymbols.length,
+          note: "used_slots counts only strategy-managed positions; passive holdings excluded",
+        }),
+      );
+    }
     if (state.safety_guard.state === "자동정지") {
       console.info(
         JSON.stringify({
@@ -3569,6 +3617,11 @@ export function createLiveDataStrategy(opts: {
           reason_enter: `early_entry_promoted|signal_ts=${ep.signal_ts ?? "na"}`,
           signal_strength: ep.signal_strength,
           volume_ratio: ep.entry_volume_ratio_1m5,
+          entry_origin: ep.entry_origin ?? "auto_trade",
+          entry_mode: ep.entry_mode ?? "CORE",
+          market_state_at_entry: ep.market_state_at_entry,
+          btc_tier_at_entry: ep.btc_tier_at_entry,
+          volatility_pct_at_entry: Number(ep.volatility_pct_at_entry ?? 0),
           position_stage: "normal_active",
           partial_tp_done: false,
           max_pnl_pct: pnlGross,
@@ -3699,9 +3752,89 @@ export function createLiveDataStrategy(opts: {
       }
       const holdMin = minutesSince(p.entry_ts);
       const isSurge = isSurgePosition(p);
+      const surgePolicyApplies = isSurge && p.entry_origin === "auto_trade" && p.entry_mode === "SURGE_V2";
+
+      if (isSurge && !surgePolicyApplies) {
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_POSITION_EXIT_POLICY_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            applies: false,
+            reason: "surge_policy_skipped_non_auto_trade_or_missing_mode",
+            entry_origin: p.entry_origin ?? null,
+            entry_mode: (p as any).entry_mode ?? null,
+          }),
+        );
+      } else if (surgePolicyApplies) {
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_POSITION_EXIT_POLICY_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            applies: true,
+            entry_origin: p.entry_origin,
+            entry_mode: p.entry_mode,
+            market_state_at_entry: p.market_state_at_entry ?? null,
+            btc_tier_at_entry: p.btc_tier_at_entry ?? null,
+            volatility_pct_at_entry: Number(p.volatility_pct_at_entry ?? 0),
+            stop_band_soft_floor_pct: -1.2,
+            stop_band_hard_floor_pct: -1.8,
+            hard_stop_pct: -2.0,
+          }),
+        );
+      }
+
       let isSurgeExitDecision = false;
-      if (isSurge && !reasonExit) {
-        const decision = evaluateSurgeExit(p, now);
+      // SURGE_V2 early failure triggers (post-entry) — only for auto-trade entered positions.
+      if (surgePolicyApplies && !reasonExit) {
+        const sig = latestAllSignals.get(market);
+        const payload = sig?.p;
+        const scoreNow = payload ? signalStrengthScore(payload) : 0;
+        const volumeRatioNow = payload ? Number(payload.volume_ratio ?? 0) : 0;
+        const filters = Array.isArray(payload?.filters) ? (payload!.filters as Array<{ id: string; passed: boolean }>) : [];
+        const hasFailed = (re: RegExp) => filters.some((f) => re.test(String(f.id)) && f.passed === false);
+
+        let earlyFailureTrigger: string | null = null;
+        if (scoreNow > 0 && scoreNow < ENTRY_PIPELINE_MID_SCORE_FLOOR) earlyFailureTrigger = "score_below_threshold";
+        else if (volumeRatioNow > 0 && volumeRatioNow < 0.75 && holdMin >= 3 && p.max_pnl_pct < 1.2) earlyFailureTrigger = "volume_fade_after_spike";
+        else if (hasFailed(/upper_wick|high_reject|high_rejected/i)) earlyFailureTrigger = "high_rejected";
+        else if (hasFailed(/retest|pullback|reclaim/i)) earlyFailureTrigger = "retest_fail";
+
+        if (earlyFailureTrigger) {
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_EARLY_FAILURE_EXIT_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              trigger: earlyFailureTrigger,
+              hold_minutes: holdMin,
+              pnl_pct: pnlGross,
+              max_pnl_pct: p.max_pnl_pct,
+              volume_ratio: volumeRatioNow,
+              score_now: scoreNow,
+              filters_failed: filters.filter((f) => !f.passed).map((f) => f.id).slice(0, 8),
+            }),
+          );
+          reasonExit = `surge_early_failure_${earlyFailureTrigger}`;
+          stopTriggerKind = "price_stop";
+          ratio = 1;
+          exitAuthorityClass = "emergency_exit";
+          exitReasonDetail = "surge_early_failure_policy";
+          isSurgeExitDecision = true;
+        }
+      }
+
+      if (surgePolicyApplies && !reasonExit) {
+        const decision = evaluateSurgeExit(
+          {
+            ...p,
+            market_state: marketState.market_state,
+            btc_tier: state.regime?.btc_filter_state ?? "neutral",
+            volatility_pct: p.volatility_pct_at_entry ?? null,
+          },
+          now,
+        );
         if (decision.runnerTrailActive !== (p as any).runner_trail_active) {
           (p as any).runner_trail_active = decision.runnerTrailActive;
         }
@@ -4204,6 +4337,18 @@ export function createLiveDataStrategy(opts: {
 
       let placeSellOk = false;
       let placeSellReason = "unknown";
+      console.info(
+        JSON.stringify({
+          tag: "LIVE_PLACESELL_ATTEMPT",
+          ts: new Date().toISOString(),
+          market,
+          reason_exit: reasonExit,
+          ratio,
+          stop_trigger_kind: stopTriggerKind,
+          authority_class: exitAuthorityClass,
+          engine_bucket: isSurge ? "surge" : "core",
+        }),
+      );
       if (isSurge) {
         console.info(
           JSON.stringify({
@@ -4262,6 +4407,20 @@ export function createLiveDataStrategy(opts: {
         });
         continue;
       } finally {
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_PLACESELL_RESULT",
+            ts: new Date().toISOString(),
+            market,
+            reason_exit: reasonExit,
+            ratio,
+            stop_trigger_kind: stopTriggerKind,
+            authority_class: exitAuthorityClass,
+            engine_bucket: isSurge ? "surge" : "core",
+            place_sell_ok: placeSellOk,
+            place_sell_reason: placeSellReason,
+          }),
+        );
         if (isSurge) {
           console.info(
             JSON.stringify({
@@ -6647,6 +6806,11 @@ export function createLiveDataStrategy(opts: {
                 order_krw: earlyOrderKrw,
                 signal_ts: signalTs,
                 signal_strength: sig.p.signal_type ?? "MID",
+                entry_origin: "auto_trade",
+                entry_mode: "SURGE_V2",
+                market_state_at_entry: marketState.market_state,
+                btc_tier_at_entry: btcTierNow,
+                volatility_pct_at_entry: 0,
                 entry_recent_high: Number(localHigh ?? currentPrice),
                 entry_volume_ratio_1m5: Number(volumeRatio1m5 ?? 0),
                 promoted: false,
@@ -7449,6 +7613,55 @@ export function createLiveDataStrategy(opts: {
         __strong_symbol_override: strongSymbolOverride,
         __risk_off_exception_reason: exception?.reason,
       };
+
+      // SURGE_V2: stopPrice must be precomputed before LIVE_PLACEBUY_ATTEMPT.
+      const finalMeta = candidateMeta.find((x) => x.market === market) ?? null;
+      const surgeStopPrice = isSurgeSource ? Number(finalMeta?.stopPrice ?? 0) : 0;
+      const surgeStopReason = isSurgeSource ? String(finalMeta?.setupReason ?? "candidate_meta_stop") : "";
+      const surgeRiskPct =
+        isSurgeSource && currentPrice > 0 && surgeStopPrice > 0
+          ? Number((((currentPrice - surgeStopPrice) / currentPrice) * 100).toFixed(4))
+          : null;
+
+      if (isSurgeSource) {
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_STOP_PRICE_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            entry_mode: "SURGE_V2",
+            current_price: currentPrice,
+            stopPrice: surgeStopPrice > 0 ? surgeStopPrice : null,
+            riskPct: surgeRiskPct,
+            stopReason: surgeStopReason || null,
+            source_kind: sourceKindForJudgment,
+            candle_source: finalMeta?.candle_source ?? null,
+            candle_cache_age_ms: finalMeta?.candle_cache_age_ms ?? null,
+          }),
+        );
+        if (!(surgeStopPrice > 0)) {
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_STOP_MISSING_BLOCK",
+              ts: new Date().toISOString(),
+              market,
+              entry_mode: "SURGE_V2",
+              final_block_reason: "surge_stop_missing",
+              stopPrice: surgeStopPrice > 0 ? surgeStopPrice : null,
+              stopReason: surgeStopReason || null,
+              candidate_meta_present: Boolean(finalMeta),
+              candidate_meta_missing_reason: finalMeta ? null : "candidate_meta_absent",
+            }),
+          );
+          logPlacebuyFinalGateBlocked("surge_stop_missing", {
+            entry_mode: "SURGE_V2",
+            stopPrice: surgeStopPrice > 0 ? surgeStopPrice : null,
+            stopReason: surgeStopReason || null,
+          });
+          continue;
+        }
+      }
+
       console.info(
         JSON.stringify({
           tag: "LIVE_ORDER_PRECHECK_RESULT",
@@ -7487,6 +7700,9 @@ export function createLiveDataStrategy(opts: {
             order_krw: orderKrw,
             strategy_type: strategyType,
             is_surge_source: isSurgeSource,
+            surge_stopPrice: isSurgeSource ? surgeStopPrice : null,
+            surge_riskPct: isSurgeSource ? surgeRiskPct : null,
+            surge_stopReason: isSurgeSource ? surgeStopReason : null,
             strong_symbol_override_applied: strongSymbolOverride,
             base_gate_blocked_detail: detailedReason,
             gate_ok_effective: gateOk || strongSymbolOverride,
@@ -7561,7 +7777,12 @@ export function createLiveDataStrategy(opts: {
           if (!leaseOk()) {
             throw new Error("TICK_LEASE_REVOKED");
           }
-          await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", signalPayloadForBuy);
+          await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", {
+            ...signalPayloadForBuy,
+            __surge_stop_price: isSurgeSource ? surgeStopPrice : undefined,
+            __surge_risk_pct: isSurgeSource ? surgeRiskPct : undefined,
+            __surge_stop_reason: isSurgeSource ? surgeStopReason : undefined,
+          });
           placeBuyOk = true;
           placeBuyReason = "success";
         } catch (innerErr) {
@@ -7734,6 +7955,11 @@ export function createLiveDataStrategy(opts: {
         market,
         strategy_type: strategyType,
         engine_bucket: isSurgeSource ? "surge" : "core",
+        entry_origin: "auto_trade",
+        entry_mode: isSurgeSource ? "SURGE_V2" : "CORE",
+        market_state_at_entry: marketState.market_state,
+        btc_tier_at_entry: btcTierNow,
+        volatility_pct_at_entry: 0,
         is_relaxed_probe: !isSurgeSource && marketMeta?.is_relaxed_probe === true,
         entry_ts: new Date().toISOString(),
         entry_price: price,

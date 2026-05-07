@@ -984,6 +984,153 @@ async function main() {
   app.get("/api/v1/trade/status", async (req) => buildTradeStatusResponse(req, "GET /api/v1/trade/status"));
   app.get("/api/v1/account/status", async (req) => buildTradeStatusResponse(req, "GET /api/v1/account/status"));
 
+  /**
+   * Account holdings classification endpoint.
+   * - managed_position: strategy engine currently manages this holding (slots/exit policy applies)
+   * - passive_holding: real account holding but NOT managed by strategy (excluded from slots/add/exit policies)
+   *
+   * This endpoint is diagnostic + UI-safe: it does NOT affect entry decisions.
+   */
+  app.get("/api/v1/account/holdings", async (req) => {
+    const t0 = Date.now();
+    const tradeStatus = await trade.status();
+    const strategyStatus = strategy.status() as any;
+    const balances = Array.isArray(tradeStatus?.balances) ? tradeStatus.balances : [];
+
+    const DUST_NOTIONAL_KRW = 1000;
+    const held = balances
+      .map((b: any) => {
+        const currency = String(b?.currency ?? "").toUpperCase();
+        if (!currency || currency === "KRW") return null;
+        const qty = Number(b?.balance ?? 0) + Number(b?.locked ?? 0);
+        const avg = Number(b?.avg_buy_price ?? 0);
+        const notional = qty * avg;
+        if (!(qty > 0) || !(notional >= DUST_NOTIONAL_KRW)) return null;
+        return { market: `KRW-${currency}`, currency, qty, avg_buy_price: avg, notional_cost_krw: notional };
+      })
+      .filter((x: any): x is { market: string; currency: string; qty: number; avg_buy_price: number; notional_cost_krw: number } => Boolean(x));
+
+    const openPositions = (strategyStatus?.open_positions ?? {}) as Record<string, any>;
+    const earlyPositions = (strategyStatus?.early_positions ?? {}) as Record<string, any>;
+    const managedMarkets = new Set<string>([
+      ...Object.keys(openPositions).filter((m) => Number(openPositions[m]?.qty ?? 0) > 0),
+      ...Object.keys(earlyPositions).filter((m) => Number(earlyPositions[m]?.qty ?? 0) > 0),
+    ]);
+
+    // Latest signal meta (for holding monitor) from logs, scoped to held+managed set only.
+    const watchSet = new Set<string>([...held.map((h) => h.market), ...managedMarkets]);
+    const rows = await readRecentLogs(env.companyId, env.serviceId, 500);
+    const latestSignalByMarket: Record<string, { ts: string; payload: any } | null> = {};
+    for (const m of watchSet) latestSignalByMarket[m] = null;
+    for (const row of rows) {
+      if (row.kind !== "signal" || !row.payload) continue;
+      const p = row.payload as any;
+      const mk = typeof p?.market === "string" ? p.market : null;
+      if (!mk || !watchSet.has(mk)) continue;
+      if (latestSignalByMarket[mk] === null) latestSignalByMarket[mk] = { ts: row.ts, payload: p };
+    }
+
+    const holdings = held.map((h) => {
+      const managed = managedMarkets.has(h.market);
+      const pos = openPositions[h.market] ?? earlyPositions[h.market] ?? null;
+      const signalMeta = latestSignalByMarket[h.market];
+      const volume_ratio =
+        typeof signalMeta?.payload?.volume_ratio === "number"
+          ? signalMeta.payload.volume_ratio
+          : typeof signalMeta?.payload?.volume_multiple === "number"
+            ? signalMeta.payload.volume_multiple
+            : null;
+
+      const exit_policy = managed
+        ? {
+            kind: "engine_exit_policy",
+            engine_bucket: typeof pos?.engine_bucket === "string" ? pos.engine_bucket : null,
+            strict_exit: Boolean(pos?.strict_exit ?? false),
+          }
+        : null;
+
+      return {
+        ...h,
+        holding_kind: managed ? ("managed_position" as const) : ("passive_holding" as const),
+        managed_position: managed ? pos : null,
+        exit_policy,
+        signal_meta: signalMeta
+          ? {
+              ts: signalMeta.ts,
+              source_kind: typeof signalMeta.payload?.source_kind === "string" ? signalMeta.payload.source_kind : null,
+              filter_pass: Boolean(signalMeta.payload?.filter_pass ?? false),
+              volume_ratio,
+            }
+          : null,
+      };
+    });
+
+    const passiveCount = holdings.filter((h) => h.holding_kind === "passive_holding").length;
+    const managedCount = holdings.filter((h) => h.holding_kind === "managed_position").length;
+    const usedSlots = managedCount;
+
+    req.log.info(
+      {
+        tag: "SPOT_ACCOUNT_HOLDING_CLASSIFICATION_PROOF",
+        ts: new Date().toISOString(),
+        holdings_count: holdings.length,
+        managed_count: managedCount,
+        passive_count: passiveCount,
+        used_slots: usedSlots,
+        sample_managed: holdings.filter((h) => h.holding_kind === "managed_position").map((h) => h.market).slice(0, 10),
+        sample_passive: holdings.filter((h) => h.holding_kind === "passive_holding").map((h) => h.market).slice(0, 10),
+      },
+      "SPOT_ACCOUNT_HOLDING_CLASSIFICATION_PROOF",
+    );
+    req.log.info(
+      {
+        tag: "SPOT_HOLDING_MONITOR_DATA_PROOF",
+        ts: new Date().toISOString(),
+        holdings_count: holdings.length,
+        signal_meta_present_count: holdings.filter((h) => Boolean(h.signal_meta)).length,
+        signal_meta_missing_count: holdings.filter((h) => !h.signal_meta).length,
+        signal_meta_missing_markets: holdings.filter((h) => !h.signal_meta).map((h) => h.market).slice(0, 15),
+      },
+      "SPOT_HOLDING_MONITOR_DATA_PROOF",
+    );
+    req.log.info(
+      {
+        tag: "SPOT_HOLDING_EXIT_POLICY_PROOF",
+        ts: new Date().toISOString(),
+        managed_count: managedCount,
+        exit_policy_attached_count: holdings.filter((h) => h.holding_kind === "managed_position" && h.exit_policy).length,
+        missing_exit_policy_markets: holdings
+          .filter((h) => h.holding_kind === "managed_position" && !h.exit_policy)
+          .map((h) => h.market)
+          .slice(0, 15),
+      },
+      "SPOT_HOLDING_EXIT_POLICY_PROOF",
+    );
+    req.log.info(
+      {
+        tag: "SPOT_SLOT_USAGE_RECONCILE_PROOF",
+        ts: new Date().toISOString(),
+        used_slots: usedSlots,
+        managed_count: managedCount,
+        note: "used_slots counts only managed holdings; passive excluded",
+      },
+      "SPOT_SLOT_USAGE_RECONCILE_PROOF",
+    );
+
+    return {
+      ok: true,
+      updated_at: new Date().toISOString(),
+      used_slots: usedSlots,
+      holdings,
+      strategy: {
+        max_positions: Number(strategyStatus?.max_positions ?? 0),
+        open_positions_count: Object.keys(openPositions).filter((m) => Number(openPositions[m]?.qty ?? 0) > 0).length,
+        early_positions_count: Object.keys(earlyPositions).filter((m) => Number(earlyPositions[m]?.qty ?? 0) > 0).length,
+      },
+      ms: Date.now() - t0,
+    };
+  });
+
   app.get("/api/v1/trade/status-lightweight", async (req) => {
     const t0 = Date.now();
     const st = await trade.statusLightweight();

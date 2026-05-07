@@ -17,6 +17,7 @@ export function useTradingEngineInsights<TScannerItem extends { market: string }
   trade: TradeLike | null;
   strategy: StrategyLike | null;
   scanner: { updated_at?: string | null; items?: TScannerItem[] | null } | null;
+  accountHoldings?: { used_slots?: number; holdings?: Array<{ market?: unknown }> } | null;
   accountPortfolioForKpi: (v: unknown) => {
     krw_total_krw: number;
     krw_available_krw: number;
@@ -24,9 +25,20 @@ export function useTradingEngineInsights<TScannerItem extends { market: string }
     net_return_pct: number;
   } | null;
 }) {
-  const { trade, strategy, scanner, accountPortfolioForKpi } = params;
+  const { trade, strategy, scanner, accountHoldings, accountPortfolioForKpi } = params;
 
   const heldLiveSymbols = useMemo(() => {
+    const fromClassified = Array.isArray(accountHoldings?.holdings)
+      ? accountHoldings!.holdings
+          .map((h) => {
+            if (!h || typeof h !== "object") return "";
+            const rec = h as Record<string, unknown>;
+            return String(rec.market ?? "");
+          })
+          .filter((m) => m.startsWith("KRW-"))
+      : null;
+    if (fromClassified && fromClassified.length > 0) return [...new Set(fromClassified)].sort();
+
     const out = new Set<string>();
     const DUST_NOTIONAL_KRW = 1000;
     for (const b of trade?.balances ?? []) {
@@ -40,7 +52,7 @@ export function useTradingEngineInsights<TScannerItem extends { market: string }
       if (Number.isFinite(qtyRaw) && qtyRaw > 0 && notionalByCost >= DUST_NOTIONAL_KRW) out.add(`KRW-${currency}`);
     }
     return [...out].sort();
-  }, [trade]);
+  }, [trade, accountHoldings]);
 
   const scannerItemsExcludingHeld = useMemo(() => {
     const before = Array.isArray(scanner?.items) ? scanner.items : ([] as TScannerItem[]);
@@ -58,9 +70,11 @@ export function useTradingEngineInsights<TScannerItem extends { market: string }
   const accountPnlPct = Number(ap?.net_return_pct ?? 0);
 
   const strategyOpenPositions = useMemo(() => {
+    const used = Number(accountHoldings?.used_slots ?? NaN);
+    if (Number.isFinite(used) && used >= 0) return Math.floor(used);
     const ops = strategy?.open_positions ?? {};
     return Object.values(ops).filter((p) => Number((p as { remaining_qty?: unknown } | null | undefined)?.remaining_qty ?? 0) > 0).length;
-  }, [strategy]);
+  }, [strategy, accountHoldings]);
   const strategyMaxPositions = Math.max(1, Math.floor(Number(strategy?.max_positions ?? 6)));
   const strategyRemainingSlots = Math.max(0, strategyMaxPositions - strategyOpenPositions);
   const strategyUsableKrw = Math.max(0, Number(strategy?.strategy_available_krw ?? 0));
