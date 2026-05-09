@@ -503,14 +503,14 @@ type PersistedState = {
   fine_profile_stats?: Record<string, LiveEntryProfileStats>;
 };
 
-const MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX", "KRW-DOGE"] as const;
-const LEADER_MARKETS = new Set<string>(MARKETS as unknown as string[]);
+const CORE_TRADE_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX", "KRW-DOGE"] as const;
+const LEADER_MARKETS = new Set<string>(CORE_TRADE_MARKETS as unknown as string[]);
 /** 코어 현물: original 반등형 대신 CORE_TREND_ENTRY(추세 지속·소액 probe) 경로 후보 */
-const CORE_TREND_ENTRY_MARKETS = new Set<string>(MARKETS as unknown as string[]);
+const CORE_TREND_ENTRY_MARKETS = new Set<string>(CORE_TRADE_MARKETS as unknown as string[]);
 /** BTC/ETH/XRP/TRX 에는 composite 게이트 우회(strong_symbol_override) 적용 금지 */
 const NO_STRONG_SYMBOL_OVERRIDE_MARKETS = new Set<string>(["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"]);
 /** CORE 6개: candle_fetch_timeout 반복 시 last_good cache fallback 허용 (DOGE 포함) */
-const CORE_MAJOR_MARKETS = new Set<string>(MARKETS as unknown as string[]);
+const CORE_MAJOR_MARKETS = new Set<string>(CORE_TRADE_MARKETS as unknown as string[]);
 
 const LIVE_CORE_ENTRY_RESERVE_SLOTS = (() => {
   const raw = process.env.LIVE_CORE_ENTRY_RESERVE_SLOTS;
@@ -734,7 +734,7 @@ const LIVE_CORE_TREND_MAJOR_MIN_VOLUME_RATIO = (() => {
 })();
 
 /** volume relax 적용 대상은 메이저 6종으로 고정 (DOGE 포함) */
-const CORE_TREND_VOLUME_RELAX_MARKETS = new Set<string>(MARKETS as unknown as string[]);
+const CORE_TREND_VOLUME_RELAX_MARKETS = new Set<string>(CORE_TRADE_MARKETS as unknown as string[]);
 const LIVE_CORE_TREND_RSI_CAP = (() => {
   const raw = process.env.LIVE_CORE_TREND_RSI_CAP;
   const n = raw === undefined || raw === "" ? 72 : Number(raw);
@@ -2566,7 +2566,7 @@ export function createLiveDataStrategy(opts: {
       const p = mvpSignalPayloadV2Schema.safeParse(row.payload);
       if (!p.success) continue;
       if (!latestAllSignals.has(p.data.market)) latestAllSignals.set(p.data.market, { ts: row.ts, p: p.data });
-      if (!MARKETS.includes(p.data.market as (typeof MARKETS)[number])) continue;
+      if (!CORE_TRADE_MARKETS.includes(p.data.market as (typeof CORE_TRADE_MARKETS)[number])) continue;
       if (!latestByMarket.has(p.data.market)) latestByMarket.set(p.data.market, { ts: row.ts, p: p.data });
     }
 
@@ -2799,7 +2799,7 @@ export function createLiveDataStrategy(opts: {
     const exceptionSlotMarket = exceptionPool[0]?.market ?? null;
     // [HARDENED] CORE markets must ALWAYS be in watchMarkets to avoid TOP_N cutoff
     const watchMarkets = Array.from(
-      new Set([...MARKETS, ...(exceptionSlotMarket ? [exceptionSlotMarket] : []), ...debugUniverseExtra]),
+      new Set([...CORE_TRADE_MARKETS, ...(exceptionSlotMarket ? [exceptionSlotMarket] : []), ...debugUniverseExtra]),
     );
 
     const allSignalsArr = Array.from(latestAllSignals.values());
@@ -3496,7 +3496,7 @@ export function createLiveDataStrategy(opts: {
             const rows = lastGood.rows;
             console.info(
               JSON.stringify({
-                tag: "LIVE_CANDIDATE_CANDLE_FETCH_FALLBACK_USED",
+                tag: "CORE_CANDLE_FETCH_FALLBACK_USED",
                 ts: new Date().toISOString(),
                 market,
                 cache_age_ms: cacheAgeMs,
@@ -3547,7 +3547,7 @@ export function createLiveDataStrategy(opts: {
       string,
       { qty?: number; avg?: number; dca_count?: number; dca_max?: number; dca_available?: boolean; exit_status?: string }
     >;
-    for (const market of MARKETS) {
+    for (const market of CORE_TRADE_MARKETS) {
       const legacy = legacyByMarket[market];
       const legacyQty = Number(legacy?.qty ?? 0);
       const legacyAvg = Number(legacy?.avg ?? 0);
@@ -4469,6 +4469,15 @@ export function createLiveDataStrategy(opts: {
             blockedReason: "order value below 5000 KRW",
           },
         });
+        console.info(JSON.stringify({
+            tag: "DUST_POSITION_UNSELLABLE",
+            ts: new Date().toISOString(),
+            market,
+            reason: reasonExit,
+            value_krw: intendedSellValueKrw,
+            qty: beforeQty,
+            note: "manual_handling_required"
+        }));
         continue;
       }
 
@@ -5052,7 +5061,7 @@ export function createLiveDataStrategy(opts: {
     let coreUsedCapitalKrw = 0;
     let surgeUsedCapitalKrw = 0;
     let usdtValueKrw = 0;
-    const coreMarketSet = new Set<string>(MARKETS);
+    const coreMarketSet = new Set<string>(CORE_TRADE_MARKETS);
     const classificationRows: any[] = [];
     
     for (const b of Array.isArray(tstatus.balances) ? tstatus.balances : []) {
@@ -5271,6 +5280,14 @@ export function createLiveDataStrategy(opts: {
                 candidate_meta_missing_reason: "candle_fetch_timeout",
               }),
             );
+            if (CORE_MAJOR_MARKETS.has(m)) {
+                console.info(JSON.stringify({
+                    tag: "CORE_CANDIDATE_DROPPED_CANDLE_TIMEOUT",
+                    ts: new Date().toISOString(),
+                    market: m,
+                    reason: "timeout_after_fallback_attempt"
+                }));
+            }
             return null;
           }
           evaluationDroppedReasons[m] = "candle_fetch_error";
@@ -8349,6 +8366,16 @@ export function createLiveDataStrategy(opts: {
         if (liveTradingOn) {
           if (isCoreMarket) coreRemainingInTick = Math.max(0, coreRemainingInTick - orderKrw);
           else surgeRemainingInTick = Math.max(0, surgeRemainingInTick - orderKrw);
+          
+          console.info(JSON.stringify({
+            tag: "LIVE_MANAGED_POSITION_REGISTERED_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            engine_bucket: isCoreMarket ? "core" : "surge",
+            order_krw: orderKrw,
+            strategy_type: strategyType,
+            ts_opened: new Date().toISOString()
+          }));
         }
         await appendLog({
           company_id: companyIdSchema.parse(opts.companyId),

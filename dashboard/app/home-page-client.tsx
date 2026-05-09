@@ -2568,7 +2568,7 @@ export default function HomePage() {
         </section>
 
         <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>
-          주요 감시 종목
+          CORE 50% 자동매매 종목
         </section>
         <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(210px, 1fr))", gap: "0.8rem", marginBottom: "1rem" }}>
           {CORE_WATCH_MARKETS.map((market) => {
