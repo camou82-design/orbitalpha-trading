@@ -13,6 +13,7 @@ import { companyIdSchema, serviceIdSchema } from "@orbitalpha/shared";
 import type { StrategyType } from "./strategy-risk-config.js";
 import { ORDER_LIMITS } from "@orbitalpha/shared";
 import { STRATEGY_RISK_CONFIG, grossPnlPct, netPnlPctPerUnit } from "./strategy-risk-config.js";
+import { computeLiveCapitalPolicyV4 } from "./live-capital-policy-v4.js";
 import crypto from "node:crypto";
 import path from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -46,6 +47,8 @@ type TradeOrderSnapshot = {
 
 type TradeState = {
   inFlight: boolean;
+  /** 진행중 주문이 매수일 때만 설정 — SURGE/CORE 예약금 배분 근거 */
+  inFlightBuyMarket: string | null;
   lastOrderAtMs: number;
   lastOrderKey: string | null;
   testMarket: "KRW-BTC" | "KRW-XRP" | null;
@@ -203,6 +206,7 @@ export function createTradeControl(
   const serviceId = serviceIdSchema.parse(env.serviceId);
   const state: TradeState = {
     inFlight: false,
+    inFlightBuyMarket: null,
     lastOrderAtMs: 0,
     lastOrderKey: null,
     testMarket: null,
@@ -634,6 +638,7 @@ export function createTradeControl(
     if (funds.live_order_available_krw < 5000) throw new Error("Live order available KRW is below minimum order amount");
     if (funds.live_order_available_krw < amountKrw) throw new Error(`Not enough live-order KRW. available=${funds.live_order_available_krw}`);
     state.inFlight = true;
+    state.inFlightBuyMarket = market;
     try {
       await log("manual_buy_request", { market, amount_krw: amountKrw, mode: env.tradingMode });
       await hooks?.onEvent?.({
@@ -741,12 +746,14 @@ export function createTradeControl(
       throw e;
     } finally {
       state.inFlight = false;
+      state.inFlightBuyMarket = null;
     }
   };
 
   const placeSell = async (market: string, confirm: boolean, ratio = 1, bucket: PositionBucket = "strategy") => {
     const conn = await ensureExitAllowed("sell", market, confirm, bucket);
     state.inFlight = true;
+    state.inFlightBuyMarket = null;
     try {
       const pos = state.strategyPositions[market as keyof typeof state.strategyPositions];
       const legacyPos = state.legacyBuckets[market as ManagedMarket];
@@ -819,6 +826,7 @@ export function createTradeControl(
       throw e;
     } finally {
       state.inFlight = false;
+      state.inFlightBuyMarket = null;
     }
   };
 
@@ -955,6 +963,19 @@ export function createTradeControl(
           },
         ]),
       );
+    const mpForCap = mark_prices && typeof mark_prices === "object" ? mark_prices : {};
+    const capitalV4 = computeLiveCapitalPolicyV4({
+      balances: conn.balances ?? [],
+      markPriceOrAvgByMarket: (mk, avgFb) => {
+        const px = Number((mpForCap as Record<string, number>)[mk]);
+        return Number.isFinite(px) && px > 0 ? px : Number.isFinite(avgFb) && avgFb > 0 ? avgFb : 0;
+      },
+      accountPortfolioTotalEvaluatedKrw: account_portfolio?.total_evaluated_krw ?? null,
+      totalKrwFallback: funds.total_krw,
+      reservedKrw: funds.reserved_krw,
+      inFlightMarket: state.inFlightBuyMarket,
+      inFlight: state.inFlight && state.inFlightBuyMarket != null,
+    });
     return {
       trading_mode: env.tradingMode,
       live_order_confirm: env.liveOrderConfirm,
@@ -982,6 +1003,7 @@ export function createTradeControl(
       last_order: state.lastOrder,
       last_error: state.lastError,
       in_flight: state.inFlight,
+      in_flight_buy_market: state.inFlightBuyMarket,
       auto_trade_enabled: state.autoTradeEnabled,
       auto_trade_changed_at: state.autoTradeChangedAt,
       recovery_ready: state.recoveryReady,
@@ -1009,6 +1031,34 @@ export function createTradeControl(
       market_data_failure_code,
       market_data_failure_message,
       pricing_debug,
+      spot_trading_equity_krw: capitalV4.spotTradingEquityKrw,
+      excluded_usdt_value_krw: capitalV4.excludedUsdtValueKrw,
+      okx_transfer_reserve_krw: capitalV4.okxTransferReserveKrw,
+      total_asset_equity_krw: capitalV4.totalAssetEquityKrw,
+      core_cap_amount: capitalV4.coreCapAmount,
+      surge_cap_amount: capitalV4.surgeCapAmount,
+      core_used_capital_krw: capitalV4.coreUsedCapitalKrw,
+      surge_used_capital_krw: capitalV4.surgeUsedCapitalKrw,
+      core_holdings_evaluation_krw: capitalV4.coreHoldingsEvaluationKrw,
+      surge_holdings_evaluation_krw: capitalV4.surgeHoldingsEvaluationKrw,
+      core_pending_buy_reserved_krw: capitalV4.corePendingBuyReservedKrw,
+      surge_pending_buy_reserved_krw: capitalV4.surgePendingBuyReservedKrw,
+      core_remaining_krw: capitalV4.coreRemainingKrw,
+      surge_remaining_krw: capitalV4.surgeRemainingKrw,
+      spotTradingEquityKrw: capitalV4.spotTradingEquityKrw,
+      excludedUsdtValueKrw: capitalV4.excludedUsdtValueKrw,
+      okxTransferReserveKrw: capitalV4.okxTransferReserveKrw,
+      totalAssetEquityKrw: capitalV4.totalAssetEquityKrw,
+      coreCapAmount: capitalV4.coreCapAmount,
+      surgeCapAmount: capitalV4.surgeCapAmount,
+      coreUsedCapital: capitalV4.coreUsedCapitalKrw,
+      surgeUsedCapital: capitalV4.surgeUsedCapitalKrw,
+      coreHoldingsEvaluationKrw: capitalV4.coreHoldingsEvaluationKrw,
+      surgeHoldingsEvaluationKrw: capitalV4.surgeHoldingsEvaluationKrw,
+      corePendingBuyReserved: capitalV4.corePendingBuyReservedKrw,
+      surgePendingBuyReserved: capitalV4.surgePendingBuyReservedKrw,
+      coreRemaining: capitalV4.coreRemainingKrw,
+      surgeRemaining: capitalV4.surgeRemainingKrw,
     };
   };
 

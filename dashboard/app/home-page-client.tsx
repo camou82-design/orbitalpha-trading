@@ -128,8 +128,8 @@ function singleFailedFilterId(parsed: NonNullable<ReturnType<typeof parseSignalP
   return failed.length === 1 ? failed[0]!.id : null;
 }
 
-const CORE_WATCH_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX", "KRW-DOGE"] as const;
-const DASHBOARD_MARKETS = CORE_WATCH_MARKETS;
+const CORE_TRADE_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX", "KRW-DOGE"] as const;
+const DASHBOARD_MARKETS = CORE_TRADE_MARKETS;
 const UPBIT_FEE_RATE = 0.0005;
 
 /** API 구버전 대비 — 서버 `volume-thresholds`와 동기 */
@@ -254,6 +254,30 @@ type TradeStatus = {
   } | null;
   /** `account_portfolio` 산출에 사용한 현재가(대시보드 4종목). */
   mark_prices?: Record<string, number> | null;
+  spot_trading_equity_krw?: number;
+  excluded_usdt_value_krw?: number;
+  okx_transfer_reserve_krw?: number;
+  total_asset_equity_krw?: number;
+  core_cap_amount?: number;
+  surge_cap_amount?: number;
+  core_used_capital_krw?: number;
+  surge_used_capital_krw?: number;
+  core_pending_buy_reserved_krw?: number;
+  surge_pending_buy_reserved_krw?: number;
+  core_remaining_krw?: number;
+  surge_remaining_krw?: number;
+  spotTradingEquityKrw?: number;
+  excludedUsdtValueKrw?: number;
+  okxTransferReserveKrw?: number;
+  totalAssetEquityKrw?: number;
+  coreCapAmount?: number;
+  surgeCapAmount?: number;
+  coreUsedCapital?: number;
+  surgeUsedCapital?: number;
+  corePendingBuyReserved?: number;
+  surgePendingBuyReserved?: number;
+  coreRemaining?: number;
+  surgeRemaining?: number;
 };
 
 /** 서버 `account_portfolio` — 필드 누락·NaN 이 있어도 KPI는 유한 숫자로만 표시. */
@@ -289,12 +313,6 @@ type AssetSummaryKpi =
   }
   | { kpi: "pending" }
   | { kpi: "unavailable" };
-
-type LiveOperatingCapital = {
-  totalOperatingKrw: number | null;
-  spotTradingEquityKrw: number | null;
-  excludedUsdtValueKrw: number | null;
-};
 
 type AuthSession = {
   authenticated: boolean;
@@ -656,68 +674,86 @@ function toPaperPanelSummary(raw: unknown): PaperPanelSummary {
   };
 }
 
-function deriveLiveOperatingCapital(trade: TradeStatus | null): LiveOperatingCapital {
-  if (!trade) return { totalOperatingKrw: null, spotTradingEquityKrw: null, excludedUsdtValueKrw: null };
-  
-  // Best case: use server-calculated fields if available
-  const serverSpotEquity = (trade as any).spot_trading_equity_krw;
-  const serverUsdtValue = (trade as any).excluded_usdt_value_krw;
-  
-  const apTotal = Number(trade.account_portfolio?.total_evaluated_krw);
-  const markPrices = (trade.mark_prices as any) ?? {};
-  
-  let usdtVal = 0;
-  const usdtBal = (trade.balances ?? []).find(b => b.currency === "USDT");
-  if (usdtBal) {
-    const qty = Number(usdtBal.balance ?? 0) + Number(usdtBal.locked ?? 0);
-    const px = markPrices["KRW-USDT"] ?? Number(usdtBal.avg_buy_price ?? 0);
-    usdtVal = qty * px;
+type LiveCapitalApiReady = {
+  ready: true;
+  totalAssetEquityKrw: number;
+  excludedUsdtValueKrw: number;
+  okxTransferReserveKrw: number;
+  spotTradingEquityKrw: number;
+  availableKrw: number;
+  coreCapAmount: number;
+  surgeCapAmount: number;
+  coreUsedCapital: number;
+  surgeUsedCapital: number;
+  corePendingBuyReserved: number;
+  surgePendingBuyReserved: number;
+  coreRemaining: number;
+  surgeRemaining: number;
+};
+
+type LiveCapitalApiState = LiveCapitalApiReady | { ready: false; reason: string };
+
+function readFinite(tr: Record<string, unknown>, snake: string, camel: string): number | null {
+  const raw = tr[snake] !== undefined && tr[snake] !== null ? tr[snake] : tr[camel];
+  const x = Number(raw);
+  return Number.isFinite(x) ? x : null;
+}
+
+/** 서버 필드만 사용. 누락 시 ready=false (구형 클라이언트 추정 금지). */
+function deriveLiveCapitalApiState(trade: TradeStatus | null, krwAvailableFallback: number): LiveCapitalApiState {
+  if (!trade?.api_connected) return { ready: false, reason: "API 미연결" };
+  const t = trade as unknown as Record<string, unknown>;
+  const totalAssetEquityKrw = readFinite(t, "total_asset_equity_krw", "totalAssetEquityKrw");
+  const spotTradingEquityKrw = readFinite(t, "spot_trading_equity_krw", "spotTradingEquityKrw");
+  const excludedUsdtValueKrw = readFinite(t, "excluded_usdt_value_krw", "excludedUsdtValueKrw");
+  const okxTransferReserveKrwRaw = readFinite(t, "okx_transfer_reserve_krw", "okxTransferReserveKrw");
+  const okxTransferReserveKrw =
+    okxTransferReserveKrwRaw ??
+    (excludedUsdtValueKrw != null ? excludedUsdtValueKrw : null);
+  const coreCapAmount = readFinite(t, "core_cap_amount", "coreCapAmount");
+  const surgeCapAmount = readFinite(t, "surge_cap_amount", "surgeCapAmount");
+  const coreUsedCapital = readFinite(t, "core_used_capital_krw", "coreUsedCapital");
+  const surgeUsedCapital = readFinite(t, "surge_used_capital_krw", "surgeUsedCapital");
+  const corePendingBuyReserved =
+    readFinite(t, "core_pending_buy_reserved_krw", "corePendingBuyReserved") ?? 0;
+  const surgePendingBuyReserved =
+    readFinite(t, "surge_pending_buy_reserved_krw", "surgePendingBuyReserved") ?? 0;
+  const coreRemaining = readFinite(t, "core_remaining_krw", "coreRemaining");
+  const surgeRemaining = readFinite(t, "surge_remaining_krw", "surgeRemaining");
+  const apKrw = trade.account_portfolio?.krw_available_krw;
+  const availableKrw = Number.isFinite(Number(apKrw)) ? Number(apKrw) : krwAvailableFallback;
+
+  if (
+    totalAssetEquityKrw == null ||
+    spotTradingEquityKrw == null ||
+    excludedUsdtValueKrw == null ||
+    okxTransferReserveKrw == null ||
+    coreCapAmount == null ||
+    surgeCapAmount == null ||
+    coreUsedCapital == null ||
+    surgeUsedCapital == null ||
+    coreRemaining == null ||
+    surgeRemaining == null
+  ) {
+    return { ready: false, reason: "데이터 대기" };
   }
 
-  const finalUsdtValue = serverUsdtValue != null ? Number(serverUsdtValue) : usdtVal;
-
-  if (Number.isFinite(apTotal) && apTotal > 0) {
-    const spotEquity = serverSpotEquity != null ? Number(serverSpotEquity) : Math.max(0, apTotal - finalUsdtValue);
-    return { 
-        totalOperatingKrw: apTotal, 
-        spotTradingEquityKrw: spotEquity,
-        excludedUsdtValueKrw: finalUsdtValue 
-    };
-  }
-
-  const krwAvailable = Number(trade.krw_available);
-  const safeKrwAvailable = Number.isFinite(krwAvailable) ? Math.max(0, krwAvailable) : 0;
-  
-  let holdingsEvaluated = 0;
-  const balances = Array.isArray(trade.balances) ? trade.balances : [];
-  for (const bal of balances) {
-    const currency = String(bal?.currency ?? "").toUpperCase();
-    if (!currency || currency === "KRW") continue;
-    
-    const qty = Math.max(0, Number(bal?.balance ?? 0)) + Math.max(0, Number(bal?.locked ?? 0));
-    if (!(qty > 0)) continue;
-    
-    const market = `KRW-${currency}`;
-    const markPrice = Number(markPrices[market]);
-    const avgBuy = Number(bal?.avg_buy_price ?? 0);
-    const px = (Number.isFinite(markPrice) && markPrice > 0) ? markPrice : (Number.isFinite(avgBuy) && avgBuy > 0 ? avgBuy : 0);
-    
-    if (px > 0) {
-      holdingsEvaluated += qty * px;
-    }
-  }
-
-  const totalEvaluated = safeKrwAvailable + holdingsEvaluated;
-  if (totalEvaluated > 0) {
-    const spotEquity = serverSpotEquity != null ? Number(serverSpotEquity) : Math.max(0, totalEvaluated - finalUsdtValue);
-    return {
-      totalOperatingKrw: totalEvaluated,
-      spotTradingEquityKrw: spotEquity,
-      excludedUsdtValueKrw: finalUsdtValue
-    };
-  }
-
-  return { totalOperatingKrw: null, spotTradingEquityKrw: null, excludedUsdtValueKrw: null };
+  return {
+    ready: true,
+    totalAssetEquityKrw,
+    spotTradingEquityKrw,
+    excludedUsdtValueKrw,
+    okxTransferReserveKrw,
+    availableKrw,
+    coreCapAmount,
+    surgeCapAmount,
+    coreUsedCapital,
+    surgeUsedCapital,
+    corePendingBuyReserved,
+    surgePendingBuyReserved,
+    coreRemaining,
+    surgeRemaining,
+  };
 }
 
 function failedFilterLabels(parsed: NonNullable<ReturnType<typeof parseSignalPayload>>): string {
@@ -2018,9 +2054,19 @@ export default function HomePage() {
   }, [trade, strategy]);
 
   const passiveHoldingCards = useMemo(
-    () => holdingCards.filter((h) => h.qty > 0 && !managedMarketSet.has(h.market)),
+    () =>
+      holdingCards.filter(
+        (h) => h.qty > 0 && !managedMarketSet.has(h.market) && String(h.currency).toUpperCase() !== "USDT",
+      ),
     [holdingCards, managedMarketSet],
   );
+
+  const okxUsdtHolding = useMemo(() => {
+    const b = (trade?.balances ?? []).find((x) => String(x?.currency ?? "").toUpperCase() === "USDT");
+    if (!b) return null;
+    const qty = Number(b.balance ?? 0) + Number(b.locked ?? 0);
+    return { qty, locked: Number(b.locked ?? 0) };
+  }, [trade?.balances]);
 
   const managedHoldingCards = useMemo(
     () => holdingCards.filter((h) => h.qty > 0 && managedMarketSet.has(h.market)),
@@ -2028,7 +2074,6 @@ export default function HomePage() {
   );
 
   const paperSummary = useMemo<PaperPanelSummary>(() => toPaperPanelSummary(paper), [paper]);
-  const liveOperatingCapital = useMemo(() => deriveLiveOperatingCapital(trade), [trade]);
 
   const assetSummary = useMemo((): AssetSummaryKpi => {
     if (!trade) return { kpi: "unavailable" };
@@ -2063,26 +2108,43 @@ export default function HomePage() {
     return "API 확인 필요";
   }, [trade, accountSyncState]);
 
-  const liveCapitalCapSummary = useMemo(() => {
-    const totalEquity =
-      assetSummary.kpi === "ready"
-        ? Number(assetSummary.totalAssets)
-        : Math.max(0, Number(trade?.account_portfolio?.total_evaluated_krw ?? accountTotalEquity ?? 0));
-    const surgeCapAmount = Math.floor(totalEquity * 0.5);
-    const pendingBuyReserved = Math.max(0, Number(trade?.reserved_krw ?? 0));
-    const holdingsEval = Math.max(0, totalEquity - Math.max(0, Number(trade?.account_portfolio?.krw_total_krw ?? trade?.total_krw ?? trade?.krw_available ?? 0)));
-    const usedCapitalIncludingPassive = Math.max(0, holdingsEval + pendingBuyReserved);
-    const capRemaining = Math.max(0, surgeCapAmount - usedCapitalIncludingPassive);
-    const allowed = surgeCapAmount > 0 ? usedCapitalIncludingPassive < surgeCapAmount : false;
+  const liveCapitalApi = useMemo(
+    () => deriveLiveCapitalApiState(trade, Number.isFinite(accountAvailableKrw) ? accountAvailableKrw : Number(trade?.krw_available ?? 0)),
+    [trade, accountAvailableKrw],
+  );
+
+  const surgeUiDiagnostics = useMemo(() => {
+    const scannerItems = scanner?.items ?? [];
+    const filterPassApprox = scannerItems.filter((it) => Boolean(it.breakout) && Boolean(it.close_upper_hold)).length;
+    const coreSetUi = new Set<string>(CORE_TRADE_MARKETS as unknown as string[]);
+    const nonCoreRow = signalRows.find(
+      (r) => !coreSetUi.has(r.parsed.p.market) && r.parsed.kind === "v2" && !r.parsed.p.filter_pass,
+    );
+    const recentBlock = nonCoreRow ? getCardFailReason(nonCoreRow.parsed) : "—";
+    const surgeCapLine = liveCapitalApi.ready
+      ? liveCapitalApi.surgeRemaining >= 5000
+        ? "매수 가능 (SURGE cap)"
+        : "SURGE cap 차단"
+      : "데이터 대기";
     return {
-      totalEquity,
-      surgeCapAmount,
-      usedCapitalIncludingPassive,
-      pendingBuyReserved,
-      capRemaining,
-      allowed,
+      filterPassApprox,
+      signalLogFilterPassApprox: signalRows.filter((r) => r.parsed.kind === "v2" && r.parsed.p.filter_pass).length,
+      recentBlockReason: recentBlock,
+      surgeCapLine,
+      noCandidateReason: entryBlockReason,
+      lastRefresh: recentScannerCalcTs ?? scanner?.updated_at ?? null,
     };
-  }, [assetSummary, trade, accountTotalEquity]);
+  }, [scanner, signalRows, liveCapitalApi, entryBlockReason, recentScannerCalcTs]);
+
+  const coreTradeStatusLabel = (market: string) => {
+    const parsed = latestByMarket[market]?.parsed;
+    if (!parsed) return "데이터 부족";
+    if (managedMarketSet.has(market)) return "보유 중";
+    const tone = getCardTone(parsed);
+    if (tone === "pass") return "진입 가능";
+    if (tone === "none") return "평가 대기";
+    return "조건 미충족";
+  };
 
   const accountSyncFailureDisplay = useMemo(() => {
     if (trade?.api_connected) return null;
@@ -2289,6 +2351,9 @@ export default function HomePage() {
             overflow: "hidden",
           }}
         >
+          <div style={{ fontSize: "0.8rem", color: UI.title, fontWeight: 900, marginBottom: "0.45rem", letterSpacing: "0.02em" }}>
+            계좌 · 현물 자동매매 자금
+          </div>
           <div
             style={{
               display: "grid",
@@ -2297,40 +2362,58 @@ export default function HomePage() {
             }}
           >
             <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
-              <div style={{ fontSize: "0.73rem", color: UI.muted, marginBottom: 3, fontWeight: 600 }}>총 보유자산</div>
-              <div style={{ fontSize: "1.55rem", fontWeight: 900, color: UI.title, lineHeight: 1.05 }}>
-                {assetSummary.kpi === "ready" ? Math.round(assetSummary.totalAssets).toLocaleString() : "—"}
+              <div style={{ fontSize: "0.72rem", color: UI.muted, marginBottom: 3, fontWeight: 600 }}>전체 계좌 평가액</div>
+              <div style={{ fontSize: "1.42rem", fontWeight: 900, color: UI.title, lineHeight: 1.05 }}>
+                {liveCapitalApi.ready ? Math.round(liveCapitalApi.totalAssetEquityKrw).toLocaleString() : "데이터 대기"}
               </div>
+              <div style={{ fontSize: "0.65rem", color: UI.mutedSoft, marginTop: 4 }}>totalAssetEquity</div>
             </div>
             <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
-              <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>보유 KRW</div>
-              <div style={{ fontSize: "1.55rem", fontWeight: 900, color: UI.title, lineHeight: 1.05 }}>
-                {assetSummary.kpi === "ready" ? Math.round(assetSummary.krw).toLocaleString() : "—"}
+              <div style={{ fontSize: "0.72rem", color: UI.muted, marginBottom: 3, fontWeight: 600 }}>OKX 이관 예정 USDT</div>
+              <div style={{ fontSize: "1.42rem", fontWeight: 900, color: UI.title, lineHeight: 1.05 }}>
+                {liveCapitalApi.ready ? Math.round(liveCapitalApi.excludedUsdtValueKrw).toLocaleString() : "데이터 대기"}
               </div>
+              <div style={{ fontSize: "0.65rem", color: UI.mutedSoft, marginTop: 4 }}>현물 자동매매 제외</div>
             </div>
             <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
-              <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>순평가손익</div>
+              <div style={{ fontSize: "0.72rem", color: UI.muted, marginBottom: 3, fontWeight: 600 }}>현물 자동매매 기준금액</div>
+              <div style={{ fontSize: "1.42rem", fontWeight: 900, color: UI.title, lineHeight: 1.05 }}>
+                {liveCapitalApi.ready ? Math.round(liveCapitalApi.spotTradingEquityKrw).toLocaleString() : "데이터 대기"}
+              </div>
+              <div style={{ fontSize: "0.65rem", color: UI.mutedSoft, marginTop: 4 }}>USDT 제외 후 50/50 분배 기준</div>
+            </div>
+            <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
+              <div style={{ fontSize: "0.72rem", color: UI.muted, marginBottom: 3, fontWeight: 600 }}>보유 KRW</div>
+              <div style={{ fontSize: "1.42rem", fontWeight: 900, color: UI.title, lineHeight: 1.05 }}>
+                {liveCapitalApi.ready
+                  ? Math.round(liveCapitalApi.availableKrw).toLocaleString()
+                  : assetSummary.kpi === "ready"
+                    ? Math.round(assetSummary.krw).toLocaleString()
+                    : "—"}
+              </div>
+              <div style={{ fontSize: "0.65rem", color: UI.mutedSoft, marginTop: 4 }}>가용 포함 총 KRW 성격별 상세는 운영 정보</div>
+            </div>
+          </div>
+          <div style={{ marginTop: "0.65rem", display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "0.65rem" }}>
+            <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.72rem 0.8rem" }}>
+              <div style={{ fontSize: "0.72rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>순평가손익</div>
               <div
                 style={{
-                  fontSize: "1.55rem",
+                  fontSize: "1.25rem",
                   fontWeight: 900,
-                  color:
-                    assetSummary.kpi === "ready" ? (assetSummary.netPnl >= 0 ? UI.pass : UI.watch) : UI.muted,
-                  lineHeight: 1.05,
+                  color: assetSummary.kpi === "ready" ? (assetSummary.netPnl >= 0 ? UI.pass : UI.watch) : UI.muted,
                 }}
               >
                 {assetSummary.kpi === "ready" ? Math.round(assetSummary.netPnl).toLocaleString() : "—"}
               </div>
             </div>
-            <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
-              <div style={{ fontSize: "0.75rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>순수익률</div>
+            <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.72rem 0.8rem" }}>
+              <div style={{ fontSize: "0.72rem", color: UI.muted, marginBottom: 2, fontWeight: 600 }}>순수익률</div>
               <div
                 style={{
-                  fontSize: "1.55rem",
+                  fontSize: "1.25rem",
                   fontWeight: 900,
-                  color:
-                    assetSummary.kpi === "ready" ? (assetSummary.netRet >= 0 ? UI.pass : UI.watch) : UI.muted,
-                  lineHeight: 1.05,
+                  color: assetSummary.kpi === "ready" ? (assetSummary.netRet >= 0 ? UI.pass : UI.watch) : UI.muted,
                 }}
               >
                 {assetSummary.kpi === "ready" ? `${assetSummary.netRet.toFixed(2)}%` : "—"}
@@ -2514,6 +2597,9 @@ export default function HomePage() {
           </div>
         </section>
 
+        <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>
+          OKX 이관 예정 USDT
+        </section>
         <section
           style={{
             background: UI.cardBg,
@@ -2524,54 +2610,132 @@ export default function HomePage() {
             boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.32)",
           }}
         >
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+          <div style={{ fontSize: "0.9rem", color: UI.title, fontWeight: 900, letterSpacing: "0.02em" }}>OKX 이관 예정 USDT</div>
+          <div style={{ fontSize: "0.72rem", color: UI.mutedSoft, marginTop: 4, lineHeight: 1.45 }}>
+            현물 자동매매 제외 / CORE·SURGE cap 계산 제외 · 자동매매 대상 아님
+          </div>
+          <div style={{ marginTop: 10, display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
             <div>
-              <div style={{ fontSize: "0.92rem", color: UI.title, fontWeight: 900, letterSpacing: "0.02em" }}>자금 cap 상태 (SURGE 50%)</div>
-              <div style={{ fontSize: "0.72rem", color: UI.mutedSoft, marginTop: 3 }}>
-                기존 보유분도 50% cap 계산에 포함됨
+              <div style={{ fontSize: "0.7rem", color: UI.mutedSoft }}>평가금액 (KRW)</div>
+              <div style={{ fontSize: "1.2rem", fontWeight: 900, color: UI.title }}>
+                {liveCapitalApi.ready ? Math.round(liveCapitalApi.excludedUsdtValueKrw).toLocaleString() : "데이터 대기"}
               </div>
             </div>
-            <div
-              style={{
-                fontSize: "0.76rem",
-                color: liveCapitalCapSummary.capRemaining >= 5000 ? UI.pass : UI.watch,
-                fontWeight: 900,
-              }}
-            >
-              {liveCapitalCapSummary.capRemaining >= 5000 ? "신규 매수 여지 있음" : "cap 여지 부족"}
-            </div>
-          </div>
-          <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 8, fontSize: "0.78rem" }}>
-            <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.65rem 0.75rem" }}>
-              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", fontWeight: 700 }}>totalEquity</div>
-              <div style={{ color: UI.title, fontWeight: 900, fontSize: "1.05rem" }}>{Math.round(liveCapitalCapSummary.totalEquity).toLocaleString()}</div>
-            </div>
-            <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.65rem 0.75rem" }}>
-              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", fontWeight: 700 }}>surgeCapAmount (50%)</div>
-              <div style={{ color: UI.title, fontWeight: 900, fontSize: "1.05rem" }}>{Math.round(liveCapitalCapSummary.surgeCapAmount).toLocaleString()}</div>
-            </div>
-            <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.65rem 0.75rem" }}>
-              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", fontWeight: 700 }}>usedCapitalIncludingPassive</div>
-              <div style={{ color: UI.title, fontWeight: 900, fontSize: "1.05rem" }}>{Math.round(liveCapitalCapSummary.usedCapitalIncludingPassive).toLocaleString()}</div>
-            </div>
-            <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.65rem 0.75rem" }}>
-              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", fontWeight: 700 }}>pendingBuyReserved</div>
-              <div style={{ color: UI.title, fontWeight: 900, fontSize: "1.05rem" }}>{Math.round(liveCapitalCapSummary.pendingBuyReserved).toLocaleString()}</div>
-            </div>
-            <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.65rem 0.75rem" }}>
-              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", fontWeight: 700 }}>capRemaining</div>
-              <div style={{ color: liveCapitalCapSummary.capRemaining >= 5000 ? UI.pass : UI.watch, fontWeight: 900, fontSize: "1.05rem" }}>
-                {Math.round(liveCapitalCapSummary.capRemaining).toLocaleString()}
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: "0.7rem", color: UI.mutedSoft }}>보유 수량 USDT</div>
+              <div style={{ fontSize: "1rem", fontWeight: 900, color: UI.body }}>
+                {okxUsdtHolding && okxUsdtHolding.qty > 0
+                  ? okxUsdtHolding.qty.toLocaleString(undefined, { maximumFractionDigits: 8 })
+                  : liveCapitalApi.ready
+                    ? "0"
+                    : "—"}
               </div>
             </div>
           </div>
         </section>
 
         <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>
-          CORE 50% 자동매매 종목
+          CORE / SURGE 자금 버킷
+        </section>
+        <section
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
+            gap: "0.85rem",
+            marginBottom: "1rem",
+          }}
+        >
+          {(() => {
+            const coreAnyEval = CORE_TRADE_MARKETS.some((m) => latestByMarket[m]?.parsed);
+            const coreAnyPass = CORE_TRADE_MARKETS.some((m) => getCardTone(latestByMarket[m]?.parsed) === "pass");
+            const coreStatus = !liveCapitalApi.ready
+              ? "데이터 대기"
+              : liveCapitalApi.coreRemaining < 5000
+                ? "CORE cap 차단"
+                : coreAnyEval && coreAnyPass
+                  ? "매수 가능"
+                  : coreAnyEval
+                    ? "조건 미충족"
+                    : "평가 대기";
+            const hasSurgeCand = scannerItemsExcludingHeld.after.length > 0;
+            const surgeStatus = !liveCapitalApi.ready
+              ? "데이터 대기"
+              : liveCapitalApi.surgeRemaining < 5000
+                ? "SURGE cap 차단"
+                : !hasSurgeCand
+                  ? "후보 없음"
+                  : surgeUiDiagnostics.filterPassApprox === 0
+                    ? "filter_pass 미충족"
+                    : "매수 가능";
+
+            const capFmt = (n: number) => Math.round(n).toLocaleString();
+            const miniMetric = (label: string, value: string) => (
+              <div>
+                <div style={{ fontSize: "0.66rem", color: UI.mutedSoft, marginBottom: 2 }}>{label}</div>
+                <div style={{ fontSize: "0.95rem", fontWeight: 900, color: UI.title }}>{value}</div>
+              </div>
+            );
+
+            const coreNums = liveCapitalApi.ready ? (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                {miniMetric("버킷 한도", `${capFmt(liveCapitalApi.coreCapAmount)} 원`)}
+                {miniMetric("사용 평가+예약", `${capFmt(liveCapitalApi.coreUsedCapital)} 원`)}
+                {miniMetric("예약 매수 (pending)", `${capFmt(liveCapitalApi.corePendingBuyReserved)} 원`)}
+                {miniMetric("잔여", `${capFmt(liveCapitalApi.coreRemaining)} 원`)}
+              </div>
+            ) : (
+              <div style={{ color: UI.muted }}>데이터 대기 ({liveCapitalApi.reason})</div>
+            );
+
+            const surgeNums = liveCapitalApi.ready ? (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                {miniMetric("버킷 한도", `${capFmt(liveCapitalApi.surgeCapAmount)} 원`)}
+                {miniMetric("사용 평가+예약", `${capFmt(liveCapitalApi.surgeUsedCapital)} 원`)}
+                {miniMetric("예약 매수 (pending)", `${capFmt(liveCapitalApi.surgePendingBuyReserved)} 원`)}
+                {miniMetric("잔여", `${capFmt(liveCapitalApi.surgeRemaining)} 원`)}
+              </div>
+            ) : (
+              <div style={{ color: UI.muted }}>데이터 대기 ({liveCapitalApi.reason})</div>
+            );
+
+            return (
+              <>
+                <article
+                  style={{
+                    background: UI.cardBg,
+                    border: `1px solid ${UI.border}`,
+                    borderRadius: 12,
+                    padding: "0.85rem",
+                    boxShadow: "0 0 0 1px #1b3558 inset",
+                  }}
+                >
+                  <div style={{ fontSize: "0.88rem", color: "#38bdf8", fontWeight: 900, marginBottom: 6 }}>CORE 50% 자동매매 자금</div>
+                  <div style={{ fontSize: "0.78rem", fontWeight: 900, marginBottom: 10, color: UI.body }}>상태: {coreStatus}</div>
+                  {coreNums}
+                </article>
+                <article
+                  style={{
+                    background: UI.cardBg,
+                    border: `1px solid ${UI.border}`,
+                    borderRadius: 12,
+                    padding: "0.85rem",
+                    boxShadow: "0 0 0 1px #1b3558 inset",
+                  }}
+                >
+                  <div style={{ fontSize: "0.88rem", color: "#818cf8", fontWeight: 900, marginBottom: 6 }}>SURGE 50% 급등주 자금</div>
+                  <div style={{ fontSize: "0.78rem", fontWeight: 900, marginBottom: 10, color: UI.body }}>상태: {surgeStatus}</div>
+                  {surgeNums}
+                </article>
+              </>
+            );
+          })()}
+        </section>
+
+        <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>
+          CORE TRADE (50% 버킷)
         </section>
         <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(210px, 1fr))", gap: "0.8rem", marginBottom: "1rem" }}>
-          {CORE_WATCH_MARKETS.map((market) => {
+          {CORE_TRADE_MARKETS.map((market) => {
             const short = market.replace("KRW-", "");
             const mp = Number(trade?.mark_prices?.[market] ?? 0);
             const hasMark = Number.isFinite(mp) && mp > 0;
@@ -2588,11 +2752,17 @@ export default function HomePage() {
               >
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
                   <strong style={{ fontSize: "1.05rem", color: UI.title, fontWeight: 900 }}>{short}</strong>
-                  <span style={{ fontSize: "0.68rem", color: UI.watch, border: `1px solid ${UI.watch}`, padding: "0.1rem 0.45rem", borderRadius: 999, fontWeight: 800 }}>
-                    CORE WATCH
+                  <span style={{ fontSize: "0.68rem", color: "#38bdf8", border: "1px solid #38bdf8", padding: "0.1rem 0.45rem", borderRadius: 999, fontWeight: 800 }}>
+                    CORE TRADE
                   </span>
                 </div>
-                <div style={{ fontSize: "0.72rem", color: UI.mutedSoft, marginBottom: 2 }}>감시 전용 (시장 기준/감시용)</div>
+                <div style={{ fontSize: "0.72rem", color: UI.mutedSoft, marginBottom: 2 }}>CORE 50% 자동매매 대상</div>
+                <div style={{ fontSize: "0.7rem", color: UI.body, marginBottom: 4, fontWeight: 700 }}>
+                  상태:{" "}
+                  {liveCapitalApi.ready && liveCapitalApi.coreRemaining < 5000
+                    ? "CORE cap 차단"
+                    : coreTradeStatusLabel(market)}
+                </div>
                 <div style={{ marginTop: 8, fontSize: "0.72rem", color: UI.mutedSoft, fontWeight: 700 }}>현재가</div>
                 <div style={{ fontSize: "1.02rem", color: UI.title, fontWeight: 900 }}>
                   {hasMark ? Math.round(mp).toLocaleString() : "—"}
@@ -2645,14 +2815,14 @@ export default function HomePage() {
               </div>
               {scannerItemsExcludingHeld.after.map((it) => {
                 const filterPass = Boolean(it.breakout) && Boolean(it.close_upper_hold);
-                const capOk = liveCapitalCapSummary.capRemaining >= 5000;
+                const capOk = liveCapitalApi.ready && liveCapitalApi.surgeRemaining >= 5000;
                 const stopPrice = null; // server log 기반 값(이번 UI 분리 작업에서는 표시만 준비)
                 const riskReward = null; // server log 기반 값(이번 UI 분리 작업에서는 표시만 준비)
                 const baseGateOk = null; // server log 기반 값(이번 UI 분리 작업에서는 표시만 준비)
                 const blockedReason = !filterPass
                   ? "진입 차단"
                   : !capOk
-                    ? "50% cap 차단"
+                    ? "SURGE cap 차단"
                     : stopPrice === 0
                       ? "손절가 없음 차단"
                       : null;
@@ -2690,15 +2860,32 @@ export default function HomePage() {
               })}
             </div>
           ) : (
-            <p style={{ margin: 0, color: UI.muted, fontSize: "0.82rem" }}>급등주 후보 없음</p>
+            <div style={{ fontSize: "0.82rem", color: UI.muted, lineHeight: 1.55 }}>
+              <p style={{ margin: "0 0 0.5rem", fontWeight: 900, color: UI.title }}>급등주 후보 없음</p>
+              <div>filter_pass_count (신호 로그·v2·전체 행 기준): {surgeUiDiagnostics.signalLogFilterPassApprox}</div>
+              <div>후보 없음 사유: {surgeUiDiagnostics.noCandidateReason}</div>
+              <div>스캐너 근사 filter_pass 행수: {surgeUiDiagnostics.filterPassApprox}</div>
+              <div>최근 차단 사유(표본): {surgeUiDiagnostics.recentBlockReason}</div>
+              <div>SURGE cap 상태: {surgeUiDiagnostics.surgeCapLine}</div>
+              <div style={{ marginTop: 6, fontSize: "0.75rem", color: UI.mutedSoft }}>
+                마지막 갱신:{" "}
+                {surgeUiDiagnostics.lastRefresh ? formatTsLocal(surgeUiDiagnostics.lastRefresh as string) : "-"}
+              </div>
+            </div>
           )}
         </section>
 
         <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>
           기존 보유 종목
         </section>
-        <div style={{ fontSize: "0.74rem", color: UI.mutedSoft, marginTop: -2, marginBottom: 10 }}>
-          <strong style={{ color: UI.watch }}>기존 보유 / 자동매매 관리 아님</strong> · SURGE_V2는 기존 보유 종목을 강제청산하지 않습니다. (단, 자금 cap 계산에는 포함)
+        <div style={{ fontSize: "0.74rem", color: UI.mutedSoft, marginTop: -2, marginBottom: 10, lineHeight: 1.55 }}>
+          <strong style={{ color: UI.watch }}>기존 보유 / 자동매매 관리 아님</strong>
+          <br />
+          자동매매가 직접 진입한 managed 포지션이 아니면 강제청산하지 않습니다.
+          <br />
+          단, USDT는 OKX 이관 예정 자산으로 별도 제외합니다.
+          <br />
+          CORE/SURGE cap 포함 여부는 해당 버킷 기준에 따라 별도 계산됩니다.
         </div>
         {passiveHoldingCards.length === 0 ? (
           <section style={{ marginBottom: "1rem", padding: "1rem", background: UI.cardSoftBg, borderRadius: 12, border: `1px dashed ${UI.borderSoft}`, color: UI.muted }}>
@@ -2999,96 +3186,10 @@ export default function HomePage() {
                     </div>
                   </div>
 
-                  {/* 3단: 실거래 자금 상태 */}
-                  <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 12 }}>
-                        <div>
-                            <div style={{ fontSize: "0.85rem", color: UI.title, fontWeight: 900, marginBottom: 2 }}>실거래 CORE / SURGE 자산 (USDT 제외)</div>
-                            <div style={{ fontSize: "0.7rem", color: UI.mutedSoft }}>USDT는 OKX 이관용 예비금으로 운용 자산에서 제외됨</div>
-                        </div>
-                        <div style={{ textAlign: "right" }}>
-                            <div style={{ fontSize: "0.65rem", color: UI.mutedSoft }}>현물 자동매매 기준금액 (Equity)</div>
-                            <div style={{ fontSize: "1.1rem", color: "#4ade80", fontWeight: 900 }}>
-                                {liveOperatingCapital.spotTradingEquityKrw != null ? `${Math.round(liveOperatingCapital.spotTradingEquityKrw).toLocaleString()}원` : "계산중..."}
-                            </div>
-                        </div>
-                    </div>
-
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "0.8rem", marginBottom: 12 }}>
-                        <div style={{ background: "#0a192f", padding: "0.6rem", borderRadius: 8, border: "1px solid #112240" }}>
-                            <div style={{ fontSize: "0.65rem", color: UI.mutedSoft }}>총 자산 가치</div>
-                            <div style={{ fontSize: "0.9rem", color: UI.title, fontWeight: 700 }}>{liveOperatingCapital.totalOperatingKrw != null ? `${Math.round(liveOperatingCapital.totalOperatingKrw).toLocaleString()}원` : "-"}</div>
-                        </div>
-                        <div style={{ background: "#1a1a1a", padding: "0.6rem", borderRadius: 8, border: "1px solid #333" }}>
-                            <div style={{ fontSize: "0.65rem", color: "#fbbf24" }}>OKX 이관 예정 USDT</div>
-                            <div style={{ fontSize: "0.9rem", color: "#fbbf24", fontWeight: 700 }}>{liveOperatingCapital.excludedUsdtValueKrw != null ? `${Math.round(liveOperatingCapital.excludedUsdtValueKrw).toLocaleString()}원` : "0원"}</div>
-                        </div>
-                        <div style={{ background: "#064e3b", padding: "0.6rem", borderRadius: 8, border: "1px solid #065f46" }}>
-                            <div style={{ fontSize: "0.65rem", color: "#6ee7b7" }}>원화 가용 잔고</div>
-                            <div style={{ fontSize: "0.9rem", color: "#6ee7b7", fontWeight: 700 }}>{Number(trade?.krw_available ?? 0).toLocaleString()}원</div>
-                        </div>
-                    </div>
-
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1rem" }}>
-                      {/* CORE Bucket */}
-                      <div style={{ background: "#0f172a", padding: "0.8rem", borderRadius: 8, border: "1px solid #1e293b" }}>
-                         <div style={{ fontSize: "0.75rem", color: "#38bdf8", fontWeight: 700, marginBottom: 6 }}>CORE 50% 한도 (BTC/ETH/SOL/XRP/TRX/DOGE)</div>
-                         {(() => {
-                           const spotEquity = liveOperatingCapital.spotTradingEquityKrw;
-                           const availableKrw = Number(trade?.krw_available ?? 0);
-                           const cap = spotEquity != null ? spotEquity * 0.5 : null;
-                           let used = 0;
-                           const coreCurrencies = ["BTC", "ETH", "SOL", "XRP", "TRX", "DOGE"];
-                           (trade?.balances ?? []).forEach(b => {
-                             if (coreCurrencies.includes(b.currency)) {
-                               const qty = Number(b.balance ?? 0) + Number(b.locked ?? 0);
-                               const markPrices = (trade?.mark_prices as any) ?? {};
-                               const markPrice = markPrices[`KRW-${b.currency}`] ?? b.avg_buy_price ?? 0;
-                               used += qty * markPrice;
-                             }
-                           });
-                           const remaining = cap != null ? cap - used : null;
-                           const potential = remaining != null ? Math.min(Math.max(0, remaining), availableKrw) : 0;
-                           return (
-                             <div style={{ display: "grid", gridTemplateColumns: "1fr 1.2fr", gap: "0.4rem", fontSize: "0.75rem" }}>
-                               <div style={{ color: UI.mutedSoft }}>Bucket 한도</div><strong>{cap != null ? `${Math.round(cap).toLocaleString()}원` : "대기"}</strong>
-                               <div style={{ color: UI.mutedSoft }}>현재 사용액</div><strong>{Math.round(used).toLocaleString()}원</strong>
-                               <div style={{ color: UI.mutedSoft }}>여유 버킷</div><strong style={{ color: "#38bdf8" }}>{remaining != null ? `${Math.round(remaining).toLocaleString()}원` : "대기"}</strong>
-                               <div style={{ color: UI.mutedSoft, fontWeight: 900 }}>진입 가능(잠재)</div><strong style={{ color: "#4ade80", fontSize: "0.8rem" }}>{`${Math.round(potential).toLocaleString()}원`}</strong>
-                             </div>
-                           );
-                         })()}
-                      </div>
-                      {/* SURGE Bucket */}
-                      <div style={{ background: "#1e1b4b", padding: "0.8rem", borderRadius: 8, border: "1px solid #312e81" }}>
-                         <div style={{ fontSize: "0.75rem", color: "#818cf8", fontWeight: 700, marginBottom: 6 }}>SURGE 50% 한도 (기타 급등주)</div>
-                         {(() => {
-                           const spotEquity = liveOperatingCapital.spotTradingEquityKrw;
-                           const availableKrw = Number(trade?.krw_available ?? 0);
-                           const cap = spotEquity != null ? spotEquity * 0.5 : null;
-                           let used = 0;
-                           const coreCurrencies = ["BTC", "ETH", "SOL", "XRP", "TRX", "DOGE"];
-                           (trade?.balances ?? []).forEach(b => {
-                             if (b.currency !== "KRW" && b.currency !== "USDT" && !coreCurrencies.includes(b.currency)) {
-                               const qty = Number(b.balance ?? 0) + Number(b.locked ?? 0);
-                               const markPrices = (trade?.mark_prices as any) ?? {};
-                               const markPrice = markPrices[`KRW-${b.currency}`] ?? b.avg_buy_price ?? 0;
-                               used += qty * markPrice;
-                             }
-                           });
-                           used += Number(trade?.reserved_krw ?? 0);
-                           const remaining = cap != null ? cap - used : null;
-                           const potential = remaining != null ? Math.min(Math.max(0, remaining), availableKrw) : 0;
-                           return (
-                             <div style={{ display: "grid", gridTemplateColumns: "1fr 1.2fr", gap: "0.4rem", fontSize: "0.75rem" }}>
-                               <div style={{ color: UI.mutedSoft }}>Bucket 한도</div><strong>{cap != null ? `${Math.round(cap).toLocaleString()}원` : "대기"}</strong>
-                               <div style={{ color: UI.mutedSoft }}>현재 사용액</div><strong>{Math.round(used).toLocaleString()}원</strong>
-                               <div style={{ color: UI.mutedSoft }}>여유 버킷</div><strong style={{ color: "#818cf8" }}>{remaining != null ? `${Math.round(remaining).toLocaleString()}원` : "대기"}</strong>
-                               <div style={{ color: UI.mutedSoft, fontWeight: 900 }}>진입 가능(잠재)</div><strong style={{ color: "#4ade80", fontSize: "0.8rem" }}>{`${Math.round(potential).toLocaleString()}원`}</strong>
-                             </div>
-                           );
-                         })()}
-                      </div>
+                  <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.65rem 0.85rem" }}>
+                    <div style={{ fontSize: "0.76rem", color: UI.muted, lineHeight: 1.45 }}>
+                      CORE/SURGE 운용 버킷과 USDT 제외 금액은 화면 상단 <strong style={{ color: UI.body }}>계좌 · 현물 자동매매 자금</strong> 및{" "}
+                      <strong style={{ color: UI.body }}>CORE / SURGE 자금 버킷</strong>의 서버 단일 스냅샷을 표시합니다 (대시보드에서 별도 재계산하지 않습니다).
                     </div>
                   </div>
 
