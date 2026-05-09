@@ -25,6 +25,7 @@ import { readReplayRange } from "./replay-store.js";
 import { createPaperTradingEngine } from "./paper-trading.js";
 import { readLiveStrategyTradesRecent } from "./recent-strategy-trades.js";
 import { liveExecutionStateRuntimePath, runtimeRoot, surgeCandidatesRuntimePath } from "./runtime-paths.js";
+import { finalizeDashboardTradeStatusPayload } from "./dashboard-runtime-snapshot.js";
 
 const cwd = process.cwd();
 const runtimeDir = runtimeRoot();
@@ -148,7 +149,8 @@ function isEntrySignalAllowed(payload: unknown, activeMonitorInstanceId?: string
   if (!volume?.passed) return { ok: false, reason: "volume_increase filter not passed" };
   return { ok: true };
 }
-const TRADE_STATUS_CACHE_TTL_MS = 2500;
+/** 대시보드가 구형 페이로드에 고착되는 것 방지 — trade.status() 매 요청마다 재평가(부하↑) */
+const TRADE_STATUS_CACHE_TTL_MS = 0;
 const TRADE_STATUS_SLOW_FALLBACK_MS = 3000;
 let tradeStatusCache: { at: number; body: any } | null = null;
 let tradeStatusInFlight: Promise<any> | null = null;
@@ -156,6 +158,7 @@ let tradeStatusInFlightStartedAt: number | null = null;
 
 async function main() {
   const env = loadEnv();
+  const apiStartedAtIso = new Date().toISOString();
 
   const procLock = acquireSignalServerProcessLock();
   if (!procLock) {
@@ -167,6 +170,29 @@ async function main() {
 
   const app = Fastify({ logger: true, trustProxy: env.trustProxy });
   const opLog = createOperationalLogger({ debugEnabled: env.debugLogEnabled });
+
+  const DASHBOARD_NO_STORE_ROUTES = new Set([
+    "/api/v1/auth/session",
+    "/api/v1/account/holdings",
+    "/api/v1/context",
+    "/api/v1/logs",
+    "/api/v1/strategy/status",
+    "/api/v1/scanner/status",
+    "/api/v1/paper/status",
+    "/api/v1/market-state",
+    "/api/v1/trade/status",
+    "/api/v1/account/status",
+    "/api/v1/trade/status-lightweight",
+  ]);
+  app.addHook("onRequest", async (req, reply) => {
+    const pathOnly = (req.url.split("?", 1)[0] ?? req.url).split("#", 1)[0] ?? "";
+    if (DASHBOARD_NO_STORE_ROUTES.has(pathOnly)) {
+      reply
+        .header("Cache-Control", "no-store, no-cache, must-revalidate")
+        .header("Pragma", "no-cache")
+        .header("Expires", "0");
+    }
+  });
 
   // Engine split prep (shadow only): create runtime file paths and initial shapes.
   // No order authority is delegated here.
@@ -855,11 +881,19 @@ async function main() {
   }));
 
   /** 동일 페이로드(account_portfolio 포함) — 레거시 클라이언트가 /account/status 를 호출하는 경우 대비. */
+  const finalizeDashboardTradePayload = (raw: unknown) =>
+    finalizeDashboardTradeStatusPayload(raw as Record<string, unknown>, {
+      strategyStatus: strategy.status() as Record<string, unknown>,
+      monitor: monitorSnap(),
+      apiStartedAtIso,
+      surgeCandidatesPath,
+    }) as Record<string, unknown>;
+
   const buildTradeStatusResponse = async (req: FastifyRequest, route: string) => {
     const now = Date.now();
 
     // 1. Cache hit check
-    if (tradeStatusCache && now - tradeStatusCache.at < TRADE_STATUS_CACHE_TTL_MS) {
+    if (tradeStatusCache && TRADE_STATUS_CACHE_TTL_MS > 0 && now - tradeStatusCache.at < TRADE_STATUS_CACHE_TTL_MS) {
       req.log.info(
         JSON.stringify({
           tag: "DASHBOARD_TRADE_STATUS_CACHE_HIT",
@@ -867,7 +901,7 @@ async function main() {
           age_ms: now - tradeStatusCache.at,
         }),
       );
-      return tradeStatusCache.body;
+      return finalizeDashboardTradePayload(tradeStatusCache.body);
     }
 
     // 2. In-flight reset/fallback
@@ -892,12 +926,12 @@ async function main() {
             last_good_age_ms: now - tradeStatusCache.at,
           }),
         );
-        return {
+        return finalizeDashboardTradePayload({
           ...tradeStatusCache.body,
           degraded: true,
           degraded_reason: "trade_status_inflight_last_good_fallback",
           last_good_age_ms: now - tradeStatusCache.at,
-        };
+        });
       }
       req.log.info(
         JSON.stringify({
@@ -905,7 +939,7 @@ async function main() {
           endpoint: route,
         }),
       );
-      return tradeStatusInFlight;
+      return finalizeDashboardTradePayload(await tradeStatusInFlight);
     }
 
     const t0 = Date.now();
@@ -959,7 +993,7 @@ async function main() {
           "trade_status_account_sync_failed",
         );
       }
-      return body;
+      return finalizeDashboardTradePayload(body);
     } catch (err: any) {
       if (err.message === "TRADE_STATUS_SLOW_FALLBACK" && tradeStatusCache) {
         req.log.warn(
@@ -969,15 +1003,16 @@ async function main() {
             last_good_age_ms: now - tradeStatusCache.at,
           }),
         );
-        return {
+        return finalizeDashboardTradePayload({
           ...tradeStatusCache.body,
           degraded: true,
           degraded_reason: "trade_status_inflight_last_good_fallback",
           last_good_age_ms: now - tradeStatusCache.at,
-        };
+        });
       }
-      // Re-throw if it wasn't a timeout fallback or if we have no cache
-      return calculationPromise;
+      const late = await calculationPromise.catch(() => null);
+      if (late) return finalizeDashboardTradePayload(late);
+      throw err;
     }
   };
 
@@ -1186,7 +1221,7 @@ async function main() {
   });
   app.get("/api/v1/scanner/status", async () => {
     const now = Date.now();
-    const ttlMs = 1200;
+    const ttlMs = 0;
     (globalThis as any).__orbitalpha_scanner_cache ??= { at: 0, bodyJson: "" };
     const c = (globalThis as any).__orbitalpha_scanner_cache as { at: number; bodyJson: string };
     if (c.bodyJson && now - c.at < ttlMs) return parseBoundedCacheBody(c.bodyJson);
@@ -1197,7 +1232,7 @@ async function main() {
   });
   app.get("/api/v1/paper/status", async () => {
     const now = Date.now();
-    const ttlMs = 2500;
+    const ttlMs = 0;
     (globalThis as any).__orbitalpha_paper_cache ??= { at: 0, bodyJson: "" };
     const c = (globalThis as any).__orbitalpha_paper_cache as { at: number; bodyJson: string };
     
@@ -1302,7 +1337,7 @@ async function main() {
   });
   app.get("/api/v1/market-state", async () => {
     const now = Date.now();
-    const ttlMs = 1200;
+    const ttlMs = 0;
     (globalThis as any).__orbitalpha_market_state_cache ??= { at: 0, body: null as any };
     const c = (globalThis as any).__orbitalpha_market_state_cache as { at: number; body: any };
     if (c.body && now - c.at < ttlMs) return c.body;

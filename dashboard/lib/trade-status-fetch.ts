@@ -88,6 +88,10 @@ export async function fetchTradeStatusDetailed(
       cache: "no-store",
       credentials: "include",
       signal: ctrl.signal,
+      headers: {
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache",
+      },
     });
     clearTimeout(tid);
     if (opts?.signal) opts.signal.removeEventListener("abort", onAbort);

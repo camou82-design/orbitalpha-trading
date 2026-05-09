@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import Link from "next/link";
 import type { SignalLogEntry } from "@orbitalpha/shared";
@@ -24,6 +24,84 @@ import { useTradingEngineInsights } from "@/app/trading/hooks/use-trading-engine
 import { SignalHistorySection } from "@/app/trading/sections/signal-history-section";
 
 const apiBase = "";
+
+/** 브라우저/중간 프록시가 GET을 재사용하지 않도록 요청 헤더 보강 */
+const REALTIME_FETCH_HEADERS: HeadersInit = {
+  "Cache-Control": "no-cache",
+  Pragma: "no-cache",
+};
+
+type DashboardFreshTier = "live" | "delayed" | "stale" | "frozen";
+
+function dashboardTierFromAgeSeconds(ageSec: number | null): DashboardFreshTier {
+  if (ageSec === null || !Number.isFinite(ageSec)) return "frozen";
+  if (ageSec <= 15) return "live";
+  if (ageSec <= 60) return "delayed";
+  if (ageSec <= 180) return "stale";
+  return "frozen";
+}
+
+function dashboardTierLabelKo(t: DashboardFreshTier): string {
+  switch (t) {
+    case "live":
+      return "실시간 정상";
+    case "delayed":
+      return "지연 중";
+    case "stale":
+      return "오래된 데이터, 매매 판단 금지";
+    case "frozen":
+      return "화면 고정 의심, 서버 로그 기준 확인 필요";
+  }
+}
+
+function readTradeDashboardRuntime(trade: unknown): Record<string, unknown> | null {
+  if (!trade || typeof trade !== "object") return null;
+  const dr = (trade as Record<string, unknown>).dashboard_runtime;
+  return dr && typeof dr === "object" ? (dr as Record<string, unknown>) : null;
+}
+
+function parseDashboardPositionRow(dr: Record<string, unknown> | null, market: string): Record<string, unknown> | undefined {
+  if (!dr) return undefined;
+  const ps = dr.position_source_summary as Record<string, unknown> | undefined;
+  const by = ps && typeof ps === "object" ? (ps.by_market as Record<string, unknown> | undefined) : undefined;
+  const row = by?.[market];
+  return row && typeof row === "object" ? (row as Record<string, unknown>) : undefined;
+}
+
+function parseAgeSecondsMaybe(iso: string | null): number | null {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, (Date.now() - t) / 1000);
+}
+
+function parseDashboardSectionStatus(ageSeconds: number | null): DashboardFreshTier {
+  return dashboardTierFromAgeSeconds(ageSeconds);
+}
+
+function parseIsoField(v: unknown): string | null {
+  return typeof v === "string" && v.length > 2 ? v : null;
+}
+
+function parseDashboardTimeline(trade: unknown, dashboardReceivedAtIso: string | null, dashboardRenderedAtIso: string | null) {
+  const dr = readTradeDashboardRuntime(trade);
+  const cap = dr?.capital_policy_latest as Record<string, unknown> | undefined;
+  const holdings = dr?.holdings_snapshot as Record<string, unknown> | undefined;
+  return {
+    dr,
+    server_now: parseIsoField(dr?.server_now),
+    api_response_at: parseIsoField(dr?.api_response_at),
+    live_loop_latest_ts: parseIsoField(dr?.live_loop_latest_ts),
+    capital_policy_updated_at: parseIsoField(cap?.source_updated_at),
+    holdings_updated_at: parseIsoField(holdings?.source_updated_at),
+    scanner_updated_at: parseIsoField(dr?.scanner_updated_at),
+    candidate_updated_at: parseIsoField(dr?.candidate_updated_at),
+    position_state_updated_at: parseIsoField(dr?.position_state_updated_at),
+    dashboard_received_at: dashboardReceivedAtIso,
+    dashboard_rendered_at: dashboardRenderedAtIso,
+    liveAgeSec: parseAgeSecondsMaybe(parseIsoField(dr?.live_loop_latest_ts)),
+  };
+}
 
 function parseSignalPayload(row: SignalLogEntry) {
   if (row.kind !== "signal" || !row.payload) return null;
@@ -278,6 +356,10 @@ type TradeStatus = {
   surgePendingBuyReserved?: number;
   coreRemaining?: number;
   surgeRemaining?: number;
+  degraded?: boolean;
+  degraded_reason?: string;
+  last_good_age_ms?: number;
+  dashboard_runtime?: Record<string, unknown>;
 };
 
 /** 서버 `account_portfolio` — 필드 누락·NaN 이 있어도 KPI는 유한 숫자로만 표시. */
@@ -1159,6 +1241,12 @@ export default function HomePage() {
   const [paperPanelError, setPaperPanelError] = useState<string | null>(null);
   const [marketState, setMarketState] = useState<MarketStateStatus | null>(null);
   const [accountSyncState, setAccountSyncState] = useState<"idle" | "syncing" | "ok" | "error" | "failed">("idle");
+  const [dashTradeRefreshing, setDashTradeRefreshing] = useState(false);
+  const [lastTradePollOkAtMs, setLastTradePollOkAtMs] = useState<number | null>(null);
+  const [lastTradePollErrAtMs, setLastTradePollErrAtMs] = useState<number | null>(null);
+  const [tradePollFailStreak, setTradePollFailStreak] = useState(0);
+  const [dashboardReceivedAtIso, setDashboardReceivedAtIso] = useState<string | null>(null);
+  const [dashboardRenderedAtIso, setDashboardRenderedAtIso] = useState<string | null>(null);
   const [lastClientTradeFailure, setLastClientTradeFailure] = useState<{ code: string; message: string } | null>(null);
   const tradeInitialSyncDoneRef = useRef(false);
   const fastShellLoggedRef = useRef(false);
@@ -1216,7 +1304,12 @@ export default function HomePage() {
     pollInFlightRef.current.set(slotKey, ctrl);
     const tid = window.setTimeout(() => ctrl.abort(), opts.timeoutMs);
     try {
-      const r = await fetch(url, { cache: "no-store", credentials: "include", signal: ctrl.signal });
+      const r = await fetch(url, {
+        cache: "no-store",
+        credentials: "include",
+        signal: ctrl.signal,
+        headers: REALTIME_FETCH_HEADERS,
+      });
       const text = await r.text().catch(() => "");
       if (!r.ok) {
         opts.onHttp?.(r.status, text);
@@ -1427,6 +1520,7 @@ export default function HomePage() {
     };
 
     const pollTradeOnce = async () => {
+      setDashTradeRefreshing(true);
       const slotKey = `trade_status:${++tradePollSeqRef.current}`;
       const ctrl = new AbortController();
       pollInFlightRef.current.set(slotKey, ctrl);
@@ -1438,29 +1532,32 @@ export default function HomePage() {
         const t = tradePollRes.payload;
           if (t) {
             const castT = t as TradeStatus;
-            setIfChanged(
-              "trade",
-              castT,
-              setTrade,
-              (p) => ({
-                api_connected: (p as TradeStatus).api_connected,
-                live_enabled: (p as TradeStatus).live_enabled,
-                auto_trade_enabled: (p as TradeStatus).auto_trade_enabled,
-                recovery_ready: (p as TradeStatus).recovery_ready,
-                total_krw: (p as TradeStatus).total_krw,
-                krw_available: (p as TradeStatus).krw_available,
-                reserved_krw: (p as TradeStatus).reserved_krw,
-                strategy_allocated_krw: (p as TradeStatus).strategy_allocated_krw,
-                pump_paper_allocated_krw: (p as TradeStatus).pump_paper_allocated_krw,
-                open_positions_count: (() => {
-                  const rec = asRecord(p);
-                  const pos = rec.strategy_positions;
-                  if (!pos || typeof pos !== "object") return 0;
-                  return Object.values(pos as Record<string, unknown>).filter((v) => Number(asRecord(v).qty ?? 0) > 0).length;
-                })(),
-                balances_len: Array.isArray((p as TradeStatus).balances) ? (p as TradeStatus).balances.length : 0,
-              }),
-            );
+            /** 평가·가격·cap 변동까지 반영하려면 거래 상태는 매 폴링 갱신(시그니처 dedupe 금지) */
+            setDashboardReceivedAtIso(new Date().toISOString());
+            setTrade(castT);
+            const softStale = tradePollRes.failureCode === "soft_fetch_failed_with_last_good";
+            if (softStale) {
+              setLastTradePollErrAtMs(Date.now());
+              setTradePollFailStreak((x) => x + 1);
+              console.info(
+                JSON.stringify({
+                  tag: "DASHBOARD_FETCH_FRESHNESS_PROOF",
+                  section: "trade_status",
+                  status: "stale",
+                  reason: tradePollRes.failureMessage ?? tradePollRes.failureCode,
+                  server_now: parseIsoField(readTradeDashboardRuntime(castT)?.server_now ?? null),
+                  dashboard_received_at: new Date().toISOString(),
+                  api_response_at: parseIsoField(readTradeDashboardRuntime(castT)?.api_response_at ?? null),
+                  source_updated_at: parseIsoField(readTradeDashboardRuntime(castT)?.live_loop_latest_ts ?? null),
+                  displayed_value: "last_good_payload",
+                  source_value: "last_good_payload",
+                  age_seconds: null,
+                }),
+              );
+            } else {
+              setLastTradePollOkAtMs(Date.now());
+              setTradePollFailStreak(0);
+            }
 
             const serverVal = castT.auto_trade_enabled;
             if (typeof serverVal === "boolean") {
@@ -1496,6 +1593,8 @@ export default function HomePage() {
             else setAccountSyncState("ok");
             setAuthState((prev) => (prev === "loading" ? "ok" : prev));
           } else if (tradePollRes.failureCode) {
+            setLastTradePollErrAtMs(Date.now());
+            setTradePollFailStreak((x) => x + 1);
             setLastClientTradeFailure({ code: tradePollRes.failureCode, message: tradePollRes.failureMessage ?? "" });
             devLog({
               tag: "DASHBOARD_TRADE_STATUS_401_PRESERVE_LAST_KNOWN_AUTO_TRADE",
@@ -1504,10 +1603,17 @@ export default function HomePage() {
               current_ui_state: autoTradeEnabled
             });
             setAutoTradeStatusConfirmedSource("uncertain");
+          } else {
+            setLastTradePollErrAtMs(Date.now());
+            setTradePollFailStreak((x) => x + 1);
           }
+      } catch {
+        setLastTradePollErrAtMs(Date.now());
+        setTradePollFailStreak((x) => x + 1);
       } finally {
         window.clearTimeout(tid);
         pollInFlightRef.current.delete(slotKey);
+        setDashTradeRefreshing(false);
       }
     };
 
@@ -1516,7 +1622,7 @@ export default function HomePage() {
 
       // start loops (staggered & independent)
       scheduleLoop("auth_session", pollSessionOnce, 45_000, 60_000);
-      scheduleLoop("trade_status", pollTradeOnce, 7_000, 10_000);
+      scheduleLoop("trade_status", pollTradeOnce, 4_000, 9_000);
       scheduleLoop(
         "context",
         async () => {
@@ -1552,8 +1658,8 @@ export default function HomePage() {
             },
           });
         },
-        30_000,
-        60_000,
+        20_000,
+        55_000,
       );
 
       scheduleLoop(
@@ -1569,8 +1675,8 @@ export default function HomePage() {
             },
           });
         },
-        25_000,
-        60_000,
+        20_000,
+        55_000,
       );
 
       scheduleLoop(
@@ -1582,22 +1688,17 @@ export default function HomePage() {
             onOk: (s) => {
               if (cancelled) return;
               setIfChanged("strategy", s, setStrategy, (x) => ({
-                safety_guard_state: asRecord(x).safety_guard_state,
-                open_positions_count: (() => {
-                  const r = asRecord(x);
-                  const pos = r.open_positions;
-                  if (!pos || typeof pos !== "object") return 0;
-                  return Object.values(pos as Record<string, unknown>).filter((v) => Number(asRecord(v).qty ?? 0) > 0).length;
-                })(),
+                sg: asRecord(x).safety_guard_state,
+                open: asRecord(x).open_positions,
+                early: asRecord(x).early_positions,
                 pnl: asRecord(x).strategy_pnl_krw,
                 invested: asRecord(x).strategy_invested_krw,
-                total_fills: asRecord(x).strategy_total_fills,
               }));
             },
           });
         },
-        15_000,
-        30_000,
+        4000,
+        9000,
       );
 
       scheduleLoop(
@@ -1615,17 +1716,15 @@ export default function HomePage() {
                   "account_holdings",
                   h,
                   setAccountHoldings,
-                  (x) => ({
-                    used_slots: Number(asRecord(x).used_slots ?? 0),
-                    holdings_len: asArray(asRecord(x).holdings).length,
-                  }),
+                  (x) =>
+                    `${Number(asRecord(x).used_slots ?? 0)}|${JSON.stringify(asArray(asRecord(x).holdings))}`,
                 );
               },
             },
           );
         },
-        12_000,
-        30_000,
+        4000,
+        9000,
       );
 
       scheduleLoop(
@@ -1639,13 +1738,13 @@ export default function HomePage() {
               const r = asRecord(sc);
               setIfChanged("scanner", sc, setScanner, (x) => ({
                 updated_at: asRecord(x).updated_at,
-                items_len: asArray(r.items).length,
+                items_ser: JSON.stringify(asArray(r.items)),
               }));
             },
           });
         },
-        10_000,
-        30_000,
+        3500,
+        9000,
       );
 
       scheduleLoop(
@@ -1698,8 +1797,8 @@ export default function HomePage() {
             },
           });
         },
-        30_000,
-        60_000,
+        20_000,
+        55_000,
       );
 
       scheduleLoop(
@@ -1715,23 +1814,24 @@ export default function HomePage() {
                 entry_policy: r.entry_policy,
                 btc_5m_trend: r.btc_5m_trend,
                 btc_15m_trend: r.btc_15m_trend,
+                ms: String(r.market_state ?? ""),
               }));
             },
           });
         },
-        15_000,
-        30_000,
+        3500,
+        9000,
       );
 
-      // UI updated clock (cheap) - keep modest even when hidden
+      // UI updated clock (cheap) — 루프 주기와 맞춰 운영자에게 “틱 변화” 피드백
       scheduleLoop(
         "updated_at",
         async () => {
           if (cancelled) return;
           setLastUpdatedAt(new Date().toLocaleTimeString("ko-KR", { hour12: false }));
         },
-        5_000,
-        30_000,
+        4_000,
+        15000,
       );
 
       // Initial trade/account sync should not block dashboard shell rendering.
@@ -1852,11 +1952,112 @@ export default function HomePage() {
   const runState = err ? "오류" : activeMonitorInstanceId ? "실행 중" : "대기";
 
   const recentServerTickTs = useMemo(() => {
+    const drTs = parseIsoField(readTradeDashboardRuntime(trade)?.live_loop_latest_ts);
+    if (drTs) return drTs;
     const candidates = [ctx?.last_strategy_tick_at, ctx?.last_market_state_tick_at].filter((v): v is string => typeof v === "string" && v.length > 0);
     if (candidates.length === 0) return null;
     candidates.sort((a, b) => Date.parse(b) - Date.parse(a));
     return candidates[0] ?? null;
-  }, [ctx]);
+  }, [trade, ctx]);
+
+  const dashTimeline = useMemo(
+    () => parseDashboardTimeline(trade, dashboardReceivedAtIso, dashboardRenderedAtIso),
+    [trade, dashboardReceivedAtIso, dashboardRenderedAtIso],
+  );
+
+  const liveFreshTier = useMemo(() => dashboardTierFromAgeSeconds(dashTimeline.liveAgeSec), [dashTimeline.liveAgeSec]);
+
+  const capitalPolicyAgeSec = useMemo(
+    () => parseAgeSecondsMaybe(dashTimeline.capital_policy_updated_at),
+    [dashTimeline.capital_policy_updated_at],
+  );
+  const holdingsEvalAgeSec = useMemo(
+    () => parseAgeSecondsMaybe(dashTimeline.holdings_updated_at),
+    [dashTimeline.holdings_updated_at],
+  );
+  const scannerDataAgeSec = useMemo(
+    () => parseAgeSecondsMaybe(dashTimeline.scanner_updated_at),
+    [dashTimeline.scanner_updated_at],
+  );
+  const candidateDataAgeSec = useMemo(
+    () => parseAgeSecondsMaybe(dashTimeline.candidate_updated_at),
+    [dashTimeline.candidate_updated_at],
+  );
+
+  const tierChip = (t: DashboardFreshTier) => (
+    <span
+      style={{
+        fontSize: "0.62rem",
+        fontWeight: 900,
+        padding: "0.12rem 0.45rem",
+        borderRadius: 6,
+        border: "1px solid #334155",
+        color: t === "live" ? "#22c55e" : t === "delayed" ? "#eab308" : t === "stale" ? "#fb923c" : "#ef4444",
+        background: "#0b1220",
+      }}
+    >
+      {t.toUpperCase()}
+    </span>
+  );
+
+  useLayoutEffect(() => {
+    setDashboardRenderedAtIso(new Date().toISOString());
+  }, [trade]);
+
+  useEffect(() => {
+    const tl = dashTimeline;
+    const row = {
+      tag: "DASHBOARD_RENDER_STATE_PROOF",
+      server_now: tl.server_now,
+      dashboard_received_at: tl.dashboard_received_at,
+      dashboard_rendered_at: tl.dashboard_rendered_at,
+      api_response_at: tl.api_response_at,
+      live_loop_latest_ts: tl.live_loop_latest_ts,
+      capital_policy_updated_at: tl.capital_policy_updated_at,
+      holdings_updated_at: tl.holdings_updated_at,
+      scanner_updated_at: tl.scanner_updated_at,
+      candidate_updated_at: tl.candidate_updated_at,
+      position_state_updated_at: tl.position_state_updated_at,
+      live_loop_age_seconds: dashTimeline.liveAgeSec,
+      live_tier: liveFreshTier,
+      trade_poll_fail_streak: tradePollFailStreak,
+      degraded: Boolean((trade as TradeStatus | null)?.degraded),
+    };
+    console.info(JSON.stringify(row));
+  }, [trade, dashTimeline, liveFreshTier, tradePollFailStreak]);
+
+  useEffect(() => {
+    const tl = dashTimeline;
+    const staleish = liveFreshTier === "stale" || liveFreshTier === "frozen";
+    if (staleish) {
+      console.info(
+        JSON.stringify({
+          tag: "DASHBOARD_STALE_DATA_PROOF",
+          server_now: tl.server_now,
+          dashboard_received_at: tl.dashboard_received_at,
+          api_response_at: tl.api_response_at,
+          source_updated_at: tl.live_loop_latest_ts,
+          age_seconds: dashTimeline.liveAgeSec,
+          section: "live_loop",
+          status: liveFreshTier,
+          displayed_value: tl.live_loop_latest_ts,
+          reason: "live_strategy_tick_age_vs_client_clock",
+        }),
+      );
+    }
+    const axl = parseDashboardPositionRow(tl.dr, "KRW-AXL");
+    if (axl) {
+      console.info(
+        JSON.stringify({
+          tag: "DASHBOARD_POSITION_SOURCE_PROOF",
+          market: "KRW-AXL",
+          server_now: tl.server_now,
+          dashboard_received_at: tl.dashboard_received_at,
+          row: axl,
+        }),
+      );
+    }
+  }, [trade, dashTimeline, liveFreshTier]);
 
   const recentScannerCalcTs = useMemo(() => {
     const fromCtx = ctx?.last_scanner_tick_at;
@@ -2132,9 +2333,14 @@ export default function HomePage() {
       recentBlockReason: recentBlock,
       surgeCapLine,
       noCandidateReason: entryBlockReason,
-      lastRefresh: recentScannerCalcTs ?? scanner?.updated_at ?? null,
+      lastRefresh:
+        scanner?.updated_at ??
+        dashTimeline.dashboard_received_at ??
+        recentScannerCalcTs ??
+        dashTimeline.live_loop_latest_ts ??
+        null,
     };
-  }, [scanner, signalRows, liveCapitalApi, entryBlockReason, recentScannerCalcTs]);
+  }, [scanner, signalRows, liveCapitalApi, entryBlockReason, recentScannerCalcTs, dashTimeline.dashboard_received_at, dashTimeline.live_loop_latest_ts]);
 
   const coreTradeStatusLabel = (market: string) => {
     const parsed = latestByMarket[market]?.parsed;
@@ -2185,9 +2391,13 @@ export default function HomePage() {
     }
     setToggleBusy(true);
     try {
-      const res = await fetch(`/api/v1/trade/auto-toggle`, {
+      const res = await fetch(`/api/v1/trade/auto-toggle?_=${Date.now()}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(REALTIME_FETCH_HEADERS as Record<string, string>),
+        },
+        cache: "no-store",
         credentials: "include",
         body: JSON.stringify({ enabled, risk_ack: enabled ? true : false, operatorExplicit: true }),
       });
@@ -2211,9 +2421,11 @@ export default function HomePage() {
 
   const onLogout = async () => {
     try {
-      await fetch(`/api/v1/auth/logout`, {
+      await fetch(`/api/v1/auth/logout?_=${Date.now()}`, {
         method: "POST",
+        cache: "no-store",
         credentials: "include",
+        headers: REALTIME_FETCH_HEADERS,
       });
     } finally {
       router.replace("/login?reason=logged_out");
@@ -2316,6 +2528,66 @@ export default function HomePage() {
 
         <section
           style={{
+            marginBottom: "0.85rem",
+            padding: "0.65rem 0.85rem",
+            borderRadius: 12,
+            border: `1px solid ${liveFreshTier === "live" ? "#14532d" : liveFreshTier === "delayed" ? "#92400e" : "#991b1b"}`,
+            background: "#071018",
+          }}
+        >
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "0.55rem", alignItems: "center", marginBottom: 8 }}>
+            {tierChip(liveFreshTier)}
+            <strong style={{ color: UI.title, fontSize: "0.86rem", letterSpacing: "0.02em" }}>{dashboardTierLabelKo(liveFreshTier)}</strong>
+            {dashTradeRefreshing ? <span style={{ fontWeight: 900, color: "#38bdf8", fontSize: "0.78rem" }}>trade/status 갱신 중…</span> : null}
+            <span style={{ fontSize: "0.72rem", color: UI.muted }}>
+              마지막 trade/status 성공: {lastTradePollOkAtMs ? new Date(lastTradePollOkAtMs).toLocaleTimeString("ko-KR", { hour12: false }) : "—"} · 실패:{" "}
+              {lastTradePollErrAtMs ? new Date(lastTradePollErrAtMs).toLocaleTimeString("ko-KR", { hour12: false }) : "—"} · 연속 실패:{" "}
+              <strong style={{ color: tradePollFailStreak > 0 ? UI.watch : UI.body }}>{tradePollFailStreak}</strong>
+            </span>
+          </div>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill,minmax(220px,1fr))",
+              gap: "0.3rem 0.55rem",
+              fontFamily: "ui-monospace,Menlo,Consolas,monospace",
+              fontSize: "0.625rem",
+              color: UI.mutedSoft,
+            }}
+          >
+            <div style={{ gridColumn: "1 / -1", color: UI.muted, marginBottom: 4 }}>필수 시각 필드 · 운영자 stale 판정용</div>
+            <div>server_now · {dashTimeline.server_now ?? "—"}</div>
+            <div>api_response_at · {dashTimeline.api_response_at ?? "—"}</div>
+            <div>live_loop_latest_ts · {dashTimeline.live_loop_latest_ts ?? "—"} ({dashTimeline.liveAgeSec !== null ? `${dashTimeline.liveAgeSec.toFixed(0)}s` : "?"})</div>
+            <div>
+              capital_policy_updated_at · {dashTimeline.capital_policy_updated_at ?? "—"}{" "}
+              {tierChip(parseDashboardSectionStatus(capitalPolicyAgeSec))}
+            </div>
+            <div>
+              holdings_updated_at · {dashTimeline.holdings_updated_at ?? "—"}{" "}
+              {tierChip(parseDashboardSectionStatus(holdingsEvalAgeSec))}
+            </div>
+            <div>
+              scanner_updated_at · {dashTimeline.scanner_updated_at ?? "—"}{" "}
+              {tierChip(parseDashboardSectionStatus(scannerDataAgeSec))}
+            </div>
+            <div>
+              candidate_updated_at · {dashTimeline.candidate_updated_at ?? "—"}{" "}
+              {tierChip(parseDashboardSectionStatus(candidateDataAgeSec))}
+            </div>
+            <div>position_state_updated_at · {dashTimeline.position_state_updated_at ?? "—"}</div>
+            <div>dashboard_received_at · {dashTimeline.dashboard_received_at ?? "—"}</div>
+            <div>dashboard_rendered_at · {dashTimeline.dashboard_rendered_at ?? "—"}</div>
+          </div>
+          {trade?.degraded ? (
+            <div style={{ marginTop: 8, color: UI.watch, fontSize: "0.72rem", fontWeight: 800 }}>
+              trade/status degraded ({String(trade.degraded_reason ?? "unknown")}) — 표시값이 폴백(지연 스냅샷)일 수 있습니다.
+            </div>
+          ) : null}
+        </section>
+
+        <section
+          style={{
             display: "flex",
             flexWrap: "wrap",
             gap: "0.5rem",
@@ -2393,6 +2665,11 @@ export default function HomePage() {
               </div>
               <div style={{ fontSize: "0.65rem", color: UI.mutedSoft, marginTop: 4 }}>가용 포함 총 KRW 성격별 상세는 운영 정보</div>
             </div>
+          </div>
+          <div style={{ marginTop: 10, fontSize: "0.62rem", color: UI.mutedSoft, lineHeight: 1.5 }}>
+            <strong style={{ color: UI.muted }}>금액 출처(API 동일 객체):</strong> 총 평가액 = total_asset_equity_krw · USDT 제외 = excluded_usdt_value_krw · 실거래 기준 = spot_trading_equity_krw(USDT 제외 후 50/50) · 검증 시각 capital_policy_updated_at={" "}
+            <span style={{ fontFamily: "ui-monospace,monospace" }}>{dashTimeline.capital_policy_updated_at ?? "—"}</span> · 평가 스냅샷 holdings_updated_at={" "}
+            <span style={{ fontFamily: "ui-monospace,monospace" }}>{dashTimeline.holdings_updated_at ?? "—"}</span>
           </div>
           <div style={{ marginTop: "0.65rem", display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "0.65rem" }}>
             <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.72rem 0.8rem" }}>
@@ -2712,6 +2989,10 @@ export default function HomePage() {
                   <div style={{ fontSize: "0.88rem", color: "#38bdf8", fontWeight: 900, marginBottom: 6 }}>CORE 50% 자동매매 자금</div>
                   <div style={{ fontSize: "0.78rem", fontWeight: 900, marginBottom: 10, color: UI.body }}>상태: {coreStatus}</div>
                   {coreNums}
+                  <div style={{ marginTop: 10, fontSize: "0.62rem", color: UI.mutedSoft, fontFamily: "ui-monospace,monospace", lineHeight: 1.4 }}>
+                    source_updated_at(capital_policy) · {dashTimeline.capital_policy_updated_at ?? "—"} · 반영 기준금액 spotTradingEquity ·{" "}
+                    {tierChip(parseDashboardSectionStatus(capitalPolicyAgeSec))}
+                  </div>
                 </article>
                 <article
                   style={{
@@ -2725,6 +3006,10 @@ export default function HomePage() {
                   <div style={{ fontSize: "0.88rem", color: "#818cf8", fontWeight: 900, marginBottom: 6 }}>SURGE 50% 급등주 자금</div>
                   <div style={{ fontSize: "0.78rem", fontWeight: 900, marginBottom: 10, color: UI.body }}>상태: {surgeStatus}</div>
                   {surgeNums}
+                  <div style={{ marginTop: 10, fontSize: "0.62rem", color: UI.mutedSoft, fontFamily: "ui-monospace,monospace", lineHeight: 1.4 }}>
+                    source_updated_at(capital_policy) · {dashTimeline.capital_policy_updated_at ?? "—"} · 반영 기준금액 spotTradingEquity ·{" "}
+                    {tierChip(parseDashboardSectionStatus(capitalPolicyAgeSec))}
+                  </div>
                 </article>
               </>
             );
@@ -2894,8 +3179,11 @@ export default function HomePage() {
         ) : (
           <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: "0.9rem", marginBottom: "1.15rem" }}>
             {passiveHoldingCards.map((h) => {
+              const posRow = parseDashboardPositionRow(readTradeDashboardRuntime(trade), h.market);
               const pnlColor = h.netPnl > 0 ? "#22c55e" : h.netPnl < 0 ? "#ef4444" : UI.muted;
               const retColor = h.netRet > 0 ? "#22c55e" : h.netRet < 0 ? "#ef4444" : UI.muted;
+              const linesRaw = Array.isArray(posRow?.display_lines_ko) ? posRow?.display_lines_ko : [];
+              const hintLines = linesRaw.filter((line): line is string => typeof line === "string" && line.length > 0);
               return (
                 <article
                   key={`passive-${h.market}`}
@@ -2923,6 +3211,23 @@ export default function HomePage() {
                     <span style={{ color: UI.mutedSoft }}>순평가손익</span>
                     <strong style={{ color: pnlColor }}>{h.evalAmount > 0 ? Math.round(h.netPnl).toLocaleString() : "-"}</strong>
                   </div>
+                  {hintLines.length > 0 ? (
+                    <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px dashed ${UI.borderSoft}`, fontSize: "0.68rem", color: UI.body, fontWeight: 700, lineHeight: 1.45 }}>
+                      {hintLines.map((line, i) => (
+                        <div key={i} style={{ color: UI.mutedSoft }}>
+                          · {line}
+                        </div>
+                      ))}
+                      <div style={{ marginTop: 6, fontSize: "0.6rem", color: UI.muted, fontFamily: "ui-monospace,monospace" }}>
+                        증거: last_order+LIVE_PLACEBUY 추정 · ledger reconcile · 장부등록(LIVE_MANAGED_POSITION_REGISTERED_BOOK)=
+                        {String(posRow?.LIVE_MANAGED_POSITION_REGISTERED_BOOK ?? "—")}
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ marginTop: 10, fontSize: "0.63rem", color: UI.watch, fontWeight: 800 }}>
+                      서버 position_source 요약 미수신 — trade/status의 dashboard_runtime를 확인하세요.
+                    </div>
+                  )}
                 </article>
               );
             })}
@@ -2939,6 +3244,9 @@ export default function HomePage() {
         ) : (
           <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: "0.9rem", marginBottom: "1.15rem" }}>
             {managedHoldingCards.map((h) => {
+              const posRow = parseDashboardPositionRow(readTradeDashboardRuntime(trade), h.market);
+              const linesRaw = Array.isArray(posRow?.display_lines_ko) ? posRow?.display_lines_ko : [];
+              const hintLines = linesRaw.filter((line): line is string => typeof line === "string" && line.length > 0);
               const pnlColor = h.netPnl > 0 ? "#22c55e" : h.netPnl < 0 ? "#ef4444" : UI.muted;
               const retColor = h.netRet > 0 ? "#22c55e" : h.netRet < 0 ? "#ef4444" : UI.muted;
               return (
@@ -2968,6 +3276,20 @@ export default function HomePage() {
                     <span style={{ color: UI.mutedSoft }}>순평가손익</span>
                     <strong style={{ color: pnlColor }}>{h.evalAmount > 0 ? Math.round(h.netPnl).toLocaleString() : "-"}</strong>
                   </div>
+                  {hintLines.length > 0 ? (
+                    <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px dashed ${UI.border}`, fontSize: "0.68rem", lineHeight: 1.45 }}>
+                      {hintLines.map((line, i) => (
+                        <div key={i} style={{ color: UI.mutedSoft }}>
+                          · {line}
+                        </div>
+                      ))}
+                      <div style={{ marginTop: 6, fontSize: "0.6rem", color: UI.muted, fontFamily: "ui-monospace,monospace" }}>
+                        engine_bucket={String(posRow?.engine_bucket ?? "—")} · strict_exit={String(posRow?.strict_exit_managed ?? "—")}
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ marginTop: 10, fontSize: "0.63rem", color: UI.watch, fontWeight: 800 }}>서버 요약 행 미수신</div>
+                  )}
                 </article>
               );
             })}

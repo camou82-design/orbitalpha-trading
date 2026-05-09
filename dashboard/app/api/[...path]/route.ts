@@ -55,6 +55,9 @@ async function proxy(req: NextRequest, pathSegments: string[]): Promise<Response
     if (k.toLowerCase() === "transfer-encoding") return;
     outHeaders.set(k, v);
   });
+  outHeaders.set("Cache-Control", "no-store, no-cache, must-revalidate");
+  outHeaders.set("Pragma", "no-cache");
+  outHeaders.set("Expires", "0");
   return new NextResponse(res.body, { status: res.status, statusText: res.statusText, headers: outHeaders });
 }
 
