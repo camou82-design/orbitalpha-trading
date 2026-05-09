@@ -292,6 +292,8 @@ type AssetSummaryKpi =
 
 type LiveOperatingCapital = {
   totalOperatingKrw: number | null;
+  spotTradingEquityKrw: number | null;
+  excludedUsdtValueKrw: number | null;
 };
 
 type AuthSession = {
@@ -655,38 +657,67 @@ function toPaperPanelSummary(raw: unknown): PaperPanelSummary {
 }
 
 function deriveLiveOperatingCapital(trade: TradeStatus | null): LiveOperatingCapital {
-  if (!trade) return { totalOperatingKrw: null };
+  if (!trade) return { totalOperatingKrw: null, spotTradingEquityKrw: null, excludedUsdtValueKrw: null };
+  
+  // Best case: use server-calculated fields if available
+  const serverSpotEquity = (trade as any).spot_trading_equity_krw;
+  const serverUsdtValue = (trade as any).excluded_usdt_value_krw;
+  
   const apTotal = Number(trade.account_portfolio?.total_evaluated_krw);
-  if (Number.isFinite(apTotal) && apTotal > 0) {
-    return { totalOperatingKrw: apTotal };
+  const markPrices = (trade.mark_prices as any) ?? {};
+  
+  let usdtVal = 0;
+  const usdtBal = (trade.balances ?? []).find(b => b.currency === "USDT");
+  if (usdtBal) {
+    const qty = Number(usdtBal.balance ?? 0) + Number(usdtBal.locked ?? 0);
+    const px = markPrices["KRW-USDT"] ?? Number(usdtBal.avg_buy_price ?? 0);
+    usdtVal = qty * px;
   }
 
-  const totalKrw = Number(trade.total_krw);
-  if (Number.isFinite(totalKrw) && totalKrw > 0) {
-    return { totalOperatingKrw: totalKrw };
+  const finalUsdtValue = serverUsdtValue != null ? Number(serverUsdtValue) : usdtVal;
+
+  if (Number.isFinite(apTotal) && apTotal > 0) {
+    const spotEquity = serverSpotEquity != null ? Number(serverSpotEquity) : Math.max(0, apTotal - finalUsdtValue);
+    return { 
+        totalOperatingKrw: apTotal, 
+        spotTradingEquityKrw: spotEquity,
+        excludedUsdtValueKrw: finalUsdtValue 
+    };
   }
 
   const krwAvailable = Number(trade.krw_available);
   const safeKrwAvailable = Number.isFinite(krwAvailable) ? Math.max(0, krwAvailable) : 0;
-  const markPrices = trade.mark_prices ?? {};
+  
   let holdingsEvaluated = 0;
-  for (const bal of Array.isArray(trade.balances) ? trade.balances : []) {
+  const balances = Array.isArray(trade.balances) ? trade.balances : [];
+  for (const bal of balances) {
     const currency = String(bal?.currency ?? "").toUpperCase();
     if (!currency || currency === "KRW") continue;
+    
     const qty = Math.max(0, Number(bal?.balance ?? 0)) + Math.max(0, Number(bal?.locked ?? 0));
     if (!(qty > 0)) continue;
+    
     const market = `KRW-${currency}`;
-    const markPrice = Number((markPrices as Record<string, unknown>)[market]);
+    const markPrice = Number(markPrices[market]);
     const avgBuy = Number(bal?.avg_buy_price ?? 0);
-    const px = Number.isFinite(markPrice) && markPrice > 0 ? markPrice : Number.isFinite(avgBuy) && avgBuy > 0 ? avgBuy : 0;
-    if (px <= 0) continue;
-    holdingsEvaluated += qty * px;
+    const px = (Number.isFinite(markPrice) && markPrice > 0) ? markPrice : (Number.isFinite(avgBuy) && avgBuy > 0 ? avgBuy : 0);
+    
+    if (px > 0) {
+      holdingsEvaluated += qty * px;
+    }
   }
-  const combined = safeKrwAvailable + holdingsEvaluated;
-  if (combined > 0) {
-    return { totalOperatingKrw: combined };
+
+  const totalEvaluated = safeKrwAvailable + holdingsEvaluated;
+  if (totalEvaluated > 0) {
+    const spotEquity = serverSpotEquity != null ? Number(serverSpotEquity) : Math.max(0, totalEvaluated - finalUsdtValue);
+    return {
+      totalOperatingKrw: totalEvaluated,
+      spotTradingEquityKrw: spotEquity,
+      excludedUsdtValueKrw: finalUsdtValue
+    };
   }
-  return { totalOperatingKrw: null };
+
+  return { totalOperatingKrw: null, spotTradingEquityKrw: null, excludedUsdtValueKrw: null };
 }
 
 function failedFilterLabels(parsed: NonNullable<ReturnType<typeof parseSignalPayload>>): string {
@@ -2970,34 +3001,94 @@ export default function HomePage() {
 
                   {/* 3단: 실거래 자금 상태 */}
                   <div style={{ background: UI.cardSoftBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 10, padding: "0.8rem" }}>
-                    <div style={{ fontSize: "0.85rem", color: UI.title, fontWeight: 900, marginBottom: 8 }}>실거래 급등주 자금 상태</div>
-                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "1rem", fontSize: "0.8rem" }}>
-                      {(() => {
-                        const totalOperatingKrw = liveOperatingCapital.totalOperatingKrw;
-                        const surgeLiveCap = totalOperatingKrw != null ? totalOperatingKrw * 0.5 : null;
-                        const usedKrw = Math.max(0, Number(trade?.pump_paper_allocated_krw ?? 0));
-                        const remainingKrw = surgeLiveCap != null ? surgeLiveCap - usedKrw : null;
-                        return (
-                          <>
-                            <div>
-                              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", marginBottom: 2 }}>실거래 총 운용금액</div>
-                              <strong>{totalOperatingKrw != null ? `${Math.round(totalOperatingKrw).toLocaleString()}원` : "수집 대기"}</strong>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 12 }}>
+                        <div>
+                            <div style={{ fontSize: "0.85rem", color: UI.title, fontWeight: 900, marginBottom: 2 }}>실거래 CORE / SURGE 자산 (USDT 제외)</div>
+                            <div style={{ fontSize: "0.7rem", color: UI.mutedSoft }}>USDT는 OKX 이관용 예비금으로 운용 자산에서 제외됨</div>
+                        </div>
+                        <div style={{ textAlign: "right" }}>
+                            <div style={{ fontSize: "0.65rem", color: UI.mutedSoft }}>현물 자동매매 기준금액 (Equity)</div>
+                            <div style={{ fontSize: "1.1rem", color: "#4ade80", fontWeight: 900 }}>
+                                {liveOperatingCapital.spotTradingEquityKrw != null ? `${Math.round(liveOperatingCapital.spotTradingEquityKrw).toLocaleString()}원` : "계산중..."}
                             </div>
-                            <div>
-                              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", marginBottom: 2 }}>급등주 실거래 한도 = 실거래 총 운용금액의 50%</div>
-                              <strong>{surgeLiveCap != null ? `${Math.round(surgeLiveCap).toLocaleString()}원` : "수집 대기"}</strong>
-                            </div>
-                            <div>
-                              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", marginBottom: 2 }}>현재 급등주 사용액</div>
-                              <strong>{Math.round(usedKrw).toLocaleString()}원</strong>
-                            </div>
-                            <div>
-                              <div style={{ color: UI.mutedSoft, fontSize: "0.7rem", marginBottom: 2 }}>남은 급등주 한도</div>
-                              <strong>{remainingKrw != null ? `${Math.round(remainingKrw).toLocaleString()}원` : "수집 대기"}</strong>
-                            </div>
-                          </>
-                        );
-                      })()}
+                        </div>
+                    </div>
+
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "0.8rem", marginBottom: 12 }}>
+                        <div style={{ background: "#0a192f", padding: "0.6rem", borderRadius: 8, border: "1px solid #112240" }}>
+                            <div style={{ fontSize: "0.65rem", color: UI.mutedSoft }}>총 자산 가치</div>
+                            <div style={{ fontSize: "0.9rem", color: UI.title, fontWeight: 700 }}>{liveOperatingCapital.totalOperatingKrw != null ? `${Math.round(liveOperatingCapital.totalOperatingKrw).toLocaleString()}원` : "-"}</div>
+                        </div>
+                        <div style={{ background: "#1a1a1a", padding: "0.6rem", borderRadius: 8, border: "1px solid #333" }}>
+                            <div style={{ fontSize: "0.65rem", color: "#fbbf24" }}>OKX 이관 예정 USDT</div>
+                            <div style={{ fontSize: "0.9rem", color: "#fbbf24", fontWeight: 700 }}>{liveOperatingCapital.excludedUsdtValueKrw != null ? `${Math.round(liveOperatingCapital.excludedUsdtValueKrw).toLocaleString()}원` : "0원"}</div>
+                        </div>
+                        <div style={{ background: "#064e3b", padding: "0.6rem", borderRadius: 8, border: "1px solid #065f46" }}>
+                            <div style={{ fontSize: "0.65rem", color: "#6ee7b7" }}>원화 가용 잔고</div>
+                            <div style={{ fontSize: "0.9rem", color: "#6ee7b7", fontWeight: 700 }}>{Number(trade?.krw_available ?? 0).toLocaleString()}원</div>
+                        </div>
+                    </div>
+
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1rem" }}>
+                      {/* CORE Bucket */}
+                      <div style={{ background: "#0f172a", padding: "0.8rem", borderRadius: 8, border: "1px solid #1e293b" }}>
+                         <div style={{ fontSize: "0.75rem", color: "#38bdf8", fontWeight: 700, marginBottom: 6 }}>CORE 50% 한도 (BTC/ETH/SOL/XRP/TRX/DOGE)</div>
+                         {(() => {
+                           const spotEquity = liveOperatingCapital.spotTradingEquityKrw;
+                           const availableKrw = Number(trade?.krw_available ?? 0);
+                           const cap = spotEquity != null ? spotEquity * 0.5 : null;
+                           let used = 0;
+                           const coreCurrencies = ["BTC", "ETH", "SOL", "XRP", "TRX", "DOGE"];
+                           (trade?.balances ?? []).forEach(b => {
+                             if (coreCurrencies.includes(b.currency)) {
+                               const qty = Number(b.balance ?? 0) + Number(b.locked ?? 0);
+                               const markPrices = (trade?.mark_prices as any) ?? {};
+                               const markPrice = markPrices[`KRW-${b.currency}`] ?? b.avg_buy_price ?? 0;
+                               used += qty * markPrice;
+                             }
+                           });
+                           const remaining = cap != null ? cap - used : null;
+                           const potential = remaining != null ? Math.min(Math.max(0, remaining), availableKrw) : 0;
+                           return (
+                             <div style={{ display: "grid", gridTemplateColumns: "1fr 1.2fr", gap: "0.4rem", fontSize: "0.75rem" }}>
+                               <div style={{ color: UI.mutedSoft }}>Bucket 한도</div><strong>{cap != null ? `${Math.round(cap).toLocaleString()}원` : "대기"}</strong>
+                               <div style={{ color: UI.mutedSoft }}>현재 사용액</div><strong>{Math.round(used).toLocaleString()}원</strong>
+                               <div style={{ color: UI.mutedSoft }}>여유 버킷</div><strong style={{ color: "#38bdf8" }}>{remaining != null ? `${Math.round(remaining).toLocaleString()}원` : "대기"}</strong>
+                               <div style={{ color: UI.mutedSoft, fontWeight: 900 }}>진입 가능(잠재)</div><strong style={{ color: "#4ade80", fontSize: "0.8rem" }}>{`${Math.round(potential).toLocaleString()}원`}</strong>
+                             </div>
+                           );
+                         })()}
+                      </div>
+                      {/* SURGE Bucket */}
+                      <div style={{ background: "#1e1b4b", padding: "0.8rem", borderRadius: 8, border: "1px solid #312e81" }}>
+                         <div style={{ fontSize: "0.75rem", color: "#818cf8", fontWeight: 700, marginBottom: 6 }}>SURGE 50% 한도 (기타 급등주)</div>
+                         {(() => {
+                           const spotEquity = liveOperatingCapital.spotTradingEquityKrw;
+                           const availableKrw = Number(trade?.krw_available ?? 0);
+                           const cap = spotEquity != null ? spotEquity * 0.5 : null;
+                           let used = 0;
+                           const coreCurrencies = ["BTC", "ETH", "SOL", "XRP", "TRX", "DOGE"];
+                           (trade?.balances ?? []).forEach(b => {
+                             if (b.currency !== "KRW" && b.currency !== "USDT" && !coreCurrencies.includes(b.currency)) {
+                               const qty = Number(b.balance ?? 0) + Number(b.locked ?? 0);
+                               const markPrices = (trade?.mark_prices as any) ?? {};
+                               const markPrice = markPrices[`KRW-${b.currency}`] ?? b.avg_buy_price ?? 0;
+                               used += qty * markPrice;
+                             }
+                           });
+                           used += Number(trade?.reserved_krw ?? 0);
+                           const remaining = cap != null ? cap - used : null;
+                           const potential = remaining != null ? Math.min(Math.max(0, remaining), availableKrw) : 0;
+                           return (
+                             <div style={{ display: "grid", gridTemplateColumns: "1fr 1.2fr", gap: "0.4rem", fontSize: "0.75rem" }}>
+                               <div style={{ color: UI.mutedSoft }}>Bucket 한도</div><strong>{cap != null ? `${Math.round(cap).toLocaleString()}원` : "대기"}</strong>
+                               <div style={{ color: UI.mutedSoft }}>현재 사용액</div><strong>{Math.round(used).toLocaleString()}원</strong>
+                               <div style={{ color: UI.mutedSoft }}>여유 버킷</div><strong style={{ color: "#818cf8" }}>{remaining != null ? `${Math.round(remaining).toLocaleString()}원` : "대기"}</strong>
+                               <div style={{ color: UI.mutedSoft, fontWeight: 900 }}>진입 가능(잠재)</div><strong style={{ color: "#4ade80", fontSize: "0.8rem" }}>{`${Math.round(potential).toLocaleString()}원`}</strong>
+                             </div>
+                           );
+                         })()}
+                      </div>
                     </div>
                   </div>
 

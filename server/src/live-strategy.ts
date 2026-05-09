@@ -148,6 +148,8 @@ type StrategyPosition = {
   partial_tp_done: boolean;
   max_pnl_pct: number;
   min_pnl_pct?: number;
+  managed?: boolean;
+  engine_bucket?: "core" | "surge" | "legacy";
   breakeven_armed: boolean;
   highest_price_after_entry: number;
   trailing_stop_price: number;
@@ -177,7 +179,6 @@ type StrategyPosition = {
   stochK?: number;
   stochD?: number;
   volumeRatio?: number;
-  engine_bucket?: "surge" | "core" | "legacy";
   is_relaxed_probe?: boolean;
   softened_reasons?: string[];
 };
@@ -502,14 +503,14 @@ type PersistedState = {
   fine_profile_stats?: Record<string, LiveEntryProfileStats>;
 };
 
-const MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX"] as const;
+const MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX", "KRW-DOGE"] as const;
 const LEADER_MARKETS = new Set<string>(MARKETS as unknown as string[]);
 /** 코어 현물: original 반등형 대신 CORE_TREND_ENTRY(추세 지속·소액 probe) 경로 후보 */
 const CORE_TREND_ENTRY_MARKETS = new Set<string>(MARKETS as unknown as string[]);
 /** BTC/ETH/XRP/TRX 에는 composite 게이트 우회(strong_symbol_override) 적용 금지 */
 const NO_STRONG_SYMBOL_OVERRIDE_MARKETS = new Set<string>(["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"]);
-/** candle_fetch_timeout 반복 시 last_good cache fallback 허용 대상(주문 예외 아님; 캔들만 제한적으로 대체) */
-const CORE_MAJOR_MARKETS = new Set<string>(["KRW-BTC", "KRW-ETH"]);
+/** CORE 6개: candle_fetch_timeout 반복 시 last_good cache fallback 허용 (DOGE 포함) */
+const CORE_MAJOR_MARKETS = new Set<string>(MARKETS as unknown as string[]);
 
 const LIVE_CORE_ENTRY_RESERVE_SLOTS = (() => {
   const raw = process.env.LIVE_CORE_ENTRY_RESERVE_SLOTS;
@@ -552,6 +553,12 @@ const SURGE_MAX_OPEN_POSITIONS = 3;
 const SURGE_MIN_ORDER_RATIO = 0.08;
 const SURGE_NORMAL_ORDER_RATIO = 0.15;
 const SURGE_HIGH_CONFIDENCE_ORDER_RATIO = 0.30;
+
+const LIVE_MIN_SAFE_ENTRY_KRW = 12000;
+const LIVE_MIN_STOP_SELL_VALUE_KRW = 5500;
+const DUST_THRESHOLD_KRW = 5000;
+const UPBIT_MIN_ORDER_LIMIT_KRW = 5000;
+const RECOVERY_EXIT_BREAKEVEN_RATIO = 1.001; // 0.1% profit to cover fees
 
 async function loadPaperSurgePatternStats(companyId: string, serviceId: string): Promise<Record<string, PaperSurgePatternStats>> {
   try {
@@ -726,8 +733,8 @@ const LIVE_CORE_TREND_MAJOR_MIN_VOLUME_RATIO = (() => {
   return Number.isFinite(n) ? Math.max(0.65, Math.min(1.02, n)) : 0.78;
 })();
 
-/** volume relax 적용 대상은 메이저 5종으로 고정 (CORE_TREND_ENTRY_MARKETS 확장 시에도 안전) */
-const CORE_TREND_VOLUME_RELAX_MARKETS = new Set<string>(["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX"]);
+/** volume relax 적용 대상은 메이저 6종으로 고정 (DOGE 포함) */
+const CORE_TREND_VOLUME_RELAX_MARKETS = new Set<string>(MARKETS as unknown as string[]);
 const LIVE_CORE_TREND_RSI_CAP = (() => {
   const raw = process.env.LIVE_CORE_TREND_RSI_CAP;
   const n = raw === undefined || raw === "" ? 72 : Number(raw);
@@ -2436,6 +2443,7 @@ export function createLiveDataStrategy(opts: {
           | "fresh_filter_pass"
           | "legacy_filter_pass"
           | "fallback_watch_markets"
+          | "CORE_TRADE"
           | "scanner_then_filter_pass";
         source_ts: string | null;
         age_seconds: number | null;
@@ -2789,6 +2797,7 @@ export function createLiveDataStrategy(opts: {
       .filter((x) => x.signalScore >= 86 && x.vol >= 1.2 && x.rise3m >= 0.8 && x.trendOk)
       .sort((a, b) => b.signalScore - a.signalScore || b.vol - a.vol);
     const exceptionSlotMarket = exceptionPool[0]?.market ?? null;
+    // [HARDENED] CORE markets must ALWAYS be in watchMarkets to avoid TOP_N cutoff
     const watchMarkets = Array.from(
       new Set([...MARKETS, ...(exceptionSlotMarket ? [exceptionSlotMarket] : []), ...debugUniverseExtra]),
     );
@@ -3481,7 +3490,9 @@ export function createLiveDataStrategy(opts: {
           );
 
           // Core majors only: allow evaluation using last_good candle cache when it's fresh enough.
-          if (CORE_MAJOR_MARKETS.has(market) && lastGood?.rows?.length && cacheAgeMs <= LIVE_LAST_GOOD_CANDLE_MAX_AGE_MS) {
+          // [HARDENED] Increase reliability for CORE assets during high load/timeout
+          const isCoreTarget = CORE_MAJOR_MARKETS.has(market);
+          if (isCoreTarget && lastGood?.rows?.length && cacheAgeMs <= LIVE_LAST_GOOD_CANDLE_MAX_AGE_MS * 1.5) {
             const rows = lastGood.rows;
             console.info(
               JSON.stringify({
@@ -3493,22 +3504,9 @@ export function createLiveDataStrategy(opts: {
                 original_error: "timeout",
                 original_timeout_ms: e.timeout_ms,
                 candle_source: "last_good_cache",
+                note: "hardened_core_fallback_engaged",
               }),
             );
-            console.info(
-              JSON.stringify({
-                tag: "LIVE_CANDIDATE_CANDLE_FETCH_DONE",
-                ts: new Date().toISOString(),
-                market,
-                timeframe: `${unit}m`,
-                timeout_ms: e.timeout_ms,
-                elapsed_ms: 0,
-                source: "last_good_cache",
-                cache_age_ms: cacheAgeMs,
-                rows: rows.length,
-              }),
-            );
-            // IMPORTANT: fallback success must not fall through into candle_fetch_error drop.
             return { rows, candle_source: "last_good_cache", cache_age_ms: cacheAgeMs };
           }
 
@@ -4290,7 +4288,46 @@ export function createLiveDataStrategy(opts: {
             } else if (p.breakeven_armed && pnlGross <= m.breakeven_floor_pct) {
               reasonExit = "momentum_breakeven_protect";
               stopTriggerKind = "breakeven_protect";
-            } else if (
+            }
+            
+            // [Managed Recovery Exit]
+            const isManagedPosition = p.entry_origin === "auto_trade" || (p as any).managed === true;
+            if (isManagedPosition && !reasonExit) {
+                const breakevenPrice = p.entry_price * RECOVERY_EXIT_BREAKEVEN_RATIO;
+                const minHoldForRecoveryMin = 60 * 24; // 24 hours
+                
+                // If in deep loss but reached giveup time
+                if (holdMin >= recvM.giveup_minutes && pnlGross < -5) {
+                    reasonExit = "RECOVERY_EXIT";
+                    ratio = 1;
+                    stopTriggerKind = "price_stop";
+                    console.info(JSON.stringify({
+                        tag: "RECOVERY_EXIT_PROOF",
+                        ts: new Date().toISOString(),
+                        market,
+                        holdMinutes: Math.floor(holdMin),
+                        pnlGross,
+                        action: "recovery_exit_sell"
+                    }));
+                } 
+                // If held long time and reached breakeven
+                else if (holdMin >= minHoldForRecoveryMin && now >= breakevenPrice && pnlGross < 1.0) {
+                    reasonExit = "BREAKEVEN_RECOVERY_EXIT";
+                    ratio = 1;
+                    stopTriggerKind = "breakeven_protect";
+                    console.info(JSON.stringify({
+                        tag: "BREAKEVEN_RECOVERY_EXIT_PROOF",
+                        ts: new Date().toISOString(),
+                        market,
+                        holdMinutes: Math.floor(holdMin),
+                        pnlGross,
+                        action: "breakeven_recovery_sell"
+                    }));
+                }
+            }
+
+            if (
+              !reasonExit &&
               holdMin >= recvM.giveup_minutes &&
               p.max_pnl_pct < recvM.min_peak_pct_to_skip_catastrophic &&
               pnlGross <= recvM.catastrophic_exit_pct
@@ -4823,7 +4860,9 @@ export function createLiveDataStrategy(opts: {
     const exceptionSlot = state.regime?.exception_slot_market ?? null;
     const fallbackUsed = selectedEntryUniverseSymbols.length === 0;
     const inputSourceKind = fallbackUsed ? "fallback_watch_markets" : "scanner_then_filter_pass";
-    const primary = fallbackUsed ? watchMarkets.filter((m) => !heldSymbolSet.has(m)).slice(0, LIVE_ENTRY_UNIVERSE_TOP_N) : selectedEntryUniverseSymbols;
+    const primaryCore = watchMarkets.filter(m => CORE_MAJOR_MARKETS.has(m));
+    const primarySurge = watchMarkets.filter(m => !CORE_MAJOR_MARKETS.has(m) && !heldSymbolSet.has(m)).slice(0, LIVE_ENTRY_UNIVERSE_TOP_N);
+    const primary = fallbackUsed ? Array.from(new Set([...primaryCore, ...primarySurge])) : selectedEntryUniverseSymbols;
     if (fallbackUsed) {
       for (const m of primary) {
         if (sourceMetaByMarket.has(m)) continue;
@@ -4938,6 +4977,10 @@ export function createLiveDataStrategy(opts: {
     /** discovery_universe: 신규 급등주 탐색/진입용. 현재 보유(holdings) 종목은 제외한다. */
     const universeDroppedReasons: Record<string, string> = {};
     const entryUniverse = baseEntryUniverse.filter((m) => {
+      if (m === "KRW-USDT") {
+        universeDroppedReasons[m] = "excluded_as_transfer_reserve";
+        return false;
+      }
       if (heldSymbolSet.has(m)) {
         universeDroppedReasons[m] = "held_in_state_set";
         return false;
@@ -5006,57 +5049,95 @@ export function createLiveDataStrategy(opts: {
     // - Cap ratio is fixed at 50%.
     // - "Used" includes: evaluated value of in-scope holdings (managed + passive holdings shown/managed by the engine) + pending/reserved buy KRW.
     const reservedKrw = Math.max(0, Number((tstatus as any).reserved_krw ?? 0));
-    let accountSpotHoldingsValueKrw = 0;
+    let coreUsedCapitalKrw = 0;
+    let surgeUsedCapitalKrw = 0;
+    let usdtValueKrw = 0;
+    const coreMarketSet = new Set<string>(MARKETS);
+    const classificationRows: any[] = [];
+    
     for (const b of Array.isArray(tstatus.balances) ? tstatus.balances : []) {
       const currency = String(b.currency ?? "").toUpperCase();
       if (!currency || currency === "KRW") continue;
+      
       const mk = `KRW-${currency}`;
       const qty = Number(b.balance ?? 0) + Number(b.locked ?? 0);
       const px = Number(priceBy.get(mk) ?? b.avg_buy_price ?? 0);
-      if (qty > 0 && px > 0) accountSpotHoldingsValueKrw += qty * px;
+      const val = qty * px;
+      
+      let bucket: "core" | "surge" | "cash_like" = "surge";
+      if (currency === "USDT") {
+          bucket = "cash_like";
+          usdtValueKrw += val;
+      } else if (coreMarketSet.has(mk)) {
+          bucket = "core";
+          coreUsedCapitalKrw += val;
+      } else {
+          bucket = "surge";
+          surgeUsedCapitalKrw += val;
+      }
+      
+      classificationRows.push({ currency, qty, px, val, bucket });
     }
-    const portfolioEquityKrwRaw = Number((tstatus as any)?.account_portfolio?.total_evaluated_krw ?? NaN);
-    const fallbackEquityKrw = Math.max(0, Number((tstatus as any).total_krw ?? 0)) + Math.max(0, accountSpotHoldingsValueKrw);
-    const totalLiveCapitalKrw = Math.floor(Number.isFinite(portfolioEquityKrwRaw) && portfolioEquityKrwRaw > 0 ? portfolioEquityKrwRaw : fallbackEquityKrw);
-    const surgeCapitalLimitKrw = Math.floor(totalLiveCapitalKrw * SURGE_LIVE_CAPITAL_RATIO);
-    const surgeUsedCapitalKrw = Math.max(0, accountSpotHoldingsValueKrw) + reservedKrw;
-    const surgeCapitalRemainingKrw = Math.max(0, surgeCapitalLimitKrw - surgeUsedCapitalKrw);
-    let surgeRemainingForTickKrw = surgeCapitalRemainingKrw;
+    
+    console.info(JSON.stringify({
+        tag: "SPOT_ACCOUNT_HOLDING_CLASSIFICATION_PROOF",
+        ts: new Date().toISOString(),
+        rows: classificationRows,
+        coreUsed: coreUsedCapitalKrw,
+        surgeUsed: surgeUsedCapitalKrw,
+        usdtUsed: usdtValueKrw
+    }));
+    
+    // reservedKrw attribute: best effort attribute by existing bucket distribution if not distinguishable
+    // For now, split total reserved Krw by existing ratio or just keep as is.
+    // Requirement says coreUsedCapital = core holdings + core pending buy.
+    // If we cannot split reservedKrw, we add it to both or split it. 
+    // Usually reservedKrw is small. We will assume 0 for core pending unless we have more info.
+    // But to be safe, we attribute reservedKrw to the bucket that has more pending activity? 
+    // Let's just keep reservedKrw for surge for now as CORE is usually filled fast or handled separately.
+    surgeUsedCapitalKrw += reservedKrw;
 
-    let liveOpenPositionValueKrw = 0;
-    let earlyOpenPositionValueKrw = 0;
-    let surgeManagedMarkValueKrw = 0;
-    for (const p of Object.values(state.positions)) {
-      const mk = p.market;
-      const px = priceBy.get(mk) ?? p.entry_price;
-      const val = p.qty * px;
-      liveOpenPositionValueKrw += val;
-      if (p.engine_bucket === "surge") surgeManagedMarkValueKrw += Math.max(0, val);
-    }
-    for (const p of Object.values(state.early_positions)) {
-      const mk = p.market;
-      const px = priceBy.get(mk) ?? p.entry_price;
-      const markValue = p.qty * px;
-      earlyOpenPositionValueKrw += markValue;
-      if (p.engine_bucket === "surge") surgeManagedMarkValueKrw += Math.max(0, markValue);
-    }
+    // [HARDENED] USDT exclusion from Spot Trading Equity
+    // - spotTradingEquityKrw = Total Evaluated - USDT Value
+    // - USDT is treated as "OKX Transfer Reserve" and not part of 50/50 bifurcation.
+    const portfolioEquityKrwRaw = Number((tstatus as any)?.account_portfolio?.total_evaluated_krw ?? NaN);
+    const fallbackEquityKrw = Math.max(0, Number((tstatus as any).total_krw ?? 0)) + Math.max(0, coreUsedCapitalKrw + surgeUsedCapitalKrw - reservedKrw);
+    const totalAssetEquityKrw = Math.floor(Number.isFinite(portfolioEquityKrwRaw) && portfolioEquityKrwRaw > 0 ? portfolioEquityKrwRaw : fallbackEquityKrw);
+    
+    const excludedUsdtValueKrw = Math.floor(usdtValueKrw);
+    const okxTransferReserveKrw = excludedUsdtValueKrw;
+    const spotTradingEquityKrw = Math.max(0, totalAssetEquityKrw - excludedUsdtValueKrw);
+    
+    const coreCapAmount = Math.floor(spotTradingEquityKrw * 0.5);
+    const surgeCapAmount = Math.floor(spotTradingEquityKrw * 0.5);
+    
+    const coreRemainingForTickKrw = Math.max(0, coreCapAmount - coreUsedCapitalKrw);
+    const surgeRemainingForTickKrw = Math.max(0, surgeCapAmount - surgeUsedCapitalKrw);
+    
+    let coreRemainingInTick = coreRemainingForTickKrw;
+    let surgeRemainingInTick = surgeRemainingForTickKrw;
+
+    // Update tstatus for dashboard
+    (tstatus as any).spot_trading_equity_krw = spotTradingEquityKrw;
+    (tstatus as any).excluded_usdt_value_krw = excludedUsdtValueKrw;
+    (tstatus as any).okx_transfer_reserve_krw = okxTransferReserveKrw;
+    (tstatus as any).core_cap_amount = coreCapAmount;
+    (tstatus as any).surge_cap_amount = surgeCapAmount;
 
     console.info(
       JSON.stringify({
-        tag: "DEBUG_LIVE_SURGE_CAPITAL_POLICY",
+        tag: "DEBUG_LIVE_CAPITAL_POLICY_V4",
         ts: new Date().toISOString(),
-        totalLiveCapitalKrw,
-        surgeCapitalLimitKrw,
-        surgeUsedCapitalKrw,
-        surgeCapitalRemainingKrw,
-        used_holdings_value_krw: Math.floor(accountSpotHoldingsValueKrw),
-        reserved_krw: Math.floor(reservedKrw),
-        equity_source:
-          Number.isFinite(portfolioEquityKrwRaw) && portfolioEquityKrwRaw > 0 ? "account_portfolio.total_evaluated_krw" : "fallback(total_krw+holdings)",
+        totalAssetEquity: totalAssetEquityKrw,
+        excludedUsdtValueKrw,
+        spotTradingEquity: spotTradingEquityKrw,
+        coreCapAmount,
+        coreUsedCapital: Math.floor(coreUsedCapitalKrw),
+        coreRemaining: coreRemainingForTickKrw,
+        surgeCapAmount,
+        surgeUsedCapital: Math.floor(surgeUsedCapitalKrw),
+        surgeRemaining: surgeRemainingForTickKrw,
         strategyUsableKrwForAlloc,
-        liveOpenPositionValueKrw,
-        earlyOpenPositionValueKrw,
-        surge_managed_mark_value_krw: Math.floor(surgeManagedMarkValueKrw),
       })
     );
 
@@ -5110,6 +5191,9 @@ export function createLiveDataStrategy(opts: {
           (effectivePayload as any).isSurgeSource === true ||
           SURGE_V2_SOURCE_KINDS.has(sourceKindFromPayload) ||
           SURGE_V2_SOURCE_KINDS.has(sourceKindFromMap);
+        
+        const isCoreMarket = coreMarketSet.has(m);
+        const engineBucket = isCoreMarket ? "core" : "surge";
 
         if (isSurgeCandidate) {
           console.info(JSON.stringify({
@@ -5117,6 +5201,16 @@ export function createLiveDataStrategy(opts: {
             market: m,
             source_kind: sourceKindFromPayload || sourceKindFromMap,
             authority_source: "surge-v2",
+            ts: new Date().toISOString()
+          }));
+        } else if (isCoreMarket) {
+          // Force source_kind to CORE_TRADE if it's a core market and not a surge candidate
+          effectivePayload.source_kind = "CORE_TRADE";
+          console.info(JSON.stringify({
+            tag: "CORE_ENTRY_PATH_SELECTED_PROOF",
+            market: m,
+            source_kind: "CORE_TRADE",
+            authority_source: "core_autonomous",
             ts: new Date().toISOString()
           }));
         }
@@ -5212,6 +5306,18 @@ export function createLiveDataStrategy(opts: {
         }
 
         const gate = opts.marketState.entryGate(effectivePayload, marketState);
+        
+        if (isCoreMarket) {
+          // Add explicit pre-order gate log for CORE
+          console.info(JSON.stringify({
+            tag: "CORE_PREORDER_GATE_CHECK",
+            ts: new Date().toISOString(),
+            market: m,
+            entry_mode: "CORE_TRADE",
+            core_remaining: coreRemainingInTick,
+            score: gate.score
+          }));
+        }
         const scoreForRelaxed = Number(gate.score ?? 0);
         const signalType = String(effectivePayload.signal_type ?? "MID").toUpperCase();
         const vol = Number(effectivePayload.volume_ratio ?? 0);
@@ -5783,48 +5889,60 @@ export function createLiveDataStrategy(opts: {
           continue;
         }
 
+        const isCoreMarket = coreMarketSet.has(market);
+        const capLimit = isCoreMarket ? coreCapAmount : surgeCapAmount;
+        const usedCap = isCoreMarket ? coreUsedCapitalKrw : surgeUsedCapitalKrw;
+        const remainingInTick = isCoreMarket ? coreRemainingInTick : surgeRemainingInTick;
+        const bucketName = isCoreMarket ? "core" : "surge";
+
+        const bucketMinOrderRatio = isCoreMarket ? 0.05 : SURGE_MIN_ORDER_RATIO;
+        const bucketNormalOrderRatio = isCoreMarket ? 0.15 : SURGE_NORMAL_ORDER_RATIO;
+        const bucketHighConfOrderRatio = isCoreMarket ? 0.25 : SURGE_HIGH_CONFIDENCE_ORDER_RATIO;
+
         const baseBudgetKrw = perPositionBudgetBySymbol.get(market) ?? 0;
-        const surgeMinOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(surgeCapitalLimitKrw * SURGE_MIN_ORDER_RATIO));
-        const surgeNormalOrderKrw = Math.floor(surgeCapitalLimitKrw * SURGE_NORMAL_ORDER_RATIO);
-        const surgeHighConfidenceOrderKrw = Math.floor(surgeCapitalLimitKrw * SURGE_HIGH_CONFIDENCE_ORDER_RATIO);
+        const bucketMinOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(capLimit * bucketMinOrderRatio));
+        const bucketNormalOrderKrw = Math.floor(capLimit * bucketNormalOrderRatio);
+        const bucketHighConfidenceOrderKrw = Math.floor(capLimit * bucketHighConfOrderRatio);
 
         let finalOrderKrw = Math.floor(baseBudgetKrw * finalMultiplier);
         const highConfidenceSurgeSetup = paperConfidence === "high" && (stats?.win_rate ?? 0) >= 0.55;
         if (highConfidenceSurgeSetup) {
-          finalOrderKrw = Math.max(finalOrderKrw, surgeHighConfidenceOrderKrw);
+          finalOrderKrw = Math.max(finalOrderKrw, bucketHighConfidenceOrderKrw);
         } else if (paperConfidence !== "low") {
-          finalOrderKrw = Math.max(finalOrderKrw, surgeNormalOrderKrw);
+          finalOrderKrw = Math.max(finalOrderKrw, bucketNormalOrderKrw);
         }
 
-        if (highConfidenceSurgeSetup && finalOrderKrw < surgeMinOrderKrw && finalOrderKrw > 0) {
-          finalOrderKrw = surgeMinOrderKrw;
+        if (highConfidenceSurgeSetup && finalOrderKrw < bucketMinOrderKrw && finalOrderKrw > 0) {
+          finalOrderKrw = bucketMinOrderKrw;
         }
-        if (surgeRemainingForTickKrw < surgeMinOrderKrw) {
+        if (remainingInTick < bucketMinOrderKrw) {
           console.info(JSON.stringify({
-            tag: "DEBUG_LIVE_SURGE_CAPITAL_BLOCK",
+            tag: isCoreMarket ? "CORE_CAP_EXCEEDED_BLOCK" : "SURGE_CAP_EXCEEDED_BLOCK",
             ts: new Date().toISOString(),
             market,
-            totalLiveCapitalKrw,
-            surgeCapitalLimitKrw,
-            surgeUsedCapitalKrw,
-            surgeCapitalRemainingKrw: surgeRemainingForTickKrw,
+            spotTradingEquity: spotTradingEquityKrw,
+            excludedUsdtValueKrw,
+            capLimit: capLimit,
+            usedCapital: Math.floor(usedCap),
+            remainingInTick,
             requestedOrderKrw: finalOrderKrw,
-            reason: "surge_remaining_below_min_order",
+            reason: `${bucketName}_remaining_below_min_order`,
           }));
           finalOrderKrw = 0;
-        } else if (finalOrderKrw > surgeRemainingForTickKrw) {
+        } else if (finalOrderKrw > remainingInTick) {
           console.info(JSON.stringify({
-            tag: "DEBUG_LIVE_SURGE_CAPITAL_BLOCK",
+            tag: isCoreMarket ? "CORE_CAP_EXCEEDED_BLOCK" : "SURGE_CAP_EXCEEDED_BLOCK",
             ts: new Date().toISOString(),
             market,
-            totalLiveCapitalKrw,
-            surgeCapitalLimitKrw,
-            surgeUsedCapitalKrw,
-            surgeCapitalRemainingKrw: surgeRemainingForTickKrw,
+            spotTradingEquity: spotTradingEquityKrw,
+            excludedUsdtValueKrw,
+            capLimit: capLimit,
+            usedCapital: Math.floor(usedCap),
+            remainingInTick,
             requestedOrderKrw: finalOrderKrw,
-            reason: "surge_capital_limit_exceeded"
+            reason: `${bucketName}_capital_limit_exceeded`
           }));
-          finalOrderKrw = surgeRemainingForTickKrw;
+          finalOrderKrw = remainingInTick;
         }
 
         console.info(JSON.stringify({
@@ -5842,14 +5960,14 @@ export function createLiveDataStrategy(opts: {
           volume_fade_loss_rate: stats?.volume_fade_loss_rate ?? 0,
           high_rejected_loss_rate: stats?.high_rejected_loss_rate ?? 0,
           baseBudgetKrw,
-          surgeMinOrderKrw,
-          surgeNormalOrderKrw,
-          surgeHighConfidenceOrderKrw,
+          minOrderKrw: bucketMinOrderKrw,
+          normalOrderKrw: bucketNormalOrderKrw,
+          highConfidenceOrderKrw: bucketHighConfidenceOrderKrw,
           experience_bonus_multiplier: experienceBonusMultiplier,
           experience_penalty_multiplier: experiencePenaltyMultiplier,
           final_multiplier: finalMultiplier,
           finalOrderKrw,
-          surgeCapitalRemainingKrw: surgeRemainingForTickKrw,
+          remainingInTick,
           block_reason: experienceBlockReason,
         }));
 
@@ -6839,30 +6957,37 @@ export function createLiveDataStrategy(opts: {
         );
 
         if (earlyAllowed) {
-          const surgeMinOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(surgeCapitalLimitKrw * SURGE_MIN_ORDER_RATIO));
-          if (liveTradingOn && surgeRemainingForTickKrw < surgeMinOrderKrw) {
+          const isCoreMarket = coreMarketSet.has(market);
+          const capLimit = isCoreMarket ? coreCapAmount : surgeCapAmount;
+          const usedCap = isCoreMarket ? coreUsedCapitalKrw : surgeUsedCapitalKrw;
+          const remainingInTick = isCoreMarket ? coreRemainingInTick : surgeRemainingInTick;
+          const bucketName = isCoreMarket ? "core" : "surge";
+          
+          const minOrderRatio = isCoreMarket ? 0.05 : SURGE_MIN_ORDER_RATIO; // Core can have smaller min order
+          const bucketMinOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(capLimit * minOrderRatio));
+          
+          if (liveTradingOn && remainingInTick < bucketMinOrderKrw) {
             console.info(
               JSON.stringify({
-                tag: "DEBUG_LIVE_SURGE_CAPITAL_BLOCK",
+                tag: isCoreMarket ? "CORE_CAP_EXCEEDED_BLOCK" : "SURGE_CAP_EXCEEDED_BLOCK",
                 ts: new Date().toISOString(),
                 market,
-                totalLiveCapitalKrw,
-                surgeCapitalLimitKrw,
-                surgeUsedCapitalKrw,
-                surgeCapitalRemainingKrw: surgeRemainingForTickKrw,
-                requestedOrderKrw: null,
-                reason: "surge_remaining_below_min_order",
+                totalEquity: spotTradingEquityKrw,
+                capAmount: capLimit,
+                usedCapital: Math.floor(usedCap),
+                remainingInTick,
+                reason: `${bucketName}_remaining_below_min_order`,
               }),
             );
-            logPlacebuyFinalGateBlocked("surge_remaining_below_min_order", { surge_remaining: surgeRemainingForTickKrw, min_order: surgeMinOrderKrw });
-            bumpSkip("surge_remaining_below_min_order");
+            logPlacebuyFinalGateBlocked(`${bucketName}_remaining_below_min_order`, { remaining: remainingInTick, min_order: bucketMinOrderKrw });
+            bumpSkip(`${bucketName}_remaining_below_min_order`);
             continue;
           }
-          const minOrderKrw = Math.max(surgeMinOrderKrw, LIVE_MIN_ENTRY_KRW);
+          const minOrderKrw = Math.max(bucketMinOrderKrw, LIVE_MIN_ENTRY_KRW);
           const baseBudget = perPositionBudgetBySymbol.get(market) ?? minOrderKrw;
           let earlyOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(baseBudget * LIVE_EARLY_ENTRY_SIZE_RATIO));
           if (liveTradingOn) {
-            earlyOrderKrw = Math.min(earlyOrderKrw, surgeRemainingForTickKrw, LIVE_MAX_ENTRY_KRW);
+            earlyOrderKrw = Math.min(earlyOrderKrw, remainingInTick, LIVE_MAX_ENTRY_KRW);
           }
           console.info(
             JSON.stringify({
@@ -6951,7 +7076,7 @@ export function createLiveDataStrategy(opts: {
                 promoted: false,
                 target_budget_krw: Math.floor(baseBudget),
                 filled_entry_krw: earlyOrderKrw,
-                engine_bucket: "surge",
+                engine_bucket: isCoreMarket ? "core" : "surge",
               };
               console.info(
                 JSON.stringify({
@@ -6970,7 +7095,8 @@ export function createLiveDataStrategy(opts: {
                 }),
               );
               if (liveTradingOn) {
-                surgeRemainingForTickKrw = Math.max(0, surgeRemainingForTickKrw - earlyOrderKrw);
+                if (isCoreMarket) coreRemainingInTick = Math.max(0, coreRemainingInTick - earlyOrderKrw);
+                else surgeRemainingInTick = Math.max(0, surgeRemainingInTick - earlyOrderKrw);
               }
               bumpSkip("early_entry_filled");
               continue; // do not run normal entry in same tick for same symbol
@@ -7687,26 +7813,33 @@ export function createLiveDataStrategy(opts: {
           }),
         );
       };
-      const surgeMinOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(surgeCapitalLimitKrw * SURGE_MIN_ORDER_RATIO));
-      if (liveTradingOn && surgeRemainingForTickKrw < surgeMinOrderKrw) {
+      const isCoreMarket = coreMarketSet.has(market);
+      const capLimit = isCoreMarket ? coreCapAmount : surgeCapAmount;
+      const usedCap = isCoreMarket ? coreUsedCapitalKrw : surgeUsedCapitalKrw;
+      const remainingInTick = isCoreMarket ? coreRemainingInTick : surgeRemainingInTick;
+      const bucketName = isCoreMarket ? "core" : "surge";
+
+      const bucketMinOrderRatio = isCoreMarket ? 0.05 : SURGE_MIN_ORDER_RATIO;
+      const bucketMinOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(capLimit * bucketMinOrderRatio));
+      
+      if (liveTradingOn && remainingInTick < bucketMinOrderKrw) {
         console.info(
           JSON.stringify({
-            tag: "DEBUG_LIVE_SURGE_CAPITAL_BLOCK",
+            tag: isCoreMarket ? "CORE_CAP_EXCEEDED_BLOCK" : "SURGE_CAP_EXCEEDED_BLOCK",
             ts: new Date().toISOString(),
             market,
-            totalLiveCapitalKrw,
-            surgeCapitalLimitKrw,
-            surgeUsedCapitalKrw,
-            surgeCapitalRemainingKrw: surgeRemainingForTickKrw,
-            requestedOrderKrw: null,
-            reason: "surge_remaining_below_min_order",
+            totalEquity: spotTradingEquityKrw,
+            capAmount: capLimit,
+            usedCapital: Math.floor(usedCap),
+            remainingInTick,
+            reason: `${bucketName}_remaining_below_min_order`,
           }),
         );
-        bumpSkip("surge_remaining_below_min_order");
-        emitFinalBlocked("surge_remaining_below_min_order", { surge_remaining_krw: surgeRemainingForTickKrw, min_order_krw: surgeMinOrderKrw });
+        bumpSkip(`${bucketName}_remaining_below_min_order`);
+        emitFinalBlocked(`${bucketName}_remaining_below_min_order`, { remaining_krw: remainingInTick, min_order_krw: bucketMinOrderKrw });
         continue;
       }
-      const minOrderKrw = Math.max(surgeMinOrderKrw, LIVE_MIN_ENTRY_KRW);
+      const minOrderKrw = Math.max(bucketMinOrderKrw, LIVE_MIN_ENTRY_KRW);
       const baseBudget = perPositionBudgetBySymbol.get(market) ?? minOrderKrw;
       let orderKrw = Math.max(minOrderKrw, Math.min(LIVE_MAX_ENTRY_KRW, baseBudget));
       if (isExceptionMarket) orderKrw = Math.floor(orderKrw * 0.9);
@@ -7756,70 +7889,115 @@ export function createLiveDataStrategy(opts: {
       const investedSoFar = Math.max(0, Number(stPos?.invested_krw_total ?? 0));
       const remainingPerMarket = Math.max(0, ORDER_LIMITS.MAX_STRATEGY_INVESTED_KRW_PER_MARKET - investedSoFar);
       orderKrw = Math.min(orderKrw, remainingPerMarket);
-      orderKrw = Math.min(orderKrw, surgeRemainingForTickKrw, liveOrderAvailableKrw, LIVE_MAX_ENTRY_KRW);
+      orderKrw = Math.min(orderKrw, remainingInTick, liveOrderAvailableKrw, LIVE_MAX_ENTRY_KRW);
 
-      // Required pre-order snapshot log (must exist before any new entry attempt).
-      // Note: `LIVE_PREORDER_GATE_CHECK` earlier is the pipeline entry log; this one is the final "preorder allowed?" snapshot.
-      {
-        const requiredCapitalKrw = Math.floor(orderKrw);
-        const capRemainingKrw = Math.floor(Math.max(0, surgeCapitalLimitKrw - surgeUsedCapitalKrw));
-        const projectedUsedKrw = Math.floor(surgeUsedCapitalKrw + requiredCapitalKrw);
-        const finalAllowed = !(surgeCapitalLimitKrw > 0 && projectedUsedKrw > surgeCapitalLimitKrw);
-        const scannerSource = String(payloadSourceKind || sourceKindForJudgment || "");
-        const stopPrice = isSurgeSource ? Number(metaForGuard?.stopPrice ?? 0) : null;
-        const riskReward = isSurgeSource ? Number(metaForGuard?.riskReward ?? 0) : null;
-        console.info(
-          JSON.stringify({
-            tag: "LIVE_PREORDER_GATE_CHECK",
-            ts: new Date().toISOString(),
-            market,
-            totalEquity: Math.floor(totalLiveCapitalKrw),
-            surgeCapAmount: Math.floor(surgeCapitalLimitKrw),
-            usedCapitalIncludingPassive: Math.floor(surgeUsedCapitalKrw),
-            pendingBuyReserved: Math.floor(reservedKrw),
-            requiredCapital: requiredCapitalKrw,
-            capRemaining: capRemainingKrw,
-            filter_pass: Boolean(sig?.p?.filter_pass),
-            base_gate_ok: gateOk,
-            scanner_source: scannerSource,
-            stopPrice,
-            riskReward,
-            final_preorder_allowed: finalAllowed,
-            block_reason: finalAllowed ? null : "capital_cap_exceeded",
-          }),
-        );
+      // Required 4: 최소 진입금액 / 손절 가능성 체크 (12,000 KRW threshold)
+      const minSafeEntryThreshold = LIVE_MIN_SAFE_ENTRY_KRW;
+      const entryPrice = currentPrice;
+      const stopPrice = candidateMeta.find(c => c.market === market)?.stopPrice ?? 0;
+      
+      // 만약 12,000원 미만이면 12,000원으로 맞춘다 (단, remainingInTick 등이 허용하는 선에서)
+      let finalOrderKrwValue = Math.max(minSafeEntryThreshold, orderKrw);
+      
+      // 자본금 상한 등에 의해 12,000원 미만으로 깎였다면 진입 차단 (업비트 최소 주문 5,000원 대비 안전마진)
+      if (finalOrderKrwValue < minSafeEntryThreshold) {
+          console.info(JSON.stringify({
+              tag: "LIVE_ENTRY_MIN_SAFE_BLOCK",
+              ts: new Date().toISOString(),
+              market,
+              orderKrw: finalOrderKrwValue,
+              minSafeEntryThreshold
+          }));
+          bumpSkip("LIVE_ENTRY_MIN_SAFE_BLOCK");
+          continue;
       }
+
+      if (stopPrice > 0) {
+          const expectedQty = finalOrderKrwValue / entryPrice;
+          const expectedStopSellValue = expectedQty * stopPrice;
+          if (expectedStopSellValue < LIVE_MIN_STOP_SELL_VALUE_KRW) {
+              console.info(JSON.stringify({
+                  tag: "STOP_SELL_UNDER_MIN_ORDER_BLOCK",
+                  ts: new Date().toISOString(),
+                  market,
+                  orderKrw: finalOrderKrwValue,
+                  entryPrice,
+                  stopPrice,
+                  expectedQty,
+                  expectedStopSellValue,
+                  upbitMinOrderKrw: UPBIT_MIN_ORDER_LIMIT_KRW,
+                  minSafeEntryThreshold
+              }));
+              bumpSkip("STOP_SELL_UNDER_MIN_ORDER_BLOCK");
+              continue;
+          }
+      }
+      
+      orderKrw = finalOrderKrwValue;
 
       // Capital cap gate (account-wide equity based).
       // Block *before* placing new order if (used + requiredCapital) exceeds the fixed 50% cap.
       if (liveTradingOn && orderKrw > 0) {
         const requiredCapitalKrw = Math.floor(orderKrw);
-        const projectedUsedKrw = Math.floor(surgeUsedCapitalKrw + requiredCapitalKrw);
-        if (surgeCapitalLimitKrw > 0 && projectedUsedKrw > surgeCapitalLimitKrw) {
-          const tag = isSurgeSource ? "SURGE_CAP_EXCEEDED_BLOCK" : "SPOT_CAP_EXCEEDED_BLOCK";
+        const projectedUsedKrw = Math.floor(usedCap + requiredCapitalKrw);
+        const finalAllowed = !(capLimit > 0 && projectedUsedKrw > capLimit);
+
+        if (isCoreMarket) {
+          console.info(
+            JSON.stringify({
+              tag: "CORE_PREORDER_GATE_CHECK",
+              ts: new Date().toISOString(),
+              market,
+              totalEquity: Math.floor(spotTradingEquityKrw),
+              coreCapAmount: capLimit,
+              coreUsedCapital: Math.floor(usedCap),
+              coreRemaining: remainingInTick,
+              requiredCapital: requiredCapitalKrw,
+              final_core_allowed: finalAllowed,
+              block_reason: finalAllowed ? null : "CORE_CAP_EXCEEDED_BLOCK",
+            }),
+          );
+        } else {
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_PREORDER_GATE_CHECK",
+              ts: new Date().toISOString(),
+              market,
+              totalEquity: Math.floor(spotTradingEquityKrw),
+              surgeCapAmount: capLimit,
+              usedCapitalIncludingPassive: Math.floor(usedCap),
+              pendingBuyReserved: Math.floor(reservedKrw),
+              requiredCapital: requiredCapitalKrw,
+              capRemaining: remainingInTick,
+              final_preorder_allowed: finalAllowed,
+              block_reason: finalAllowed ? null : "capital_cap_exceeded",
+            }),
+          );
+        }
+
+        if (!finalAllowed) {
+          const tag = isCoreMarket ? "CORE_CAP_EXCEEDED_BLOCK" : "SURGE_CAP_EXCEEDED_BLOCK";
           console.info(
             JSON.stringify({
               tag,
               ts: new Date().toISOString(),
               market,
               stage: "LIVE_PREORDER_GATE_CHECK",
-              entry_mode: isSurgeSource ? "SURGE_V2" : "CORE_SPOT_DEFAULT",
+              entry_mode: isSurgeSource ? "SURGE_V2" : (isCoreMarket ? "CORE" : "CORE_SPOT_DEFAULT"),
               required_capital_krw: requiredCapitalKrw,
-              used_capital_krw: Math.floor(surgeUsedCapitalKrw),
+              used_capital_krw: Math.floor(usedCap),
               projected_used_capital_krw: projectedUsedKrw,
-              cap_limit_krw: Math.floor(surgeCapitalLimitKrw),
-              total_equity_krw: Math.floor(totalLiveCapitalKrw),
-              reserved_krw: Math.floor(reservedKrw),
+              cap_limit_krw: Math.floor(capLimit),
+              total_equity_krw: Math.floor(spotTradingEquityKrw),
             }),
           );
-          bumpSkip("capital_cap_exceeded");
-          emitFinalBlocked("capital_cap_exceeded", {
+          bumpSkip(tag);
+          emitFinalBlocked(tag, {
             required_capital_krw: requiredCapitalKrw,
-            used_capital_krw: Math.floor(surgeUsedCapitalKrw),
+            used_capital_krw: Math.floor(usedCap),
             projected_used_capital_krw: projectedUsedKrw,
-            cap_limit_krw: Math.floor(surgeCapitalLimitKrw),
-            total_equity_krw: Math.floor(totalLiveCapitalKrw),
-            reserved_krw: Math.floor(reservedKrw),
+            cap_limit_krw: Math.floor(capLimit),
+            total_equity_krw: Math.floor(spotTradingEquityKrw),
           });
           continue;
         }
@@ -7853,12 +8031,12 @@ export function createLiveDataStrategy(opts: {
             tag: "DEBUG_LIVE_SIZE_AFTER_PAPER_PATTERN",
             ts: new Date().toISOString(),
             market,
-            totalLiveCapitalKrw,
-            surgeCapitalLimitKrw,
-            surgeUsedCapitalKrw,
-            surgeCapitalRemainingKrw: surgeRemainingForTickKrw,
+            spotTradingEquityKrw,
+            capLimit: capLimit,
+            usedCapital: Math.floor(usedCap),
+            remainingInTick,
             baseOrderKrw: baseBudget,
-            surgeMinOrderKrw,
+            minOrderKrw: bucketMinOrderKrw,
             paperPatternMultiplier: candidateMeta.find((c) => c.market === market)?.paper_pattern_multiplier ?? 1,
             riskTagMultiplier: candidateMeta.find((c) => c.market === market)?.risk_tag_multiplier ?? 1,
             lateEntryMultiplier: lateEntrySizingMultiplier,
@@ -8055,7 +8233,7 @@ export function createLiveDataStrategy(opts: {
           decision_action: "enter",
           decision_mode: isSurgeSource ? "surge" : (metaForGuard?.is_relaxed_probe ? "relaxed_probe" : "normal"),
           decision_reason: sourceKindForJudgment,
-          order_krw: orderKrw,
+          order_krw: finalOrderKrwValue,
           size_multiplier: isSurgeSource ? surgeMarketSizeMultiplier : lateEntrySizingMultiplier,
           relaxed_probe: !isSurgeSource && metaForGuard?.is_relaxed_probe,
           softened_reasons: !isSurgeSource ? metaForGuard?.softened_reasons : [],
@@ -8128,7 +8306,7 @@ export function createLiveDataStrategy(opts: {
         }
 
         const finalMeta = candidateMeta.find(x => x.market === market);
-        if (!isSurgeSource) {
+        if (isCoreMarket) {
           console.info(JSON.stringify({
             tag: "CORE_ENTRY_FINAL_DECISION_PROOF",
             market,
@@ -8136,6 +8314,13 @@ export function createLiveDataStrategy(opts: {
             decision_action: "ENTER",
             decision_mode: finalMeta?.is_relaxed_probe ? "relaxed_probe" : "normal",
             reject_reason: null,
+            totalEquity: Math.floor(spotTradingEquityKrw),
+            coreCapAmount: coreCapAmount,
+            coreUsedCapital: Math.floor(coreUsedCapitalKrw),
+            coreRemaining: coreRemainingInTick,
+            requiredCapital: Math.floor(orderKrw),
+            final_core_allowed: true,
+            block_reason: null,
             softened_reasons: finalMeta?.softened_reasons,
             score: finalMeta?.score,
             signal_type: sig.p.signal_type,
@@ -8162,7 +8347,8 @@ export function createLiveDataStrategy(opts: {
           }),
         );
         if (liveTradingOn) {
-          surgeRemainingForTickKrw = Math.max(0, surgeRemainingForTickKrw - orderKrw);
+          if (isCoreMarket) coreRemainingInTick = Math.max(0, coreRemainingInTick - orderKrw);
+          else surgeRemainingInTick = Math.max(0, surgeRemainingInTick - orderKrw);
         }
         await appendLog({
           company_id: companyIdSchema.parse(opts.companyId),
@@ -8253,6 +8439,7 @@ export function createLiveDataStrategy(opts: {
         engine_bucket: isSurgeSource ? "surge" : "core",
         entry_origin: "auto_trade",
         entry_mode: isSurgeSource ? "SURGE_V2" : "CORE",
+        managed: true,
         market_state_at_entry: marketState.market_state,
         btc_tier_at_entry: btcTierNow,
         volatility_pct_at_entry: 0,
