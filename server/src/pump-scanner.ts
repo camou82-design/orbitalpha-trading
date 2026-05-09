@@ -415,6 +415,22 @@ export function createPumpScanner(
     try {
       const dir = path.dirname(surgeCandidatesPath);
       await fs.mkdir(dir, { recursive: true });
+
+      // [PRIORITY-PROTECTION] If engine2 has already written candidates, and we have nothing, do NOT overwrite.
+      let existingKind: string | null = null;
+      try {
+        const existingRaw = await fs.readFile(surgeCandidatesPath, "utf8");
+        const existing = JSON.parse(existingRaw);
+        existingKind = existing?.kind;
+      } catch {
+        // file missing or malformed
+      }
+
+      if (existingKind === "surge_candidates_engine2" && state.rows.length === 0) {
+        // Keep engine2 candidates if legacy scanner found nothing
+        return;
+      }
+
       await fs.writeFile(surgeCandidatesPath, JSON.stringify({
         kind: "surge_candidates_live",
         updated_at: state.updatedAt,
@@ -429,6 +445,7 @@ export function createPumpScanner(
           source_kind: "scanner_tradable_candidate"
         }))
       }, null, 2), "utf8");
+
     } catch (e) {
       console.warn("[pump-scanner] surge-candidates.json persist failed", e);
     }

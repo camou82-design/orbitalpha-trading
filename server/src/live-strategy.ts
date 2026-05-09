@@ -545,6 +545,8 @@ type LastGoodCandleCacheRow = {
   count: number;
 };
 const lastGoodMinuteCandleCache = new Map<string, LastGoodCandleCacheRow>();
+const lastGoodTickerCache = new Map<string, { ts_ms: number; row: any }>();
+
 const EXISTING_POSITION_MIN_KRW = Math.max(
   1000,
   Number(process.env.LIVE_EXISTING_POSITION_MIN_KRW ?? 5000),
@@ -583,12 +585,13 @@ const LIVE_TICK_PHASE_MS = {
   trade_status: Number(process.env.LIVE_TICK_PHASE_MS_TRADE_STATUS ?? 25_000),
   persist: Number(process.env.LIVE_TICK_PHASE_MS_PERSIST ?? 15_000),
   read_logs: Number(process.env.LIVE_TICK_PHASE_MS_READ_LOGS ?? 25_000),
-  market_state: Number(process.env.LIVE_TICK_PHASE_MS_MARKET_STATE ?? 45_000),
+  market_state: Number(process.env.LIVE_TICK_PHASE_MS_MARKET_STATE ?? 15_000),
   partition_validity: Number(process.env.LIVE_TICK_PHASE_MS_PARTITION ?? 35_000),
-  fetch_tickers: Number(process.env.LIVE_TICK_PHASE_MS_FETCH_TICKERS ?? 75_000),
+  fetch_tickers: Number(process.env.LIVE_TICK_PHASE_MS_FETCH_TICKERS ?? 12_000),
   fetch_minute_candles: Number(process.env.LIVE_TICK_PHASE_MS_FETCH_CANDLES ?? 30_000),
   paper_stats: Number(process.env.LIVE_TICK_PHASE_MS_PAPER_STATS ?? 20_000),
-  candidate_meta_parallel: Number(process.env.LIVE_TICK_PHASE_MS_CANDIDATE_META ?? 240_000),
+  candidate_meta_parallel: Number(process.env.LIVE_TICK_PHASE_MS_CANDIDATE_META ?? 180_000),
+
 } as const;
 
 /** 단일 틱 전체 상한(개별 phase 타임아웃이 빠진 await 방지). */
@@ -2221,10 +2224,6 @@ export function createLiveDataStrategy(opts: {
         return fallback;
       }
     };
-    // Backward-compatible alias for the rest of the tick code.
-    const raceTradeStatus = (phase: string) => raceTradeStatusSafe(phase);
-    const racePersist = (phase: string) => racePhase(`persist:${phase}`, PHASE_MS.persist, () => persist());
-
     let lastGoodLogs: SignalLogEntry[] = [];
     let lastGoodLogsAtMs = 0;
     let logsRefreshInFlight: Promise<void> | null = null;
@@ -2234,21 +2233,26 @@ export function createLiveDataStrategy(opts: {
       if (lastGoodLogsAtMs > 0 && now - lastGoodLogsAtMs < 12_000) return;
       logsRefreshInFlight = (async () => {
         try {
-          const rows = await liveTickRacePhase(
-            { phase: "read_logs_220_background", tick_lease: myLease, timeout_ms: Math.max(300, Math.min(1200, PHASE_MS.read_logs)) },
-            () => opts.readLogs(220),
-          );
+          const rows = await opts.readLogs(220);
           if (Array.isArray(rows)) {
             lastGoodLogs = rows;
             lastGoodLogsAtMs = Date.now();
           }
         } catch {
-          // ignore
+          // silent background failure
         } finally {
           logsRefreshInFlight = null;
         }
       })();
     };
+
+    requestLogsRefreshNonBlocking();
+
+    // Backward-compatible alias for the rest of the tick code.
+    const raceTradeStatus = (phase: string) => raceTradeStatusSafe(phase);
+    const racePersist = (phase: string) => racePhase(`persist:${phase}`, PHASE_MS.persist, () => persist());
+
+
     await liveTickRacePhase(
       { phase: "tick_hard_wall_clock", tick_lease: myLease, timeout_ms: LIVE_TICK_HARD_WALL_MS },
       async () => {
@@ -2451,7 +2455,7 @@ export function createLiveDataStrategy(opts: {
         stale_filtered_before_eval: boolean;
       }
     >();
-    requestLogsRefreshNonBlocking();
+
     const logs = lastGoodLogs.length > 0 ? lastGoodLogs : [];
     if (logs.length === 0) {
       console.info(
@@ -2481,36 +2485,31 @@ export function createLiveDataStrategy(opts: {
       lastGoodMarketStateAt = Date.now();
     } catch (e) {
       const cacheAgeMs = lastGoodMarketStateAt > 0 ? Date.now() - lastGoodMarketStateAt : Infinity;
-      const useCache = lastGoodMarketState && cacheAgeMs < 10 * 60 * 1000;
       const isTimeout = isLiveTickPhaseTimeout(e);
+      const useCache = lastGoodMarketState && cacheAgeMs < 10 * 60 * 1000;
 
       if (useCache) {
         marketState = lastGoodMarketState!;
         console.info(
           JSON.stringify({
-            tag: "LIVE_MARKET_STATE_FAST_FALLBACK_USED",
+            tag: "LIVE_MARKET_STATE_FALLBACK_USED",
             ts: new Date().toISOString(),
             source: "last_good",
-            min_entry_score: marketState.min_entry_score,
-            market_state: marketState.market_state,
             reason: isTimeout ? "timeout" : "error",
             cache_age_ms: cacheAgeMs,
-            tick_lease: myLease,
+            market_state: marketState.market_state,
           }),
         );
       } else {
-        // 캐시가 없거나 너무 오래됨 -> logs 기반으로 neutral_safe 시도 (완전 risk_off로 막기 전에)
+        // [HARDENED] Favor neutral_safe over risk_off if we have active signals
         const recentSignals = (logs || []).filter((l) => l.kind === "signal" && l.payload);
         const highSignals = recentSignals.filter((l) => signalStrengthScore(l.payload) >= 70).length;
-        const lowSignals = recentSignals.filter((l) => signalStrengthScore(l.payload) < 55).length;
-        
-        // 최근 신호가 활발하고 강한 신호가 어느 정도 있으면 neutral_safe 적용
-        const useNeutralSafe = highSignals >= 3 && highSignals > lowSignals;
-        
-        marketState = useNeutralSafe 
+        const useNeutralSafe = highSignals >= 3;
+
+        marketState = useNeutralSafe
           ? {
               market_state: "neutral",
-              min_entry_score: 82, // 약간 보수적인 neutral
+              min_entry_score: 82,
               market_bonus: 0,
               btc_5m_trend: "flat",
               btc_15m_trend: "flat",
@@ -2525,42 +2524,17 @@ export function createLiveDataStrategy(opts: {
 
         console.info(
           JSON.stringify({
-            tag: "LIVE_MARKET_STATE_FAST_FALLBACK_USED",
+            tag: "LIVE_MARKET_STATE_FALLBACK_USED",
             ts: new Date().toISOString(),
             source: useNeutralSafe ? "neutral_safe" : "risk_off_safe",
-            min_entry_score: marketState.min_entry_score,
-            market_state: marketState.market_state,
             reason: isTimeout ? "timeout_and_no_cache" : "error_and_no_cache",
-            cache_age_ms: cacheAgeMs,
-            tick_lease: myLease,
             high_signals: highSignals,
-            low_signals: lowSignals,
+            market_state: marketState.market_state,
           }),
         );
-
-        console.info(
-          JSON.stringify({
-            tag: "LIVE_TICK_PHASE_EXIT",
-            ts: new Date().toISOString(),
-            phase: "market_state_evaluate",
-            tick_lease: myLease,
-            outcome: "fallback_used",
-            fallback_source: useNeutralSafe ? "neutral_safe" : "risk_off_safe"
-          })
-        );
-
-        if (!useNeutralSafe) {
-          console.info(
-            JSON.stringify({
-              tag: "LIVE_MARKET_STATE_UNAVAILABLE_ENTRY_BLOCKED",
-              ts: new Date().toISOString(),
-              tick_lease: myLease,
-              reason: "no_valid_market_state_and_weak_signals",
-            }),
-          );
-        }
       }
     }
+
     const conservativeMode = marketState.market_state === "risk_off";
     for (const row of logs) {
       if (row.kind !== "signal" || !row.payload) continue;
@@ -3307,7 +3281,7 @@ export function createLiveDataStrategy(opts: {
         requested_symbols: tickerRequestedSymbols.slice(0, 20),
       }),
     );
-    let tickerRows: Awaited<ReturnType<typeof fetchTickers>> = [];
+    let tickerRows: any[] = [];
     try {
       tickerRows = await racePhase("fetch_tickers", PHASE_MS.fetch_tickers, () =>
         fetchTickers(tickerRequestedSymbols, {
@@ -3315,23 +3289,33 @@ export function createLiveDataStrategy(opts: {
           signal: tickSignal,
         }),
       );
+      // Update cache
+      for (const r of tickerRows) {
+        lastGoodTickerCache.set(r.market, { ts_ms: Date.now(), row: r });
+      }
     } catch (e) {
-      const aborted =
-        tickSignal.aborted ||
-        (e instanceof DOMException && e.name === "AbortError") ||
-        (e instanceof Error && e.name === "AbortError");
+      const isTimeout = isLiveTickPhaseTimeout(e);
+      const fallbackRows: any[] = [];
+      const cacheMaxAgeMs = 60_000;
+      for (const m of tickerRequestedSymbols) {
+        const cached = lastGoodTickerCache.get(m);
+        if (cached && Date.now() - cached.ts_ms < cacheMaxAgeMs) {
+          fallbackRows.push(cached.row);
+        }
+      }
+
       console.info(
         JSON.stringify({
-          tag: aborted ? "DEBUG_TICKER_FETCH_ABORTED" : "DEBUG_TICKER_FETCH_ERROR",
+          tag: isTimeout ? "DEBUG_TICKER_FETCH_TIMEOUT" : "DEBUG_TICKER_FETCH_ERROR",
           ts: new Date().toISOString(),
-          stage: "after_scanner_before_tickers",
-          reason: aborted ? "fetch_tickers_aborted" : "fetch_tickers_throw",
-          error_message: e instanceof Error ? e.message : String(e),
-          requested_symbols: tickerRequestedSymbols.slice(0, 30),
+          reason: isTimeout ? "timeout" : "error",
+          fallback_count: fallbackRows.length,
+          requested_count: tickerRequestedSymbols.length,
         }),
       );
-      // [ISOLATION] Do not rethrow to prevent tick halt. tickerRows will be empty.
+      tickerRows = fallbackRows;
     }
+
     
     console.info(
       JSON.stringify({
@@ -3427,31 +3411,22 @@ export function createLiveDataStrategy(opts: {
         }),
       );
 
+      const abortCtrl = new AbortController();
+      const onTickAbort = () => abortCtrl.abort();
+      tickSignal.addEventListener("abort", onTickAbort, { once: true });
+
       try {
         const rows = await candleFetchLimiter(async () => {
           const phase = `candidate_meta_fetch_minute_candles:${market}:u${unit}:n${count}`;
-          const fetched = await racePhase(phase, timeoutMs, () => fetchMinuteCandles(market, unit, count, tickSignal));
+          const fetched = await racePhase(phase, timeoutMs, () => fetchMinuteCandles(market, unit, count, abortCtrl.signal));
           minute1CandleCache.set(`${market}:${count}`, fetched);
           return fetched;
         });
-
-        console.info(
-          JSON.stringify({
-            tag: "LIVE_CANDIDATE_CANDLE_FETCH_DONE",
-            ts: new Date().toISOString(),
-            market,
-            timeframe: `${unit}m`,
-            timeout_ms: timeoutMs,
-            elapsed_ms: Date.now() - t0,
-            source: "live_fetch",
-            cache_age_ms: null,
-            rows: rows.length,
-          }),
-        );
-
+        
         lastGoodMinuteCandleCache.set(key, { ts_ms: Date.now(), rows, unit, count });
         return { rows, candle_source: "live_fetch", cache_age_ms: null };
       } catch (e) {
+        abortCtrl.abort();
         // Abort is its own class of drop reason (do not mix with candle_fetch_error)
         if (isAbortLike(e)) {
           const phase = isLiveTickPhaseTimeout(e) ? e.phase : "candidate_meta_fetch_minute_candles:aborted";
@@ -3511,12 +3486,12 @@ export function createLiveDataStrategy(opts: {
             );
             return { rows, candle_source: "last_good_cache", cache_age_ms: cacheAgeMs };
           }
-
-          throw e;
         }
-
         throw e;
+      } finally {
+        tickSignal.removeEventListener("abort", onTickAbort);
       }
+
     };
     const btcChange = Number(changeRateBy.get("KRW-BTC") ?? 0);
     const btcTier: "strong" | "neutral" | "weak" =
