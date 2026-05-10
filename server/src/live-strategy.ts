@@ -75,6 +75,7 @@ type TradeStatus = {
   krw_available?: number;
   live_order_available_krw?: number;
   strategy_available_krw?: number;
+  last_order?: any;
 };
 
 type SignalPayloadV2 = {
@@ -114,6 +115,7 @@ type TradeApi = {
   placeLegacyDcaBuy?: (market: string, confirm: boolean, amountKrw?: number, signalPayload?: unknown) => Promise<{ ok?: boolean; reason?: string } | Record<string, unknown>>;
   placeLegacyExitSell?: (market: string, confirm: boolean, ratio?: number) => Promise<{ ok?: boolean; reason?: string } | Record<string, unknown>>;
   setAutoTradeEnabled?: (enabled: boolean) => Promise<void>;
+  syncManagedPosition?: (market: string, qty: number, avg: number, strategyType: StrategyType) => Promise<boolean>;
 };
 
 type MarketStateApi = {
@@ -2315,6 +2317,79 @@ export function createLiveDataStrategy(opts: {
     const lr = tstatus.ledger_reconcile;
     const reconcileActions: string[] = [];
     const strategyPosSnap = tstatus.strategy_positions ?? {};
+    // holdings_universe: 현재 계좌 보유 종목(관리/청산/표시용). discovery/entry_universe/precheck 경로에서는 제외한다.
+    const heldSymbols = balArr
+      .map((b) => {
+        const currency = String(b?.currency ?? "").toUpperCase();
+        const qty = Number(b?.balance ?? 0) + Number(b?.locked ?? 0);
+        if (!currency || currency === "KRW" || !(qty > 0)) return null;
+        return `KRW-${currency}`;
+      })
+      .filter((x): x is string => Boolean(x) && String(x).startsWith("KRW-"));
+
+    // [RECOVERY] last_order 기준으로 자동매매 매수임이 확인되면 managed position으로 복구한다.
+    const lastOrder = tstatus.last_order as any;
+    if (lastOrder && lastOrder.side === "buy" && lastOrder.status === "ok" && lastOrder.ts) {
+      const mk = lastOrder.market;
+      const ageMs = Date.now() - Date.parse(lastOrder.ts);
+      const isManaged = Boolean(state.positions[mk] || state.early_positions[mk]);
+      const totalSpot = accountTotalSpotQtyForMarket(mk, balArr);
+      
+      if (!isManaged && totalSpot > 0 && ageMs < 15 * 60 * 1000) {
+        console.error(
+          JSON.stringify({
+            tag: "MANAGED_POSITION_RECOVERY_HARD_WARNING",
+            ts: new Date().toISOString(),
+            market: mk,
+            reason: "매수 성공했으나 관리 장부 등록 실패 (복구 시도)",
+            last_order_ts: lastOrder.ts,
+            age_ms: ageMs,
+            spot_qty: totalSpot,
+            order_krw: lastOrder.amount_krw
+          })
+        );
+        
+        // 최소 정보로 복구
+        state.positions[mk] = {
+          market: mk,
+          strategy_type: "stable", // fallback
+          engine_bucket: "surge", // fallback for recovery
+          entry_origin: "auto_trade_recovered",
+          entry_mode: "RECOVERED",
+          managed: true,
+          market_state_at_entry: "unknown",
+          btc_tier_at_entry: "unknown" as any,
+          volatility_pct_at_entry: 0,
+          is_relaxed_probe: false,
+          entry_ts: lastOrder.ts,
+          entry_price: 0,
+          qty: totalSpot,
+          order_krw: lastOrder.amount_krw ?? 0,
+          reason_enter: "RECOVERED_AFTER_LEDGER_MISS",
+          signal_strength: "MID",
+          volume_ratio: 0,
+          position_stage: "normal_active",
+          partial_tp_done: false,
+          max_pnl_pct: 0,
+          min_pnl_pct: 0,
+          breakeven_armed: false,
+          highest_price_after_entry: 0,
+          trailing_stop_price: 0,
+          realized_partial_profit: 0,
+          remaining_qty: totalSpot,
+          current_net_pnl_pct: 0,
+          breakeven_armed_at: null,
+          partial_tp_at: null,
+          strict_exit: true,
+          position_id: `${mk}|RECOVERED|${lastOrder.ts}`,
+          softened_reasons: []
+        } as any;
+        reconcileActions.push(`${mk}:recovered_from_last_order`);
+        await opts.trade.syncManagedPosition?.(mk, totalSpot, 0, "stable");
+        await racePersist("after_recovery_action");
+      }
+    }
+
     for (const m of new Set([...Object.keys(state.positions), ...Object.keys(state.early_positions)])) {
       const totalSpot = accountTotalSpotQtyForMarket(m, balArr);
       const stratQty = Number(strategyPosSnap[m]?.qty ?? 0);
@@ -2370,15 +2445,6 @@ export function createLiveDataStrategy(opts: {
       await racePersist("after_reconcile_actions");
     }
 
-    // holdings_universe: 현재 계좌 보유 종목(관리/청산/표시용). discovery/entry_universe/precheck 경로에서는 제외한다.
-    const heldSymbols = balArr
-      .map((b) => {
-        const currency = String(b?.currency ?? "").toUpperCase();
-        const qty = Number(b?.balance ?? 0) + Number(b?.locked ?? 0);
-        if (!currency || currency === "KRW" || !(qty > 0)) return null;
-        return `KRW-${currency}`;
-      })
-      .filter((x): x is string => Boolean(x) && String(x).startsWith("KRW-"));
     const heldSymbolSet = new Set<string>([...heldSymbols, ...Object.keys(state.positions)]);
 
     {
@@ -8497,6 +8563,8 @@ export function createLiveDataStrategy(opts: {
             strategy_type: strategyType,
             ts_opened: new Date().toISOString()
           }));
+          // Ensure immediate persistence of managed state change
+          await racePersist("after_managed_position_registered_pre_meta");
         }
         await appendLog({
           company_id: companyIdSchema.parse(opts.companyId),
@@ -8632,6 +8700,22 @@ export function createLiveDataStrategy(opts: {
         stochD: marketMeta?.stochD,
         softened_reasons: !isSurgeSource ? marketMeta?.softened_reasons : [],
       };
+      
+      // [ATOMICITY] Ensure position metadata is persisted immediately
+      await racePersist("after_managed_position_meta_registered");
+
+      const tstatusPost = await opts.trade.status();
+      const registeredInBook = Boolean(tstatusPost.strategy_positions?.[market]);
+      if (!registeredInBook && liveTradingOn) {
+        console.error(JSON.stringify({
+          tag: "MANAGED_POSITION_BOOK_REGISTRATION_FAILED_ERROR",
+          ts: new Date().toISOString(),
+          market,
+          error: "매수 성공했으나 관리 장부(trade-control) 등록 실패",
+          note: "recovery logic will attempt restore in next tick"
+        }));
+      }
+
       console.info(
         JSON.stringify({
           tag: "SURGE_V2_POSITION_BUCKET_PROOF",

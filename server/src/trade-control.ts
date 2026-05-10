@@ -20,7 +20,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
 type TradeOrderSide = "buy" | "sell";
 type PositionBucket = "strategy" | "legacy";
-type ManagedMarket = "KRW-BTC" | "KRW-ETH" | "KRW-SOL" | "KRW-XRP" | "KRW-TRX";
+type ManagedMarket = string;
 
 type LegacyBucketState = {
   qty: number;
@@ -246,9 +246,11 @@ export function createTradeControl(
         return;
       }
       const raw = readFileSync(TRADE_CONTROL_STATE_FILE, "utf8");
-      const parsed = JSON.parse(raw) as { autoTradeEnabled?: unknown; autoTradeChangedAt?: unknown };
+      const parsed = JSON.parse(raw) as any;
       state.autoTradeEnabled = Boolean(parsed.autoTradeEnabled);
       state.autoTradeChangedAt = typeof parsed.autoTradeChangedAt === "string" ? parsed.autoTradeChangedAt : null;
+      if (parsed.strategyPositions) state.strategyPositions = { ...state.strategyPositions, ...parsed.strategyPositions };
+      if (parsed.legacyBuckets) state.legacyBuckets = { ...state.legacyBuckets, ...parsed.legacyBuckets };
       console.info(
         JSON.stringify({
           tag: "TRADE_CONTROL_STATE_RESTORED",
@@ -289,6 +291,8 @@ export function createTradeControl(
           {
             autoTradeEnabled: state.autoTradeEnabled,
             autoTradeChangedAt: state.autoTradeChangedAt,
+            strategyPositions: state.strategyPositions,
+            legacyBuckets: state.legacyBuckets,
           },
           null,
           2,
@@ -433,7 +437,8 @@ export function createTradeControl(
   const reconcileAuthoritativeStrategyBook = (balances: ConnectionBalances) => {
     const zeroed: string[] = [];
     const clamped: string[] = [];
-    for (const market of MANAGED_MARKETS) {
+    const allStrategyMarkets = new Set([...MANAGED_MARKETS, ...Object.keys(state.strategyPositions)]);
+    for (const market of allStrategyMarkets) {
       const currency = market.replace("KRW-", "");
       const account = balances.find((b) => b.currency === currency);
       const totalQty = Number(account?.balance ?? 0) + Number(account?.locked ?? 0);
@@ -466,7 +471,8 @@ export function createTradeControl(
   };
 
   const syncLegacyBuckets = (balances: ConnectionBalances) => {
-    for (const market of MANAGED_MARKETS) {
+    const allLegacyMarkets = new Set([...MANAGED_MARKETS, ...Object.keys(state.legacyBuckets)]);
+    for (const market of allLegacyMarkets) {
       const currency = market.replace("KRW-", "");
       const account = balances.find((b) => b.currency === currency);
       const accountQty = Number(account?.balance ?? 0) + Number(account?.locked ?? 0);
@@ -507,7 +513,7 @@ export function createTradeControl(
     const key = `${side}:${market}:${Math.floor(now / 1000)}`;
     if (state.lastOrderKey === key) throw new Error("Duplicate order blocked");
     if (side === "buy" && bucket === "strategy") {
-      const p = state.strategyPositions[market as keyof typeof state.strategyPositions];
+      const p = state.strategyPositions[market];
       const openingNewMarket = (p?.qty ?? 0) <= 0;
       if (openingNewMarket) {
         const openPositions = Object.values(state.strategyPositions).filter((x) => x.qty > 0).length;
@@ -530,7 +536,7 @@ export function createTradeControl(
 
   const ensureExitAllowed = async (side: TradeOrderSide, market: string, confirm: boolean, bucket: PositionBucket = "strategy") => {
     const conn = await ensureOrderCommonAllowed(market, confirm, bucket);
-    const pos = state.strategyPositions[market as keyof typeof state.strategyPositions];
+    const pos = state.strategyPositions[market];
     const legacyPos = state.legacyBuckets[market as ManagedMarket];
     const baseQty = bucket === "legacy" ? legacyPos?.qty ?? 0 : pos?.qty ?? 0;
     if (!Number.isFinite(baseQty) || baseQty <= 0) {
@@ -627,7 +633,7 @@ export function createTradeControl(
       }
     }
     if (bucket === "strategy") {
-      const posPre = state.strategyPositions[market as keyof typeof state.strategyPositions];
+      const posPre = state.strategyPositions[market];
       const curInv = Number(posPre?.invested_krw_total ?? 0);
       if (curInv + amountKrw > ORDER_LIMITS.MAX_STRATEGY_INVESTED_KRW_PER_MARKET) {
         throw new Error(`Strategy invested KRW limit exceeded for ${market}`);
@@ -674,7 +680,17 @@ export function createTradeControl(
       };
       markOrderResult(snap);
       const executed = Number(rsp.executed_volume ?? "0");
-      const pos = state.strategyPositions[market as keyof typeof state.strategyPositions];
+      if (bucket === "strategy" && !state.strategyPositions[market]) {
+        state.strategyPositions[market] = {
+          qty: 0, avg: 0, entries: 0, invested_krw_total: 0, realized_pnl: 0,
+          strategy_type: strategyType,
+          stop_loss_pct: STRATEGY_RISK_CONFIG[strategyType].stop_loss_pct,
+          breakeven_arm_pct: STRATEGY_RISK_CONFIG[strategyType].breakeven_arm_pct,
+          partial_take_profit_pct: STRATEGY_RISK_CONFIG[strategyType].partial_take_profit_pct,
+          trailing_from_peak_pct: STRATEGY_RISK_CONFIG[strategyType].trailing_from_peak_pct
+        };
+      }
+      const pos = state.strategyPositions[market];
       if (bucket === "strategy" && pos && Number.isFinite(executed) && executed > 0) {
         const nextQty = pos.qty + executed;
         const nextCost = pos.qty * pos.avg + amountKrw;
@@ -690,7 +706,13 @@ export function createTradeControl(
         pos.trailing_from_peak_pct = rule.trailing_from_peak_pct;
       }
       if (bucket === "legacy") {
-        const lb = state.legacyBuckets[market as ManagedMarket];
+        if (!state.legacyBuckets[market]) {
+          state.legacyBuckets[market] = {
+            qty: 0, avg: 0, dca_count: 0, dca_max: ORDER_LIMITS.MAX_LEGACY_DCA_COUNT_PER_MARKET,
+            dca_krw_total: 0, dca_locked: false, next_dca_at: null, exit_stage: 0, exit_status: "평단 복귀 대기"
+          };
+        }
+        const lb = state.legacyBuckets[market];
         lb.dca_krw_total += amountKrw;
         lb.dca_count = Math.min(lb.dca_count + 1, lb.dca_max);
         lb.dca_locked = lb.dca_count >= lb.dca_max;
@@ -698,6 +720,7 @@ export function createTradeControl(
         lb.exit_status = lb.exit_stage === 0 ? "평단 복귀 대기" : lb.exit_stage === 1 ? "1차 탈출" : "분할 청산 중";
       }
       await log("manual_buy_response", { market, amount_krw: amountKrw, order: rsp });
+      persistAutoTradeState();
       await hooks?.onEvent?.({
         timestamp: snap.ts,
         event_type: "order_filled",
@@ -755,8 +778,8 @@ export function createTradeControl(
     state.inFlight = true;
     state.inFlightBuyMarket = null;
     try {
-      const pos = state.strategyPositions[market as keyof typeof state.strategyPositions];
-      const legacyPos = state.legacyBuckets[market as ManagedMarket];
+      const pos = state.strategyPositions[market];
+      const legacyPos = state.legacyBuckets[market];
       const baseQty = bucket === "legacy" ? legacyPos?.qty ?? 0 : pos?.qty ?? 0;
       const volume = baseQty * Math.min(1, Math.max(0.01, ratio));
       if (!Number.isFinite(volume) || volume <= 0) throw new Error(`No ${bucket} position to sell for ${market}`);
@@ -810,6 +833,7 @@ export function createTradeControl(
         }
       }
       await log("manual_sell_response", { market, volume, order: rsp });
+      persistAutoTradeState();
       return snap;
     } catch (e) {
       const msg = e instanceof Error ? e.message : "sell failed";
@@ -945,21 +969,22 @@ export function createTradeControl(
           mark_prices_stale = true;
         }
       }
+      const allKnownMarkets = new Set([...MANAGED_MARKETS, ...Object.keys(state.legacyBuckets), ...Object.keys(state.strategyPositions)]);
       const legacyPositions = Object.fromEntries(
-        MANAGED_MARKETS.map((market) => [
+        [...allKnownMarkets].map((market) => [
           market,
           {
             market,
-            qty: state.legacyBuckets[market].qty,
-            avg: state.legacyBuckets[market].avg,
+            qty: state.legacyBuckets[market]?.qty ?? 0,
+            avg: state.legacyBuckets[market]?.avg ?? 0,
             stop_loss_disabled: true,
-            dca_count: state.legacyBuckets[market].dca_count,
-            dca_max: state.legacyBuckets[market].dca_max,
-            dca_available: !state.legacyBuckets[market].dca_locked,
-            dca_krw_total: state.legacyBuckets[market].dca_krw_total,
+            dca_count: state.legacyBuckets[market]?.dca_count ?? 0,
+            dca_max: state.legacyBuckets[market]?.dca_max ?? 0,
+            dca_available: !state.legacyBuckets[market]?.dca_locked,
+            dca_krw_total: state.legacyBuckets[market]?.dca_krw_total ?? 0,
             dca_krw_cap: ORDER_LIMITS.MAX_LEGACY_DCA_KRW_PER_MARKET,
-            next_dca_at: state.legacyBuckets[market].next_dca_at,
-            exit_status: state.legacyBuckets[market].exit_status,
+            next_dca_at: state.legacyBuckets[market]?.next_dca_at ?? null,
+            exit_status: state.legacyBuckets[market]?.exit_status ?? "평단 복귀 대기",
           },
         ]),
       );
@@ -1074,5 +1099,25 @@ export function createTradeControl(
       placeSell(market, confirm, ratio, "legacy"),
     setAutoTradeEnabled,
     setRecoveryReady,
+    syncManagedPosition: async (market: string, qty: number, avg: number, strategyType: StrategyType) => {
+      if (!state.strategyPositions[market] || state.strategyPositions[market].qty <= 0) {
+        const rule = strategyType === "momentum" ? STRATEGY_RISK_CONFIG.momentum : STRATEGY_RISK_CONFIG.stable;
+        state.strategyPositions[market] = {
+          qty,
+          avg,
+          entries: 1,
+          invested_krw_total: qty * avg,
+          realized_pnl: 0,
+          strategy_type: strategyType,
+          stop_loss_pct: rule.stop_loss_pct,
+          breakeven_arm_pct: rule.breakeven_arm_pct,
+          partial_take_profit_pct: rule.partial_take_profit_pct,
+          trailing_from_peak_pct: rule.trailing_from_peak_pct,
+        };
+        persistAutoTradeState();
+        return true;
+      }
+      return false;
+    },
   };
 }
