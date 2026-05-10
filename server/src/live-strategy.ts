@@ -540,6 +540,19 @@ const LIVE_CANDIDATE_CANDLE_FETCH_TIMEOUT_MS = (() => {
   return Number.isFinite(n) ? Math.max(3_000, Math.min(15_000, Math.floor(n))) : 9_000;
 })();
 
+/** 배치 티커 누락 시 last_good 캐시 허용 상한(비코어). */
+const LIVE_TICKER_LAST_GOOD_MAX_AGE_MS = (() => {
+  const raw = process.env.LIVE_TICKER_LAST_GOOD_MAX_AGE_MS;
+  const n = raw === undefined || raw === "" ? 45 * 60_000 : Number(raw);
+  return Number.isFinite(n) ? Math.max(60_000, Math.min(24 * 60 * 60_000, Math.floor(n))) : 45 * 60_000;
+})();
+/** CORE_TRADE 기본 심볼: 배치 누락·지연 시 last_good 허용 창을 더 길게(운영 가격 소스 복구용). */
+const LIVE_CORE_TICKER_LAST_GOOD_MAX_AGE_MS = (() => {
+  const raw = process.env.LIVE_CORE_TICKER_LAST_GOOD_MAX_AGE_MS;
+  const n = raw === undefined || raw === "" ? 6 * 60 * 60_000 : Number(raw);
+  return Number.isFinite(n) ? Math.max(LIVE_TICKER_LAST_GOOD_MAX_AGE_MS, Math.min(48 * 60 * 60_000, Math.floor(n))) : 6 * 60 * 60_000;
+})();
+
 type LastGoodCandleCacheRow = {
   ts_ms: number;
   rows: UpbitCandle[];
@@ -548,6 +561,112 @@ type LastGoodCandleCacheRow = {
 };
 const lastGoodMinuteCandleCache = new Map<string, LastGoodCandleCacheRow>();
 const lastGoodTickerCache = new Map<string, { ts_ms: number; row: any }>();
+
+type LiveTickerPriceSourceTag =
+  | "ticker_batch"
+  | "last_good_cache"
+  | "mark_prices_trade_status"
+  | "per_symbol_fetch"
+  | "still_missing";
+
+async function hydrateLiveTickerPriceMaps(
+  priceBy: Map<string, number>,
+  changeRateBy: Map<string, number>,
+  symbolsNeeded: readonly string[],
+  signal: AbortSignal,
+  markPrices: Record<string, number> | undefined,
+): Promise<{
+  sourceByMarket: Record<string, LiveTickerPriceSourceTag>;
+  stillMissing: string[];
+  fromLastGood: string[];
+  fromMarkPrices: string[];
+  fromPerSymbol: string[];
+}> {
+  const coreSet = new Set<string>(CORE_TRADE_MARKETS as unknown as string[]);
+  const uniq = Array.from(
+    new Set(symbolsNeeded.filter((m) => typeof m === "string" && String(m).startsWith("KRW-"))),
+  );
+  const sourceByMarket: Record<string, LiveTickerPriceSourceTag> = {};
+  const fromLastGood: string[] = [];
+  const fromMarkPrices: string[] = [];
+  const fromPerSymbol: string[] = [];
+  const stillMissing: string[] = [];
+
+  for (const m of uniq) {
+    const px0 = Number(priceBy.get(m) ?? 0);
+    if (Number.isFinite(px0) && px0 > 0) {
+      sourceByMarket[m] = "ticker_batch";
+      continue;
+    }
+    const maxAge = coreSet.has(m) ? LIVE_CORE_TICKER_LAST_GOOD_MAX_AGE_MS : LIVE_TICKER_LAST_GOOD_MAX_AGE_MS;
+    const cached = lastGoodTickerCache.get(m);
+    const row = cached?.row;
+    const cpx = Number(row?.trade_price ?? 0);
+    if (cached && Date.now() - cached.ts_ms <= maxAge && Number.isFinite(cpx) && cpx > 0) {
+      priceBy.set(m, cpx);
+      changeRateBy.set(m, Number(row?.signed_change_rate ?? changeRateBy.get(m) ?? 0));
+      sourceByMarket[m] = "last_good_cache";
+      fromLastGood.push(m);
+      continue;
+    }
+    const mp = markPrices && typeof markPrices === "object" ? Number(markPrices[m] ?? 0) : 0;
+    if (Number.isFinite(mp) && mp > 0) {
+      priceBy.set(m, mp);
+      if (!changeRateBy.has(m)) changeRateBy.set(m, 0);
+      sourceByMarket[m] = "mark_prices_trade_status";
+      fromMarkPrices.push(m);
+      continue;
+    }
+  }
+
+  const missingForRefetch = uniq.filter((m) => !(Number(priceBy.get(m) ?? 0) > 0));
+  const refetchOrdered = [
+    ...missingForRefetch.filter((m) => coreSet.has(m)),
+    ...missingForRefetch.filter((m) => !coreSet.has(m)),
+  ];
+  const perSymTotal = Math.max(2000, Number(process.env.LIVE_TICKER_PER_SYMBOL_TOTAL_TIMEOUT_MS ?? 4000));
+  const perSymBatch = Math.max(1500, Number(process.env.LIVE_TICKER_PER_SYMBOL_BATCH_TIMEOUT_MS ?? 3500));
+  for (const m of refetchOrdered) {
+    if (signal.aborted) break;
+    if (Number(priceBy.get(m) ?? 0) > 0) continue;
+    try {
+      const rows = await fetchTickers([m], {
+        debugCaller: "live-strategy:hydrate_per_symbol",
+        signal,
+        batchSize: 1,
+        parallelTickerBatches: 1,
+        batchDelayMs: 0,
+        sortByCached24hVolume: false,
+        totalTimeoutMs: perSymTotal,
+        batchTimeoutMs: perSymBatch,
+        maxMarkets: 1,
+      });
+      const r = rows[0];
+      const tp = Number(r?.trade_price ?? 0);
+      if (r?.market === m && Number.isFinite(tp) && tp > 0) {
+        priceBy.set(m, tp);
+        changeRateBy.set(m, Number(r.signed_change_rate ?? 0));
+        lastGoodTickerCache.set(m, { ts_ms: Date.now(), row: r });
+        sourceByMarket[m] = "per_symbol_fetch";
+        fromPerSymbol.push(m);
+      }
+    } catch {
+      // ignore single-market failure
+    }
+  }
+
+  for (const m of uniq) {
+    const px = Number(priceBy.get(m) ?? 0);
+    if (Number.isFinite(px) && px > 0) {
+      if (!sourceByMarket[m]) sourceByMarket[m] = "ticker_batch";
+    } else {
+      stillMissing.push(m);
+      sourceByMarket[m] = "still_missing";
+    }
+  }
+
+  return { sourceByMarket, stillMissing, fromLastGood, fromMarkPrices, fromPerSymbol };
+}
 
 const EXISTING_POSITION_MIN_KRW = Math.max(
   1000,
@@ -3400,7 +3519,10 @@ export function createLiveDataStrategy(opts: {
     );
     // 보유 포지션 평가/표시 보강 + BTC 기준가 보강(레짐/스케일 계산용)
     const heldExtraSymbols = Array.from(new Set(["KRW-BTC", ...Array.from(heldSymbolSet)])).filter((m) => m.startsWith("KRW-"));
-    const tickerRequestedSymbols = Array.from(new Set([...baseInputSymbols, ...heldExtraSymbols]));
+    // CORE_TRADE 6종은 이후 entry_universe에 강제 병합되므로 배치 티커 요청에 반드시 포함(누락 시 candidate_meta entry_price=0 방지).
+    const tickerRequestedSymbols = Array.from(
+      new Set([...baseInputSymbols, ...heldExtraSymbols, ...(CORE_TRADE_MARKETS as readonly string[])]),
+    );
     console.info(
       JSON.stringify({
         tag: "DEBUG_TICKER_REQUEST_SOURCE",
@@ -3453,9 +3575,11 @@ export function createLiveDataStrategy(opts: {
           signal: tickSignal,
         }),
       );
-      // Update cache
       for (const r of tickerRows) {
-        lastGoodTickerCache.set(r.market, { ts_ms: Date.now(), row: r });
+        const tp = Number(r?.trade_price ?? 0);
+        if (r?.market && Number.isFinite(tp) && tp > 0) {
+          lastGoodTickerCache.set(r.market, { ts_ms: Date.now(), row: r });
+        }
       }
     } catch (e) {
       const isTimeout = isLiveTickPhaseTimeout(e);
@@ -3506,6 +3630,50 @@ export function createLiveDataStrategy(opts: {
     }
     const priceBy = new Map(tickerRows.map((r) => [r.market, r.trade_price]));
     const changeRateBy = new Map(tickerRows.map((r) => [r.market, Number(r.signed_change_rate ?? 0)]));
+    const markPricesForTicker = (tstatus as any)?.mark_prices as Record<string, number> | undefined;
+    let tickerPriceHydrationForCandidates = await hydrateLiveTickerPriceMaps(
+      priceBy,
+      changeRateBy,
+      tickerRequestedSymbols,
+      tickSignal,
+      markPricesForTicker,
+    );
+    console.info(
+      JSON.stringify({
+        tag: "TICKER_PRICE_MAP_HYDRATION_PROOF",
+        ts: new Date().toISOString(),
+        phase: "after_batch_ticker_fetch",
+        requested_symbols: tickerRequestedSymbols.length,
+        from_ticker_batch_positive: tickerRequestedSymbols.filter(
+          (m) => tickerPriceHydrationForCandidates.sourceByMarket[m] === "ticker_batch",
+        ).length,
+        from_last_good_cache: tickerPriceHydrationForCandidates.fromLastGood.length,
+        from_mark_prices: tickerPriceHydrationForCandidates.fromMarkPrices.length,
+        from_per_symbol_fetch: tickerPriceHydrationForCandidates.fromPerSymbol.length,
+        still_missing: tickerPriceHydrationForCandidates.stillMissing,
+        still_missing_count: tickerPriceHydrationForCandidates.stillMissing.length,
+        core_still_missing: (CORE_TRADE_MARKETS as readonly string[]).filter((m) =>
+          tickerPriceHydrationForCandidates.stillMissing.includes(m),
+        ),
+        sample: tickerRequestedSymbols.slice(0, 14).map((m) => ({
+          market: m,
+          source: tickerPriceHydrationForCandidates.sourceByMarket[m] ?? "unknown",
+          px: Number(priceBy.get(m) ?? 0),
+        })),
+      }),
+    );
+    if (tickerPriceHydrationForCandidates.stillMissing.length >= 3) {
+      console.warn(
+        JSON.stringify({
+          tag: "TICKER_SOURCE_DEGRADED_PROOF",
+          ts: new Date().toISOString(),
+          phase: "after_batch_ticker_fetch",
+          missing_count: tickerPriceHydrationForCandidates.stillMissing.length,
+          missing_markets: tickerPriceHydrationForCandidates.stillMissing.slice(0, 30),
+          note: "per_symbol_drop_only; remaining_symbols_keep_evaluating",
+        }),
+      );
+    }
     const minute1CandleCache = new Map<string, UpbitCandle[]>();
     const minute5CandleCache = new Map<string, UpbitCandle[]>();
     const fetchMinuteCandlesCached = async (market: string, unit: 1 | 5, count: number): Promise<UpbitCandle[]> => {
@@ -5196,6 +5364,50 @@ export function createLiveDataStrategy(opts: {
       });
     }
 
+    tickerPriceHydrationForCandidates = await hydrateLiveTickerPriceMaps(
+      priceBy,
+      changeRateBy,
+      entryUniverse,
+      tickSignal,
+      markPricesForTicker,
+    );
+    console.info(
+      JSON.stringify({
+        tag: "TICKER_PRICE_ENTRY_UNIVERSE_HYDRATION_PROOF",
+        ts: new Date().toISOString(),
+        phase: "after_entry_universe_final",
+        entry_universe_count: entryUniverse.length,
+        from_ticker_batch_positive: entryUniverse.filter(
+          (m) => tickerPriceHydrationForCandidates.sourceByMarket[m] === "ticker_batch",
+        ).length,
+        from_last_good_cache: tickerPriceHydrationForCandidates.fromLastGood.length,
+        from_mark_prices: tickerPriceHydrationForCandidates.fromMarkPrices.length,
+        from_per_symbol_fetch: tickerPriceHydrationForCandidates.fromPerSymbol.length,
+        still_missing: tickerPriceHydrationForCandidates.stillMissing,
+        still_missing_count: tickerPriceHydrationForCandidates.stillMissing.length,
+        core_still_missing: (CORE_TRADE_MARKETS as readonly string[]).filter((m) =>
+          tickerPriceHydrationForCandidates.stillMissing.includes(m),
+        ),
+        sample: entryUniverse.slice(0, 14).map((m) => ({
+          market: m,
+          source: tickerPriceHydrationForCandidates.sourceByMarket[m] ?? "unknown",
+          px: Number(priceBy.get(m) ?? 0),
+        })),
+      }),
+    );
+    if (tickerPriceHydrationForCandidates.stillMissing.length >= 3) {
+      console.warn(
+        JSON.stringify({
+          tag: "TICKER_SOURCE_DEGRADED_PROOF",
+          ts: new Date().toISOString(),
+          phase: "after_entry_universe_final",
+          missing_count: tickerPriceHydrationForCandidates.stillMissing.length,
+          missing_markets: tickerPriceHydrationForCandidates.stillMissing.slice(0, 30),
+          note: "per_symbol_drop_only; remaining_symbols_keep_evaluating",
+        }),
+      );
+    }
+
     console.info(
       JSON.stringify({
         tag: "SURGE_ENTRY_PIPELINE_PROOF",
@@ -5433,8 +5645,17 @@ export function createLiveDataStrategy(opts: {
           signal_score: 0,
           source_kind: "fallback_watch_markets",
         };
-        const currentPx = priceBy.get(m) ?? 0;
+        const currentPx = Number(priceBy.get(m) ?? 0);
         if (!(currentPx > 0)) {
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_CANDIDATE_TICKER_PRICE_UNAVAILABLE",
+              ts: new Date().toISOString(),
+              market: m,
+              ticker_px: currentPx,
+              resolved_source: tickerPriceHydrationForCandidates.sourceByMarket[m] ?? "unknown",
+            }),
+          );
           evaluationDroppedReasons[m] = "missing_ticker_price";
           emitCoreCandidateReject(m, "missing_ticker_price");
           return null;
@@ -5475,7 +5696,8 @@ export function createLiveDataStrategy(opts: {
           stage: "candidate_meta_eval_start",
           source_kind: sourceKindFromPayload || sourceKindFromMap,
           has_signal: realSignalPresent,
-          price: currentPx
+          price: currentPx,
+          ticker_price_source: tickerPriceHydrationForCandidates.sourceByMarket[m] ?? null,
         }));
 
         // [ORIGINAL SETUP] Primary Gate Enforcement (Upbit fetch limit is 200)
