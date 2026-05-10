@@ -564,6 +564,8 @@ const LIVE_MIN_STOP_SELL_VALUE_KRW = 5500;
 const DUST_THRESHOLD_KRW = 5000;
 const UPBIT_MIN_ORDER_LIMIT_KRW = 5000;
 const RECOVERY_EXIT_BREAKEVEN_RATIO = 1.001; // 0.1% profit to cover fees
+/** last_order 매수 증거 기반 복구: 타임스탬프 왜곡·무한 과거만 차단(진입 조건 완화와 무관). */
+const LAST_ORDER_MANAGED_RECOVERY_MAX_EVIDENCE_AGE_MS = 180 * 24 * 60 * 60 * 1000;
 
 async function loadPaperSurgePatternStats(companyId: string, serviceId: string): Promise<Record<string, PaperSurgePatternStats>> {
   try {
@@ -1740,6 +1742,15 @@ function accountTotalSpotQtyForMarket(market: string, balances: UpbitBalance[] |
   return Number(row?.balance ?? 0) + Number(row?.locked ?? 0);
 }
 
+function accountAvgBuyPriceForMarket(market: string, balances: UpbitBalance[] | undefined): number {
+  const cur = market.replace("KRW-", "").toUpperCase();
+  const row = Array.isArray(balances)
+    ? balances.find((b) => String(b?.currency ?? "").toUpperCase() === cur)
+    : undefined;
+  const a = Number(row?.avg_buy_price ?? 0);
+  return Number.isFinite(a) && a > 0 ? a : 0;
+}
+
 function classifyEntryQuality(params: {
   market: string;
   score: number;
@@ -2316,7 +2327,10 @@ export function createLiveDataStrategy(opts: {
     const balArr = Array.isArray(tstatus.balances) ? tstatus.balances : [];
     const lr = tstatus.ledger_reconcile;
     const reconcileActions: string[] = [];
-    const strategyPosSnap = tstatus.strategy_positions ?? {};
+    // trade.status() 시점 스냅샷 — 동일 tick 내 syncManagedPosition 이후 reconcile이 stale qty로 장부를 덮어쓰지 않게 가변 복사본을 유지한다.
+    const strategyPosSnap: Record<string, any> = {
+      ...(typeof tstatus.strategy_positions === "object" && tstatus.strategy_positions ? tstatus.strategy_positions : {}),
+    };
     // holdings_universe: 현재 계좌 보유 종목(관리/청산/표시용). discovery/entry_universe/precheck 경로에서는 제외한다.
     const heldSymbols = balArr
       .map((b) => {
@@ -2327,33 +2341,87 @@ export function createLiveDataStrategy(opts: {
       })
       .filter((x): x is string => Boolean(x) && String(x).startsWith("KRW-"));
 
-    // [RECOVERY] last_order 기준으로 자동매매 매수임이 확인되면 managed position으로 복구한다.
-    const lastOrder = tstatus.last_order as any;
-    if (lastOrder && lastOrder.side === "buy" && lastOrder.status === "ok" && lastOrder.ts) {
-      const mk = lastOrder.market;
-      const ageMs = Date.now() - Date.parse(lastOrder.ts);
-      const isManaged = Boolean(state.positions[mk] || state.early_positions[mk]);
-      const totalSpot = accountTotalSpotQtyForMarket(mk, balArr);
-      
-      if (!isManaged && totalSpot > 0 && ageMs < 15 * 60 * 1000) {
+    // [RECOVERY] last_order 매수 성공 증거 + 계좌 실물 보유: signal_meta 없이도 검토(진입 후보 메타와 무관).
+    const lastOrder = tstatus.last_order as Record<string, unknown> | null | undefined;
+    const loBuyOk =
+      lastOrder &&
+      lastOrder.side === "buy" &&
+      lastOrder.status === "ok" &&
+      typeof lastOrder.ts === "string" &&
+      typeof lastOrder.market === "string" &&
+      String(lastOrder.market).startsWith("KRW-");
+    const passiveForRecoveryEval = heldSymbols.filter((pm) => !state.positions[pm] && !state.early_positions[pm]);
+    const recoveryEvalItems: Array<{
+      market: string;
+      result: "RECOVERY_APPLIED" | "RECOVERY_SKIPPED";
+      reason?: string;
+      detail?: Record<string, unknown>;
+    }> = [];
+
+    if (passiveForRecoveryEval.length > 0) {
+      for (const pm of passiveForRecoveryEval) {
+        if (!loBuyOk) {
+          recoveryEvalItems.push({
+            market: pm,
+            result: "RECOVERY_SKIPPED",
+            reason: "no_last_order_buy_ok_evidence",
+            detail: {
+              last_order_present: Boolean(lastOrder),
+              last_order_side: lastOrder?.side ?? null,
+              last_order_status: lastOrder?.status ?? null,
+            },
+          });
+          continue;
+        }
+        const loMarket = String(lastOrder!.market);
+        if (loMarket !== pm) {
+          recoveryEvalItems.push({
+            market: pm,
+            result: "RECOVERY_SKIPPED",
+            reason: "last_order_market_mismatch",
+            detail: { last_order_market: loMarket },
+          });
+          continue;
+        }
+        const ageMs = Date.now() - Date.parse(String(lastOrder!.ts));
+        if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > LAST_ORDER_MANAGED_RECOVERY_MAX_EVIDENCE_AGE_MS) {
+          recoveryEvalItems.push({
+            market: pm,
+            result: "RECOVERY_SKIPPED",
+            reason: "last_order_evidence_ts_invalid_or_too_old",
+            detail: { age_ms: Number.isFinite(ageMs) ? ageMs : null, max_age_ms: LAST_ORDER_MANAGED_RECOVERY_MAX_EVIDENCE_AGE_MS },
+          });
+          continue;
+        }
+        const totalSpot = accountTotalSpotQtyForMarket(pm, balArr);
+        if (!(totalSpot > 0)) {
+          recoveryEvalItems.push({
+            market: pm,
+            result: "RECOVERY_SKIPPED",
+            reason: "no_spot_balance_for_market",
+            detail: {},
+          });
+          continue;
+        }
+
+        const avgBuy = accountAvgBuyPriceForMarket(pm, balArr);
         console.error(
           JSON.stringify({
             tag: "MANAGED_POSITION_RECOVERY_HARD_WARNING",
             ts: new Date().toISOString(),
-            market: mk,
-            reason: "매수 성공했으나 관리 장부 등록 실패 (복구 시도)",
-            last_order_ts: lastOrder.ts,
+            market: pm,
+            reason: "매수 성공(last_order) 증거 + 보유 확인 — 전략 장부 복구 시도",
+            last_order_ts: lastOrder!.ts,
             age_ms: ageMs,
             spot_qty: totalSpot,
-            order_krw: lastOrder.amount_krw
-          })
+            order_krw: lastOrder!.amount_krw,
+          }),
         );
-        
-        // 최소 정보로 복구
-        state.positions[mk] = {
-          market: mk,
-          strategy_type: "stable", // fallback
-          engine_bucket: "surge", // fallback for recovery
+
+        state.positions[pm] = {
+          market: pm,
+          strategy_type: "stable",
+          engine_bucket: "surge",
           entry_origin: "auto_trade_recovered",
           entry_mode: "RECOVERED",
           managed: true,
@@ -2361,10 +2429,10 @@ export function createLiveDataStrategy(opts: {
           btc_tier_at_entry: "unknown" as any,
           volatility_pct_at_entry: 0,
           is_relaxed_probe: false,
-          entry_ts: lastOrder.ts,
-          entry_price: 0,
+          entry_ts: String(lastOrder!.ts),
+          entry_price: avgBuy,
           qty: totalSpot,
-          order_krw: lastOrder.amount_krw ?? 0,
+          order_krw: Number(lastOrder!.amount_krw ?? 0),
           reason_enter: "RECOVERED_AFTER_LEDGER_MISS",
           signal_strength: "MID",
           volume_ratio: 0,
@@ -2373,7 +2441,7 @@ export function createLiveDataStrategy(opts: {
           max_pnl_pct: 0,
           min_pnl_pct: 0,
           breakeven_armed: false,
-          highest_price_after_entry: 0,
+          highest_price_after_entry: avgBuy,
           trailing_stop_price: 0,
           realized_partial_profit: 0,
           remaining_qty: totalSpot,
@@ -2381,13 +2449,43 @@ export function createLiveDataStrategy(opts: {
           breakeven_armed_at: null,
           partial_tp_at: null,
           strict_exit: true,
-          position_id: `${mk}|RECOVERED|${lastOrder.ts}`,
-          softened_reasons: []
+          position_id: `${pm}|RECOVERED|${String(lastOrder!.ts)}`,
+          softened_reasons: [],
         } as any;
-        reconcileActions.push(`${mk}:recovered_from_last_order`);
-        await opts.trade.syncManagedPosition?.(mk, totalSpot, 0, "stable");
+        reconcileActions.push(`${pm}:recovered_from_last_order`);
+        await opts.trade.syncManagedPosition?.(pm, totalSpot, avgBuy, "stable");
+        const prevSq = strategyPosSnap[pm] ?? {};
+        strategyPosSnap[pm] = {
+          ...prevSq,
+          qty: Math.max(Number(prevSq.qty ?? 0), totalSpot),
+        };
+        recoveryEvalItems.push({
+          market: pm,
+          result: "RECOVERY_APPLIED",
+          detail: { spot_qty: totalSpot, avg_buy_used: avgBuy },
+        });
+        console.info(
+          JSON.stringify({
+            tag: "SPOT_MANAGED_POSITION_RECOVERY_APPLIED_PROOF",
+            ts: new Date().toISOString(),
+            market: pm,
+            spot_qty: totalSpot,
+            avg_buy_used: avgBuy,
+            last_order_ts: lastOrder!.ts,
+          }),
+        );
         await racePersist("after_recovery_action");
       }
+
+      console.info(
+        JSON.stringify({
+          tag: "SPOT_MANAGED_POSITION_RECOVERY_TICK_PROOF",
+          ts: new Date().toISOString(),
+          passive_markets_evaluated: passiveForRecoveryEval,
+          last_order_market: loBuyOk ? String(lastOrder!.market) : null,
+          items: recoveryEvalItems,
+        }),
+      );
     }
 
     for (const m of new Set([...Object.keys(state.positions), ...Object.keys(state.early_positions)])) {

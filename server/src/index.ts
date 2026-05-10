@@ -443,7 +443,16 @@ async function main() {
   });
   await strategy.init();
   app.log.info({ tag: "DEBUG_LIVE_LOOP_STARTED", stage: "strategy_init_done" }, "DEBUG_LIVE_LOOP_STARTED");
-  const pumpScanner = createPumpScanner(() => Object.keys((strategy.status() as any).open_positions ?? {}), {
+  const pumpScanner = createPumpScanner(() => {
+    const s = strategy.status() as any;
+    const open = (s?.open_positions ?? {}) as Record<string, { qty?: number }>;
+    const early = (s?.early_positions ?? {}) as Record<string, { qty?: number }>;
+    const keys = new Set<string>([
+      ...Object.keys(open).filter((m) => Number(open[m]?.qty ?? 0) > 0),
+      ...Object.keys(early).filter((m) => Number(early[m]?.qty ?? 0) > 0),
+    ]);
+    return [...keys];
+  }, {
     onEvent: (row) => opLog.event(row),
   });
   pumpScannerRef = pumpScanner;

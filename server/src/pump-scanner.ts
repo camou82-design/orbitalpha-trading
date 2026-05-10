@@ -378,6 +378,8 @@ export function createPumpScanner(
 
   let isTickInFlight = false;
   let lastTickStartedAt = 0;
+  /** stale in-flight reset 시 진행 중이던 tick의 fetch를 끊어 다음 tick이 오래 막히지 않게 한다. */
+  let activeTickAbort: AbortController | null = null;
   let dynamicCandleTarget = Math.min(2, CANDLE_MAX_MARKETS_PER_TICK);
   let consecutiveNormalTicks = 0;
   const TICK_BUDGET_SECONDS = 60;
@@ -531,8 +533,15 @@ export function createPumpScanner(
             ts: new Date().toISOString(),
             elapsed_ms: elapsedSinceStart,
             reset_at: new Date().toISOString(),
+            aborted_hung_fetch: Boolean(activeTickAbort),
           }),
         );
+        try {
+          activeTickAbort?.abort();
+        } catch {
+          // ignore
+        }
+        activeTickAbort = null;
         isTickInFlight = false;
       } else {
         console.warn(
@@ -554,6 +563,7 @@ export function createPumpScanner(
     let skippedDueToBudget = 0;
     let releaseReason = "normal";
     const tickAbort = new AbortController();
+    activeTickAbort = tickAbort;
 
     try {
       const heldMarkets = Array.from(new Set(getHeldMarkets().filter((m) => typeof m === "string" && m.length > 0)));
@@ -633,10 +643,56 @@ export function createPumpScanner(
             ticker_returned: 0,
             alt_market_count: altMarkets.length,
             elapsed_ms: Date.now() - tickT0,
-            action: "release_tick_early",
+            action: "attempt_held_only_ticker_recovery",
           }),
         );
-        return;
+        const heldAltOnly = heldMarkets.filter((m) => !BASE_MARKET_SET.has(m));
+        if (heldAltOnly.length > 0) {
+          try {
+            tickers = await fetchTickers(heldAltOnly, {
+              sortByCached24hVolume: false,
+              batchSize: Math.min(20, Math.max(1, heldAltOnly.length)),
+              batchDelayMs: PUMP_TICKER_BATCH_DELAY_MS,
+              parallelTickerBatches: 1,
+              maxMarkets: heldAltOnly.length,
+              debugCaller: "pump-scanner:ticker_alt_degraded_held",
+              signal: tickAbort.signal,
+              batchTimeoutMs: Math.max(800, Number(process.env.PUMP_SCANNER_TICKER_HELD_RECOVERY_BATCH_TIMEOUT_MS ?? 2500)),
+              totalTimeoutMs: Math.max(1000, Number(process.env.PUMP_SCANNER_TICKER_HELD_RECOVERY_TOTAL_TIMEOUT_MS ?? 6000)),
+            });
+          } catch (e) {
+            console.warn(
+              JSON.stringify({
+                tag: "PUMP_SCANNER_ALT_DEGRADED_HELD_FETCH_FAILED",
+                ts: new Date().toISOString(),
+                error: e instanceof Error ? e.message : String(e),
+              }),
+            );
+          }
+        }
+        if (tickers.length === 0) {
+          releaseReason = "ticker_alt_and_held_recovery_empty";
+          tickAbort.abort();
+          console.warn(
+            JSON.stringify({
+              tag: "PUMP_SCANNER_TICK_RELEASE_EARLY_EMPTY_UNIVERSE",
+              ts: new Date().toISOString(),
+              phase: "ticker_alt_returned_zero",
+              elapsed_ms: Date.now() - tickT0,
+              held_alt_markets_attempted: heldAltOnly.length,
+            }),
+          );
+          return;
+        }
+        console.info(
+          JSON.stringify({
+            tag: "PUMP_SCANNER_TICK_DEGRADED_UNIVERSE_PROOF",
+            ts: new Date().toISOString(),
+            ticker_returned: tickers.length,
+            held_recovery_markets: tickers.map((t) => t.market).slice(0, 24),
+            elapsed_ms: Date.now() - tickT0,
+          }),
+        );
       }
       const tAfterAltTickers = Date.now();
       const fetchedAltSet = new Set(tickers.map((t) => t.market));
@@ -997,6 +1053,7 @@ export function createPumpScanner(
       }
     } finally {
       tickAbort.abort(); // Cleanup any pending fetches
+      if (activeTickAbort === tickAbort) activeTickAbort = null;
       isTickInFlight = false;
       const elapsed = Date.now() - tickT0;
       
