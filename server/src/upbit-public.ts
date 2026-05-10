@@ -110,6 +110,29 @@ function candleKey(market: string, unit: 1 | 5 | 15, count: number) {
   return `${market}|u${unit}|c${count}`;
 }
 
+/** 단일 Upbit REST 호출 상한 — racePhase보다 짧으면 underlying fetch가 먼저 끊겨 candidate_meta가 불필요하게 timeout 된다. */
+const UPBIT_CANDLE_HTTP_TIMEOUT_MS = Math.max(8_000, Number(process.env.UPBIT_CANDLE_HTTP_TIMEOUT_MS ?? 24_000));
+
+/**
+ * 프로세스 공유 캔들 캐시 조회(HTTP 없음). live-strategy candidate_meta / precheck 등에서 최근 정상 캔들 우선에 사용.
+ */
+export function peekMinuteCandleCache(
+  market: string,
+  unit: 1 | 5 | 15,
+  count: number,
+): { rows: UpbitCandle[]; age_ms: number; expires_at_ms: number; stale_until_ms: number } | null {
+  const key = candleKey(market, unit, count);
+  const c = candleCache.get(key);
+  if (!c?.value?.length) return null;
+  const now = Date.now();
+  return {
+    rows: c.value,
+    age_ms: now - c.fetchedAtMs,
+    expires_at_ms: c.expiresAtMs,
+    stale_until_ms: c.staleUntilMs,
+  };
+}
+
 function maybeLogCandleCacheStats(nowMs: number) {
   if (nowMs - candleLastStatsLogAtMs < CANDLE_CACHE_STATS_LOG_INTERVAL_MS) return;
   if (candleLastStatsLogAtMs !== 0 && candleHttpFetchesSinceLastLog + candleCacheHitsSinceLastLog + candleStaleServedSinceLastLog === 0) {
@@ -253,12 +276,18 @@ export async function partitionKrwMarketsByUpbitValidity(
   return { accepted, rejected, skippedBecauseUnknown: false };
 }
 
+export type FetchMinuteCandlesOptions = {
+  /** fetchJson(HTTP) 하드 타임아웃 — 미지정 시 UPBIT_CANDLE_HTTP_TIMEOUT_MS */
+  httpTimeoutMs?: number;
+};
+
 /** Newest candle first — reverse to oldest-first for indicators. */
 export async function fetchMinuteCandles(
   market: string,
   unit: 1 | 5 | 15,
   count: number,
   signal?: AbortSignal,
+  opts?: FetchMinuteCandlesOptions,
 ): Promise<UpbitCandle[]> {
   const validMarkets = await sanitizeKrwMarkets([market]);
   if (validMarkets.length === 0) return [];
@@ -310,7 +339,8 @@ export async function fetchMinuteCandles(
 
       try {
         const path = `/v1/candles/minutes/${unit}?market=${encodeURIComponent(market)}&count=${count}`;
-        const rows = await fetchJson<UpbitCandle[]>(path, signal);
+        const httpTimeoutMs = Math.max(5_000, opts?.httpTimeoutMs ?? UPBIT_CANDLE_HTTP_TIMEOUT_MS);
+        const rows = await fetchJson<UpbitCandle[]>(path, signal, httpTimeoutMs);
         const value = [...rows].reverse();
         const fetchedAtMs = Date.now();
         candleFailureCountByKey.delete(key);

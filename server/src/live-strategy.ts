@@ -10,7 +10,13 @@ import {
 } from "@orbitalpha/shared";
 import { tradingDataRoot } from "./paths.js";
 import { appendLog } from "./log-store.js";
-import { fetchMinuteCandles, fetchTickers, partitionKrwMarketsByUpbitValidity, type UpbitCandle } from "./upbit-public.js";
+import {
+  fetchMinuteCandles,
+  fetchTickers,
+  partitionKrwMarketsByUpbitValidity,
+  peekMinuteCandleCache,
+  type UpbitCandle,
+} from "./upbit-public.js";
 import { LogDeduper } from "./log-deduper.js";
 import {
   LIVE_ENTRY_SIGNAL_GATES,
@@ -535,10 +541,22 @@ const LIVE_CANDIDATE_CANDLE_FETCH_CONCURRENCY = (() => {
 
 const LIVE_CANDIDATE_CANDLE_FETCH_TIMEOUT_MS = (() => {
   const raw = process.env.LIVE_CANDIDATE_CANDLE_FETCH_TIMEOUT_MS;
-  const n = raw === undefined || raw === "" ? 9_000 : Number(raw);
-  // Keep this short to avoid holding the whole tick; candidate_meta can drop per-market.
-  return Number.isFinite(n) ? Math.max(3_000, Math.min(15_000, Math.floor(n))) : 9_000;
+  const n = raw === undefined || raw === "" ? 14_000 : Number(raw);
+  return Number.isFinite(n) ? Math.max(8_000, Math.min(24_000, Math.floor(n))) : 14_000;
 })();
+/** candidate_meta: 이 시간 이내 캔들이면 HTTP 없이 평가에 사용(매 tick u1:n200 재호출 억제). */
+const LIVE_CANDIDATE_CANDLE_CACHE_SERVE_MAX_AGE_MS = (() => {
+  const raw = process.env.LIVE_CANDIDATE_CANDLE_CACHE_SERVE_MAX_AGE_MS;
+  const n = raw === undefined || raw === "" ? 12 * 60_000 : Number(raw);
+  return Number.isFinite(n) ? Math.max(120_000, Math.min(45 * 60_000, Math.floor(n))) : 12 * 60_000;
+})();
+/** candidate_meta: fetch timeout 후에도 이 이내면 last_good / 공유 캐시로 해당 종목만 구제(그 외는 drop). */
+const LIVE_CANDIDATE_CANDLE_CACHE_DROP_MAX_AGE_MS = (() => {
+  const raw = process.env.LIVE_CANDIDATE_CANDLE_CACHE_DROP_MAX_AGE_MS;
+  const n = raw === undefined || raw === "" ? 50 * 60_000 : Number(raw);
+  return Number.isFinite(n) ? Math.max(LIVE_CANDIDATE_CANDLE_CACHE_SERVE_MAX_AGE_MS, Math.min(3 * 60 * 60_000, Math.floor(n))) : 50 * 60_000;
+})();
+const LIVE_CANDIDATE_CANDLE_MIN_ROWS = Math.max(180, Math.min(200, Number(process.env.LIVE_CANDIDATE_CANDLE_MIN_ROWS ?? 200)));
 
 /** 배치 티커 누락 시 last_good 캐시 허용 상한(비코어). */
 const LIVE_TICKER_LAST_GOOD_MAX_AGE_MS = (() => {
@@ -3729,7 +3747,50 @@ export function createLiveDataStrategy(opts: {
       const count = 200 as const;
       const key = `${market}:u${unit}:n${count}`;
       const timeoutMs = Math.min(PHASE_MS.fetch_minute_candles, LIVE_CANDIDATE_CANDLE_FETCH_TIMEOUT_MS);
+      const httpTimeoutMs = Math.min(28_000, timeoutMs + 8_000);
       const t0 = Date.now();
+
+      const pickFallbackRows = (
+        maxAgeMs: number,
+      ): { rows: UpbitCandle[]; cache_age_ms: number; via: "last_good_process" | "upbit_shared_cache" } | null => {
+        const now = Date.now();
+        const cands: Array<{ rows: UpbitCandle[]; cache_age_ms: number; via: "last_good_process" | "upbit_shared_cache" }> = [];
+        const lg = lastGoodMinuteCandleCache.get(key);
+        if (lg?.rows && lg.rows.length >= LIVE_CANDIDATE_CANDLE_MIN_ROWS) {
+          const age = now - lg.ts_ms;
+          if (age <= maxAgeMs) cands.push({ rows: lg.rows, cache_age_ms: age, via: "last_good_process" });
+        }
+        const pk = peekMinuteCandleCache(market, unit, count);
+        if (pk && pk.rows.length >= LIVE_CANDIDATE_CANDLE_MIN_ROWS && pk.age_ms <= maxAgeMs) {
+          cands.push({ rows: pk.rows, cache_age_ms: pk.age_ms, via: "upbit_shared_cache" });
+        }
+        if (cands.length === 0) return null;
+        cands.sort((a, b) => a.cache_age_ms - b.cache_age_ms);
+        return cands[0]!;
+      };
+
+      const fresh = pickFallbackRows(LIVE_CANDIDATE_CANDLE_CACHE_SERVE_MAX_AGE_MS);
+      if (fresh) {
+        minute1CandleCache.set(`${market}:${count}`, fresh.rows);
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_CANDIDATE_CANDLE_CACHE_HIT",
+            ts: new Date().toISOString(),
+            market,
+            timeframe: `${unit}m`,
+            rows: fresh.rows.length,
+            cache_age_ms: fresh.cache_age_ms,
+            via: fresh.via,
+            reason: "serve_without_http",
+            max_serve_age_ms: LIVE_CANDIDATE_CANDLE_CACHE_SERVE_MAX_AGE_MS,
+          }),
+        );
+        return { rows: fresh.rows, candle_source: "last_good_cache", cache_age_ms: fresh.cache_age_ms };
+      }
+
+      const abortCtrl = new AbortController();
+      const onTickAbort = () => abortCtrl.abort();
+      tickSignal.addEventListener("abort", onTickAbort, { once: true });
 
       console.info(
         JSON.stringify({
@@ -3738,28 +3799,35 @@ export function createLiveDataStrategy(opts: {
           market,
           timeframe: `${unit}m`,
           timeout_ms: timeoutMs,
+          http_timeout_ms: httpTimeoutMs,
           source: "live_fetch",
-          cache_age_ms: null,
         }),
       );
-
-      const abortCtrl = new AbortController();
-      const onTickAbort = () => abortCtrl.abort();
-      tickSignal.addEventListener("abort", onTickAbort, { once: true });
 
       try {
         const rows = await candleFetchLimiter(async () => {
           const phase = `candidate_meta_fetch_minute_candles:${market}:u${unit}:n${count}`;
-          const fetched = await racePhase(phase, timeoutMs, () => fetchMinuteCandles(market, unit, count, abortCtrl.signal));
+          const fetched = await racePhase(phase, timeoutMs, () =>
+            fetchMinuteCandles(market, unit, count, abortCtrl.signal, { httpTimeoutMs }),
+          );
           minute1CandleCache.set(`${market}:${count}`, fetched);
           return fetched;
         });
-        
         lastGoodMinuteCandleCache.set(key, { ts_ms: Date.now(), rows, unit, count });
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_CANDIDATE_CANDLE_FETCH_OK",
+            ts: new Date().toISOString(),
+            market,
+            timeframe: `${unit}m`,
+            rows: rows.length,
+            elapsed_ms: Date.now() - t0,
+            candle_source: "live_fetch",
+          }),
+        );
         return { rows, candle_source: "live_fetch", cache_age_ms: null };
       } catch (e) {
         abortCtrl.abort();
-        // Abort is its own class of drop reason (do not mix with candle_fetch_error)
         if (isAbortLike(e)) {
           const phase = isLiveTickPhaseTimeout(e) ? e.phase : "candidate_meta_fetch_minute_candles:aborted";
           const abort_reason = tickSignal.aborted
@@ -3781,9 +3849,6 @@ export function createLiveDataStrategy(opts: {
         }
 
         if (isLiveTickPhaseTimeout(e) && e.phase.startsWith("candidate_meta_fetch_minute_candles:")) {
-          const lastGood = lastGoodMinuteCandleCache.get(key);
-          const cacheAgeMs = lastGood?.ts_ms ? Date.now() - lastGood.ts_ms : Infinity;
-
           console.info(
             JSON.stringify({
               tag: "LIVE_CANDIDATE_CANDLE_FETCH_TIMEOUT",
@@ -3792,38 +3857,33 @@ export function createLiveDataStrategy(opts: {
               timeframe: `${unit}m`,
               timeout_ms: e.timeout_ms,
               elapsed_ms: Date.now() - t0,
-              source: "live_fetch",
-              cache_age_ms: Number.isFinite(cacheAgeMs) ? cacheAgeMs : null,
               phase: e.phase,
+              drop_max_age_ms: LIVE_CANDIDATE_CANDLE_CACHE_DROP_MAX_AGE_MS,
             }),
           );
-
-          // Core majors only: allow evaluation using last_good candle cache when it's fresh enough.
-          // [HARDENED] Increase reliability for CORE assets during high load/timeout
-          const isCoreTarget = CORE_MAJOR_MARKETS.has(market);
-          if (isCoreTarget && lastGood?.rows?.length && cacheAgeMs <= LIVE_LAST_GOOD_CANDLE_MAX_AGE_MS * 1.5) {
-            const rows = lastGood.rows;
+          const stale = pickFallbackRows(LIVE_CANDIDATE_CANDLE_CACHE_DROP_MAX_AGE_MS);
+          if (stale) {
+            minute1CandleCache.set(`${market}:${count}`, stale.rows);
             console.info(
               JSON.stringify({
-                tag: "CORE_CANDLE_FETCH_FALLBACK_USED",
+                tag: "LIVE_CANDIDATE_CANDLE_CACHE_HIT",
                 ts: new Date().toISOString(),
                 market,
-                cache_age_ms: cacheAgeMs,
-                rows: rows.length,
-                original_error: "timeout",
+                timeframe: `${unit}m`,
+                rows: stale.rows.length,
+                cache_age_ms: stale.cache_age_ms,
+                via: stale.via,
+                reason: "stale_serve_after_timeout",
                 original_timeout_ms: e.timeout_ms,
-                candle_source: "last_good_cache",
-                note: "hardened_core_fallback_engaged",
               }),
             );
-            return { rows, candle_source: "last_good_cache", cache_age_ms: cacheAgeMs };
+            return { rows: stale.rows, candle_source: "last_good_cache", cache_age_ms: stale.cache_age_ms };
           }
         }
         throw e;
       } finally {
         tickSignal.removeEventListener("abort", onTickAbort);
       }
-
     };
     const btcChange = Number(changeRateBy.get("KRW-BTC") ?? 0);
     const btcTier: "strong" | "neutral" | "weak" =
