@@ -8440,19 +8440,7 @@ export function createLiveDataStrategy(opts: {
             }),
           );
 
-          if (isCoreMarket) {
-            console.info(JSON.stringify({
-              tag: "CORE_FINAL_ALLOWED_DECISION_PROOF",
-              ts: new Date().toISOString(),
-              market,
-              decision: "allow",
-              setup_ok: Boolean(metaForGuard?.setup?.ok),
-              entry_mode: metaForGuard?.setupReason === "CORE_TREND_ENTRY" ? "CORE_TREND_ENTRY" : "CORE_SPOT_DEFAULT",
-              order_krw: orderKrw,
-              entry_price: entryPrice,
-              stop_price: stopPrice
-            }));
-          }
+
         }
       } catch (e) {
         await appendLog({
@@ -8681,6 +8669,20 @@ export function createLiveDataStrategy(opts: {
       }
       
       orderKrw = finalOrderKrwValue;
+
+      if (isCoreMarket) {
+        console.info(JSON.stringify({
+          tag: "CORE_FINAL_ALLOWED_DECISION_PROOF",
+          ts: new Date().toISOString(),
+          market,
+          decision: "allow",
+          setup_ok: Boolean(metaForGuard?.setup?.ok),
+          entry_mode: metaForGuard?.setupReason === "CORE_TREND_ENTRY" ? "CORE_TREND_ENTRY" : "CORE_SPOT_DEFAULT",
+          order_krw: orderKrw,
+          entry_price: entryPrice,
+          stop_price: stopPrice
+        }));
+      }
 
       // Capital cap gate (account-wide equity based).
       // Block *before* placing new order if (used + requiredCapital) exceeds the fixed 50% cap.
