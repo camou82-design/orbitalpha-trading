@@ -1507,6 +1507,18 @@ function evaluateOriginalSpotScalpingSetup(
       const rr = selectedBranch === "CORE_PULLBACK_REVERSAL" ? 1.5 : 2.0;
       const targetPrice = currentPrice + risk * rr;
 
+      console.info(JSON.stringify({
+        tag: "CORE_SETUP_BRANCH_PROMOTION_PROOF",
+        ts: new Date().toISOString(),
+        market,
+        selectedBranch,
+        stopPrice,
+        targetPrice,
+        riskReward: rr,
+        riskAmount: risk,
+        currentPrice
+      }));
+
       return {
         ok: true,
         mode: selectedBranch === "CORE_PULLBACK_REVERSAL" ? "safe" : "aggressive",
@@ -1518,6 +1530,16 @@ function evaluateOriginalSpotScalpingSetup(
         safePriceAboveEma200, pullbackToEma200, stochOversoldBullishCross, isBullish, safe_condition_pass: corePullbackRevPass,
         aggressiveEmaStack, aggressivePriceAbove, aggressiveRsiOk: rsiBullish, aggressiveVolumeOk: volSpike, aggressiveRiskRewardOk: true, aggressive_condition_pass: coreTrendContPass || coreBreakoutVolPass
       };
+    } else {
+      console.info(JSON.stringify({
+        tag: "CORE_SETUP_BRANCH_REJECTED_PROOF",
+        ts: new Date().toISOString(),
+        market,
+        reason: "invalid_risk_reward_parameters",
+        risk,
+        currentPrice,
+        stopPrice
+      }));
     }
   }
 
@@ -6260,6 +6282,18 @@ export function createLiveDataStrategy(opts: {
         const isSurgeSourceFinal = isSurgeCandidate;
         if (!(riskReward > 0) && !isSurgeSourceFinal) {
           evaluationDroppedReasons[m] = "risk_reward_invalid";
+          
+          if (isCoreMarket) {
+            console.info(JSON.stringify({
+              tag: "CORE_CANDIDATE_META_DROPPED_AFTER_BRANCH_PROOF",
+              ts: new Date().toISOString(),
+              market: m,
+              reason: "risk_reward_invalid",
+              risk_reward: riskReward,
+              setup_reason: setup.reason
+            }));
+          }
+
           emitCoreCandidateReject(m, "risk_reward_invalid", {
             setup_ok: setup.ok,
             stopPrice: setup.stopPrice ?? 0,
@@ -6321,6 +6355,21 @@ export function createLiveDataStrategy(opts: {
           gate_reason: gateReason,
           setup_mode: setup.mode,
           source_kind: effectivePayload.source_kind
+        }));
+
+        console.info(JSON.stringify({
+          tag: "CORE_CANDIDATE_META_KEPT_PROOF",
+          ts: new Date().toISOString(),
+          market: m,
+          is_fresh_signal: isFreshSignal,
+          is_watch_candidate: isWatchCandidate,
+          gate_ok: gateOk,
+          setup_ok: setup.ok,
+          setup_reason: setup.reason,
+          risk_reward: riskReward,
+          stop_price: setup.stopPrice,
+          target_price: setup.targetPrice,
+          engine_bucket: isSurgeCandidate ? "surge" : isCoreMarket ? "core" : "other"
         }));
 
         candidateMetaMap.set(m, meta);
@@ -7109,9 +7158,12 @@ export function createLiveDataStrategy(opts: {
       const rawStrength = signalStrengthScore(sig.p);
       const bridgedStrength = scannerBridgeScore ? Math.max(rawStrength, scannerBridgeScore.signalStrengthScore) : rawStrength;
       if (scannerBridgeScore) {
+        const filtersArr = Array.isArray(sig.p.filters) ? (sig.p.filters as Array<{ id?: unknown; passed?: unknown }>) : [];
+        const failedFilterIds = filtersArr.filter(f => f && f.passed === false).map(f => String(f.id ?? ""));
+        
         console.info(
           JSON.stringify({
-            tag: "LIVE_SCANNER_SIGNAL_BRIDGE_SCORE",
+            tag: "SURGE_SCANNER_BRIDGE_SCORE_PROOF",
             ts: new Date().toISOString(),
             market,
             scanner_score: Number(sig?.p?.scanner_score ?? sig?.p?.signal_score ?? 0),
@@ -7126,6 +7178,7 @@ export function createLiveDataStrategy(opts: {
             pass: scannerBridgeScore.pass,
             reason: scannerBridgeScore.reason,
             filter_pass: Boolean(sig?.p?.filter_pass),
+            failed_filters: failedFilterIds,
           }),
         );
       }
@@ -7858,15 +7911,21 @@ export function createLiveDataStrategy(opts: {
       const filterPass = Boolean(sig.p.filter_pass);
 
       if (isSurgeSource) {
+        const filtersArr = Array.isArray(sig.p.filters) ? (sig.p.filters as Array<{ id?: unknown; passed?: unknown }>) : [];
+        const failedFilterIds = filtersArr.filter(f => f && f.passed === false).map(f => String(f.id ?? ""));
+
         console.info(
           JSON.stringify({
             tag: "SURGE_FILTER_PASS_DECISION_PROOF",
             ts: new Date().toISOString(),
             market,
             filter_pass: filterPass,
+            failed_filters: failedFilterIds,
             source_kind: sourceKindForJudgment,
             payload_source_kind: payloadSourceKind,
             signal_reason: sig.p.signal_reason,
+            volume_ratio: Number(sig.p.volume_ratio ?? 0),
+            signal_score: Number(sig.p.signal_score ?? 0),
           }),
         );
       }
@@ -8380,6 +8439,20 @@ export function createLiveDataStrategy(opts: {
               detail: entryPipelineDetail,
             }),
           );
+
+          if (isCoreMarket) {
+            console.info(JSON.stringify({
+              tag: "CORE_FINAL_ALLOWED_DECISION_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              decision: "allow",
+              setup_ok: Boolean(metaForGuard?.setup?.ok),
+              entry_mode: metaForGuard?.setupReason === "CORE_TREND_ENTRY" ? "CORE_TREND_ENTRY" : "CORE_SPOT_DEFAULT",
+              order_krw: orderKrw,
+              entry_price: entryPrice,
+              stop_price: stopPrice
+            }));
+          }
         }
       } catch (e) {
         await appendLog({
