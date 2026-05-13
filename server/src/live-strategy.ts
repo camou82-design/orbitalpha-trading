@@ -1535,11 +1535,12 @@ function evaluateOriginalSpotScalpingSetup(
         tag: "CORE_SETUP_BRANCH_REJECTED_PROOF",
         ts: new Date().toISOString(),
         market,
-        reason: "invalid_risk_reward_parameters",
+        reason: risk <= 0 ? "core_risk_invalid" : "core_stop_price_missing",
         risk,
         currentPrice,
         stopPrice
       }));
+      return { ok: false, mode: "none", reason: risk <= 0 ? "core_risk_invalid" : "core_stop_price_missing" };
     }
   }
 
@@ -1717,7 +1718,7 @@ function evaluateCoreTrendEntrySetup(
   const targetPrice = currentPrice + risk * 1.35;
   const rr = (targetPrice - currentPrice) / risk;
   if (rr < 1.15) {
-    return coreReject("core_trend_rr_weak", {
+    return coreReject("core_rr_invalid", {
       ema50: ema50Last,
       ema200: ema200Last,
       rsi,
@@ -6117,27 +6118,41 @@ export function createLiveDataStrategy(opts: {
                }));
             }
 
-            const surgeReasonCanonical =
-              surgeShadowSetup.reason === "surge_setup_passed"
-                ? "surge_v2_entry_path"
-                : `surge_v2:${surgeShadowSetup.reason}`;
-            setup = {
-              ok: surgeShadowSetup.ok,
-              mode: probeAllowed ? "relaxed_probe" : "none",
-              reason: surgeReasonCanonical,
-              riskReward: Number(surgeShadowSetup.riskReward ?? 1),
-              stopPrice: Number(surgeShadowSetup.stopPrice ?? 0),
-              targetPrice: Number(surgeShadowSetup.targetPrice ?? 0),
-              candleLow: Number(surgeShadowSetup.stopPrice ?? 0),
-              swingLow: Number(surgeShadowSetup.stopPrice ?? 0),
-              ema50: surgeShadowSetup.ema50,
-              ema200: surgeShadowSetup.ema200,
-              rsi: surgeShadowSetup.rsi,
-              stochK: surgeShadowSetup.stochK,
-              stochD: surgeShadowSetup.stochD,
-              volumeRatio: surgeShadowSetup.volumeRatio,
-              failed_conditions: surgeShadowSetup.failed_conditions,
-            };
+            // [FIX] Priority Overwrite: Don't let a failing Surge setup kill a passing Core setup for Core markets.
+            const shouldPreserveCore = isCoreMarket && setup.ok && !surgeShadowSetup.ok;
+            
+            if (shouldPreserveCore) {
+              console.info(JSON.stringify({
+                tag: "CORE_SETUP_PRESERVED_OVER_SURGE_FAIL_PROOF",
+                ts: new Date().toISOString(),
+                market: m,
+                core_reason: setup.reason,
+                surge_fail_reason: surgeShadowSetup.reason,
+                note: "preserving successful core setup despite failing surge shadow eval"
+              }));
+            } else {
+              const surgeReasonCanonical =
+                surgeShadowSetup.reason === "surge_setup_passed"
+                  ? "surge_v2_entry_path"
+                  : `surge_v2:${surgeShadowSetup.reason}`;
+              setup = {
+                ok: surgeShadowSetup.ok,
+                mode: probeAllowed ? "relaxed_probe" : "none",
+                reason: surgeReasonCanonical,
+                riskReward: Number(surgeShadowSetup.riskReward ?? 1),
+                stopPrice: Number(surgeShadowSetup.stopPrice ?? 0),
+                targetPrice: Number(surgeShadowSetup.targetPrice ?? 0),
+                candleLow: Number(surgeShadowSetup.stopPrice ?? 0),
+                swingLow: Number(surgeShadowSetup.stopPrice ?? 0),
+                ema50: surgeShadowSetup.ema50,
+                ema200: surgeShadowSetup.ema200,
+                rsi: surgeShadowSetup.rsi,
+                stochK: surgeShadowSetup.stochK,
+                stochD: surgeShadowSetup.stochD,
+                volumeRatio: surgeShadowSetup.volumeRatio,
+                failed_conditions: surgeShadowSetup.failed_conditions,
+              };
+            }
           }
         }
 
@@ -6281,20 +6296,21 @@ export function createLiveDataStrategy(opts: {
         const riskReward = Number(setup.riskReward ?? 0);
         const isSurgeSourceFinal = isSurgeCandidate;
         if (!(riskReward > 0) && !isSurgeSourceFinal) {
-          evaluationDroppedReasons[m] = "risk_reward_invalid";
+          const dropReason = isCoreMarket ? "core_rr_invalid" : "risk_reward_invalid";
+          evaluationDroppedReasons[m] = dropReason;
           
           if (isCoreMarket) {
             console.info(JSON.stringify({
               tag: "CORE_CANDIDATE_META_DROPPED_AFTER_BRANCH_PROOF",
               ts: new Date().toISOString(),
               market: m,
-              reason: "risk_reward_invalid",
+              reason: dropReason,
               risk_reward: riskReward,
               setup_reason: setup.reason
             }));
           }
 
-          emitCoreCandidateReject(m, "risk_reward_invalid", {
+          emitCoreCandidateReject(m, dropReason, {
             setup_ok: setup.ok,
             stopPrice: setup.stopPrice ?? 0,
             entry_price: currentPx,
@@ -8643,6 +8659,16 @@ export function createLiveDataStrategy(opts: {
               orderKrw: finalOrderKrwValue,
               minSafeEntryThreshold
           }));
+          if (isCoreMarket) {
+            emitCoreEntryFinalDecisionProof({
+              market,
+              decision: "reject",
+              reason: "core_order_krw_invalid",
+              block_reason: "core_order_krw_invalid",
+              order_krw: finalOrderKrwValue,
+              min_safe_threshold: minSafeEntryThreshold
+            });
+          }
           bumpSkip("LIVE_ENTRY_MIN_SAFE_BLOCK");
           continue;
       }
@@ -8663,6 +8689,17 @@ export function createLiveDataStrategy(opts: {
                   upbitMinOrderKrw: UPBIT_MIN_ORDER_LIMIT_KRW,
                   minSafeEntryThreshold
               }));
+              if (isCoreMarket) {
+                emitCoreEntryFinalDecisionProof({
+                  market,
+                  decision: "reject",
+                  reason: "core_stop_price_missing",
+                  block_reason: "core_stop_price_missing",
+                  order_krw: finalOrderKrwValue,
+                  stop_price: stopPrice,
+                  expected_stop_value: expectedStopSellValue
+                });
+              }
               bumpSkip("STOP_SELL_UNDER_MIN_ORDER_BLOCK");
               continue;
           }
