@@ -1448,69 +1448,94 @@ function evaluateOriginalSpotScalpingSetup(
 
   const prevRsi = rsiValues[lastIdx - 1] ?? 0;
 
-  // 1. 안전형 조건 (Pullback Reversal)
   const safePriceAboveEma200 = currentPrice > ema200Last || Number(lastCandle.trade_price) > ema200Last;
   const pullbackToEma200 = lows.slice(-20).some(l => l <= ema200Last * 1.015);
-  const stochOversoldBullishCross = prevK <= 25 && prevD <= 25 && k > d; // 20->25로 약간 완화, prevK<=prevD 삭제
-  const safe_condition_pass = safePriceAboveEma200 && pullbackToEma200 && stochOversoldBullishCross && isBullish;
-
-  if (safe_condition_pass) {
-    const stopPrice = swingLow * 0.998;
-    const risk = currentPrice - stopPrice;
-    if (risk > 0) {
-      const targetPrice = currentPrice + risk * 1.5;
-      const rr = 1.5;
-      return {
-        ok: true,
-        mode: "safe",
-        reason: "safe_pullback_ema200_stoch_cross",
-        ema50: ema50Last, ema200: ema200Last, rsi, stochK: k, stochD: d,
-        volumeRatio: volRatio,
-        stopPrice, targetPrice, riskReward: rr,
-        candleLow, swingLow,
-        safePriceAboveEma200, pullbackToEma200, stochOversoldBullishCross, isBullish, safe_condition_pass
-      };
-    }
-  }
-
-  // 2. 공격형 조건 (Trend / Early Surge)
+  const stochOversoldBullishCross = prevK <= 25 && prevD <= 25 && k > d;
   const aggressiveEmaStack = ema50Last > ema200Last;
   const aggressivePriceAbove = currentPrice > ema50Last && currentPrice > ema200Last;
-  const stochReversal = (k > prevK && k > 20) || (k > d && k > 40); // 추세 추종 시에는 굳이 침체권일 필요 없음
-  const rsiBullish = rsi > 45 || (prevRsi <= 50 && rsi > 50) || rsi > prevRsi; // 50->45 완화
-  const volSpike = volRatio > 0.95; // 1.0->0.95 완화
-  const aggressiveRiskRewardOk = true; // RR checked inside
-  const aggressive_condition_pass = aggressiveEmaStack && aggressivePriceAbove && stochReversal && rsiBullish && volSpike;
+  const stochReversal = (k > prevK && k > 20) || (k > d && k > 40);
+  const rsiBullish = rsi > 45 || (prevRsi <= 50 && rsi > 50) || rsi > prevRsi;
+  const volSpike = volRatio > 0.95;
 
-  if (aggressive_condition_pass) {
-    const stopPrice = Math.min(candleLow, swingLow) * 0.998;
+  // 1. CORE_TREND_CONTINUATION: 추세 지속 (EMA 정배열 및 가격 우위)
+  const coreTrendContPass = safePriceAboveEma200 && aggressiveEmaStack && aggressivePriceAbove;
+
+  // 2. CORE_PULLBACK_REVERSAL: 눌림목 반등 (Stoch 침체권 상향 돌파 및 RSI 강세)
+  const corePullbackRevPass = stochOversoldBullishCross && stochReversal && rsiBullish;
+
+  // 3. CORE_BREAKOUT_VOLUME: 거래량 실린 돌파 (가격 우위 및 거래량 급증)
+  const coreBreakoutVolPass = aggressivePriceAbove && volSpike;
+
+  const branchProof = {
+    market,
+    safePriceAboveEma200,
+    aggressiveEmaStack,
+    aggressivePriceAbove,
+    stochOversoldBullishCross,
+    stochReversal,
+    rsiBullish,
+    volSpike,
+    coreTrendContPass,
+    corePullbackRevPass,
+    coreBreakoutVolPass,
+  };
+
+  console.info(JSON.stringify({
+    tag: "CORE_SETUP_BRANCH_DECISION_PROOF",
+    ts: new Date().toISOString(),
+    ...branchProof
+  }));
+
+  if (coreTrendContPass || corePullbackRevPass || coreBreakoutVolPass) {
+    const selectedBranch = coreTrendContPass ? "CORE_TREND_CONTINUATION"
+                         : (corePullbackRevPass ? "CORE_PULLBACK_REVERSAL" : "CORE_BREAKOUT_VOLUME");
+
+    console.info(JSON.stringify({
+      tag: "CORE_SETUP_BRANCH_SELECTED_PROOF",
+      ts: new Date().toISOString(),
+      market,
+      selectedBranch,
+      mode: coreTrendContPass ? "aggressive" : (corePullbackRevPass ? "safe" : "aggressive"),
+    }));
+
+    const stopPrice = selectedBranch === "CORE_PULLBACK_REVERSAL"
+                    ? swingLow * 0.998
+                    : Math.min(candleLow, swingLow) * 0.998;
     const risk = currentPrice - stopPrice;
+
     if (risk > 0) {
-      const targetPrice = currentPrice + risk * 2.0;
-      const rr = 2.0;
+      const rr = selectedBranch === "CORE_PULLBACK_REVERSAL" ? 1.5 : 2.0;
+      const targetPrice = currentPrice + risk * rr;
+
       return {
         ok: true,
-        mode: "aggressive",
-        reason: "aggressive_trend_volume_spike",
+        mode: selectedBranch === "CORE_PULLBACK_REVERSAL" ? "safe" : "aggressive",
+        reason: selectedBranch,
         ema50: ema50Last, ema200: ema200Last, rsi, stochK: k, stochD: d,
         volumeRatio: volRatio,
         stopPrice, targetPrice, riskReward: rr,
         candleLow, swingLow,
-        aggressiveEmaStack, aggressivePriceAbove, aggressiveRsiOk: rsiBullish, aggressiveVolumeOk: volSpike, aggressiveRiskRewardOk, aggressive_condition_pass
+        safePriceAboveEma200, pullbackToEma200, stochOversoldBullishCross, isBullish, safe_condition_pass: corePullbackRevPass,
+        aggressiveEmaStack, aggressivePriceAbove, aggressiveRsiOk: rsiBullish, aggressiveVolumeOk: volSpike, aggressiveRiskRewardOk: true, aggressive_condition_pass: coreTrendContPass || coreBreakoutVolPass
       };
     }
   }
 
   const failed: string[] = [];
   if (!safePriceAboveEma200) failed.push("safePriceAboveEma200");
-  if (!pullbackToEma200) failed.push("pullbackToEma200");
-  if (!stochOversoldBullishCross) failed.push("stochOversoldBullishCross");
-  if (!isBullish) failed.push("isBullish");
   if (!aggressiveEmaStack) failed.push("aggressiveEmaStack");
   if (!aggressivePriceAbove) failed.push("aggressivePriceAbove");
+  if (!stochOversoldBullishCross) failed.push("stochOversoldBullishCross");
   if (!stochReversal) failed.push("stochReversal");
   if (!rsiBullish) failed.push("rsiBullish");
-  if (volRatio <= 1.0) failed.push("volRatio<=1.0");
+  if (volRatio <= 0.95) failed.push("volRatio<=0.95");
+
+  console.info(JSON.stringify({
+    tag: "CORE_SETUP_BRANCH_REJECTED_PROOF",
+    ts: new Date().toISOString(),
+    market,
+    failed_conditions: failed
+  }));
 
   return {
     ok: false,
@@ -1522,9 +1547,8 @@ function evaluateOriginalSpotScalpingSetup(
     stochK: k,
     stochD: d,
     volumeRatio: volRatio,
-    safePriceAboveEma200, pullbackToEma200, stochOversoldBullishCross, isBullish, safe_condition_pass,
-    aggressiveEmaStack, aggressivePriceAbove, aggressiveRsiOk: rsiBullish, aggressiveVolumeOk: volSpike, aggressiveRiskRewardOk, aggressive_condition_pass,
-    failed_conditions: failed,
+    safePriceAboveEma200, pullbackToEma200, stochOversoldBullishCross, isBullish, safe_condition_pass: corePullbackRevPass,
+    aggressiveEmaStack, aggressivePriceAbove, aggressiveRsiOk: rsiBullish, aggressiveVolumeOk: volSpike, aggressiveRiskRewardOk: true, aggressive_condition_pass: coreTrendContPass || coreBreakoutVolPass,
   };
 }
 
@@ -7063,6 +7087,25 @@ export function createLiveDataStrategy(opts: {
             staleThresholdSeconds: LIVE_ENTRY_SIGNAL_STALE_SECONDS,
           })
         : null;
+
+      if (isSurgeSource && scannerBridgeScore) {
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_SCANNER_BRIDGE_SCORE_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            scanner_score: Number(sig?.p?.scanner_score ?? sig?.p?.signal_score ?? 0),
+            volume_multiple: Number(sig?.p?.volume_ratio ?? 0),
+            breakout: Boolean(sig?.p?.breakout),
+            close_upper_hold: Boolean(sig?.p?.close_upper_hold),
+            rise_3m_pct: Number(sig?.p?.rise_3m_pct ?? sig?.p?.momentum_3m_pct ?? sig?.p?.price_change_3m_pct ?? 0),
+            age_seconds: sourceMetaResolved.age_seconds,
+            live_entry_score: Number(scannerBridgeScore.liveEntryScore.toFixed(1)),
+            pass: scannerBridgeScore.pass,
+            reason: scannerBridgeScore.reason,
+          }),
+        );
+      }
       const rawStrength = signalStrengthScore(sig.p);
       const bridgedStrength = scannerBridgeScore ? Math.max(rawStrength, scannerBridgeScore.signalStrengthScore) : rawStrength;
       if (scannerBridgeScore) {
@@ -7813,6 +7856,20 @@ export function createLiveDataStrategy(opts: {
         }
       }
       const filterPass = Boolean(sig.p.filter_pass);
+
+      if (isSurgeSource) {
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_FILTER_PASS_DECISION_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            filter_pass: filterPass,
+            source_kind: sourceKindForJudgment,
+            payload_source_kind: payloadSourceKind,
+            signal_reason: sig.p.signal_reason,
+          }),
+        );
+      }
       const signalTypeLow = (sig.p.signal_type ?? "").toUpperCase() === "LOW";
       const gate = opts.marketState.entryGate(sig.p, marketState);
       const baseGateOriginalResult = Boolean(gate.ok);
