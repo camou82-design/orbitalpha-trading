@@ -3711,18 +3711,32 @@ export function createLiveDataStrategy(opts: {
     const candleFetchLimiter = (() => {
       const concurrency = LIVE_CANDIDATE_CANDLE_FETCH_CONCURRENCY;
       let active = 0;
-      const queue: Array<() => void> = [];
+      const queue: Array<{ resolve: () => void; signal?: AbortSignal }> = [];
       const pump = () => {
         while (active < concurrency && queue.length > 0) {
-          const next = queue.shift();
-          if (next) next();
+          const item = queue.shift();
+          if (!item) continue;
+          if (item.signal?.aborted) {
+            continue; // Skip aborted items
+          }
+          active += 1;
+          item.resolve();
         }
       };
-      return async <T>(fn: () => Promise<T>): Promise<T> => {
+      return async <T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> => {
         if (active >= concurrency) {
-          await new Promise<void>((resolve) => queue.push(resolve));
+          await new Promise<void>((resolve, reject) => {
+            const onAbort = () => {
+              reject(new DOMException("Aborted", "AbortError"));
+            };
+            if (signal?.aborted) return onAbort();
+            queue.push({ resolve, signal });
+            if (signal) signal.addEventListener("abort", onAbort, { once: true });
+          });
+        } else {
+          active += 1;
         }
-        active += 1;
+        
         try {
           return await fn();
         } finally {
@@ -3812,22 +3826,24 @@ export function createLiveDataStrategy(opts: {
           );
           minute1CandleCache.set(`${market}:${count}`, fetched);
           return fetched;
-        });
+        }, tickSignal);
         lastGoodMinuteCandleCache.set(key, { ts_ms: Date.now(), rows, unit, count });
         console.info(
           JSON.stringify({
-            tag: "LIVE_CANDIDATE_CANDLE_FETCH_OK",
+            tag: "CANDIDATE_META_DATA_SOURCE_PROOF",
             ts: new Date().toISOString(),
-            market,
-            timeframe: `${unit}m`,
-            rows: rows.length,
+            market, unit, count, key,
+            timeout_ms: timeoutMs,
             elapsed_ms: Date.now() - t0,
-            candle_source: "live_fetch",
+            cache_age_ms: null,
+            result_source: "live_http",
+            final_reason: "success"
           }),
         );
         return { rows, candle_source: "live_fetch", cache_age_ms: null };
       } catch (e) {
         abortCtrl.abort();
+        const elapsed = Date.now() - t0;
         if (isAbortLike(e)) {
           const phase = isLiveTickPhaseTimeout(e) ? e.phase : "candidate_meta_fetch_minute_candles:aborted";
           const abort_reason = tickSignal.aborted
@@ -3837,49 +3853,82 @@ export function createLiveDataStrategy(opts: {
               : "aborted_message";
           console.info(
             JSON.stringify({
-              tag: "LIVE_CANDIDATE_CANDLE_FETCH_ABORTED",
+              tag: "CANDIDATE_META_DATA_SOURCE_PROOF",
               ts: new Date().toISOString(),
-              market,
-              phase,
-              elapsed_ms: Date.now() - t0,
-              abort_reason,
+              market, unit, count, key,
+              timeout_ms: timeoutMs,
+              elapsed_ms: elapsed,
+              result_source: "dropped",
+              final_reason: "candle_fetch_aborted",
+              abort_reason
             }),
           );
           throw e;
         }
 
         if (isLiveTickPhaseTimeout(e) && e.phase.startsWith("candidate_meta_fetch_minute_candles:")) {
-          console.info(
-            JSON.stringify({
-              tag: "LIVE_CANDIDATE_CANDLE_FETCH_TIMEOUT",
-              ts: new Date().toISOString(),
-              market,
-              timeframe: `${unit}m`,
-              timeout_ms: e.timeout_ms,
-              elapsed_ms: Date.now() - t0,
-              phase: e.phase,
-              drop_max_age_ms: LIVE_CANDIDATE_CANDLE_CACHE_DROP_MAX_AGE_MS,
-            }),
-          );
           const stale = pickFallbackRows(LIVE_CANDIDATE_CANDLE_CACHE_DROP_MAX_AGE_MS);
           if (stale) {
             minute1CandleCache.set(`${market}:${count}`, stale.rows);
             console.info(
               JSON.stringify({
-                tag: "LIVE_CANDIDATE_CANDLE_CACHE_HIT",
+                tag: "CANDIDATE_META_DATA_SOURCE_PROOF",
                 ts: new Date().toISOString(),
-                market,
-                timeframe: `${unit}m`,
-                rows: stale.rows.length,
+                market, unit, count, key,
+                timeout_ms: timeoutMs,
+                elapsed_ms: elapsed,
                 cache_age_ms: stale.cache_age_ms,
-                via: stale.via,
-                reason: "stale_serve_after_timeout",
-                original_timeout_ms: e.timeout_ms,
+                result_source: "stale_served",
+                final_reason: "timeout_fallback_success"
               }),
             );
             return { rows: stale.rows, candle_source: "last_good_cache", cache_age_ms: stale.cache_age_ms };
           }
+          console.info(
+            JSON.stringify({
+              tag: "CANDIDATE_META_DATA_SOURCE_PROOF",
+              ts: new Date().toISOString(),
+              market, unit, count, key,
+              timeout_ms: timeoutMs,
+              elapsed_ms: elapsed,
+              result_source: "dropped",
+              final_reason: "candle_fetch_timeout_no_cache"
+            }),
+          );
+          throw e;
         }
+        
+        // General error fallback
+        const fallback = pickFallbackRows(LIVE_CANDIDATE_CANDLE_CACHE_DROP_MAX_AGE_MS);
+        if (fallback) {
+           console.info(
+              JSON.stringify({
+                tag: "CANDIDATE_META_DATA_SOURCE_PROOF",
+                ts: new Date().toISOString(),
+                market, unit, count, key,
+                timeout_ms: timeoutMs,
+                elapsed_ms: elapsed,
+                cache_age_ms: fallback.cache_age_ms,
+                result_source: "stale_served",
+                final_reason: "error_fallback_success",
+                error: e instanceof Error ? e.message : String(e)
+              }),
+            );
+            return { rows: fallback.rows, candle_source: "last_good_cache", cache_age_ms: fallback.cache_age_ms };
+        }
+
+        console.info(
+            JSON.stringify({
+              tag: "CANDIDATE_META_DATA_SOURCE_PROOF",
+              ts: new Date().toISOString(),
+              market, unit, count, key,
+              timeout_ms: timeoutMs,
+              elapsed_ms: elapsed,
+              result_source: "dropped",
+              final_reason: "candle_fetch_error",
+              error: e instanceof Error ? e.message : String(e)
+            }),
+          );
         throw e;
       } finally {
         tickSignal.removeEventListener("abort", onTickAbort);

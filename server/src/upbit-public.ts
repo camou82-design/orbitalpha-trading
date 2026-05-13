@@ -92,6 +92,7 @@ const UPBIT_INVALID_MARKET_TTL_MS = Number(process.env.UPBIT_INVALID_MARKET_TTL_
 
 const candleCache = new Map<string, CandleCacheEntry>();
 const candleInFlight = new Map<string, Promise<UpbitCandle[]>>();
+const candleInFlightStartedAtMs = new Map<string, number>();
 const candleCooldownUntilMs = new Map<string, number>();
 let candleGlobalCooldownUntilMs = 0;
 const candle429LastLogAtMs = new Map<string, number>();
@@ -141,7 +142,7 @@ function maybeLogCandleCacheStats(nowMs: number) {
   }
   candleLastStatsLogAtMs = nowMs;
   console.log(
-    `[upbit-candles][stats] http_calls=${candleHttpFetchesSinceLastLog} cache_hits=${candleCacheHitsSinceLastLog} stale_served=${candleStaleServedSinceLastLog} inFlight=${candleInFlight.size}`,
+    `[upbit-candles][stats] http_calls=${candleHttpFetchesSinceLastLog} cache_hits=${candleCacheHitsSinceLastLog} stale_served=${candleStaleServedSinceLastLog} inFlight=${candleInFlight.size} inFlight_keys=${Array.from(candleInFlight.keys()).join(",")}`,
   );
   candleHttpFetchesSinceLastLog = 0;
   candleCacheHitsSinceLastLog = 0;
@@ -158,6 +159,7 @@ function maybeLog429(nowMs: number, key: string, meta: { market: string; unit: 1
 }
 
 async function fetchJson<T>(path: string, signal?: AbortSignal, timeoutMs = 8000): Promise<T> {
+  const t0 = Date.now();
   const url = `${UPBIT}${path}`;
   const ctrl = new AbortController();
   const tid = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -174,6 +176,12 @@ async function fetchJson<T>(path: string, signal?: AbortSignal, timeoutMs = 8000
       throw new UpbitHttpError(`Upbit ${path} → ${r.status}: ${text.slice(0, 200)}`, r.status, path);
     }
     return (await r.json()) as Promise<T>;
+  } catch (e) {
+    if (ctrl.signal.aborted && !signal?.aborted && Date.now() - t0 >= timeoutMs) {
+      // Local timeout
+      (e as any).isUpbitHttpTimeout = true;
+    }
+    throw e;
   } finally {
     clearTimeout(tid);
     if (signal) signal.removeEventListener("abort", onAbort);
@@ -289,15 +297,44 @@ export async function fetchMinuteCandles(
   signal?: AbortSignal,
   opts?: FetchMinuteCandlesOptions,
 ): Promise<UpbitCandle[]> {
+  const t0_overall = Date.now();
   const validMarkets = await sanitizeKrwMarkets([market]);
   if (validMarkets.length === 0) return [];
   const key = candleKey(market, unit, count);
   const nowMs = Date.now();
   maybeLogCandleCacheStats(nowMs);
+
+  // 0) inFlight stale purge (hard defense)
+  const MAX_INFLIGHT_DURATION_MS = 120_000;
+  for (const [k, startedAt] of candleInFlightStartedAtMs.entries()) {
+    if (nowMs - startedAt > MAX_INFLIGHT_DURATION_MS) {
+      console.warn(`[upbit-candles][inFlight] force_purge_stale key=${k} age_ms=${nowMs - startedAt}`);
+      console.info(JSON.stringify({
+        tag: "UPBIT_CANDLE_INFLIGHT_STALE_PURGE",
+        ts: new Date().toISOString(),
+        key: k,
+        age_ms: nowMs - startedAt,
+        inFlight_size: candleInFlight.size
+      }));
+      candleInFlight.delete(k);
+      candleInFlightStartedAtMs.delete(k);
+    }
+  }
+
   const circuitOpenUntil = candleCircuitOpenUntilByKey.get(key) ?? 0;
   if (nowMs < circuitOpenUntil) {
     const cachedOnCircuit = candleCache.get(key);
-    if (cachedOnCircuit) return cachedOnCircuit.value;
+    if (cachedOnCircuit) {
+      console.info(JSON.stringify({
+        tag: "CANDIDATE_META_DATA_SOURCE_PROOF",
+        market, unit, count, key,
+        result_source: "stale_served",
+        final_reason: "circuit_breaker_open",
+        cache_age_ms: nowMs - cachedOnCircuit.fetchedAtMs,
+        inFlight_size: candleInFlight.size
+      }));
+      return cachedOnCircuit.value;
+    }
     return [];
   }
 
@@ -305,12 +342,23 @@ export async function fetchMinuteCandles(
   if (cached) {
     if (nowMs <= cached.expiresAtMs) {
       candleCacheHitsSinceLastLog += 1;
+      console.info(JSON.stringify({
+        tag: "UPBIT_CANDLE_CACHE_HIT",
+        market, unit, count, key,
+        cache_age_ms: nowMs - cached.fetchedAtMs
+      }));
       return cached.value;
     }
     // fresh TTL 지났더라도, 429 쿨다운 중이면 마지막 값을 재사용할 수 있도록 허용.
     const cooldownUntilMs = candleCooldownUntilMs.get(key) ?? 0;
     if (nowMs <= cached.staleUntilMs && (nowMs < cooldownUntilMs || nowMs < candleGlobalCooldownUntilMs)) {
       candleStaleServedSinceLastLog += 1;
+      console.info(JSON.stringify({
+        tag: "UPBIT_CANDLE_STALE_SERVED",
+        market, unit, count, key,
+        reason: "cooldown_active",
+        cache_age_ms: nowMs - cached.fetchedAtMs
+      }));
       return cached.value;
     }
   }
@@ -327,14 +375,12 @@ export async function fetchMinuteCandles(
       const cooldownUntilMs = candleCooldownUntilMs.get(key) ?? 0;
       const left = cooldownUntilMs - Date.now();
       if (left > 0) {
-        // 쿨다운 중에는 즉시 재시도하지 않고 대기.
-        // (콜러가 여러 개여도 inFlight dedupe로 HTTP 호출은 1번만 발생)
-        await sleep(left);
+        await sleepAbortable(left, signal);
       }
 
       const globalLeft = candleGlobalCooldownUntilMs - Date.now();
       if (globalLeft > 0) {
-        await sleep(globalLeft);
+        await sleepAbortable(globalLeft, signal);
       }
 
       try {
@@ -352,12 +398,45 @@ export async function fetchMinuteCandles(
           expiresAtMs: fetchedAtMs + CANDLE_CACHE_TTL_MS,
           staleUntilMs: fetchedAtMs + CANDLE_CACHE_TTL_MS + CANDLE_CACHE_STALE_GRACE_MS,
         });
+        console.info(JSON.stringify({
+          tag: "UPBIT_CANDLE_FETCH_FINAL_STATUS",
+          ts: new Date().toISOString(),
+          market, unit, count, key,
+          result_source: "live_http",
+          final_reason: "success",
+          elapsed_ms: Date.now() - t0_overall,
+          inFlight_size: candleInFlight.size
+        }));
         return value;
       } catch (e) {
+        const nowCatch = Date.now();
+        const elapsed = nowCatch - t0_overall;
+        
+        if (e instanceof DOMException && e.name === "AbortError") {
+          console.info(JSON.stringify({
+            tag: "UPBIT_CANDLE_ABORTED",
+            market, unit, count, key,
+            elapsed_ms: elapsed,
+            inFlight_size: candleInFlight.size
+          }));
+          throw e;
+        }
+
+        if ((e as any).isUpbitHttpTimeout) {
+          console.info(JSON.stringify({
+            tag: "UPBIT_CANDLE_HTTP_TIMEOUT",
+            market, unit, count, key,
+            timeout_ms: opts?.httpTimeoutMs ?? UPBIT_CANDLE_HTTP_TIMEOUT_MS,
+            elapsed_ms: elapsed,
+            inFlight_size: candleInFlight.size
+          }));
+        }
+
         if (is404MarketError(e)) {
           markInvalidMarket(market);
           return [];
         }
+
         const failCount = (candleFailureCountByKey.get(key) ?? 0) + 1;
         candleFailureCountByKey.set(key, failCount);
         if (failCount >= UPBIT_FETCH_CIRCUIT_BREAKER_FAIL_THRESHOLD) {
@@ -372,38 +451,70 @@ export async function fetchMinuteCandles(
           if (cachedOnFailure) return cachedOnFailure.value;
           return [];
         }
+
         if (e instanceof UpbitHttpError && e.status === 429) {
-          const now = Date.now();
-          const cooldownUntilMs2 = now + CANDLE_429_COOLDOWN_MS;
+          const cooldownUntilMs2 = nowCatch + CANDLE_429_COOLDOWN_MS;
           candleCooldownUntilMs.set(key, cooldownUntilMs2);
           candleGlobalCooldownUntilMs = Math.max(candleGlobalCooldownUntilMs, cooldownUntilMs2);
 
-          maybeLog429(now, key, meta, cooldownUntilMs2, e.status);
+          maybeLog429(nowCatch, key, meta, cooldownUntilMs2, e.status);
 
           const cached2 = candleCache.get(key);
-          if (cached2 && now <= cached2.staleUntilMs) {
+          if (cached2 && nowCatch <= cached2.staleUntilMs) {
             candleStaleServedSinceLastLog += 1;
             return cached2.value;
           }
 
           const backoffMs = Math.min(CANDLE_429_MAX_BACKOFF_MS, Math.max(CANDLE_429_MIN_BACKOFF_MS, CANDLE_429_COOLDOWN_MS * 2 ** (attempt - 1)));
           if (attempt >= CANDLE_429_MAX_ATTEMPTS) throw e;
-          await sleep(backoffMs);
+          await sleepAbortable(backoffMs, signal);
           continue;
         }
+
+        // For other errors (timeout, server error), try to serve stale cache if available
+        const fallback = candleCache.get(key);
+        if (fallback && nowCatch <= fallback.staleUntilMs) {
+          console.info(JSON.stringify({
+            tag: "UPBIT_CANDLE_STALE_SERVED",
+            ts: new Date().toISOString(),
+            market, unit, count, key,
+            reason: "live_fetch_failed",
+            error: e instanceof Error ? e.message : String(e),
+            cache_age_ms: nowCatch - fallback.fetchedAtMs,
+            inFlight_size: candleInFlight.size
+          }));
+          return fallback.value;
+        }
+
         throw e;
       }
     }
 
-    // 논리상 도달 불가(while 종료) — 타입 만족용
     throw new Error(`Upbit candles fetch failed unexpectedly: ${market} unit=${unit} count=${count}`);
   })();
 
+  console.info(JSON.stringify({
+    tag: "UPBIT_CANDLE_INFLIGHT_SET",
+    ts: new Date().toISOString(),
+    market, unit, count, key,
+    inFlight_size: candleInFlight.size + 1
+  }));
   candleInFlight.set(key, task);
+  candleInFlightStartedAtMs.set(key, nowMs);
+
   try {
-    return await task;
+    const res = await task;
+    return res;
   } finally {
     candleInFlight.delete(key);
+    candleInFlightStartedAtMs.delete(key);
+    console.info(JSON.stringify({
+      tag: "UPBIT_CANDLE_INFLIGHT_CLEAR",
+      ts: new Date().toISOString(),
+      market, unit, count, key,
+      inFlight_size: candleInFlight.size,
+      total_elapsed_ms: Date.now() - t0_overall
+    }));
   }
 }
 
