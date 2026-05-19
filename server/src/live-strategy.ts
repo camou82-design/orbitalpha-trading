@@ -4403,6 +4403,9 @@ export function createLiveDataStrategy(opts: {
       }
 
       if (surgePolicyApplies && !reasonExit) {
+        const sig = latestAllSignals.get(market);
+        const payload = sig?.p;
+        const rise3mPct = payload ? Number(payload.rise_3m_pct ?? 0) : 0;
         const decision = evaluateSurgeExit(
           {
             ...p,
@@ -4411,9 +4414,49 @@ export function createLiveDataStrategy(opts: {
             volatility_pct: p.volatility_pct_at_entry ?? null,
           },
           now,
+          rise3mPct
         );
-        if (decision.runnerTrailActive !== (p as any).runner_trail_active) {
-          (p as any).runner_trail_active = decision.runnerTrailActive;
+        if (decision.runnerTrailActive !== (p as any).surge_runner_active) {
+          (p as any).surge_runner_active = decision.runnerTrailActive;
+        }
+
+        if (decision.reason === "SURGE_TP1_PARTIAL" || decision.reason === "SURGE_TP2_PARTIAL") {
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_PARTIAL_TAKE_PROFIT_DECISION_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              surge_entry_mode: (p as any).surge_entry_mode,
+              stage: decision.reason === "SURGE_TP1_PARTIAL" ? "TP1" : "TP2",
+              pnlPct: pnlGross,
+              maxPnlPct: p.max_pnl_pct,
+              currentPrice: now,
+              entryPrice: p.entry_price,
+              targetPct: decision.reason === "SURGE_TP1_PARTIAL" ? 1.5 : ((p as any).surge_entry_mode === "FAST_SURGE_PROBE" ? 3.5 : 5.0),
+              sellRatio: decision.ratio,
+              remainingQty: p.qty,
+              reason: decision.reason,
+              decision: decision.action === "sell" ? "partial_sell" : "hold"
+            }),
+          );
+        } else if (decision.reason === "SURGE_RUNNER_TRAILING_EXIT" || decision.reason === "SURGE_BREAKEVEN_PROTECT") {
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_RUNNER_TRAILING_DECISION_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              surge_entry_mode: (p as any).surge_entry_mode,
+              runnerActive: decision.runnerTrailActive,
+              currentPrice: now,
+              highestPriceAfterEntry: p.highest_price_after_entry,
+              drawdownFromHighPct: p.highest_price_after_entry > 0 ? ((p.highest_price_after_entry - now) / p.highest_price_after_entry) * 100 : 0,
+              trailingGapPct: (p as any).surge_trailing_gap_pct,
+              pnlPct: pnlGross,
+              maxPnlPct: p.max_pnl_pct,
+              decision: decision.action === "sell" ? "close_runner" : "hold",
+              reason: decision.reason
+            })
+          );
         }
 
         console.info(
@@ -4426,12 +4469,13 @@ export function createLiveDataStrategy(opts: {
             pnl_pct: pnlGross,
             max_pnl_pct: p.max_pnl_pct,
             hold_minutes: holdMin,
-            partial_tp_done: p.partial_tp_done,
+            surge_tp1_done: (p as any).surge_tp1_done,
+            surge_tp2_done: (p as any).surge_tp2_done,
             is_surge_position: true,
             decision_action: decision.action,
             decision_reason: decision.reason,
             exit_ratio: decision.ratio,
-            runner_trail_active: (p as any).runner_trail_active,
+            runner_trail_active: (p as any).surge_runner_active,
             authority_source: decision.authoritySource,
           }),
         );
@@ -4975,6 +5019,29 @@ export function createLiveDataStrategy(opts: {
         }),
       );
       if (isSurge) {
+        if (reasonExit === "SURGE_TP1_PARTIAL" || reasonExit === "SURGE_TP2_PARTIAL") {
+          console.info(JSON.stringify({
+            tag: "SURGE_PARTIAL_PLACESELL_ATTEMPT_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            stage: reasonExit === "SURGE_TP1_PARTIAL" ? "TP1" : "TP2",
+            sellQty: intendedSellQty,
+            sellRatio: ratio,
+            estimatedValueKrw: intendedSellValueKrw,
+            reason: reasonExit,
+            remainingQtyBefore: beforeQty
+          }));
+        } else if (reasonExit === "SURGE_RUNNER_TRAILING_EXIT" || reasonExit === "SURGE_BREAKEVEN_PROTECT") {
+          console.info(JSON.stringify({
+            tag: "SURGE_RUNNER_PLACESELL_ATTEMPT_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            sellQty: intendedSellQty,
+            remainingQty: beforeQty,
+            reason: reasonExit
+          }));
+        }
+
         console.info(
           JSON.stringify({
             tag: "SURGE_PLACESELL_ATTEMPT_PROOF",
@@ -5047,6 +5114,34 @@ export function createLiveDataStrategy(opts: {
           }),
         );
         if (isSurge) {
+          if (reasonExit === "SURGE_TP1_PARTIAL" || reasonExit === "SURGE_TP2_PARTIAL") {
+            const netProfitEst = placeSellOk ? Math.round(intendedSellQty * now * (1 - UPBIT_FEE_RATE) - intendedSellQty * p.entry_price * (1 + UPBIT_FEE_RATE)) : 0;
+            console.info(JSON.stringify({
+              tag: "SURGE_PARTIAL_PLACESELL_RESULT_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              stage: reasonExit === "SURGE_TP1_PARTIAL" ? "TP1" : "TP2",
+              ok: placeSellOk,
+              sellQty: intendedSellQty,
+              remainingQtyBefore: beforeQty,
+              remainingQtyAfter: placeSellOk ? Math.max(0, beforeQty - intendedSellQty) : beforeQty,
+              realizedPartialProfit: netProfitEst,
+              reason: reasonExit,
+              error_message: placeSellOk ? null : placeSellReason
+            }));
+          } else if (reasonExit === "SURGE_RUNNER_TRAILING_EXIT" || reasonExit === "SURGE_BREAKEVEN_PROTECT") {
+            console.info(JSON.stringify({
+              tag: "SURGE_RUNNER_PLACESELL_RESULT_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              ok: placeSellOk,
+              sellQty: intendedSellQty,
+              remainingQtyAfter: placeSellOk ? Math.max(0, beforeQty - intendedSellQty) : beforeQty,
+              reason: reasonExit,
+              error_message: placeSellOk ? null : placeSellReason
+            }));
+          }
+
           console.info(
             JSON.stringify({
               tag: "SURGE_PLACESELL_RESULT_PROOF",
@@ -5277,6 +5372,35 @@ export function createLiveDataStrategy(opts: {
             }),
           );
         }
+
+        if (reasonExit === "SURGE_TP1_PARTIAL" && !(p as any).surge_tp1_done) {
+          (p as any).surge_tp1_done = true;
+          p.partial_tp_at = new Date().toISOString();
+          p.realized_partial_profit += Math.round(netPnlKrw);
+          p.position_stage = "scaled_out_partial";
+          console.info(JSON.stringify({
+            tag: "DEBUG_SURGE_PARTIAL_TAKE_PROFIT_TP1",
+            ts: new Date().toISOString(),
+            symbol: market,
+            filled_qty: soldQty,
+            pnl_krw: Math.round(netPnlKrw),
+            stage: "scaled_out_partial_tp1"
+          }));
+        } else if (reasonExit === "SURGE_TP2_PARTIAL" && !(p as any).surge_tp2_done) {
+          (p as any).surge_tp2_done = true;
+          p.partial_tp_at = new Date().toISOString();
+          p.realized_partial_profit += Math.round(netPnlKrw);
+          p.position_stage = "scaled_out_partial";
+          console.info(JSON.stringify({
+            tag: "DEBUG_SURGE_PARTIAL_TAKE_PROFIT_TP2",
+            ts: new Date().toISOString(),
+            symbol: market,
+            filled_qty: soldQty,
+            pnl_krw: Math.round(netPnlKrw),
+            stage: "scaled_out_partial_tp2"
+          }));
+        }
+
         p.qty = qtyAfter;
         p.remaining_qty = qtyAfter;
       }

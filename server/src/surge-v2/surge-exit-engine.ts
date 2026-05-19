@@ -16,76 +16,83 @@ import { SurgeExitDecision } from "./surge-types.js";
  * 10. Partial Take Profit
  * 11. Hold
  */
-export function evaluateSurgeExit(pos: any, currentPx: number): SurgeExitDecision {
+export function evaluateSurgeExit(pos: any, currentPx: number, rise3mPct?: number): SurgeExitDecision {
   // Enforce zero-interference for legacy positions
   if (pos.strict_exit !== true) {
-    return { action: "hold", reason: "surge_hold", ratio: 0, runnerTrailActive: pos.runner_trail_active || false, authoritySource: "surge-v2" };
+    return { action: "hold", reason: "surge_hold", ratio: 0, runnerTrailActive: pos.surge_runner_active || false, authoritySource: "surge-v2" };
   }
 
-  const entryPrice = pos.entry_price;
+  const entryPrice = pos.entry_price || 0;
+  if (entryPrice <= 0) return { action: "hold", reason: "surge_hold", ratio: 0, runnerTrailActive: false, authoritySource: "surge-v2" };
+
   const pnlPct = ((currentPx - entryPrice) / entryPrice) * 100;
   const maxPnlPct = pos.max_pnl_pct || 0;
+  const highestPriceAfterEntry = pos.highest_price_after_entry || entryPrice;
   const entryTs = new Date(pos.entry_ts).getTime();
   const holdMinutes = (Date.now() - entryTs) / 60000;
-  const partialTpDone = pos.partial_tp_done || false;
-  let runnerTrailActive = pos.runner_trail_active || false;
+  
+  const tp1Done = pos.surge_tp1_done || false;
+  const tp2Done = pos.surge_tp2_done || false;
+  let runnerTrailActive = pos.surge_runner_active || false;
+  
+  const entryMode = pos.surge_entry_mode || "CONFIRMED_SURGE_ENTRY";
 
-  // Extract dynamic policies
+  // Dynamic policies
   const stopPrice = pos.surge_stop_price;
-  const takeProfitPrice = pos.surge_take_profit_price;
-  const trailingStartPct = pos.surge_trailing_start_pct ?? 3.0;
-  const trailingGapPct = pos.surge_trailing_gap_pct ?? 1.2;
+  // takeProfitPrice is now TP2 target price!
+  const tp2Price = pos.surge_take_profit_price;
+
+  let tp1Target = 1.5;
+  let tp2Target = entryMode === "FAST_SURGE_PROBE" ? 3.5 : 5.0;
+  let tp1Ratio = entryMode === "FAST_SURGE_PROBE" ? 0.4 : 0.3;
+  let tp2Ratio = 0.5;
+  let trailingStartPct = entryMode === "FAST_SURGE_PROBE" ? 2.0 : 3.0;
+  let trailingGapPct = pos.surge_trailing_gap_pct || (entryMode === "FAST_SURGE_PROBE" ? 1.5 : 2.0);
+  let breakevenProtectTrigger = entryMode === "FAST_SURGE_PROBE" ? 0.2 : 0.5;
 
   // Update Trailing State
-  if (maxPnlPct >= trailingStartPct) {
+  if (maxPnlPct >= trailingStartPct && (tp1Done || tp2Done)) {
     runnerTrailActive = true;
   }
 
-  // 1. Strict Stop Loss
-  if (stopPrice && currentPx <= stopPrice) {
-    return { action: "sell", reason: "surge_strict_stop_loss", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+  // 1. Hard Stop Loss
+  if (stopPrice > 0 && currentPx <= stopPrice) {
+    return { action: "sell", reason: "SURGE_STOP_LOSS", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
-  // 2. Strict Take Profit
-  if (takeProfitPrice && currentPx >= takeProfitPrice) {
-    return { action: "sell", reason: "surge_strict_take_profit", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+  // 2. Catastrophic Reversal
+  // Example: pnlPct <= -2% and momentum broken (rise3mPct <= 0)
+  if (pnlPct <= -2.0 && (rise3mPct !== undefined ? rise3mPct <= 0 : true)) {
+    return { action: "sell", reason: "SURGE_REVERSAL_CUT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
-  // 3. Strict Trailing Stop
-  if (runnerTrailActive && pnlPct <= maxPnlPct - trailingGapPct) {
-    return { action: "sell", reason: "surge_strict_trailing_exit", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+  // 3. TP1 Partial
+  if (!tp1Done && pnlPct >= tp1Target) {
+    return { action: "sell", reason: "SURGE_TP1_PARTIAL", ratio: tp1Ratio, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
-  // 4. Breakeven Protect
-  if (maxPnlPct >= 1.2 && pnlPct <= 0.15) {
-    return { action: "sell", reason: "surge_breakeven_protect", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+  // 4. TP2 Partial
+  if (tp1Done && !tp2Done && pnlPct >= tp2Target) {
+    return { action: "sell", reason: "SURGE_TP2_PARTIAL", ratio: tp2Ratio, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
-  // 5. Early Fail (No follow through)
-  if (holdMinutes >= 3 && maxPnlPct < 0.3 && pnlPct <= -0.3) {
-    return { action: "sell", reason: "surge_early_fail_no_follow_through", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+  // 5. Runner Trailing Exit
+  if (runnerTrailActive) {
+    const drawdownFromHighPct = ((highestPriceAfterEntry - currentPx) / highestPriceAfterEntry) * 100;
+    if (drawdownFromHighPct >= trailingGapPct) {
+      return { action: "sell", reason: "SURGE_RUNNER_TRAILING_EXIT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+    }
   }
 
-  // 6. Breakout Failed
-  if (holdMinutes >= 3 && holdMinutes <= 7 && maxPnlPct < 0.5 && pnlPct <= 0) {
-    return { action: "sell", reason: "surge_breakout_failed", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+  // 6. Breakeven Protect
+  if (maxPnlPct >= trailingStartPct && pnlPct <= breakevenProtectTrigger) {
+    return { action: "sell", reason: "SURGE_BREAKEVEN_PROTECT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
-  // 7. Timeout (No profit)
-  if (holdMinutes >= 15 && pnlPct < 0.8 && !partialTpDone) {
-    return { action: "sell", reason: "surge_timeout_no_profit", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+  // 7. Timeout Exit
+  if (holdMinutes >= 30 && pnlPct < 1.0 && !tp1Done) {
+    return { action: "sell", reason: "SURGE_TIMEOUT_EXIT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
-  // 8. Residual Timeout Exit
-  if (holdMinutes >= 45 && partialTpDone && pnlPct < 1.0) {
-    return { action: "sell", reason: "surge_residual_timeout_exit", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
-  }
-
-  // 9. Partial Take Profit
-  if (pnlPct >= 1.5 && !partialTpDone) {
-    return { action: "sell", reason: "surge_partial_take_profit", ratio: 0.4, runnerTrailActive, authoritySource: "surge-v2" };
-  }
-
-  // Hold
   return { action: "hold", reason: "surge_hold", ratio: 0, runnerTrailActive, authoritySource: "surge-v2" };
 }
