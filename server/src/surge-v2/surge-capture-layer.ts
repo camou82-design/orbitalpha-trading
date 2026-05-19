@@ -74,8 +74,18 @@ export function evaluateSurgeCaptureCandidate(input: {
   const rejectRisks: string[] = [];
 
   const volRatio = Number(input.payload.volume_ratio ?? input.payload.volume_multiple ?? 0);
-  const volumeAccel = volRatio; // Using payload volume ratio as proxy for 1m accel if not fully calculable
+  let volumeAccel = volRatio; // Fallback
   
+  if (input.candles1 && input.candles1.length >= 7) {
+    const last = input.candles1[input.candles1.length - 1];
+    const prev5 = input.candles1.slice(-6, -1);
+    const lastNotional = Number(last.trade_price ?? 0) * Number(last.candle_acc_trade_volume ?? 0);
+    const prevAvg = prev5.reduce((acc: number, c: any) => acc + (Number(c.trade_price ?? 0) * Number(c.candle_acc_trade_volume ?? 0)), 0) / Math.max(1, prev5.length);
+    if (prevAvg > 0) {
+      volumeAccel = lastNotional / prevAvg;
+    }
+  }
+
   // A. 거래량 가속도
   if (volumeAccel >= 3.0) {
     score += 45;
@@ -182,7 +192,8 @@ export function evaluateSurgeCaptureCandidate(input: {
 export function processSurgeCaptureQueue(
   queue: SurgeCaptureItem[],
   currentTickTs: number,
-  marketMap: Map<string, any>
+  marketMap: Map<string, any>,
+  currentTickLease: number
 ): {
   promoted: SurgeCaptureItem[];
   watchingCount: number;
@@ -202,8 +213,10 @@ export function processSurgeCaptureQueue(
 
     const currentPrice = marketData.currentPrice;
     const expiresAtMs = new Date(item.expires_at).getTime();
+    const itemLease = Number(item.tick_lease);
+    const maxTicks = Number(process.env.LIVE_SURGE_CAPTURE_TTL_TICKS ?? 3);
 
-    if (currentTickTs >= expiresAtMs) {
+    if (currentTickLease - itemLease >= maxTicks || currentTickTs >= expiresAtMs) {
       item.status = "EXPIRED";
       expiredCount++;
       continue;
@@ -214,8 +227,15 @@ export function processSurgeCaptureQueue(
     // Check Rejection Criteria
     if (priceChangePct <= -1.2 || marketData.volumeState === "faded" || marketData.btcCrashGuard) {
       item.status = "REJECTED";
-      item.reject_risks.push(priceChangePct <= -1.2 ? "price_drop_1.2pct" : "faded_or_crash");
+      const rejectReason = priceChangePct <= -1.2 ? "price_drop_1.2pct" : "faded_or_crash";
+      item.reject_risks.push(rejectReason);
       rejectedCount++;
+      console.info(JSON.stringify({
+        tag: "SURGE_CAPTURE_REJECTED_PROOF",
+        ts: new Date().toISOString(),
+        market: item.market,
+        reason: rejectReason
+      }));
       continue;
     }
 
@@ -255,8 +275,21 @@ export function processSurgeCaptureQueue(
       item.status = "PROMOTED";
       item.capture_grade = isConfirmed ? "HIGH" : "MID";
       promoted.push(item);
+      console.info(JSON.stringify({
+        tag: "SURGE_CAPTURE_PROMOTED_PROOF",
+        ts: new Date().toISOString(),
+        market: item.market,
+        capture_grade: item.capture_grade,
+        is_fast_probe: isFastProbe
+      }));
     } else {
       watchingCount++;
+      console.info(JSON.stringify({
+        tag: "SURGE_CAPTURE_WATCH_UPDATED_PROOF",
+        ts: new Date().toISOString(),
+        market: item.market,
+        confirm_count: item.confirm_count
+      }));
     }
   }
 

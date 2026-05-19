@@ -5827,20 +5827,26 @@ export function createLiveDataStrategy(opts: {
            btcCrashGuard: btcChange <= -0.025
          });
       }
-      const processResult = processSurgeCaptureQueue(surgeCaptureQueue, Date.now(), surgeCaptureMarketMap);
+      const processResult = processSurgeCaptureQueue(surgeCaptureQueue, Date.now(), surgeCaptureMarketMap, myLease);
       if (processResult.promoted.length > 0 || processResult.expiredCount > 0 || processResult.rejectedCount > 0) {
-        const pruned = surgeCaptureQueue.filter(q => q.status === "WATCHING" || (Date.now() - new Date(q.last_seen_at).getTime() < 600000));
+        let pruned = surgeCaptureQueue.filter(q => q.status === "WATCHING" || (Date.now() - new Date(q.last_seen_at).getTime() < 600000));
+        const maxWatch = Number(process.env.LIVE_SURGE_CAPTURE_MAX_WATCH ?? 12);
+        if (pruned.length > maxWatch) {
+          pruned.sort((a, b) => b.capture_score - a.capture_score);
+          pruned = pruned.slice(0, maxWatch);
+        }
         saveCaptureQueue(pruned);
       }
       if (processResult.promoted.length > 0) {
         console.info(JSON.stringify({
           tag: "SURGE_CAPTURE_QUEUE_SUMMARY",
           ts: new Date().toISOString(),
-          watching: processResult.watchingCount,
-          promoted: processResult.promoted.length,
-          expired: processResult.expiredCount,
-          rejected: processResult.rejectedCount,
-          promoted_markets: processResult.promoted.map(x => x.market)
+          watching_count: processResult.watchingCount,
+          promoted_count: processResult.promoted.length,
+          expired_count: processResult.expiredCount,
+          rejected_count: processResult.rejectedCount,
+          top_markets: processResult.promoted.map(x => x.market),
+          tick_lease: myLease
         }));
       }
       for (const p of processResult.promoted) {
@@ -5857,7 +5863,7 @@ export function createLiveDataStrategy(opts: {
               breakout: p.breakout,
               close_upper_hold: p.close_upper_hold,
               relative_strength: p.relative_strength,
-              filter_pass: true,
+              filter_pass: false,
               surge_capture_promoted: true
             }
           } as any);
@@ -8378,8 +8384,10 @@ export function createLiveDataStrategy(opts: {
           const surgeSetupFromCandidate = candidateMetaFromSetup?.surge_shadow_setup;
           const isPromoted = Boolean((sig.p as any).surge_capture_promoted);
           const alreadyInQueue = surgeCaptureQueue.some(q => q.market === market && (q.status === "WATCHING" || q.status === "PROMOTED"));
+          const payloadFilterPass = Boolean(sig.p?.filter_pass);
+          const fullyPassed = payloadFilterPass && (scannerBridgeScore ? scannerBridgeScore.pass : true);
           
-          if (!isPromoted && !alreadyInQueue) {
+          if (!isPromoted && !alreadyInQueue && !fullyPassed) {
              const evalCapture = evaluateSurgeCaptureCandidate({
                market, currentPrice, payload: sig.p, candles1: await fetchMinuteCandlesCached(market, 1, 12), candles5, marketState: { btc_5m_trend: marketState.btc_5m_trend, btc_15m_trend: marketState.btc_15m_trend, btc_change_24h: btcChange }, tickLease: String(myLease), sourceKind: sourceKindForJudgment
              });
