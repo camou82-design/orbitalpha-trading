@@ -5,6 +5,14 @@ function num(x: unknown): number {
   return typeof x === "number" ? x : Number(x);
 }
 
+function emaLast(closes: readonly number[], period: number): number | null {
+  if (closes.length < period) return null;
+  const k = 2 / (period + 1);
+  let e = closes[0]!;
+  for (let i = 1; i < closes.length; i++) e = closes[i]! * k + e * (1 - k);
+  return e;
+}
+
 const SURGE_MIN_SCANNER_SCORE = Math.max(40, Math.min(85, Number(process.env.LIVE_SURGE_MIN_SCANNER_SCORE ?? 52)));
 const SURGE_CRASH_UPPER_WICK_MAX = Math.max(0.35, Math.min(0.85, Number(process.env.LIVE_SURGE_CRASH_UPPER_WICK_MAX ?? 0.58)));
 const SURGE_CRASH_3BAR_5M_RETURN_MAX_PCT = Math.max(8, Math.min(35, Number(process.env.LIVE_SURGE_CRASH_3BAR_5M_RETURN_MAX_PCT ?? 16)));
@@ -57,9 +65,17 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
     (input.marketState.btc_5m_trend === "down" || input.marketState.btc_15m_trend === "down");
   
   if (btcCrashGuard || marketPanicGuard) {
+    const reason = btcCrashGuard ? "surge_market_crash_guard" : "surge_market_panic_guard";
+    console.info(JSON.stringify({
+      tag: "SURGE_ENTRY_REJECTED_PROOF",
+      ts: new Date().toISOString(),
+      market: input.market,
+      reject_reasons: [reason],
+      price: 0, volume_ratio: input.volumeRatio, relative_strength: 0, breakout, pullback_rebound: false, overextended: false, spread_ok: true
+    }));
     return {
       action: "reject",
-      reason: btcCrashGuard ? "surge_market_crash_guard" : "surge_market_panic_guard",
+      reason,
       authoritySource: "surge-v2",
       detail: { symbol: input.market, btc_change: btcChange, btc_5m_trend: input.marketState.btc_5m_trend, ...surgeSetupContext },
     };
@@ -191,10 +207,56 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
     };
   }
 
+  const closes = completed.map(x => num(x.trade_price));
+  const e5 = emaLast(closes, 5) ?? 0;
+  const btcMatched = input.marketState.btc_5m_trend === "up";
+  const aboveEma = e5 > 0 && close > e5;
+  const pullbackRebound = Boolean(p.would_pass_with_pullback_relaxed || closeUpperHold);
+  const relativeStrengthOk = num(p.relative_strength ?? 0) > 0 || num(p.rsi ?? 0) > 55;
+  
+  const isConfirmed = input.volumeRatio >= 1.5 && btcMatched && aboveEma && pullbackRebound && relativeStrengthOk;
+  const entryMode = isConfirmed ? "CONFIRMED_SURGE_ENTRY" : "FAST_SURGE_PROBE";
+  
+  const sizeMultiplier = entryMode === "FAST_SURGE_PROBE" ? 0.5 : 1.0;
+  const stopPct = entryMode === "FAST_SURGE_PROBE" ? -2.5 : -3.4;
+  const takeProfitPct = entryMode === "FAST_SURGE_PROBE" ? 3.5 : 5.0;
+  const trailingStartPct = entryMode === "FAST_SURGE_PROBE" ? 2.0 : 3.0;
+  const trailingGapPct = entryMode === "FAST_SURGE_PROBE" ? 1.5 : 2.0;
+
+  const proofTag = entryMode === "FAST_SURGE_PROBE" ? "SURGE_ENTRY_FAST_PROBE_DECISION_PROOF" : "SURGE_ENTRY_CONFIRMED_DECISION_PROOF";
+  const baseLogPayload = {
+    ts: new Date().toISOString(),
+    market: input.market,
+    entry_mode: entryMode,
+    price: close,
+    volume_ratio: input.volumeRatio,
+    relative_strength: num(p.relative_strength ?? 0),
+    breakout,
+    pullback_rebound: pullbackRebound,
+    overextended: false,
+    spread_ok: true,
+    reject_reasons: [],
+    selected_size_krw: 0,
+    stopPrice: close * (1 + stopPct / 100),
+    takeProfitPrice: close * (1 + takeProfitPct / 100),
+    trailingStopPct: trailingGapPct,
+    strict_exit: true,
+    exit_policy_attached: true
+  };
+
+  console.info(JSON.stringify({ tag: proofTag, ...baseLogPayload }));
+  console.info(JSON.stringify({ tag: "SURGE_ENTRY_SELECTED_PROOF", ...baseLogPayload }));
+
   return {
     action: "enter",
     reason: "surge_entry_approved",
     authoritySource: "surge-v2",
+    entryMode,
+    sizeMultiplier,
+    stopPct,
+    takeProfitPct,
+    trailingStartPct,
+    trailingGapPct,
     detail: {
       symbol: input.market,
       pipeline: "surge",

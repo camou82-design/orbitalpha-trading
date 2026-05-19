@@ -73,6 +73,14 @@ type TradeState = {
       breakeven_arm_pct: number;
       partial_take_profit_pct: number;
       trailing_from_peak_pct: number;
+      
+      // SURGE V2 specific
+      strict_exit?: boolean;
+      exit_policy_attached?: boolean;
+      surge_stop_price?: number;
+      surge_take_profit_price?: number;
+      surge_trailing_start_pct?: number;
+      surge_trailing_gap_pct?: number;
     }
   >;
   legacyBuckets: Record<ManagedMarket, LegacyBucketState>;
@@ -704,6 +712,16 @@ export function createTradeControl(
         pos.breakeven_arm_pct = rule.breakeven_arm_pct;
         pos.partial_take_profit_pct = rule.partial_take_profit_pct;
         pos.trailing_from_peak_pct = rule.trailing_from_peak_pct;
+        
+        if (signalPayload && typeof signalPayload === "object") {
+          const sp = signalPayload as any;
+          if (sp.strict_exit === true) pos.strict_exit = true;
+          if (sp.exit_policy_attached === true) pos.exit_policy_attached = true;
+          if (typeof sp.surge_stop_price === "number") pos.surge_stop_price = sp.surge_stop_price;
+          if (typeof sp.surge_take_profit_price === "number") pos.surge_take_profit_price = sp.surge_take_profit_price;
+          if (typeof sp.surge_trailing_start_pct === "number") pos.surge_trailing_start_pct = sp.surge_trailing_start_pct;
+          if (typeof sp.surge_trailing_gap_pct === "number") pos.surge_trailing_gap_pct = sp.surge_trailing_gap_pct;
+        }
       }
       if (bucket === "legacy") {
         if (!state.legacyBuckets[market]) {

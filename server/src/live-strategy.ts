@@ -4315,7 +4315,7 @@ export function createLiveDataStrategy(opts: {
       }
       const holdMin = minutesSince(p.entry_ts);
       const isSurge = isSurgePosition(p);
-      const surgePolicyApplies = isSurge && p.entry_origin === "auto_trade" && p.entry_mode === "SURGE_V2";
+      const surgePolicyApplies = isSurge && p.entry_origin === "auto_trade" && p.entry_mode === "SURGE_V2" && p.strict_exit === true;
 
       if (isSurge && !surgePolicyApplies) {
         console.info(
@@ -8268,6 +8268,7 @@ export function createLiveDataStrategy(opts: {
       }
 
       let entryPipelineDetail: Record<string, unknown> = {};
+      let surgeDecisionMetrics: any = null;
       try {
         const candles5 = await fetchMinuteCandlesCached(market, 5, 48);
         const staleOk =
@@ -8350,6 +8351,7 @@ export function createLiveDataStrategy(opts: {
             continue;
           }
           entryPipelineDetail = { ...decision.detail, entry_pipeline: "surge" };
+          surgeDecisionMetrics = decision;
         } else {
           let pr = evaluateSpotLongEntryPipeline({
             market,
@@ -8878,17 +8880,33 @@ export function createLiveDataStrategy(opts: {
         continue;
       }
       const strategyType: StrategyType = marketState.market_state === "risk_on" ? "momentum" : "stable";
-      const signalPayloadForBuy = {
+      const signalPayloadForBuy: any = {
         ...sig.p,
         __allow_risk_scaled_entry: true,
         __strong_symbol_override: strongSymbolOverride,
         __risk_off_exception_reason: exception?.reason,
       };
 
-      // SURGE_V2: stopPrice must be precomputed before LIVE_PLACEBUY_ATTEMPT.
       const finalMeta = candidateMeta.find((x) => x.market === market) ?? null;
-      const surgeStopPrice = isSurgeSource ? Number(finalMeta?.stopPrice ?? 0) : 0;
-      const surgeStopReason = isSurgeSource ? String(finalMeta?.setupReason ?? "candidate_meta_stop") : "";
+      let surgeStopPrice = isSurgeSource ? Number(finalMeta?.stopPrice ?? 0) : 0;
+      let surgeStopReason = isSurgeSource ? String(finalMeta?.setupReason ?? "candidate_meta_stop") : "";
+      
+      if (isSurgeSource && surgeDecisionMetrics) {
+         signalPayloadForBuy.strict_exit = true;
+         signalPayloadForBuy.exit_policy_attached = true;
+         
+         const currentPx = currentPrice > 0 ? currentPrice : Number(priceBy.get(market) ?? 0);
+         if (currentPx > 0) {
+           surgeStopPrice = currentPx * (1 + surgeDecisionMetrics.stopPct / 100);
+           const takeProfitPrice = currentPx * (1 + surgeDecisionMetrics.takeProfitPct / 100);
+           signalPayloadForBuy.surge_stop_price = surgeStopPrice;
+           signalPayloadForBuy.surge_take_profit_price = takeProfitPrice;
+           signalPayloadForBuy.surge_trailing_start_pct = surgeDecisionMetrics.trailingStartPct;
+           signalPayloadForBuy.surge_trailing_gap_pct = surgeDecisionMetrics.trailingGapPct;
+           surgeStopReason = "surge_v2_engine_stop";
+         }
+      }
+
       const surgeRiskPct =
         isSurgeSource && currentPrice > 0 && surgeStopPrice > 0
           ? Number((((currentPrice - surgeStopPrice) / currentPrice) * 100).toFixed(4))
