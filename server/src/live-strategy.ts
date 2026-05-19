@@ -5223,24 +5223,6 @@ export function createLiveDataStrategy(opts: {
         realized_partial_profit: p.realized_partial_profit,
         final_net_pnl_pct: netPnlPctValue,
       };
-      state.trades.push(row);
-      if (isSurge) {
-        console.info(
-          JSON.stringify({
-            tag: "SURGE_POSITION_CLOSED_PROOF",
-            ts: new Date().toISOString(),
-            market,
-            position_id: p.position_id ?? `${market}|${p.entry_ts}`,
-            opened_at: p.entry_ts,
-            filled_qty: soldQty,
-            filled_price: now,
-            pnl_pct: netPnlPctValue,
-            pnl_krw: Math.round(netPnlKrw),
-            exit_reason: reasonExit,
-            open_positions_after: qtyAfter <= 0 ? Math.max(0, Object.keys(state.positions).length - 1) : Object.keys(state.positions).length,
-          }),
-        );
-      }
       console.info(
         JSON.stringify({
           tag: "DEBUG_LIVE_SELL_FILLED",
@@ -5341,6 +5323,25 @@ export function createLiveDataStrategy(opts: {
           net_pnl_pct: netPnlPctValue,
           held_seconds: Math.floor((Date.now() - Date.parse(p.entry_ts)) / 1000),
         });
+
+        state.trades.push(row);
+        if (isSurge) {
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_POSITION_CLOSED_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              position_id: p.position_id ?? `${market}|${p.entry_ts}`,
+              opened_at: p.entry_ts,
+              filled_qty: soldQty,
+              filled_price: now,
+              pnl_pct: netPnlPctValue,
+              pnl_krw: Math.round(netPnlKrw),
+              exit_reason: reasonExit,
+              open_positions_after: Math.max(0, Object.keys(state.positions).length - 1),
+            }),
+          );
+        }
       } else {
         if (!p.partial_tp_done && (reasonExit === "partial_take_profit" || reasonExit === "partial_take_profit_1st_strict")) {
           p.partial_tp_done = true;

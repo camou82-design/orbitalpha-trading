@@ -23,9 +23,7 @@ export function evaluateSurgeExit(pos: any, currentPx: number, rise3mPct?: numbe
   }
 
   const entryPrice = pos.entry_price || 0;
-  if (entryPrice <= 0) return { action: "hold", reason: "surge_hold", ratio: 0, runnerTrailActive: false, authoritySource: "surge-v2" };
-
-  const pnlPct = ((currentPx - entryPrice) / entryPrice) * 100;
+  const pnlPct = entryPrice > 0 ? ((currentPx - entryPrice) / entryPrice) * 100 : 0;
   const maxPnlPct = pos.max_pnl_pct || 0;
   const highestPriceAfterEntry = pos.highest_price_after_entry || entryPrice;
   const entryTs = new Date(pos.entry_ts).getTime();
@@ -43,12 +41,31 @@ export function evaluateSurgeExit(pos: any, currentPx: number, rise3mPct?: numbe
   const tp2Price = pos.surge_take_profit_price;
 
   let tp1Target = 1.5;
-  let tp2Target = entryMode === "FAST_SURGE_PROBE" ? 3.5 : 5.0;
   let tp1Ratio = entryMode === "FAST_SURGE_PROBE" ? 0.4 : 0.3;
   let tp2Ratio = 0.5;
   let trailingStartPct = entryMode === "FAST_SURGE_PROBE" ? 2.0 : 3.0;
   let trailingGapPct = pos.surge_trailing_gap_pct || (entryMode === "FAST_SURGE_PROBE" ? 1.5 : 2.0);
   let breakevenProtectTrigger = entryMode === "FAST_SURGE_PROBE" ? 0.2 : 0.5;
+
+  if (
+    entryPrice <= 0 || !Number.isFinite(entryPrice) ||
+    currentPx <= 0 || !Number.isFinite(currentPx) ||
+    stopPrice <= 0 || !Number.isFinite(stopPrice) ||
+    tp2Price <= 0 || !Number.isFinite(tp2Price) ||
+    trailingGapPct <= 0 || !Number.isFinite(trailingGapPct)
+  ) {
+    console.info(JSON.stringify({
+      tag: "SURGE_EXIT_POLICY_INVALID_PROOF",
+      ts: new Date().toISOString(),
+      entryPrice,
+      currentPx,
+      stopPrice,
+      tp2Price,
+      trailingGapPct,
+      reason: "invalid_prices_or_gap_detected"
+    }));
+    return { action: "hold", reason: "surge_hold", ratio: 0, runnerTrailActive: false, authoritySource: "surge-v2" };
+  }
 
   // Update Trailing State
   if (maxPnlPct >= trailingStartPct && (tp1Done || tp2Done)) {
@@ -72,7 +89,7 @@ export function evaluateSurgeExit(pos: any, currentPx: number, rise3mPct?: numbe
   }
 
   // 4. TP2 Partial
-  if (tp1Done && !tp2Done && pnlPct >= tp2Target) {
+  if (tp1Done && !tp2Done && currentPx >= tp2Price) {
     return { action: "sell", reason: "SURGE_TP2_PARTIAL", ratio: tp2Ratio, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
