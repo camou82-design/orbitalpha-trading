@@ -19,6 +19,12 @@ import {
 } from "./upbit-public.js";
 import { LogDeduper } from "./log-deduper.js";
 import {
+  evaluateSurgeCaptureCandidate,
+  loadCaptureQueue,
+  processSurgeCaptureQueue,
+  saveCaptureQueue,
+} from "./surge-v2/surge-capture-layer.js";
+import {
   LIVE_ENTRY_SIGNAL_GATES,
   RECOVERY_EXIT_CONFIG,
   STRATEGY_RISK_CONFIG,
@@ -2338,6 +2344,7 @@ export function createLiveDataStrategy(opts: {
     const tickAbort = new AbortController();
     liveTickAbort = tickAbort;
     const tickSignal = tickAbort.signal;
+    const surgeCaptureQueue = loadCaptureQueue();
     const myLease = (liveTickLeaseSeq += 1);
     liveTickValidLease = myLease;
 
@@ -3591,8 +3598,9 @@ export function createLiveDataStrategy(opts: {
     // 보유 포지션 평가/표시 보강 + BTC 기준가 보강(레짐/스케일 계산용)
     const heldExtraSymbols = Array.from(new Set(["KRW-BTC", ...Array.from(heldSymbolSet)])).filter((m) => m.startsWith("KRW-"));
     // CORE_TRADE 6종은 이후 entry_universe에 강제 병합되므로 배치 티커 요청에 반드시 포함(누락 시 candidate_meta entry_price=0 방지).
+    const captureQueueMarkets = surgeCaptureQueue.filter(q => q.status === "WATCHING").map(q => q.market);
     const tickerRequestedSymbols = Array.from(
-      new Set([...baseInputSymbols, ...heldExtraSymbols, ...(CORE_TRADE_MARKETS as readonly string[])]),
+      new Set([...baseInputSymbols, ...heldExtraSymbols, ...captureQueueMarkets, ...(CORE_TRADE_MARKETS as readonly string[])]),
     );
     console.info(
       JSON.stringify({
@@ -5795,6 +5803,74 @@ export function createLiveDataStrategy(opts: {
     ]);
     const candidateMetaMap = new Map<string, CandidateMeta>();
     const evaluationDroppedReasons: Record<string, string> = {};
+
+    const surgeCaptureMarketMap = new Map<string, any>();
+    if (surgeCaptureQueue.length > 0) {
+      for (const q of surgeCaptureQueue) {
+         if (q.status !== "WATCHING") continue;
+         const px = priceBy.get(q.market) || 0;
+         let volumeState = "alive";
+         try {
+             const c1 = await fetchMinuteCandlesCached(q.market, 1, 12);
+             if (c1.length >= 7) {
+               const last = c1[c1.length - 1];
+               const prev5 = c1.slice(-6, -1);
+               const lastNotional = Number(last.trade_price ?? 0) * Number(last.candle_acc_trade_volume ?? 0);
+               const prevAvg = prev5.reduce((a, b) => a + Number(b.trade_price ?? 0)*Number(b.candle_acc_trade_volume ?? 0), 0) / Math.max(1, prev5.length);
+               if (prevAvg > 0 && lastNotional / prevAvg < 0.65) volumeState = "faded";
+             }
+         } catch {}
+         const btcChange = Number((tstatus as any)?.btc_change_24h ?? 0);
+         surgeCaptureMarketMap.set(q.market, {
+           currentPrice: px,
+           volumeState,
+           btcCrashGuard: btcChange <= -0.025
+         });
+      }
+      const processResult = processSurgeCaptureQueue(surgeCaptureQueue, Date.now(), surgeCaptureMarketMap);
+      if (processResult.promoted.length > 0 || processResult.expiredCount > 0 || processResult.rejectedCount > 0) {
+        const pruned = surgeCaptureQueue.filter(q => q.status === "WATCHING" || (Date.now() - new Date(q.last_seen_at).getTime() < 600000));
+        saveCaptureQueue(pruned);
+      }
+      if (processResult.promoted.length > 0) {
+        console.info(JSON.stringify({
+          tag: "SURGE_CAPTURE_QUEUE_SUMMARY",
+          ts: new Date().toISOString(),
+          watching: processResult.watchingCount,
+          promoted: processResult.promoted.length,
+          expired: processResult.expiredCount,
+          rejected: processResult.rejectedCount,
+          promoted_markets: processResult.promoted.map(x => x.market)
+        }));
+      }
+      for (const p of processResult.promoted) {
+        if (!latestAllSignals.has(p.market)) {
+          latestAllSignals.set(p.market, {
+            ts: p.last_seen_at,
+            p: {
+              v: 2,
+              market: p.market,
+              signal_type: "MID",
+              source_kind: p.source_kind,
+              volume_ratio: p.volume_multiple,
+              scanner_score: p.scanner_score,
+              breakout: p.breakout,
+              close_upper_hold: p.close_upper_hold,
+              relative_strength: p.relative_strength,
+              filter_pass: true,
+              surge_capture_promoted: true
+            }
+          } as any);
+        } else {
+          const existingSig = latestAllSignals.get(p.market);
+          if (existingSig && existingSig.p) {
+            (existingSig.p as any).surge_capture_promoted = true;
+          }
+        }
+        if (!entryUniverse.includes(p.market)) entryUniverse.push(p.market);
+      }
+    }
+
     const candidateMetaSettled = await racePhase("candidate_meta_parallel", PHASE_MS.candidate_meta_parallel, () =>
       Promise.allSettled(
         entryUniverse.map(async (m) => {
@@ -8300,6 +8376,67 @@ export function createLiveDataStrategy(opts: {
         const surgeSourceKindLog = payloadSourceKind || sourceKindForJudgment;
         if (isSurgeSource) {
           const surgeSetupFromCandidate = candidateMetaFromSetup?.surge_shadow_setup;
+          const isPromoted = Boolean((sig.p as any).surge_capture_promoted);
+          const alreadyInQueue = surgeCaptureQueue.some(q => q.market === market && (q.status === "WATCHING" || q.status === "PROMOTED"));
+          
+          if (!isPromoted && !alreadyInQueue) {
+             const evalCapture = evaluateSurgeCaptureCandidate({
+               market, currentPrice, payload: sig.p, candles1: await fetchMinuteCandlesCached(market, 1, 12), candles5, marketState: { btc_5m_trend: marketState.btc_5m_trend, btc_15m_trend: marketState.btc_15m_trend, btc_change_24h: btcChange }, tickLease: String(myLease), sourceKind: sourceKindForJudgment
+             });
+             console.info(JSON.stringify({
+               tag: "SURGE_CAPTURE_EVALUATED_PROOF",
+               ts: new Date().toISOString(),
+               market,
+               score: evalCapture.score,
+               grade: evalCapture.grade,
+               pass: evalCapture.pass,
+               reject_risks: evalCapture.rejectRisks
+             }));
+             if (evalCapture.pass) {
+               surgeCaptureQueue.push({
+                 market,
+                 first_seen_at: new Date().toISOString(),
+                 last_seen_at: new Date().toISOString(),
+                 expires_at: new Date(Date.now() + 3 * 10000).toISOString(),
+                 tick_lease: String(myLease),
+                 capture_score: evalCapture.score,
+                 capture_grade: evalCapture.grade,
+                 source_kind: sourceKindForJudgment,
+                 scanner_score: Number(sig.p.scanner_score ?? sig.p.signal_score ?? 0),
+                 volume_multiple: Number(sig.p.volume_ratio ?? 0),
+                 volume_accel_1m: evalCapture.volumeAccel,
+                 near_high_pct: evalCapture.nearHighPct,
+                 breakout: Boolean(sig.p.breakout),
+                 close_upper_hold: Boolean(sig.p.close_upper_hold),
+                 relative_strength: Number(sig.p.relative_strength ?? 0),
+                 btc_5m_trend: marketState.btc_5m_trend ?? "flat",
+                 btc_15m_trend: marketState.btc_15m_trend ?? "flat",
+                 btc_change_24h: btcChange,
+                 reject_risks: evalCapture.rejectRisks,
+                 confirm_count: 1,
+                 last_price: currentPrice,
+                 high_price_reference: Math.max(localHigh ?? 0, currentPrice),
+                 status: "WATCHING"
+               });
+               saveCaptureQueue(surgeCaptureQueue);
+               console.info(JSON.stringify({
+                 tag: "SURGE_CAPTURE_WATCH_REGISTERED_PROOF",
+                 ts: new Date().toISOString(),
+                 market,
+                 expires_at: new Date(Date.now() + 3 * 10000).toISOString()
+               }));
+             }
+             emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "surge_capture_watching_or_rejected" });
+             logPlacebuyFinalGateBlocked("surge_capture_gate", { entry_mode: "SURGE_V2", base_gate_blocked_detail: "surge_capture_watching_or_rejected" });
+             continue;
+          }
+          
+          if (!isPromoted && alreadyInQueue) {
+             emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "surge_capture_already_watching" });
+             logPlacebuyFinalGateBlocked("surge_capture_gate", { entry_mode: "SURGE_V2", base_gate_blocked_detail: "surge_capture_already_watching" });
+             continue;
+          }
+
           const decision = evaluateSurgeEntryPipeline({
             market,
             payload: sig.p,
