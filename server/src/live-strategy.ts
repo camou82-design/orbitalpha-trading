@@ -170,6 +170,7 @@ type StrategyPosition = {
   /** 복원 시 없으면 기존 보유 — 신규만 엄격 손익 곡선 */
   strict_exit?: boolean;
   exit_policy_attached?: boolean;
+  surge_entry_mode?: string;
   surge_stop_price?: number;
   surge_take_profit_price?: number;
   surge_trailing_start_pct?: number;
@@ -4409,7 +4410,7 @@ export function createLiveDataStrategy(opts: {
 
         console.info(
           JSON.stringify({
-            tag: "SURGE_V2_EXIT_DECISION_PROOF",
+            tag: "SURGE_EXIT_DECISION_PROOF",
             ts: new Date().toISOString(),
             market,
             entry_price: p.entry_price,
@@ -8912,6 +8913,7 @@ export function createLiveDataStrategy(opts: {
 
       const finalMeta = candidateMeta.find((x) => x.market === market) ?? null;
       let surgeStopPrice = isSurgeSource ? Number(finalMeta?.stopPrice ?? 0) : 0;
+      let surgeTakeProfitPrice = 0;
       let surgeStopReason = isSurgeSource ? String(finalMeta?.setupReason ?? "candidate_meta_stop") : "";
       
       if (isSurgeSource && surgeDecisionMetrics) {
@@ -8921,9 +8923,9 @@ export function createLiveDataStrategy(opts: {
          const currentPx = currentPrice > 0 ? currentPrice : Number(priceBy.get(market) ?? 0);
          if (currentPx > 0) {
            surgeStopPrice = currentPx * (1 + surgeDecisionMetrics.stopPct / 100);
-           const takeProfitPrice = currentPx * (1 + surgeDecisionMetrics.takeProfitPct / 100);
+           surgeTakeProfitPrice = currentPx * (1 + surgeDecisionMetrics.takeProfitPct / 100);
            signalPayloadForBuy.surge_stop_price = surgeStopPrice;
-           signalPayloadForBuy.surge_take_profit_price = takeProfitPrice;
+           signalPayloadForBuy.surge_take_profit_price = surgeTakeProfitPrice;
            signalPayloadForBuy.surge_trailing_start_pct = surgeDecisionMetrics.trailingStartPct;
            signalPayloadForBuy.surge_trailing_gap_pct = surgeDecisionMetrics.trailingGapPct;
            surgeStopReason = "surge_v2_engine_stop";
@@ -9089,10 +9091,10 @@ export function createLiveDataStrategy(opts: {
             ts: new Date().toISOString(),
             market,
             entry_mode: surgeDecisionMetrics?.entryMode ?? "UNKNOWN",
-            selected_size_krw: finalOrderKrwValue,
+            selected_size_krw: orderKrw,
             stopPrice: surgeStopPrice,
-            takeProfitPrice: surgeDecisionMetrics?.detail?.takeProfitPrice,
-            trailingStopPct: surgeDecisionMetrics?.detail?.trailingStopPct,
+            takeProfitPrice: surgeTakeProfitPrice,
+            trailingStopPct: surgeDecisionMetrics?.trailingGapPct,
             strict_exit: true,
             exit_policy_attached: true
           })
@@ -9310,6 +9312,7 @@ export function createLiveDataStrategy(opts: {
         engine_bucket: isSurgeSource ? "surge" : "core",
         entry_origin: "auto_trade",
         entry_mode: isSurgeSource ? "SURGE_V2" : "CORE",
+        surge_entry_mode: isSurgeSource ? surgeDecisionMetrics?.entryMode : undefined,
         managed: true,
         market_state_at_entry: marketState.market_state,
         btc_tier_at_entry: btcTierNow,
@@ -9341,7 +9344,7 @@ export function createLiveDataStrategy(opts: {
         strict_exit: true,
         exit_policy_attached: isSurgeSource ? true : undefined,
         surge_stop_price: isSurgeSource ? surgeStopPrice : undefined,
-        surge_take_profit_price: isSurgeSource ? surgeDecisionMetrics?.detail?.takeProfitPrice : undefined,
+        surge_take_profit_price: isSurgeSource ? surgeTakeProfitPrice : undefined,
         surge_trailing_start_pct: isSurgeSource ? surgeDecisionMetrics?.trailingStartPct : undefined,
         surge_trailing_gap_pct: isSurgeSource ? surgeDecisionMetrics?.trailingGapPct : undefined,
         position_id: `${market}|${new Date().toISOString()}`,
@@ -9372,7 +9375,7 @@ export function createLiveDataStrategy(opts: {
             market,
             engine_bucket: "surge",
             stopPrice: surgeStopPrice,
-            takeProfitPrice: surgeDecisionMetrics?.detail?.takeProfitPrice,
+            takeProfitPrice: surgeTakeProfitPrice,
             trailingStartPct: surgeDecisionMetrics?.trailingStartPct,
             trailingGapPct: surgeDecisionMetrics?.trailingGapPct,
             strict_exit: true,
