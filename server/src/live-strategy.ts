@@ -8413,7 +8413,6 @@ export function createLiveDataStrategy(opts: {
                  market,
                  first_seen_at: new Date().toISOString(),
                  last_seen_at: new Date().toISOString(),
-                 expires_at: new Date(Date.now() + 3 * 10000).toISOString(),
                  tick_lease: String(myLease),
                  capture_score: evalCapture.score,
                  capture_grade: evalCapture.grade,
@@ -8438,8 +8437,7 @@ export function createLiveDataStrategy(opts: {
                console.info(JSON.stringify({
                  tag: "SURGE_CAPTURE_WATCH_REGISTERED_PROOF",
                  ts: new Date().toISOString(),
-                 market,
-                 expires_at: new Date(Date.now() + 3 * 10000).toISOString()
+                 market
                }));
              }
              emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "surge_capture_watching_or_rejected" });

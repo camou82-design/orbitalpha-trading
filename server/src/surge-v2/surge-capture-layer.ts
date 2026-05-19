@@ -5,7 +5,6 @@ export interface SurgeCaptureItem {
   market: string;
   first_seen_at: string;
   last_seen_at: string;
-  expires_at: string;
   tick_lease: string;
   capture_score: number;
   capture_grade: "LOW" | "MID" | "HIGH";
@@ -293,11 +292,12 @@ export function processSurgeCaptureQueue(
       const promotionReasons = [];
       if (isConfirmed) promotionReasons.push("confirmed_conditions_met");
       if (isFastProbe) promotionReasons.push("fast_probe_conditions_met");
+      const promotedToMode = isConfirmed ? "CONFIRMED_SURGE_ENTRY" : "FAST_SURGE_PROBE";
       console.info(JSON.stringify({
         tag: "SURGE_CAPTURE_PROMOTED_PROOF",
         ts: new Date().toISOString(),
         market: item.market,
-        promoted_to: "latestAllSignals",
+        promoted_to: promotedToMode,
         capture_score: item.capture_score,
         confirm_count: item.confirm_count,
         promotion_reasons: promotionReasons,
