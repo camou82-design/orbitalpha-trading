@@ -5864,13 +5864,21 @@ export function createLiveDataStrategy(opts: {
               close_upper_hold: p.close_upper_hold,
               relative_strength: p.relative_strength,
               filter_pass: false,
-              surge_capture_promoted: true
+              surge_capture_promoted: true,
+              surge_capture_score: p.capture_score,
+              surge_capture_confirm_count: p.confirm_count,
+              surge_capture_volume_accel_1m: p.volume_accel_1m,
+              surge_capture_near_high_pct: p.near_high_pct
             }
           } as any);
         } else {
           const existingSig = latestAllSignals.get(p.market);
           if (existingSig && existingSig.p) {
             (existingSig.p as any).surge_capture_promoted = true;
+            (existingSig.p as any).surge_capture_score = p.capture_score;
+            (existingSig.p as any).surge_capture_confirm_count = p.confirm_count;
+            (existingSig.p as any).surge_capture_volume_accel_1m = p.volume_accel_1m;
+            (existingSig.p as any).surge_capture_near_high_pct = p.near_high_pct;
           }
         }
         if (!entryUniverse.includes(p.market)) entryUniverse.push(p.market);
@@ -8463,6 +8471,11 @@ export function createLiveDataStrategy(opts: {
             surgeSetupScore: surgeSetupFromCandidate?.score,
             surgeSetupGrade: surgeSetupFromCandidate?.grade,
             failedSurgeConditions: surgeSetupFromCandidate?.failed_conditions,
+            capturePromoted: isPromoted,
+            captureScore: (sig.p as any).surge_capture_score,
+            captureConfirmCount: (sig.p as any).surge_capture_confirm_count,
+            captureVolumeAccel1m: (sig.p as any).surge_capture_volume_accel_1m,
+            captureNearHighPct: (sig.p as any).surge_capture_near_high_pct
           });
 
           console.info(
@@ -9260,6 +9273,7 @@ export function createLiveDataStrategy(opts: {
         }),
       );
       if (isSurgeSource) {
+        const isPromoted = Boolean((sig.p as any).surge_capture_promoted);
         console.info(
           JSON.stringify({
             tag: "SURGE_ENTRY_SELECTED_PROOF",
@@ -9271,7 +9285,13 @@ export function createLiveDataStrategy(opts: {
             takeProfitPrice: surgeTakeProfitPrice,
             trailingStopPct: surgeDecisionMetrics?.trailingGapPct,
             strict_exit: true,
-            exit_policy_attached: true
+            exit_policy_attached: true,
+            ...(isPromoted ? {
+              capture_promoted: true,
+              capture_score: (sig.p as any).surge_capture_score,
+              capture_confirm_count: (sig.p as any).surge_capture_confirm_count,
+              capture_promoted_from: "SURGE_CAPTURE_LAYER"
+            } : {})
           })
         );
       }

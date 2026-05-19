@@ -42,6 +42,11 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
   surgeSetupScore?: number;
   surgeSetupGrade?: string;
   failedSurgeConditions?: string[];
+  capturePromoted?: boolean;
+  captureScore?: number;
+  captureConfirmCount?: number;
+  captureVolumeAccel1m?: number;
+  captureNearHighPct?: number;
 }>): SurgeEntryDecision {
   const p = (input.payload && typeof input.payload === "object" ? input.payload : {}) as Record<string, unknown>;
   const sourceKind = String(p.source_kind ?? "");
@@ -90,12 +95,56 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
     };
   }
   if (!filterPass) {
-    return {
-      action: "reject",
-      reason: "blocked_surge_filter",
-      authoritySource: "surge-v2",
-      detail: { symbol: input.market, sub: "filter_pass_false", source_kind: sourceKind, ...surgeSetupContext },
-    };
+    if (input.capturePromoted) {
+      const minScore = Number(process.env.LIVE_SURGE_CAPTURE_MIN_SCORE ?? 55);
+      const minVol = Number(process.env.LIVE_SURGE_CAPTURE_MIN_VOLUME_ACCEL ?? 1.6);
+      const cScore = input.captureScore ?? 0;
+      const cConf = input.captureConfirmCount ?? 0;
+      const cVol = input.captureVolumeAccel1m ?? 0;
+      const cNearHigh = input.captureNearHighPct ?? -100;
+
+      const isStructureOk = breakout || closeUpperHold || cNearHigh >= -0.6;
+      const isBtcOk = input.marketState.btc_5m_trend !== "down";
+
+      if (cScore >= minScore && cConf >= 2 && cVol >= minVol && isStructureOk && isBtcOk) {
+         console.info(JSON.stringify({
+            tag: "SURGE_CAPTURE_PROMOTION_GATE_PROOF",
+            ts: new Date().toISOString(),
+            market: input.market,
+            capture_score: cScore,
+            confirm_count: cConf,
+            volume_accel_1m: cVol,
+            structure_ok: isStructureOk,
+            btc_ok: isBtcOk,
+            pass: true
+         }));
+      } else {
+         console.info(JSON.stringify({
+            tag: "SURGE_CAPTURE_PROMOTION_GATE_PROOF",
+            ts: new Date().toISOString(),
+            market: input.market,
+            capture_score: cScore,
+            confirm_count: cConf,
+            volume_accel_1m: cVol,
+            structure_ok: isStructureOk,
+            btc_ok: isBtcOk,
+            pass: false
+         }));
+         return {
+           action: "reject",
+           reason: "blocked_surge_capture_promotion_gate",
+           authoritySource: "surge-v2",
+           detail: { symbol: input.market, sub: "capture_promotion_failed", source_kind: sourceKind, ...surgeSetupContext }
+         };
+      }
+    } else {
+      return {
+        action: "reject",
+        reason: "blocked_surge_filter",
+        authoritySource: "surge-v2",
+        detail: { symbol: input.market, sub: "filter_pass_false", source_kind: sourceKind, ...surgeSetupContext },
+      };
+    }
   }
   if (!input.staleOk) {
     return {

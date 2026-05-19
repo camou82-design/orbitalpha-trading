@@ -43,6 +43,17 @@ export function loadCaptureQueue(): SurgeCaptureItem[] {
 
 export function saveCaptureQueue(queue: SurgeCaptureItem[]) {
   try {
+    const maxWatch = Number(process.env.LIVE_SURGE_CAPTURE_MAX_WATCH ?? 12);
+    if (queue.length > maxWatch) {
+      queue.sort((a, b) => {
+        if (b.capture_score !== a.capture_score) return b.capture_score - a.capture_score;
+        return new Date(b.last_seen_at).getTime() - new Date(a.last_seen_at).getTime();
+      });
+      const truncated = queue.slice(0, maxWatch);
+      queue.length = 0;
+      queue.push(...truncated);
+    }
+
     const dir = path.dirname(DATA_FILE);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -212,11 +223,10 @@ export function processSurgeCaptureQueue(
     if (!marketData) continue;
 
     const currentPrice = marketData.currentPrice;
-    const expiresAtMs = new Date(item.expires_at).getTime();
     const itemLease = Number(item.tick_lease);
     const maxTicks = Number(process.env.LIVE_SURGE_CAPTURE_TTL_TICKS ?? 3);
 
-    if (currentTickLease - itemLease >= maxTicks || currentTickTs >= expiresAtMs) {
+    if (currentTickLease - itemLease >= maxTicks) {
       item.status = "EXPIRED";
       expiredCount++;
       continue;
@@ -234,7 +244,12 @@ export function processSurgeCaptureQueue(
         tag: "SURGE_CAPTURE_REJECTED_PROOF",
         ts: new Date().toISOString(),
         market: item.market,
-        reason: rejectReason
+        reason: rejectReason,
+        capture_score: item.capture_score,
+        reject_reasons: item.reject_risks,
+        age_ticks: currentTickLease - itemLease,
+        price_change_from_watch_pct: priceChangePct,
+        tick_lease: currentTickLease
       }));
       continue;
     }
@@ -275,12 +290,19 @@ export function processSurgeCaptureQueue(
       item.status = "PROMOTED";
       item.capture_grade = isConfirmed ? "HIGH" : "MID";
       promoted.push(item);
+      const promotionReasons = [];
+      if (isConfirmed) promotionReasons.push("confirmed_conditions_met");
+      if (isFastProbe) promotionReasons.push("fast_probe_conditions_met");
       console.info(JSON.stringify({
         tag: "SURGE_CAPTURE_PROMOTED_PROOF",
         ts: new Date().toISOString(),
         market: item.market,
-        capture_grade: item.capture_grade,
-        is_fast_probe: isFastProbe
+        promoted_to: "latestAllSignals",
+        capture_score: item.capture_score,
+        confirm_count: item.confirm_count,
+        promotion_reasons: promotionReasons,
+        selected_size_multiplier: isConfirmed ? 1.0 : 0.5,
+        tick_lease: currentTickLease
       }));
     } else {
       watchingCount++;
@@ -288,7 +310,14 @@ export function processSurgeCaptureQueue(
         tag: "SURGE_CAPTURE_WATCH_UPDATED_PROOF",
         ts: new Date().toISOString(),
         market: item.market,
-        confirm_count: item.confirm_count
+        previous_score: item.capture_score,
+        current_score: item.capture_score,
+        confirm_count: item.confirm_count,
+        last_price: currentPrice,
+        price_change_from_watch_pct: priceChangePct,
+        volume_accel_1m: item.volume_accel_1m,
+        status: "WATCHING",
+        tick_lease: currentTickLease
       }));
     }
   }
