@@ -169,6 +169,11 @@ type StrategyPosition = {
   partial_tp_at: string | null;
   /** 복원 시 없으면 기존 보유 — 신규만 엄격 손익 곡선 */
   strict_exit?: boolean;
+  exit_policy_attached?: boolean;
+  surge_stop_price?: number;
+  surge_take_profit_price?: number;
+  surge_trailing_start_pct?: number;
+  surge_trailing_gap_pct?: number;
   position_id?: string;
   entry_profile_key?: string;
   entry_profile_decision?: "allow" | "block" | "unknown";
@@ -4963,7 +4968,7 @@ export function createLiveDataStrategy(opts: {
       if (isSurge) {
         console.info(
           JSON.stringify({
-            tag: "SURGE_V2_LIVE_EXIT_EXECUTION_PROOF",
+            tag: "SURGE_PLACESELL_ATTEMPT_PROOF",
             ts: new Date().toISOString(),
             market,
             reason_exit: reasonExit,
@@ -5035,7 +5040,7 @@ export function createLiveDataStrategy(opts: {
         if (isSurge) {
           console.info(
             JSON.stringify({
-              tag: "SURGE_V2_LIVE_EXIT_EXECUTION_PROOF",
+              tag: "SURGE_PLACESELL_RESULT_PROOF",
               ts: new Date().toISOString(),
               market,
               reason_exit: reasonExit,
@@ -5115,6 +5120,23 @@ export function createLiveDataStrategy(opts: {
         final_net_pnl_pct: netPnlPctValue,
       };
       state.trades.push(row);
+      if (isSurge) {
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_POSITION_CLOSED_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            position_id: p.position_id ?? `${market}|${p.entry_ts}`,
+            opened_at: p.entry_ts,
+            filled_qty: soldQty,
+            filled_price: now,
+            pnl_pct: netPnlPctValue,
+            pnl_krw: Math.round(netPnlKrw),
+            exit_reason: reasonExit,
+            open_positions_after: qtyAfter <= 0 ? Math.max(0, Object.keys(state.positions).length - 1) : Object.keys(state.positions).length,
+          }),
+        );
+      }
       console.info(
         JSON.stringify({
           tag: "DEBUG_LIVE_SELL_FILLED",
@@ -8352,6 +8374,7 @@ export function createLiveDataStrategy(opts: {
           }
           entryPipelineDetail = { ...decision.detail, entry_pipeline: "surge" };
           surgeDecisionMetrics = decision;
+          surgeMarketSizeMultiplier *= decision.sizeMultiplier;
         } else {
           let pr = evaluateSpotLongEntryPipeline({
             market,
@@ -9059,6 +9082,22 @@ export function createLiveDataStrategy(opts: {
           place_buy_reason: "pending",
         }),
       );
+      if (isSurgeSource) {
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_ENTRY_SELECTED_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            entry_mode: surgeDecisionMetrics?.entryMode ?? "UNKNOWN",
+            selected_size_krw: finalOrderKrwValue,
+            stopPrice: surgeStopPrice,
+            takeProfitPrice: surgeDecisionMetrics?.detail?.takeProfitPrice,
+            trailingStopPct: surgeDecisionMetrics?.detail?.trailingStopPct,
+            strict_exit: true,
+            exit_policy_attached: true
+          })
+        );
+      }
       try {
         let placeBuyOk = false;
         let placeBuyReason = "unknown";
@@ -9300,6 +9339,11 @@ export function createLiveDataStrategy(opts: {
         breakeven_armed_at: null,
         partial_tp_at: null,
         strict_exit: true,
+        exit_policy_attached: isSurgeSource ? true : undefined,
+        surge_stop_price: isSurgeSource ? surgeStopPrice : undefined,
+        surge_take_profit_price: isSurgeSource ? surgeDecisionMetrics?.detail?.takeProfitPrice : undefined,
+        surge_trailing_start_pct: isSurgeSource ? surgeDecisionMetrics?.trailingStartPct : undefined,
+        surge_trailing_gap_pct: isSurgeSource ? surgeDecisionMetrics?.trailingGapPct : undefined,
         position_id: `${market}|${new Date().toISOString()}`,
         entry_profile_key,
         entry_profile_decision: profileInfo.decision,
@@ -9319,6 +9363,23 @@ export function createLiveDataStrategy(opts: {
       
       // [ATOMICITY] Ensure position metadata is persisted immediately
       await racePersist("after_managed_position_meta_registered");
+
+      if (isSurgeSource) {
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_EXIT_POLICY_ATTACHED_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            engine_bucket: "surge",
+            stopPrice: surgeStopPrice,
+            takeProfitPrice: surgeDecisionMetrics?.detail?.takeProfitPrice,
+            trailingStartPct: surgeDecisionMetrics?.trailingStartPct,
+            trailingGapPct: surgeDecisionMetrics?.trailingGapPct,
+            strict_exit: true,
+            exit_policy_attached: true
+          }),
+        );
+      }
 
       const tstatusPost = await opts.trade.status();
       const registeredInBook = Boolean(tstatusPost.strategy_positions?.[market]);

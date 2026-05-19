@@ -236,7 +236,6 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
     overextended: false,
     spread_ok: true,
     reject_reasons: [],
-    selected_size_krw: 0,
     stopPrice: close * (1 + stopPct / 100),
     takeProfitPrice: close * (1 + takeProfitPct / 100),
     trailingStopPct: trailingGapPct,
@@ -245,7 +244,6 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
   };
 
   console.info(JSON.stringify({ tag: proofTag, ...baseLogPayload }));
-  console.info(JSON.stringify({ tag: "SURGE_ENTRY_SELECTED_PROOF", ...baseLogPayload }));
 
   return {
     action: "enter",
