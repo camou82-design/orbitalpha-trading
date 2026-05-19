@@ -8938,6 +8938,36 @@ export function createLiveDataStrategy(opts: {
           : null;
 
       if (isSurgeSource) {
+        if (
+          surgeStopPrice <= 0 ||
+          surgeTakeProfitPrice <= 0 ||
+          !Number.isFinite(surgeStopPrice) ||
+          !Number.isFinite(surgeTakeProfitPrice)
+        ) {
+          const currentPx = currentPrice > 0 ? currentPrice : Number(priceBy.get(market) ?? 0);
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_EXIT_POLICY_BUILD_FAILED_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              entry_mode: "SURGE_V2",
+              currentPrice: currentPx,
+              surgeStopPrice,
+              surgeTakeProfitPrice,
+              stopPct: surgeDecisionMetrics?.stopPct ?? null,
+              takeProfitPct: surgeDecisionMetrics?.takeProfitPct ?? null,
+              reason: "invalid_surge_exit_policy_price",
+              blocked_before_placebuy: true,
+            })
+          );
+          bumpSkip("invalid_surge_exit_policy_price");
+          emitFinalBlocked("invalid_surge_exit_policy_price", {
+            surgeStopPrice,
+            surgeTakeProfitPrice
+          });
+          continue;
+        }
+
         console.info(
           JSON.stringify({
             tag: "SURGE_STOP_PRICE_PROOF",
