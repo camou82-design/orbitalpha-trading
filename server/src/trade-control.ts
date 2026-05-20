@@ -93,8 +93,14 @@ const ALLOWED_MARKETS = new Set(["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KR
 const MANAGED_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX"] as const;
 const MAX_CONCURRENT_STRATEGY_POSITIONS = (() => {
   const raw = process.env.LIVE_MAX_POSITIONS_CAP;
-  const n = raw === undefined || raw === "" ? 6 : Number(raw);
-  return Number.isFinite(n) ? Math.max(1, Math.min(12, Math.floor(n))) : 6;
+  const n = raw === undefined || raw === "" ? 10 : Number(raw);
+  const cap = Number.isFinite(n) ? Math.max(1, Math.min(20, Math.floor(n))) : 10;
+  console.info(JSON.stringify({
+    tag: "SPOT_SLOT_LIMIT_CONFIG_PROOF",
+    ts: new Date().toISOString(),
+    configured_max_slots: cap
+  }));
+  return cap;
 })();
 const STRATEGY_RULES = {
   tp1_pct: 2.5,
@@ -529,7 +535,24 @@ export function createTradeControl(
       const p = state.strategyPositions[market];
       const openingNewMarket = (p?.qty ?? 0) <= 0;
       if (openingNewMarket) {
-        const openPositions = Object.values(state.strategyPositions).filter((x) => x.qty > 0).length;
+        const openPositions = Object.entries(state.strategyPositions).filter(([m, x]) => {
+          if (x.qty <= 0) return false;
+          if (m === "KRW-TRUST") return true;
+          const evalKrw = x.qty * x.avg;
+          const isDust = evalKrw < 5000 || x.qty < 0.0001;
+          if (isDust) {
+            console.info(JSON.stringify({
+              tag: "SPOT_DUST_POSITION_EXCLUDED_FROM_SLOT_PROOF",
+              ts: new Date().toISOString(),
+              market: m,
+              qty: x.qty,
+              eval_krw: evalKrw,
+              reason: "dust_evaluation_excluded_from_slot_count"
+            }));
+            return false;
+          }
+          return true;
+        }).length;
         if (openPositions >= MAX_CONCURRENT_STRATEGY_POSITIONS) {
           throw new Error(`Max concurrent strategy positions is ${MAX_CONCURRENT_STRATEGY_POSITIONS}`);
         }
@@ -879,7 +902,26 @@ export function createTradeControl(
 
   const status = async () => {
     const conn = await getConnectionStatus();
-    const strategyPositions = state.strategyPositions;
+    const strategyPositions = Object.fromEntries(
+      Object.entries(state.strategyPositions).filter(([m, x]) => {
+        if (x.qty <= 0) return false;
+        if (m === "KRW-TRUST") return true;
+        const evalKrw = x.qty * x.avg;
+        const isDust = evalKrw < 5000 || x.qty < 0.0001;
+        if (isDust) {
+          console.info(JSON.stringify({
+            tag: "SPOT_ACCOUNT_HOLDING_CLASSIFICATION_PROOF",
+            ts: new Date().toISOString(),
+            market: m,
+            qty: x.qty,
+            eval_krw: evalKrw,
+            reason: "classified_as_dust_in_status_read"
+          }));
+          return false;
+        }
+        return true;
+      })
+    );
     let ledger_reconcile: { zeroed: string[]; clamped: string[] } | null = null;
     if (conn.connected && Array.isArray(conn.balances) && conn.balances.length > 0) {
       ledger_reconcile = reconcileAuthoritativeStrategyBook(conn.balances);
