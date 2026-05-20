@@ -8641,7 +8641,14 @@ export function createLiveDataStrategy(opts: {
           const isPromoted = Boolean((sig.p as any).surge_capture_promoted);
           const alreadyInQueue = surgeCaptureQueue.some(q => q.market === market && (q.status === "WATCHING" || q.status === "PROMOTED"));
           const payloadFilterPass = Boolean(sig.p?.filter_pass);
-          const fullyPassed = payloadFilterPass && (scannerBridgeScore ? scannerBridgeScore.pass : true);
+          const nowKst = new Date();
+          const kstTimeStr = nowKst.toLocaleTimeString("en-US", { timeZone: "Asia/Seoul", hour12: false, hour: "numeric", minute: "numeric" });
+          const [kstHour, kstMinute] = kstTimeStr.split(":").map(Number);
+          const kstTotalMins = kstHour * 60 + kstMinute;
+          const isDailyResetWindow = kstTotalMins >= 535 && kstTotalMins < 543;
+          const isReclaimWindow = kstTotalMins >= 543 && kstTotalMins < 555;
+          
+          const fullyPassed = payloadFilterPass && (scannerBridgeScore ? scannerBridgeScore.pass : true) && !isDailyResetWindow && !isReclaimWindow;
           
           if (!isPromoted && !alreadyInQueue && !fullyPassed) {
              const evalCapture = evaluateSurgeCaptureCandidate({

@@ -89,6 +89,40 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
     };
   }
 
+  const now = new Date();
+  const kstTimeStr = now.toLocaleTimeString("en-US", { timeZone: "Asia/Seoul", hour12: false, hour: "numeric", minute: "numeric" });
+  const [kstHour, kstMinute] = kstTimeStr.split(":").map(Number);
+  const kstTotalMins = kstHour * 60 + kstMinute;
+
+  // UPBIT_DAILY_RESET_SURGE_WINDOW: 08:55 ~ 09:03
+  if (kstTotalMins >= 535 && kstTotalMins < 543) {
+    console.info(JSON.stringify({
+      tag: "SURGE_ENTRY_REJECTED_PROOF",
+      ts: now.toISOString(),
+      market: input.market,
+      reject_reasons: ["UPBIT_DAILY_RESET_SURGE_WINDOW"],
+      price: 0, volume_ratio: input.volumeRatio, relative_strength: 0, breakout, pullback_rebound: false, overextended: false, spread_ok: true
+    }));
+    return {
+      action: "reject",
+      reason: "UPBIT_DAILY_RESET_SURGE_WINDOW",
+      authoritySource: "surge-v2",
+      detail: { symbol: input.market, kst_time: kstTimeStr, sub: "daily_reset_window_registration_only", ...surgeSetupContext }
+    };
+  }
+
+  // RECLAIM 우선 구간: 09:03 ~ 09:15
+  if (kstTotalMins >= 543 && kstTotalMins < 555) {
+     if (!input.capturePromoted) {
+        return {
+          action: "reject",
+          reason: "UPBIT_DAILY_RESET_RECLAIM_WINDOW",
+          authoritySource: "surge-v2",
+          detail: { symbol: input.market, kst_time: kstTimeStr, sub: "need_capture_promotion_in_reclaim_window", ...surgeSetupContext }
+        };
+     }
+  }
+
   let capturePromotionPassed = false;
 
   if (input.capturePromoted) {
@@ -305,10 +339,11 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
           const prevAvgNotional = prev5_1m.reduce((a, b) => a + num(b.trade_price)*num(b.candle_acc_trade_volume), 0) / Math.max(1, prev5_1m.length);
           const volume_accel_1m = prevAvgNotional > 0 ? lastNotional / prevAvgNotional : 1.0;
           
-          const LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX ?? 4.5);
-          const LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX ?? 3.5);
-          const LIVE_SURGE_LATE_CHASE_WICK_RATIO_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_WICK_RATIO_MAX ?? 0.6);
-          const LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX ?? 0.4);
+          const isPostReset = kstTotalMins >= 555;
+          const LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX ?? (isPostReset ? 3.0 : 4.5));
+          const LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX ?? (isPostReset ? 2.5 : 3.5));
+          const LIVE_SURGE_LATE_CHASE_WICK_RATIO_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_WICK_RATIO_MAX ?? (isPostReset ? 0.45 : 0.6));
+          const LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX ?? (isPostReset ? 0.6 : 0.4));
 
           let chaseCondCount = 0;
           if (recent_1m_return_3bar_pct >= LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX) { chaseCondCount++; chaseBlockReasons.push("recent_1m_return_3bar_pct_high"); }
