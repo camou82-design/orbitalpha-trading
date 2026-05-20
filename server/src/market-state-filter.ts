@@ -81,6 +81,10 @@ export function createMarketStateFilter(args: {
     pnl_net: number | null;
     pnl_net_pct: number | null;
     note: string | null;
+    type?: string;
+    final_close?: boolean;
+    partial_exit?: boolean;
+    stage?: string;
   }) => Promise<void>;
 }) {
   const state: { latest: MarketStateSnapshot | null } = { latest: null };

@@ -2137,6 +2137,10 @@ export function createLiveDataStrategy(opts: {
     pnl_net: number | null;
     pnl_net_pct: number | null;
     note: string | null;
+    type?: string;
+    final_close?: boolean;
+    partial_exit?: boolean;
+    stage?: string;
   }) => Promise<void>;
 }) {
   const baseDir = path.join(tradingDataRoot(), "strategy", opts.companyId, opts.serviceId);
@@ -5223,6 +5227,10 @@ export function createLiveDataStrategy(opts: {
         realized_partial_profit: p.realized_partial_profit,
         final_net_pnl_pct: netPnlPctValue,
       };
+      const isPartial = qtyAfter > 0;
+      const isFinalClose = qtyAfter <= 0;
+      const surgeExitStage = isSurge ? (isFinalClose ? "FINAL" : (reasonExit === "SURGE_TP1_PARTIAL" ? "TP1" : (reasonExit === "SURGE_TP2_PARTIAL" ? "TP2" : undefined))) : undefined;
+
       console.info(
         JSON.stringify({
           tag: "DEBUG_LIVE_SELL_FILLED",
@@ -5235,25 +5243,35 @@ export function createLiveDataStrategy(opts: {
           pnl_pct: netPnlPctValue,
           pnl_krw: Math.round(netPnlKrw),
           exit_reason: reasonExit,
-          open_positions_after: qtyAfter <= 0 ? Math.max(0, Object.keys(state.positions).length - 1) : Object.keys(state.positions).length,
+          open_positions_after: isFinalClose ? Math.max(0, Object.keys(state.positions).length - 1) : Object.keys(state.positions).length,
+          event_type: isFinalClose ? "position_closed" : "partial_take_profit",
+          partial_exit: isPartial,
+          final_close: isFinalClose,
+          surge_exit_stage: surgeExitStage,
+          surge_exit_reason: isSurge ? reasonExit : undefined,
+          remaining_qty_after: qtyAfter,
+          realized_partial_profit: isPartial ? Math.round(netPnlKrw) : undefined,
+          position_still_open: isPartial,
         }),
       );
       await opts.onEvent?.({
         timestamp: row.timestamp,
         event_type:
-          reasonExit === "partial_take_profit" || reasonExit === "partial_take_profit_1st_strict"
+          reasonExit === "partial_take_profit" || reasonExit === "partial_take_profit_1st_strict" || reasonExit === "SURGE_TP1_PARTIAL" || reasonExit === "SURGE_TP2_PARTIAL"
             ? "partial_take_profit"
-            : reasonExit === "trailing_take_profit" || reasonExit === "trailing_runner_exit_strict"
+            : reasonExit === "trailing_take_profit" || reasonExit === "trailing_runner_exit_strict" || reasonExit === "SURGE_RUNNER_TRAILING_EXIT"
               ? "trailing_take_profit"
-              : reasonExit === "breakeven_exit" || reasonExit === "momentum_breakeven_protect"
+              : reasonExit === "breakeven_exit" || reasonExit === "momentum_breakeven_protect" || reasonExit === "SURGE_BREAKEVEN_PROTECT"
                 ? "breakeven_exit"
                 : reasonExit === "momentum_pattern_break"
                   ? "pattern_break_exit"
                   : reasonExit === "momentum_time_stop" ||
                       reasonExit === "stable_time_stop_weak_rebound" ||
-                      reasonExit === "residual_full_exit_escalation"
+                      reasonExit === "residual_full_exit_escalation" ||
+                      reasonExit === "SURGE_TIMEOUT_EXIT"
                     ? "time_stop_exit"
                     : "stop_loss",
+        type: isFinalClose ? "position_closed" : "partial_take_profit",
         market,
         strategy_type: p.strategy_type,
         market_state: null,
@@ -5266,6 +5284,9 @@ export function createLiveDataStrategy(opts: {
         pnl_net: Math.round(netPnlKrw),
         pnl_net_pct: netPnlPctValue,
         note: null,
+        final_close: isFinalClose,
+        partial_exit: isPartial,
+        stage: surgeExitStage,
       });
       if (netPnlKrw < 0) {
         state.daily.stop_by_market[market] = (state.daily.stop_by_market[market] ?? 0) + 1;
@@ -5326,6 +5347,24 @@ export function createLiveDataStrategy(opts: {
 
         state.trades.push(row);
         if (isSurge) {
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_FINAL_POSITION_CLOSED_LEDGER_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              entry_mode: p.reason_enter,
+              surge_entry_mode: (p as any).surge_entry_mode,
+              exit_reason: reasonExit,
+              sellQty: soldQty,
+              remainingQtyBefore: beforeQty,
+              remainingQtyAfter: qtyAfter,
+              realizedPnl: Math.round(netPnlKrw),
+              final_close: true,
+              history_appended: true,
+              position_deleted: true,
+              closed_at: new Date().toISOString(),
+            }),
+          );
           console.info(
             JSON.stringify({
               tag: "SURGE_POSITION_CLOSED_PROOF",
@@ -5404,6 +5443,28 @@ export function createLiveDataStrategy(opts: {
 
         p.qty = qtyAfter;
         p.remaining_qty = qtyAfter;
+
+        if (isSurge && (reasonExit === "SURGE_TP1_PARTIAL" || reasonExit === "SURGE_TP2_PARTIAL")) {
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_PARTIAL_POSITION_UPDATED_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              stage: reasonExit === "SURGE_TP1_PARTIAL" ? "TP1" : "TP2",
+              entry_mode: p.reason_enter,
+              surge_entry_mode: (p as any).surge_entry_mode,
+              sellQty: soldQty,
+              remainingQtyBefore: beforeQty,
+              remainingQtyAfter: qtyAfter,
+              realizedPartialProfit: p.realized_partial_profit,
+              surge_tp1_done: (p as any).surge_tp1_done,
+              surge_tp2_done: (p as any).surge_tp2_done,
+              position_stage: p.position_stage,
+              final_close: false,
+              updated_at: new Date().toISOString(),
+            }),
+          );
+        }
       }
     }
 

@@ -200,6 +200,10 @@ export function createTradeControl(
       pnl_net: number | null;
       pnl_net_pct: number | null;
       note: string | null;
+      type?: string;
+      final_close?: boolean;
+      partial_exit?: boolean;
+      stage?: string;
     }) => Promise<void>;
     /** 매수 직전 — 시장 스냅샷·entry 게이트 재검사 (신규/추가 공통). */
     assertBuyGate?: (ctx: {
