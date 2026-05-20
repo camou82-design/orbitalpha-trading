@@ -168,6 +168,8 @@ type StrategyPosition = {
   breakeven_armed: boolean;
   highest_price_after_entry: number;
   trailing_stop_price: number;
+  stop_loss_price?: number;
+  stop_loss_pct?: number;
   realized_partial_profit: number;
   remaining_qty: number;
   current_net_pnl_pct: number;
@@ -269,6 +271,8 @@ type StrategyTradeRow = {
   remaining_qty: number;
   highest_price_after_entry: number;
   trailing_stop_price: number;
+  stop_loss_price?: number;
+  stop_loss_pct?: number;
   breakeven_armed_at: string | null;
   partial_tp_at: string | null;
   position_id?: string;
@@ -2561,36 +2565,23 @@ export function createLiveDataStrategy(opts: {
 
     if (passiveForRecoveryEval.length > 0) {
       for (const pm of passiveForRecoveryEval) {
-        if (!loBuyOk) {
+        const hasTradeState = Boolean(strategyPosSnap[pm]);
+        const recentBuyTrade = state.trades.slice().reverse().find(t => t.market === pm && t.action === "buy");
+        const hasStrategyBuy = Boolean(recentBuyTrade && recentBuyTrade.remaining_qty > 0);
+        const ageMs = lastOrder?.ts ? Date.now() - Date.parse(String(lastOrder.ts)) : Infinity;
+        
+        const loBuyEvident = loBuyOk && String(lastOrder!.market) === pm && Number.isFinite(ageMs) && ageMs >= 0 && ageMs <= LAST_ORDER_MANAGED_RECOVERY_MAX_EVIDENCE_AGE_MS;
+
+        if (!loBuyEvident && !hasTradeState && !hasStrategyBuy) {
           recoveryEvalItems.push({
             market: pm,
             result: "RECOVERY_SKIPPED",
-            reason: "no_last_order_buy_ok_evidence",
+            reason: "no_evidence_of_managed_entry",
             detail: {
               last_order_present: Boolean(lastOrder),
-              last_order_side: lastOrder?.side ?? null,
-              last_order_status: lastOrder?.status ?? null,
+              trade_state_present: hasTradeState,
+              strategy_buy_present: hasStrategyBuy
             },
-          });
-          continue;
-        }
-        const loMarket = String(lastOrder!.market);
-        if (loMarket !== pm) {
-          recoveryEvalItems.push({
-            market: pm,
-            result: "RECOVERY_SKIPPED",
-            reason: "last_order_market_mismatch",
-            detail: { last_order_market: loMarket },
-          });
-          continue;
-        }
-        const ageMs = Date.now() - Date.parse(String(lastOrder!.ts));
-        if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > LAST_ORDER_MANAGED_RECOVERY_MAX_EVIDENCE_AGE_MS) {
-          recoveryEvalItems.push({
-            market: pm,
-            result: "RECOVERY_SKIPPED",
-            reason: "last_order_evidence_ts_invalid_or_too_old",
-            detail: { age_ms: Number.isFinite(ageMs) ? ageMs : null, max_age_ms: LAST_ORDER_MANAGED_RECOVERY_MAX_EVIDENCE_AGE_MS },
           });
           continue;
         }
@@ -2703,7 +2694,23 @@ export function createLiveDataStrategy(opts: {
           reconcileActions.push(`${m}:cleared_orphan_strategy_state_ledger_zero_nonzero_spot`);
         } else if (stratQty > 0) {
           const p = state.positions[m]!;
-          if (Math.abs(p.qty - stratQty) > 1e-10) {
+          if ((p.remaining_qty === 0 || !p.remaining_qty) && totalSpot > 0) {
+            p.qty = totalSpot;
+            p.remaining_qty = totalSpot;
+            reconcileActions.push(`${m}:repaired_zero_remaining_qty_to_spot_qty=${totalSpot}`);
+            console.error(
+              JSON.stringify({
+                tag: "POSITION_QTY_REPAIR_PROOF",
+                ts: new Date().toISOString(),
+                market: m,
+                previous_qty: p.qty,
+                repaired_qty: totalSpot,
+                trade_control_qty: stratQty,
+                spot_qty: totalSpot,
+                reason: "remaining_qty_was_zero_but_account_held_balance",
+              })
+            );
+          } else if (Math.abs(p.qty - stratQty) > 1e-10) {
             p.qty = stratQty;
             p.remaining_qty = stratQty;
             reconcileActions.push(`${m}:synced_qty_to_ledger_qty=${stratQty}`);
@@ -9419,6 +9426,28 @@ export function createLiveDataStrategy(opts: {
           });
           continue;
         }
+      } else {
+        const currentPx = currentPrice > 0 ? currentPrice : Number(priceBy.get(market) ?? 0);
+        const coreStopPrice = Number(finalMeta?.stopPrice ?? 0);
+        if (coreStopPrice <= 0 || !Number.isFinite(coreStopPrice)) {
+          console.info(
+            JSON.stringify({
+              tag: "CORE_STOP_MISSING_BLOCK",
+              ts: new Date().toISOString(),
+              market,
+              entry_mode: metaForGuard?.setupReason ?? "CORE",
+              final_block_reason: "core_stop_missing",
+              stopPrice: coreStopPrice,
+              candidate_meta_present: Boolean(finalMeta),
+              candidate_meta_missing_reason: finalMeta ? null : "candidate_meta_absent",
+            })
+          );
+          logPlacebuyFinalGateBlocked("core_stop_missing", {
+            entry_mode: metaForGuard?.setupReason ?? "CORE",
+            stopPrice: coreStopPrice,
+          });
+          continue;
+        }
       }
 
       console.info(
@@ -9807,6 +9836,10 @@ export function createLiveDataStrategy(opts: {
         original_setup_mode: marketMeta?.setupMode,
         original_setup_reason: marketMeta?.setupReason,
         entry_stop_price: marketMeta?.stopPrice,
+        stop_loss_price: isSurgeSource ? surgeStopPrice : Number(marketMeta?.stopPrice ?? 0),
+        stop_loss_pct: (isSurgeSource ? surgeStopPrice : Number(marketMeta?.stopPrice ?? 0)) > 0 
+            ? Number(((((isSurgeSource ? surgeStopPrice : Number(marketMeta?.stopPrice ?? 0)) - price) / price) * 100).toFixed(4)) 
+            : 0,
         entry_target_price: marketMeta?.targetPrice,
         entry_risk_reward: marketMeta?.riskReward,
         ema50: marketMeta?.ema50,
@@ -9897,6 +9930,10 @@ export function createLiveDataStrategy(opts: {
         remaining_qty: qty,
         highest_price_after_entry: price,
         trailing_stop_price: 0,
+        stop_loss_price: isSurgeSource ? surgeStopPrice : Number(marketMeta?.stopPrice ?? 0),
+        stop_loss_pct: (isSurgeSource ? surgeStopPrice : Number(marketMeta?.stopPrice ?? 0)) > 0 
+            ? Number(((((isSurgeSource ? surgeStopPrice : Number(marketMeta?.stopPrice ?? 0)) - price) / price) * 100).toFixed(4)) 
+            : 0,
         breakeven_armed_at: null,
         partial_tp_at: null,
         position_id: state.positions[market]?.position_id,
