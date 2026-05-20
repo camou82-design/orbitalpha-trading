@@ -1123,8 +1123,16 @@ export function createTradeControl(
     setAutoTradeEnabled,
     setRecoveryReady,
     syncManagedPosition: async (market: string, qty: number, avg: number, strategyType: StrategyType, stopLossPct?: number, stopLossPrice?: number) => {
-      if (!state.strategyPositions[market] || state.strategyPositions[market].qty <= 0) {
-        const rule = strategyType === "momentum" ? STRATEGY_RISK_CONFIG.momentum : STRATEGY_RISK_CONFIG.stable;
+      const rule = strategyType === "momentum" ? STRATEGY_RISK_CONFIG.momentum : STRATEGY_RISK_CONFIG.stable;
+      let finalStopLossPct = stopLossPct ?? rule.stop_loss_pct;
+      let finalStopLossPrice = stopLossPrice;
+      
+      const existing = state.strategyPositions[market];
+      
+      if (!existing || existing.qty <= 0) {
+        if (!(finalStopLossPrice! > 0) && avg > 0) {
+          finalStopLossPrice = avg * (1 + finalStopLossPct / 100);
+        }
         state.strategyPositions[market] = {
           qty,
           avg,
@@ -1132,8 +1140,8 @@ export function createTradeControl(
           invested_krw_total: qty * avg,
           realized_pnl: 0,
           strategy_type: strategyType,
-          stop_loss_pct: stopLossPct ?? rule.stop_loss_pct,
-          stop_loss_price: stopLossPrice,
+          stop_loss_pct: finalStopLossPct,
+          stop_loss_price: finalStopLossPrice,
           breakeven_arm_pct: rule.breakeven_arm_pct,
           partial_take_profit_pct: rule.partial_take_profit_pct,
           trailing_from_peak_pct: rule.trailing_from_peak_pct,
@@ -1141,7 +1149,36 @@ export function createTradeControl(
         persistAutoTradeState();
         return true;
       }
-      return false;
+
+      // Update existing position
+      finalStopLossPct = stopLossPct ?? existing.stop_loss_pct ?? rule.stop_loss_pct;
+      if (!(finalStopLossPrice! > 0) && avg > 0) {
+        finalStopLossPrice = avg * (1 + finalStopLossPct / 100);
+      }
+      
+      const previousStopLossPrice = existing.stop_loss_price;
+      
+      existing.qty = qty;
+      existing.avg = avg;
+      existing.invested_krw_total = qty * avg;
+      existing.strategy_type = strategyType;
+      existing.stop_loss_pct = finalStopLossPct;
+      existing.stop_loss_price = finalStopLossPrice;
+      
+      console.info(JSON.stringify({
+        tag: "SPOT_MANAGED_POSITION_STOP_LOSS_BACKFILLED_PROOF",
+        ts: new Date().toISOString(),
+        market,
+        qty,
+        avg,
+        previous_stop_loss_price: previousStopLossPrice ?? null,
+        stop_loss_price: finalStopLossPrice,
+        stop_loss_pct: finalStopLossPct,
+        source: "syncManagedPosition"
+      }));
+      
+      persistAutoTradeState();
+      return true;
     },
   };
 }
