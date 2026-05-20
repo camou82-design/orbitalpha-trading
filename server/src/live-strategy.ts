@@ -127,7 +127,7 @@ type TradeApi = {
   placeLegacyDcaBuy?: (market: string, confirm: boolean, amountKrw?: number, signalPayload?: unknown) => Promise<{ ok?: boolean; reason?: string } | Record<string, unknown>>;
   placeLegacyExitSell?: (market: string, confirm: boolean, ratio?: number) => Promise<{ ok?: boolean; reason?: string } | Record<string, unknown>>;
   setAutoTradeEnabled?: (enabled: boolean) => Promise<void>;
-  syncManagedPosition?: (market: string, qty: number, avg: number, strategyType: StrategyType) => Promise<boolean>;
+  syncManagedPosition?: (market: string, qty: number, avg: number, strategyType: StrategyType, stopLossPct?: number, stopLossPrice?: number) => Promise<boolean>;
 };
 
 type MarketStateApi = {
@@ -2597,16 +2597,43 @@ export function createLiveDataStrategy(opts: {
         }
 
         const avgBuy = accountAvgBuyPriceForMarket(pm, balArr);
+        let recoveryTs = new Date().toISOString();
+        let recoveryOrderKrw = 0;
+        let recoveryPositionId = `${pm}|RECOVERED|${recoveryTs}`;
+        let recoveryStopPrice = avgBuy > 0 ? avgBuy * 0.98 : 0;
+        let recoveryStopPct = -2;
+
+        if (loBuyEvident) {
+          recoveryTs = String(lastOrder!.ts);
+          recoveryOrderKrw = Number(lastOrder!.amount_krw ?? 0);
+          recoveryPositionId = `${pm}|RECOVERED|${recoveryTs}`;
+        } else if (recentBuyTrade) {
+          recoveryTs = recentBuyTrade.timestamp;
+          recoveryOrderKrw = Number(recentBuyTrade.order_krw ?? 0);
+          recoveryPositionId = recentBuyTrade.position_id ?? `${pm}|RECOVERED|${recoveryTs}`;
+          if (recentBuyTrade.stop_loss_price) recoveryStopPrice = recentBuyTrade.stop_loss_price;
+          if (recentBuyTrade.stop_loss_pct) recoveryStopPct = recentBuyTrade.stop_loss_pct;
+        }
+
+        const stratSnapStopPct = strategyPosSnap[pm]?.stop_loss_pct;
+        if (typeof stratSnapStopPct === "number" && stratSnapStopPct < 0) {
+           recoveryStopPct = stratSnapStopPct;
+           recoveryStopPrice = avgBuy > 0 ? avgBuy * (1 + recoveryStopPct / 100) : 0;
+        } else if (strategyPosSnap[pm]?.stop_loss_price > 0) {
+           recoveryStopPrice = strategyPosSnap[pm].stop_loss_price;
+           recoveryStopPct = avgBuy > 0 ? ((recoveryStopPrice - avgBuy) / avgBuy) * 100 : 0;
+        }
+
         console.error(
           JSON.stringify({
             tag: "MANAGED_POSITION_RECOVERY_HARD_WARNING",
             ts: new Date().toISOString(),
             market: pm,
-            reason: "매수 성공(last_order) 증거 + 보유 확인 — 전략 장부 복구 시도",
-            last_order_ts: lastOrder!.ts,
+            reason: "장부 복구 조건 충족 — 전략 장부 복구 시도",
+            recovery_ts: recoveryTs,
             age_ms: ageMs,
             spot_qty: totalSpot,
-            order_krw: lastOrder!.amount_krw,
+            order_krw: recoveryOrderKrw,
           }),
         );
 
@@ -2621,10 +2648,10 @@ export function createLiveDataStrategy(opts: {
           btc_tier_at_entry: "unknown" as any,
           volatility_pct_at_entry: 0,
           is_relaxed_probe: false,
-          entry_ts: String(lastOrder!.ts),
+          entry_ts: recoveryTs,
           entry_price: avgBuy,
           qty: totalSpot,
-          order_krw: Number(lastOrder!.amount_krw ?? 0),
+          order_krw: recoveryOrderKrw,
           reason_enter: "RECOVERED_AFTER_LEDGER_MISS",
           signal_strength: "MID",
           volume_ratio: 0,
@@ -2635,17 +2662,19 @@ export function createLiveDataStrategy(opts: {
           breakeven_armed: false,
           highest_price_after_entry: avgBuy,
           trailing_stop_price: 0,
+          stop_loss_price: recoveryStopPrice,
+          stop_loss_pct: recoveryStopPct,
           realized_partial_profit: 0,
           remaining_qty: totalSpot,
           current_net_pnl_pct: 0,
           breakeven_armed_at: null,
           partial_tp_at: null,
           strict_exit: true,
-          position_id: `${pm}|RECOVERED|${String(lastOrder!.ts)}`,
+          position_id: recoveryPositionId,
           softened_reasons: [],
         } as any;
-        reconcileActions.push(`${pm}:recovered_from_last_order`);
-        await opts.trade.syncManagedPosition?.(pm, totalSpot, avgBuy, "stable");
+        reconcileActions.push(`${pm}:recovered_from_evidence`);
+        await opts.trade.syncManagedPosition?.(pm, totalSpot, avgBuy, "stable", recoveryStopPct, recoveryStopPrice);
         const prevSq = strategyPosSnap[pm] ?? {};
         strategyPosSnap[pm] = {
           ...prevSq,
@@ -2654,7 +2683,7 @@ export function createLiveDataStrategy(opts: {
         recoveryEvalItems.push({
           market: pm,
           result: "RECOVERY_APPLIED",
-          detail: { spot_qty: totalSpot, avg_buy_used: avgBuy },
+          detail: { spot_qty: totalSpot, avg_buy_used: avgBuy, stop_loss_price: recoveryStopPrice },
         });
         console.info(
           JSON.stringify({
@@ -2663,7 +2692,9 @@ export function createLiveDataStrategy(opts: {
             market: pm,
             spot_qty: totalSpot,
             avg_buy_used: avgBuy,
-            last_order_ts: lastOrder!.ts,
+            recovery_ts: recoveryTs,
+            stop_loss_price: recoveryStopPrice,
+            stop_loss_pct: recoveryStopPct,
           }),
         );
         await racePersist("after_recovery_action");
@@ -2695,6 +2726,7 @@ export function createLiveDataStrategy(opts: {
         } else if (stratQty > 0) {
           const p = state.positions[m]!;
           if ((p.remaining_qty === 0 || !p.remaining_qty) && totalSpot > 0) {
+            const previousQty = p.qty;
             p.qty = totalSpot;
             p.remaining_qty = totalSpot;
             reconcileActions.push(`${m}:repaired_zero_remaining_qty_to_spot_qty=${totalSpot}`);
@@ -2703,7 +2735,7 @@ export function createLiveDataStrategy(opts: {
                 tag: "POSITION_QTY_REPAIR_PROOF",
                 ts: new Date().toISOString(),
                 market: m,
-                previous_qty: p.qty,
+                previous_qty: previousQty,
                 repaired_qty: totalSpot,
                 trade_control_qty: stratQty,
                 spot_qty: totalSpot,

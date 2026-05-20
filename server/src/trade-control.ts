@@ -70,6 +70,7 @@ type TradeState = {
       realized_pnl: number;
       strategy_type: StrategyType;
       stop_loss_pct: number;
+      stop_loss_price?: number;
       breakeven_arm_pct: number;
       partial_take_profit_pct: number;
       trailing_from_peak_pct: number;
@@ -1121,7 +1122,7 @@ export function createTradeControl(
       placeSell(market, confirm, ratio, "legacy"),
     setAutoTradeEnabled,
     setRecoveryReady,
-    syncManagedPosition: async (market: string, qty: number, avg: number, strategyType: StrategyType) => {
+    syncManagedPosition: async (market: string, qty: number, avg: number, strategyType: StrategyType, stopLossPct?: number, stopLossPrice?: number) => {
       if (!state.strategyPositions[market] || state.strategyPositions[market].qty <= 0) {
         const rule = strategyType === "momentum" ? STRATEGY_RISK_CONFIG.momentum : STRATEGY_RISK_CONFIG.stable;
         state.strategyPositions[market] = {
@@ -1131,7 +1132,8 @@ export function createTradeControl(
           invested_krw_total: qty * avg,
           realized_pnl: 0,
           strategy_type: strategyType,
-          stop_loss_pct: rule.stop_loss_pct,
+          stop_loss_pct: stopLossPct ?? rule.stop_loss_pct,
+          stop_loss_price: stopLossPrice,
           breakeven_arm_pct: rule.breakeven_arm_pct,
           partial_take_profit_pct: rule.partial_take_profit_pct,
           trailing_from_peak_pct: rule.trailing_from_peak_pct,
