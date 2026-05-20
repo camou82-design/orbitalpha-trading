@@ -23,7 +23,17 @@ export interface SurgeCaptureItem {
   confirm_count: number;
   last_price: number;
   high_price_reference: number;
-  status: "WATCHING" | "PROMOTED" | "EXPIRED" | "REJECTED";
+  status: "WATCHING" | "PROMOTED" | "EXPIRED" | "REJECTED" | "RECLAIM_WAIT";
+  
+  // Reclaim Wait fields
+  reference_high_price?: number;
+  reclaim_base_price?: number;
+  watch_price?: number;
+  pullback_from_high_pct?: number;
+  reclaim_attempt_count?: number;
+  chase_block_reasons?: string[];
+  first_seen_tick?: number;
+  last_seen_tick?: number;
 }
 
 const DATA_FILE = path.join(process.cwd(), "data", "runtime", "surge-capture-watch.json");
@@ -216,9 +226,88 @@ export function processSurgeCaptureQueue(
   let watchingCount = 0;
 
   for (const item of queue) {
-    if (item.status !== "WATCHING") continue;
+    if (item.status !== "WATCHING" && item.status !== "RECLAIM_WAIT") continue;
 
     const marketData = marketMap.get(item.market);
+    if (!marketData) continue;
+    
+    if (item.status === "RECLAIM_WAIT") {
+        item.reclaim_attempt_count = (item.reclaim_attempt_count || 0) + 1;
+        const maxReclaimTicks = 5;
+        const currentPrice = marketData.currentPrice;
+        const referenceHigh = item.reference_high_price || item.high_price_reference;
+        const reclaimBase = item.reclaim_base_price || item.last_price;
+        const pullbackFromHighPct = ((currentPrice - referenceHigh) / referenceHigh) * 100;
+        
+        if (item.reclaim_attempt_count > maxReclaimTicks) {
+            item.status = "REJECTED";
+            item.reject_risks.push("reclaim_timeout");
+            rejectedCount++;
+            continue;
+        }
+
+        if (pullbackFromHighPct <= -2.2 || marketData.volumeState === "faded" || marketData.btcCrashGuard) {
+            item.status = "REJECTED";
+            item.reject_risks.push(pullbackFromHighPct <= -2.2 ? "reclaim_pullback_too_deep" : "faded_or_crash");
+            rejectedCount++;
+            continue;
+        }
+
+        // FAST_SURGE_PROBE_RECLAIM condition
+        const inPullbackZone = pullbackFromHighPct >= -1.8 && pullbackFromHighPct <= -0.4;
+        const aboveEma1m = currentPrice > (marketData.ema1m || 0);
+        const aboveReclaimBase = currentPrice > reclaimBase;
+        const volumeAccelMaintained = (marketData.volume_accel_1m || 0) >= 1.0;
+        const upperWickSafe = (marketData.upper_wick_ratio_1m || 0) < 0.45;
+        const btcSafe = item.btc_5m_trend !== "down";
+        const notCrazyTop = currentPrice <= referenceHigh * 1.005; 
+
+        // If the price is rocketing with no pullback and huge wick, reject early
+        if (pullbackFromHighPct > 0.5 && upperWickSafe === false) {
+             item.status = "REJECTED";
+             item.reject_risks.push("reclaim_wick_rejection");
+             rejectedCount++;
+             continue;
+        }
+
+        if (inPullbackZone && aboveEma1m && aboveReclaimBase && volumeAccelMaintained && upperWickSafe && btcSafe && notCrazyTop) {
+            let isConfirmed = false;
+            const volumeAccelStrong = (marketData.volume_accel_1m || 0) >= 2.0;
+            const breakoutOrHold = item.breakout || item.close_upper_hold;
+            const relativeStrengthOk = item.relative_strength > 0;
+            const btc15mSafe = item.btc_15m_trend !== "down";
+
+            if (breakoutOrHold && volumeAccelStrong && relativeStrengthOk && btc15mSafe) {
+                isConfirmed = true;
+            }
+
+            item.status = "PROMOTED";
+            item.capture_grade = isConfirmed ? "HIGH" : "MID";
+            promoted.push(item);
+
+            console.info(JSON.stringify({
+                tag: "SURGE_RECLAIM_PROMOTED_PROOF",
+                ts: new Date().toISOString(),
+                market: item.market,
+                promoted_to: isConfirmed ? "CONFIRMED_SURGE_ENTRY_RECLAIM" : "FAST_SURGE_PROBE_RECLAIM",
+                pullback_pct: pullbackFromHighPct,
+                volume_accel: marketData.volume_accel_1m,
+                chase_reasons_cleared: item.chase_block_reasons,
+                tick_lease: currentTickLease
+            }));
+        } else {
+             watchingCount++;
+             console.info(JSON.stringify({
+                 tag: "SURGE_RECLAIM_WATCH_UPDATED_PROOF",
+                 ts: new Date().toISOString(),
+                 market: item.market,
+                 attempt: item.reclaim_attempt_count,
+                 pullback_pct: pullbackFromHighPct,
+                 status: "RECLAIM_WAIT"
+             }));
+        }
+        continue;
+    }
     if (!marketData) continue;
 
     const currentPrice = marketData.currentPrice;

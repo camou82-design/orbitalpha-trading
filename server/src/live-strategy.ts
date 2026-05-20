@@ -5993,9 +5993,12 @@ export function createLiveDataStrategy(opts: {
     const surgeCaptureMarketMap = new Map<string, any>();
     if (surgeCaptureQueue.length > 0) {
       for (const q of surgeCaptureQueue) {
-         if (q.status !== "WATCHING") continue;
+         if (q.status !== "WATCHING" && q.status !== "RECLAIM_WAIT") continue;
          const px = priceBy.get(q.market) || 0;
          let volumeState = "alive";
+         let ema1m = 0;
+         let upper_wick_ratio_1m = 0;
+         let volume_accel_1m = q.volume_accel_1m;
          try {
              const c1 = await fetchMinuteCandlesCached(q.market, 1, 12);
              if (c1.length >= 7) {
@@ -6003,19 +6006,38 @@ export function createLiveDataStrategy(opts: {
                const prev5 = c1.slice(-6, -1);
                const lastNotional = Number(last.trade_price ?? 0) * Number(last.candle_acc_trade_volume ?? 0);
                const prevAvg = prev5.reduce((a, b) => a + Number(b.trade_price ?? 0)*Number(b.candle_acc_trade_volume ?? 0), 0) / Math.max(1, prev5.length);
-               if (prevAvg > 0 && lastNotional / prevAvg < 0.65) volumeState = "faded";
+               if (prevAvg > 0) {
+                 volume_accel_1m = lastNotional / prevAvg;
+                 if (volume_accel_1m < 0.65) volumeState = "faded";
+               }
+               
+               const closes1 = c1.map(c => Number(c.trade_price));
+               // emaLast definition inline or available
+               const k = 2 / (5 + 1);
+               let e = closes1[0]!;
+               for (let i = 1; i < closes1.length; i++) e = closes1[i]! * k + e * (1 - k);
+               ema1m = e;
+
+               const high = Number(last.high_price);
+               const low = Number(last.low_price);
+               const close = Number(last.trade_price);
+               const range = Math.max(1e-9, high - low);
+               upper_wick_ratio_1m = (high - Math.max(close, Number(last.opening_price))) / range;
              }
          } catch {}
          const btcChange = Number((tstatus as any)?.btc_change_24h ?? 0);
          surgeCaptureMarketMap.set(q.market, {
            currentPrice: px,
            volumeState,
+           volume_accel_1m,
+           ema1m,
+           upper_wick_ratio_1m,
            btcCrashGuard: btcChange <= -0.025
          });
       }
       const processResult = processSurgeCaptureQueue(surgeCaptureQueue, Date.now(), surgeCaptureMarketMap, myLease);
       if (processResult.promoted.length > 0 || processResult.expiredCount > 0 || processResult.rejectedCount > 0) {
-        let pruned = surgeCaptureQueue.filter(q => q.status === "WATCHING" || (Date.now() - new Date(q.last_seen_at).getTime() < 600000));
+        let pruned = surgeCaptureQueue.filter(q => q.status === "WATCHING" || q.status === "RECLAIM_WAIT" || (Date.now() - new Date(q.last_seen_at).getTime() < 600000));
         const maxWatch = Number(process.env.LIVE_SURGE_CAPTURE_MAX_WATCH ?? 12);
         if (pruned.length > maxWatch) {
           pruned.sort((a, b) => b.capture_score - a.capture_score);
@@ -8570,6 +8592,7 @@ export function createLiveDataStrategy(opts: {
       let surgeDecisionMetrics: any = null;
       try {
         const candles5 = await fetchMinuteCandlesCached(market, 5, 48);
+        const candles1 = await fetchMinuteCandlesCached(market, 1, 30);
         const staleOk =
           sourceMetaResolved.age_seconds !== null && sourceMetaResolved.age_seconds <= LIVE_ENTRY_SIGNAL_STALE_SECONDS;
         const bridgePass = Boolean(scannerBridgeScore?.pass);
@@ -8583,7 +8606,7 @@ export function createLiveDataStrategy(opts: {
           
           if (!isPromoted && !alreadyInQueue && !fullyPassed) {
              const evalCapture = evaluateSurgeCaptureCandidate({
-               market, currentPrice, payload: sig.p, candles1: await fetchMinuteCandlesCached(market, 1, 12), candles5, marketState: { btc_5m_trend: marketState.btc_5m_trend, btc_15m_trend: marketState.btc_15m_trend, btc_change_24h: btcChange }, tickLease: String(myLease), sourceKind: sourceKindForJudgment
+               market, currentPrice, payload: sig.p, candles1, candles5, marketState: { btc_5m_trend: marketState.btc_5m_trend, btc_15m_trend: marketState.btc_15m_trend, btc_change_24h: btcChange }, tickLease: String(myLease), sourceKind: sourceKindForJudgment
              });
              console.info(JSON.stringify({
                tag: "SURGE_CAPTURE_EVALUATED_PROOF",
@@ -8640,7 +8663,9 @@ export function createLiveDataStrategy(opts: {
           const decision = evaluateSurgeEntryPipeline({
             market,
             payload: sig.p,
+            candles1,
             candles5,
+            currentPrice,
             marketState: {
               market_state: marketState.market_state,
               btc_5m_trend: marketState.btc_5m_trend ?? "flat",
@@ -8659,7 +8684,8 @@ export function createLiveDataStrategy(opts: {
             captureScore: (sig.p as any).surge_capture_score,
             captureConfirmCount: (sig.p as any).surge_capture_confirm_count,
             captureVolumeAccel1m: (sig.p as any).surge_capture_volume_accel_1m,
-            captureNearHighPct: (sig.p as any).surge_capture_near_high_pct
+            captureNearHighPct: (sig.p as any).surge_capture_near_high_pct,
+            tickLease: myLease
           });
 
           console.info(
@@ -8693,6 +8719,53 @@ export function createLiveDataStrategy(opts: {
           );
 
           if (decision.action === "reject") {
+            if (decision.reason === "blocked_surge_late_chase") {
+                const chaseBlockReasons = (decision.detail?.chase_block_reasons as string[]) || [];
+                const cScore = isPromoted ? Number((sig.p as any).surge_capture_score || 0) : 0;
+                
+                const exists = surgeCaptureQueue.find(q => q.market === market && q.status === "RECLAIM_WAIT");
+                if (!exists) {
+                    surgeCaptureQueue.push({
+                        market,
+                        first_seen_at: new Date().toISOString(),
+                        last_seen_at: new Date().toISOString(),
+                        tick_lease: String(myLease),
+                        capture_score: cScore || Number(sig.p?.scanner_score ?? sig.p?.signal_score ?? 0),
+                        capture_grade: "HIGH",
+                        source_kind: sourceKindForJudgment,
+                        scanner_score: Number(sig.p?.scanner_score ?? sig.p?.signal_score ?? 0),
+                        volume_multiple: vol,
+                        volume_accel_1m: (decision.detail?.volume_accel_1m as number) || 1.0,
+                        near_high_pct: 0,
+                        breakout: Boolean(sig.p?.breakout),
+                        close_upper_hold: Boolean(sig.p?.close_upper_hold),
+                        relative_strength: Number(sig.p?.relative_strength ?? 0),
+                        btc_5m_trend: marketState.btc_5m_trend ?? "flat",
+                        btc_15m_trend: marketState.btc_15m_trend ?? "flat",
+                        btc_change_24h: btcChange,
+                        reject_risks: [],
+                        confirm_count: 0,
+                        last_price: currentPrice,
+                        high_price_reference: Math.max(localHigh ?? 0, currentPrice),
+                        status: "RECLAIM_WAIT",
+                        reference_high_price: Math.max(localHigh ?? 0, currentPrice),
+                        reclaim_base_price: currentPrice,
+                        chase_block_reasons: chaseBlockReasons,
+                        reclaim_attempt_count: 0
+                    });
+                    saveCaptureQueue(surgeCaptureQueue);
+                    console.info(JSON.stringify({
+                        tag: "SURGE_RECLAIM_WATCH_REGISTERED_PROOF",
+                        ts: new Date().toISOString(),
+                        market,
+                        chase_block_reasons: chaseBlockReasons,
+                        reclaim_base_price: currentPrice,
+                        reference_high: Math.max(localHigh ?? 0, currentPrice),
+                        tick_lease: myLease
+                    }));
+                }
+            }
+
             await appendLog({
               company_id: companyIdSchema.parse(opts.companyId),
               service_id: serviceIdSchema.parse(opts.serviceId),

@@ -32,7 +32,9 @@ export type EntryPipelineMarketState = {
 export function evaluateSurgeEntryPipeline(input: Readonly<{
   market: string;
   payload: unknown;
+  candles1: UpbitCandle[];
   candles5: UpbitCandle[];
+  currentPrice: number;
   marketState: EntryPipelineMarketState;
   volumeRatio: number;
   bridgePass: boolean;
@@ -47,6 +49,7 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
   captureConfirmCount?: number;
   captureVolumeAccel1m?: number;
   captureNearHighPct?: number;
+  tickLease?: number;
 }>): SurgeEntryDecision {
   const p = (input.payload && typeof input.payload === "object" ? input.payload : {}) as Record<string, unknown>;
   const sourceKind = String(p.source_kind ?? "");
@@ -274,6 +277,77 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
 
   const closes = completed.map(x => num(x.trade_price));
   const e5 = emaLast(closes, 5) ?? 0;
+
+  // --- LATE_SURGE_CHASE_BLOCK ---
+  let chaseBlockReasons: string[] = [];
+  if (input.candles1 && input.candles1.length >= 4) {
+      const c1Completed = input.candles1.slice(0, -1);
+      const c1Last = c1Completed[c1Completed.length - 1];
+      if (c1Last) {
+          const tail1m = c1Completed.slice(-3);
+          const o1m_start = num(tail1m[0]!.opening_price);
+          const c1m_end = num(tail1m[tail1m.length - 1]!.trade_price);
+          const recent_1m_return_3bar_pct = o1m_start > 0 ? ((c1m_end / o1m_start) - 1) * 100 : 0;
+          
+          const closes1m = c1Completed.map(x => num(x.trade_price));
+          const ema1m = emaLast(closes1m, 5) ?? c1m_end;
+          const distance_from_ema1m_pct = ((input.currentPrice - ema1m) / ema1m) * 100;
+          
+          const h1m = num(c1Last.high_price);
+          const l1m = num(c1Last.low_price);
+          const cl1m = num(c1Last.trade_price);
+          const op1m = num(c1Last.opening_price);
+          const range1m = Math.max(1e-9, h1m - l1m);
+          const upper_wick_ratio_1m = (h1m - Math.max(cl1m, op1m)) / range1m;
+          
+          const prev5_1m = c1Completed.slice(-6, -1);
+          const lastNotional = cl1m * num(c1Last.candle_acc_trade_volume);
+          const prevAvgNotional = prev5_1m.reduce((a, b) => a + num(b.trade_price)*num(b.candle_acc_trade_volume), 0) / Math.max(1, prev5_1m.length);
+          const volume_accel_1m = prevAvgNotional > 0 ? lastNotional / prevAvgNotional : 1.0;
+          
+          const LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX ?? 4.5);
+          const LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX ?? 3.5);
+          const LIVE_SURGE_LATE_CHASE_WICK_RATIO_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_WICK_RATIO_MAX ?? 0.6);
+          const LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX ?? 0.4);
+
+          let chaseCondCount = 0;
+          if (recent_1m_return_3bar_pct >= LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX) { chaseCondCount++; chaseBlockReasons.push("recent_1m_return_3bar_pct_high"); }
+          if (distance_from_ema1m_pct >= LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX) { chaseCondCount++; chaseBlockReasons.push("distance_from_ema1m_pct_high"); }
+          if (upper_wick_ratio_1m >= LIVE_SURGE_LATE_CHASE_WICK_RATIO_MAX) { chaseCondCount++; chaseBlockReasons.push("upper_wick_ratio_1m_high"); }
+          if (volume_accel_1m <= LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX) { chaseCondCount++; chaseBlockReasons.push("volume_accel_1m_low"); }
+          
+          const c_and_d = distance_from_ema1m_pct >= LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX && volume_accel_1m <= LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX;
+
+          if (chaseCondCount >= 2 || c_and_d) {
+             console.info(JSON.stringify({
+                 tag: "SURGE_LATE_CHASE_EVALUATED_PROOF",
+                 ts: new Date().toISOString(),
+                 market: input.market,
+                 recent_1m_return_3bar_pct,
+                 distance_from_ema1m_pct,
+                 upper_wick_ratio_1m,
+                 volume_accel_1m,
+                 chase_block_reasons: chaseBlockReasons,
+                 is_blocked: true,
+                 tick_lease: input.tickLease
+             }));
+             return {
+                 action: "reject",
+                 reason: "blocked_surge_late_chase",
+                 authoritySource: "surge-v2",
+                 detail: {
+                     symbol: input.market,
+                     sub: "late_surge_chase",
+                     chase_block_reasons: chaseBlockReasons,
+                     volume_accel_1m,
+                     ...surgeSetupContext
+                 }
+             };
+          }
+      }
+  }
+  // --- END LATE_SURGE_CHASE_BLOCK ---
+
   const btcMatched = input.marketState.btc_5m_trend === "up";
   const aboveEma = e5 > 0 && close > e5;
   const pullbackRebound = Boolean(p.would_pass_with_pullback_relaxed || closeUpperHold);
