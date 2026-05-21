@@ -362,9 +362,16 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
                 ts: new Date().toISOString(),
                 late_entry_guard_triggered: true,
                 market: input.market,
-                kst_time: new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Seoul', hour12: false, hour: 'numeric', minute: 'numeric' }),
+                kst_time: kstTimeStr,
                 age_seconds: input.ageSeconds,
                 source_kind: sourceKind,
+                is_reset_late_chase_window: isResetLateChaseWindow,
+                thresholds: {
+                    return_max: LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX,
+                    ema_dist_max: LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX,
+                    wick_ratio_max: LIVE_SURGE_LATE_CHASE_WICK_RATIO_MAX,
+                    vol_drop_max: LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX
+                },
                 chase_block_reasons: chaseBlockReasons,
                 ck_lease: input.tickLease
             }));
