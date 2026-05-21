@@ -8203,7 +8203,8 @@ export function createLiveDataStrategy(opts: {
             distance_from_local_high_pct: distanceFromLocalHighPct,
             volume_fade_triggered: volumeFadeTriggered,
             btc_tier: btcTierNow,
-          }),
+            age_seconds: sourceMetaResolved.age_seconds,
+          })
         );
         if (!isSurgeSource) {
           if (

@@ -339,11 +339,14 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
           const prevAvgNotional = prev5_1m.reduce((a, b) => a + num(b.trade_price)*num(b.candle_acc_trade_volume), 0) / Math.max(1, prev5_1m.length);
           const volume_accel_1m = prevAvgNotional > 0 ? lastNotional / prevAvgNotional : 1.0;
           
-          const isPostReset = kstTotalMins >= 555;
-          const LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX ?? (isPostReset ? 3.0 : 4.5));
-          const LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX ?? (isPostReset ? 2.5 : 3.5));
-          const LIVE_SURGE_LATE_CHASE_WICK_RATIO_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_WICK_RATIO_MAX ?? (isPostReset ? 0.45 : 0.6));
-          const LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX ?? (isPostReset ? 0.6 : 0.4));
+          // Simplified late chase window: apply post-reset values only between 09:15 (555) and 09:45 (585) KST.
+          const LATE_CHASE_START = 555; // 09:15 KST
+          const LATE_CHASE_END = 585;   // 09:45 KST
+          const isResetLateChaseWindow = kstTotalMins >= LATE_CHASE_START && kstTotalMins < LATE_CHASE_END;
+          const LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX ?? (isResetLateChaseWindow ? 3.0 : 4.5));
+          const LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX ?? (isResetLateChaseWindow ? 2.5 : 3.5));
+          const LIVE_SURGE_LATE_CHASE_WICK_RATIO_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_WICK_RATIO_MAX ?? (isResetLateChaseWindow ? 0.45 : 0.6));
+          const LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX ?? (isResetLateChaseWindow ? 0.6 : 0.4));
 
           let chaseCondCount = 0;
           if (recent_1m_return_3bar_pct >= LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX) { chaseCondCount++; chaseBlockReasons.push("recent_1m_return_3bar_pct_high"); }
@@ -354,18 +357,17 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
           const c_and_d = distance_from_ema1m_pct >= LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX && volume_accel_1m <= LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX;
 
           if (chaseCondCount >= 2 || c_and_d) {
-             console.info(JSON.stringify({
-                 tag: "SURGE_LATE_CHASE_EVALUATED_PROOF",
-                 ts: new Date().toISOString(),
-                 market: input.market,
-                 recent_1m_return_3bar_pct,
-                 distance_from_ema1m_pct,
-                 upper_wick_ratio_1m,
-                 volume_accel_1m,
-                 chase_block_reasons: chaseBlockReasons,
-                 is_blocked: true,
-                 tick_lease: input.tickLease
-             }));
+              console.info(JSON.stringify({
+                tag: "SURGE_LATE_CHASE_EVALUATED_PROOF",
+                ts: new Date().toISOString(),
+                late_entry_guard_triggered: true,
+                market: input.market,
+                kst_time: new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Seoul', hour12: false, hour: 'numeric', minute: 'numeric' }),
+                age_seconds: input.ageSeconds,
+                source_kind: sourceKind,
+                chase_block_reasons: chaseBlockReasons,
+                ck_lease: input.tickLease
+            }));
              return {
                  action: "reject",
                  reason: "blocked_surge_late_chase",
