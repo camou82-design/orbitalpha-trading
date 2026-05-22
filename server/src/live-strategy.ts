@@ -7797,6 +7797,32 @@ export function createLiveDataStrategy(opts: {
         lateTimingTier = "hard_block";
         lateEntryGuardReason = `chase_from_signal:${priceChangeSinceSignalPct.toFixed(3)}pct>${chaseLimit}pct`;
       } else {
+        const filtersArr = Array.isArray(sig?.p?.filters) ? (sig.p.filters as Array<{ id?: unknown; passed?: unknown }>) : [];
+        const failedFilterIds = new Set(filtersArr.filter(f => f && f.passed === false).map(f => String(f.id ?? "")));
+        
+        const boxBreakoutFailed = failedFilterIds.has("box_breakout");
+        const upperWickHeavy = failedFilterIds.has("upper_wick");
+        const volumeSpikeCloseFail = failedFilterIds.has("volume_spike_close_fail");
+        const volumeRatio1m5Weak = volumeRatio1m5 === null || volumeRatio1m5 < 0.35;
+
+        const isFreshFilterSource = sourceKindForJudgment === "fresh_filter_pass" || sourceKindForJudgment === "scanner_filter_fresh";
+        const hasValidStopLoss = metaForGuard?.stopPrice !== undefined && metaForGuard.stopPrice !== null && metaForGuard.stopPrice > 0;
+        const marketStateBlock = !isSurgeSource && marketState.market_state === "risk_off";
+        const maxPositionsReached = Object.keys(state.positions).length >= state.safety_guard.max_positions;
+
+        const nearHighSoftenEligible =
+          isFreshFilterSource &&
+          score >= 70 &&
+          (secondsSinceSignal !== null && secondsSinceSignal <= 90) &&
+          !marketStateBlock &&
+          !maxPositionsReached &&
+          !volumeFadeTriggered &&
+          !volumeRatio1m5Weak &&
+          !upperWickHeavy &&
+          !boxBreakoutFailed &&
+          !volumeSpikeCloseFail &&
+          hasValidStopLoss;
+
         const nearHighProblem =
           distanceFromLocalHighPct !== null && distanceFromLocalHighPct < LIVE_MAX_ENTRY_NEAR_HIGH_PCT;
         const volFadeProblem =
@@ -7815,7 +7841,30 @@ export function createLiveDataStrategy(opts: {
             Number(metaForGuard?.volumeRatio ?? 0) >= LIVE_CORE_TREND_MIN_VOLUME_RATIO &&
             Number(metaForGuard?.stopPrice ?? 0) > 0;
 
-          if (severeNearHigh && coreTrendNearHighSoftAllowed) {
+          if (nearHighSoftenEligible) {
+            lateTimingTier = "reduced_size_allowed";
+            lateEntrySizingMultiplier *= 0.45;
+            lateEntryGuardReason = "near_high_probe_allowed";
+            if (metaForGuard) {
+              if (!metaForGuard.softened_reasons) metaForGuard.softened_reasons = [];
+              metaForGuard.softened_reasons.push("NEAR_HIGH_ENTRY_SOFTENED_PROBE");
+            }
+            console.info(JSON.stringify({
+              tag: "NEAR_HIGH_ENTRY_SOFTENED_PROBE_PROOF",
+              market,
+              source_kind: sourceKindForJudgment,
+              score,
+              age_seconds: secondsSinceSignal,
+              distance_from_local_high_pct: distanceFromLocalHighPct,
+              volume_ratio_1m5: volumeRatio1m5,
+              volume_fade_triggered: volumeFadeTriggered,
+              near_high_hard_block: false,
+              near_high_probe_allowed: true,
+              late_entry_sizing_multiplier: lateEntrySizingMultiplier,
+              stop_loss_price: metaForGuard?.stopPrice ?? 0,
+              reason: "near_high_softened_to_probe_allowed"
+            }));
+          } else if (severeNearHigh && coreTrendNearHighSoftAllowed) {
             // CORE_TREND_ENTRY 후보는 near-high를 “소액 probe”로 낮추되, 다른 위험 신호는 기존 hard block 유지.
             lateTimingTier = "reduced_size_allowed";
             lateEntrySizingMultiplier *= 0.45;
@@ -8178,14 +8227,17 @@ export function createLiveDataStrategy(opts: {
         }
       }
 
-      if (!entryAllowedByTiming) {
+      const isNearHighHardBlock = lateEntryGuardTriggered && (typeof lateEntryGuardReason === "string" && lateEntryGuardReason.includes("too_near_local_high"));
+      const isNearHighProbeAllowed = !lateEntryGuardTriggered && lateEntryGuardReason === "near_high_probe_allowed";
+
+      if (!entryAllowedByTiming || isNearHighProbeAllowed) {
         const reasonStd = stdBlockReason(lateEntryGuardReason);
         console.info(
           JSON.stringify({
             tag: "DEBUG_LIVE_ENTRY_SUMMARY",
             ts: new Date().toISOString(),
             symbol: market,
-            line: `${market} | early_candidate=yes | decision=block | reason=${reasonStd} | score=${Math.round(score)} | vr=${Number(
+            line: `${market} | early_candidate=yes | decision=${isNearHighProbeAllowed ? "scout" : "block"} | reason=${reasonStd} | score=${Math.round(score)} | vr=${Number(
               (volumeRatio1m5 ?? volumeRatio) || 0,
             ).toFixed(2)}`,
           }),
@@ -8195,32 +8247,44 @@ export function createLiveDataStrategy(opts: {
             tag: "DEBUG_LIVE_ENTRY_TIMING_GUARD",
             ts: new Date().toISOString(),
             symbol: market,
-            block_reason: reasonStd,
-            late_entry_guard_triggered: true,
+            market: market,
+            source_kind: sourceKindForJudgment,
+            score: score,
+            age_seconds: secondsSinceSignal,
+            distance_from_local_high_pct: distanceFromLocalHighPct,
+            volume_ratio_1m5: volumeRatio1m5,
+            volume_fade_triggered: volumeFadeTriggered,
+            near_high_hard_block: isNearHighHardBlock,
+            near_high_probe_allowed: isNearHighProbeAllowed,
+            late_entry_sizing_multiplier: lateEntrySizingMultiplier,
+            stop_loss_price: metaForGuard?.stopPrice ?? 0,
+            reason: reasonStd,
+            block_reason: isNearHighProbeAllowed ? null : reasonStd,
+            late_entry_guard_triggered: lateEntryGuardTriggered,
             late_entry_guard_reason: lateEntryGuardReason,
             seconds_since_signal: secondsSinceSignal,
             price_change_since_signal_pct: priceChangeSinceSignalPct,
-            distance_from_local_high_pct: distanceFromLocalHighPct,
-            volume_fade_triggered: volumeFadeTriggered,
             btc_tier: btcTierNow,
-            age_seconds: sourceMetaResolved.age_seconds,
+            age_seconds_source: sourceMetaResolved.age_seconds,
           })
         );
-        if (!isSurgeSource) {
-          if (
-            metaForGuard?.setupReason === "CORE_TREND_ENTRY" &&
-            typeof lateEntryGuardReason === "string" &&
-            lateEntryGuardReason.startsWith("too_near_local_high:")
-          ) {
-            logPlacebuyFinalGateBlocked("core_trend_late_guard:too_near_local_high", {
-              entry_mode: "CORE_TREND_ENTRY",
-              late_entry_guard_reason: lateEntryGuardReason,
-              candle_source: metaForGuard?.candle_source ?? null,
-              candle_cache_age_ms: metaForGuard?.candle_cache_age_ms ?? null,
-            });
+        if (!isNearHighProbeAllowed) {
+          if (!isSurgeSource) {
+            if (
+              metaForGuard?.setupReason === "CORE_TREND_ENTRY" &&
+              typeof lateEntryGuardReason === "string" &&
+              lateEntryGuardReason.startsWith("too_near_local_high:")
+            ) {
+              logPlacebuyFinalGateBlocked("core_trend_late_guard:too_near_local_high", {
+                entry_mode: "CORE_TREND_ENTRY",
+                late_entry_guard_reason: lateEntryGuardReason,
+                candle_source: metaForGuard?.candle_source ?? null,
+                candle_cache_age_ms: metaForGuard?.candle_cache_age_ms ?? null,
+              });
+            }
+            bumpSkip("late_entry_guard");
+            continue;
           }
-          bumpSkip("late_entry_guard");
-          continue;
         }
       }
 
@@ -9135,16 +9199,13 @@ export function createLiveDataStrategy(opts: {
       const entryPrice = currentPrice;
       const stopPrice = candidateMeta.find(c => c.market === market)?.stopPrice ?? 0;
       
-      // 만약 12,000원 미만이면 12,000원으로 맞춘다 (단, remainingInTick 등이 허용하는 선에서)
-      let finalOrderKrwValue = Math.max(minSafeEntryThreshold, orderKrw);
-      
-      // 자본금 상한 등에 의해 12,000원 미만으로 깎였다면 진입 차단 (업비트 최소 주문 5,000원 대비 안전마진)
-      if (finalOrderKrwValue < minSafeEntryThreshold) {
+      // 김 사장 지시: 최종 주문 금액이 최소 주문금액(minSafeEntryThreshold) 이하가 되면 차단되어야 합니다.
+      if (orderKrw < minSafeEntryThreshold) {
           console.info(JSON.stringify({
               tag: "LIVE_ENTRY_MIN_SAFE_BLOCK",
               ts: new Date().toISOString(),
               market,
-              orderKrw: finalOrderKrwValue,
+              orderKrw,
               minSafeEntryThreshold
           }));
           if (isCoreMarket) {
@@ -9153,13 +9214,14 @@ export function createLiveDataStrategy(opts: {
               decision: "reject",
               reason: "core_order_krw_invalid",
               block_reason: "core_order_krw_invalid",
-              order_krw: finalOrderKrwValue,
+              order_krw: orderKrw,
               min_safe_threshold: minSafeEntryThreshold
             });
           }
           bumpSkip("LIVE_ENTRY_MIN_SAFE_BLOCK");
           continue;
       }
+      let finalOrderKrwValue = orderKrw;
 
       if (stopPrice > 0) {
           const expectedQty = finalOrderKrwValue / entryPrice;
@@ -9511,11 +9573,25 @@ export function createLiveDataStrategy(opts: {
         emitFinalBlocked("tick_lease_revoked", { order_krw: orderKrw });
         continue;
       }
+      const isNearHighProbeAllowedAtGate = !lateEntryGuardTriggered && lateEntryGuardReason === "near_high_probe_allowed";
+      const isNearHighHardBlockAtGate = lateEntryGuardTriggered && (typeof lateEntryGuardReason === "string" && lateEntryGuardReason.includes("too_near_local_high"));
+
       console.info(
         JSON.stringify({
           tag: "LIVE_PLACEBUY_ATTEMPT_FINAL_GATE",
           ts: new Date().toISOString(),
           market,
+          source_kind: sourceKindForJudgment,
+          score,
+          age_seconds: secondsSinceSignal,
+          distance_from_local_high_pct: distanceFromLocalHighPct,
+          volume_ratio_1m5: volumeRatio1m5,
+          volume_fade_triggered: volumeFadeTriggered,
+          near_high_hard_block: isNearHighHardBlockAtGate,
+          near_high_probe_allowed: isNearHighProbeAllowedAtGate,
+          late_entry_sizing_multiplier: lateEntrySizingMultiplier,
+          stop_loss_price: isSurgeSource ? surgeStopPrice : Number(metaForGuard?.stopPrice ?? 0),
+          reason: "reached_final_gate",
           path: isSurgeSource ? "surge_normal" : "normal",
           final_block_reason: null,
           candidate_meta_missing_reason: null,
@@ -9542,6 +9618,8 @@ export function createLiveDataStrategy(opts: {
             candle_cache_age_ms: metaForGuard?.candle_cache_age_ms ?? null,
             is_fresh_signal: metaForGuard?.is_fresh_signal ?? null,
             is_watch_candidate: metaForGuard?.is_watch_candidate ?? null,
+            near_high_hard_block: isNearHighHardBlockAtGate,
+            near_high_probe_allowed: isNearHighProbeAllowedAtGate,
           },
           tick_lease: myLease,
         }),
