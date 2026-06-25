@@ -4334,6 +4334,21 @@ export function createLiveDataStrategy(opts: {
                   await opts.trade.placeBuy(market, true, promoteFillKrw, "momentum", "strategy", {
                     __early_promote_fill: true,
                     __early_promote_fill_krw: promoteFillKrw,
+                    strict_exit: true,
+                    exit_policy_attached: true,
+                    surge_entry_mode: ep.surge_entry_mode ?? "FAST_SURGE_PROBE",
+                    surge_stop_price: ep.surge_stop_price,
+                    surge_take_profit_price: ep.surge_take_profit_price,
+                    surge_trailing_start_pct: ep.surge_trailing_start_pct ?? 2.0,
+                    surge_trailing_gap_pct: ep.surge_trailing_gap_pct ?? 1.5,
+                    entry_stop_price: ep.entry_stop_price,
+                    entry_target_price: ep.entry_target_price,
+                    entry_risk_reward: ep.entry_risk_reward,
+                    __surge_stop_price: ep.surge_stop_price,
+                    __surge_risk_pct: ep.entry_stop_price && currentPrice > 0
+                      ? ((currentPrice - ep.entry_stop_price) / currentPrice) * 100
+                      : 0,
+                    __surge_stop_reason: "early_promote_exit_policy",
                   });
                 }
               }
@@ -4376,6 +4391,15 @@ export function createLiveDataStrategy(opts: {
           breakeven_armed_at: null,
           partial_tp_at: null,
           strict_exit: true,
+          exit_policy_attached: ep.exit_policy_attached,
+          surge_entry_mode: ep.surge_entry_mode,
+          surge_stop_price: ep.surge_stop_price,
+          surge_take_profit_price: ep.surge_take_profit_price,
+          surge_trailing_start_pct: ep.surge_trailing_start_pct,
+          surge_trailing_gap_pct: ep.surge_trailing_gap_pct,
+          entry_stop_price: ep.entry_stop_price,
+          entry_target_price: ep.entry_target_price,
+          entry_risk_reward: ep.entry_risk_reward,
         };
         emitStageChange({
           symbol: market,
