@@ -55,7 +55,7 @@ export function evaluateSurgeExit(pos: any, currentPx: number, rise3mPct?: numbe
     trailingGapPct <= 0 || !Number.isFinite(trailingGapPct)
   ) {
     console.info(JSON.stringify({
-      tag: "SURGE_EXIT_POLICY_INVALID_PROOF",
+      tag: "SURGE_EXIT_POLICY_INVALID_FORCE_EXIT_PROOF",
       ts: new Date().toISOString(),
       entryPrice,
       currentPx,
@@ -64,7 +64,7 @@ export function evaluateSurgeExit(pos: any, currentPx: number, rise3mPct?: numbe
       trailingGapPct,
       reason: "invalid_prices_or_gap_detected"
     }));
-    return { action: "hold", reason: "surge_hold", ratio: 0, runnerTrailActive: false, authoritySource: "surge-v2" };
+    return { action: "sell", reason: "SURGE_EXIT_POLICY_INVALID_FORCE_EXIT", ratio: 1, runnerTrailActive: false, authoritySource: "surge-v2" };
   }
 
   // Update Trailing State

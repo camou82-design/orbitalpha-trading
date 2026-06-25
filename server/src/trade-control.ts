@@ -78,10 +78,14 @@ type TradeState = {
       // SURGE V2 specific
       strict_exit?: boolean;
       exit_policy_attached?: boolean;
+      surge_entry_mode?: string;
       surge_stop_price?: number;
       surge_take_profit_price?: number;
       surge_trailing_start_pct?: number;
       surge_trailing_gap_pct?: number;
+      entry_stop_price?: number;
+      entry_target_price?: number;
+      entry_risk_reward?: number;
     }
   >;
   legacyBuckets: Record<ManagedMarket, LegacyBucketState>;
@@ -745,10 +749,28 @@ export function createTradeControl(
           const sp = signalPayload as any;
           if (sp.strict_exit === true) pos.strict_exit = true;
           if (sp.exit_policy_attached === true) pos.exit_policy_attached = true;
+          if (typeof sp.surge_entry_mode === "string") pos.surge_entry_mode = sp.surge_entry_mode;
           if (typeof sp.surge_stop_price === "number") pos.surge_stop_price = sp.surge_stop_price;
           if (typeof sp.surge_take_profit_price === "number") pos.surge_take_profit_price = sp.surge_take_profit_price;
           if (typeof sp.surge_trailing_start_pct === "number") pos.surge_trailing_start_pct = sp.surge_trailing_start_pct;
           if (typeof sp.surge_trailing_gap_pct === "number") pos.surge_trailing_gap_pct = sp.surge_trailing_gap_pct;
+          if (typeof sp.entry_stop_price === "number") pos.entry_stop_price = sp.entry_stop_price;
+          if (typeof sp.entry_target_price === "number") pos.entry_target_price = sp.entry_target_price;
+          if (typeof sp.entry_risk_reward === "number") pos.entry_risk_reward = sp.entry_risk_reward;
+
+          if (sp.exit_policy_attached) {
+            console.info(JSON.stringify({
+              tag: "TRADE_CONTROL_EXIT_POLICY_ATTACHED_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              strict_exit: pos.strict_exit,
+              exit_policy_attached: pos.exit_policy_attached,
+              surge_stop_price: pos.surge_stop_price,
+              surge_take_profit_price: pos.surge_take_profit_price,
+              surge_trailing_start_pct: pos.surge_trailing_start_pct,
+              surge_trailing_gap_pct: pos.surge_trailing_gap_pct,
+            }));
+          }
         }
       }
       if (bucket === "legacy") {

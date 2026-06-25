@@ -228,9 +228,16 @@ type EarlyEntryPosition = {
   position_stage?: "early_candidate" | "early_active" | "normal_active" | "scaled_out_partial" | "cooldown" | "closed";
   /** 진입 시 설정된 전체 목표 예산 (normal 승격 시 이 금액까지 채움) */
   target_budget_krw?: number;
-  /** 실제 체결된 금액 (수수료 제외 순수 매수액) */
+  /** actual 체결된 금액 (수수료 제외 순수 매수액) */
   filled_entry_krw?: number;
   /** Original Setup fields */
+  strict_exit?: boolean;
+  exit_policy_attached?: boolean;
+  surge_stop_price?: number;
+  surge_take_profit_price?: number;
+  surge_trailing_start_pct?: number;
+  surge_trailing_gap_pct?: number;
+  surge_entry_mode?: string;
   original_setup_mode?: OriginalSetupMode;
   original_setup_reason?: string;
   entry_stop_price?: number;
@@ -2587,6 +2594,20 @@ export function createLiveDataStrategy(opts: {
         }
         const totalSpot = accountTotalSpotQtyForMarket(pm, balArr);
         if (!(totalSpot > 0)) {
+          const ep = strategyPosSnap[pm];
+          const recoveredPolicy = ep ? {
+            engine_bucket: ep.engine_bucket,
+            strict_exit: ep.strict_exit,
+            exit_policy_attached: ep.exit_policy_attached,
+            surge_entry_mode: ep.surge_entry_mode,
+            surge_stop_price: ep.surge_stop_price,
+            surge_take_profit_price: ep.surge_take_profit_price,
+            surge_trailing_start_pct: ep.surge_trailing_start_pct,
+            surge_trailing_gap_pct: ep.surge_trailing_gap_pct,
+            entry_stop_price: ep.entry_stop_price,
+            entry_target_price: ep.entry_target_price,
+            entry_risk_reward: ep.entry_risk_reward,
+          } : {};
           recoveryEvalItems.push({
             market: pm,
             result: "RECOVERY_SKIPPED",
@@ -2712,6 +2733,58 @@ export function createLiveDataStrategy(opts: {
     }
 
     for (const m of new Set([...Object.keys(state.positions), ...Object.keys(state.early_positions)])) {
+      const p1 = state.positions[m];
+      if (p1 && (!p1.surge_stop_price || !p1.surge_take_profit_price || !p1.strict_exit || !p1.exit_policy_attached)) {
+          const entry_price = p1.entry_price;
+          if (entry_price > 0) {
+              const stopPrice = entry_price * 0.982;
+              const takeProfitPrice = entry_price + (entry_price - stopPrice) * 1.4;
+              p1.surge_stop_price = stopPrice;
+              p1.surge_take_profit_price = takeProfitPrice;
+              p1.surge_trailing_start_pct = 2.0;
+              p1.surge_trailing_gap_pct = 1.5;
+              p1.strict_exit = true;
+              p1.exit_policy_attached = true;
+              if (!p1.surge_entry_mode) p1.surge_entry_mode = "RECOVERED_SURGE_POLICY";
+              
+              console.info(JSON.stringify({
+                  tag: "MISSING_EXIT_POLICY_REPAIRED_ON_RESTORE",
+                  ts: new Date().toISOString(),
+                  market: m,
+                  entry_price,
+                  repaired_stop_price: stopPrice,
+                  repaired_take_profit_price: takeProfitPrice,
+                  reason: "missing_exit_policy_on_existing_position"
+              }));
+          }
+      }
+
+      const p2 = state.early_positions[m];
+      if (p2 && (!p2.surge_stop_price || !p2.surge_take_profit_price || !p2.strict_exit || !p2.exit_policy_attached)) {
+          const entry_price = p2.entry_price;
+          if (entry_price > 0) {
+              const stopPrice = entry_price * 0.982;
+              const takeProfitPrice = entry_price + (entry_price - stopPrice) * 1.4;
+              p2.surge_stop_price = stopPrice;
+              p2.surge_take_profit_price = takeProfitPrice;
+              p2.surge_trailing_start_pct = 2.0;
+              p2.surge_trailing_gap_pct = 1.5;
+              p2.strict_exit = true;
+              p2.exit_policy_attached = true;
+              if (!p2.surge_entry_mode) p2.surge_entry_mode = "RECOVERED_SURGE_POLICY";
+              
+              console.info(JSON.stringify({
+                  tag: "MISSING_EXIT_POLICY_REPAIRED_ON_RESTORE",
+                  ts: new Date().toISOString(),
+                  market: m,
+                  entry_price,
+                  repaired_stop_price: stopPrice,
+                  repaired_take_profit_price: takeProfitPrice,
+                  reason: "missing_exit_policy_on_existing_position"
+              }));
+          }
+      }
+
       const totalSpot = accountTotalSpotQtyForMarket(m, balArr);
       const stratQty = Number(strategyPosSnap[m]?.qty ?? 0);
       if (state.positions[m]) {
@@ -4169,6 +4242,15 @@ export function createLiveDataStrategy(opts: {
       const promoteNow = breakoutNow || pnlGross >= LIVE_EARLY_PROMOTION_PCT || heldSec >= LIVE_EARLY_PROMOTION_MAX_SECONDS;
 
       if (promoteNow) {
+        if (!ep.strict_exit || !ep.exit_policy_attached || !(Number(ep.surge_stop_price) > 0) || !(Number(ep.surge_take_profit_price) > 0) || !(Number(ep.entry_stop_price) > 0) || !(Number(ep.entry_target_price) > 0)) {
+          console.info(JSON.stringify({
+            tag: "EARLY_PROMOTION_EXIT_POLICY_MISSING_BLOCK",
+            market,
+            reason: "Missing required exit policy on early position during promotion"
+          }));
+          continue;
+        }
+
         // [HARDENED] budget-aware promotion calculation
         const minOrderFallback = Math.max(UPBIT_MIN_ORDER_KRW, LIVE_MIN_ENTRY_KRW);
         const targetBudget = ep.target_budget_krw ?? minOrderFallback;
@@ -4179,42 +4261,81 @@ export function createLiveDataStrategy(opts: {
             if (!assertLiveOrderAuthority("early_promote_before_attempt")) {
               /* revoked — no fill; keep early position state */
             } else {
-              console.info(
-                JSON.stringify({
-                  tag: "LIVE_PLACEBUY_ATTEMPT_FINAL_GATE",
-                  ts: new Date().toISOString(),
+              const currentPrice = now;
+              const targetStopPrice = ep.entry_stop_price ?? 0;
+              const targetTakeProfitPrice = ep.entry_target_price ?? 0;
+              const targetRiskReward = ep.entry_risk_reward ?? 0;
+              if (!(
+                currentPrice > 0 &&
+                targetStopPrice > 0 &&
+                targetTakeProfitPrice > 0 &&
+                targetStopPrice < currentPrice &&
+                targetTakeProfitPrice > currentPrice &&
+                targetRiskReward > 0
+              )) {
+                console.info(JSON.stringify({
+                  tag: "ENTRY_EXIT_POLICY_MISSING_BLOCK",
                   market,
                   path: "early_promote_fill",
-                  final_block_reason: null,
-                  candidate_meta_missing_reason: null,
-                  entry_mode: "EARLY_PROMOTE_FILL",
-                  preclearance_snapshot: {
-                    promote_fill_krw: promoteFillKrw,
-                    breakout_promote: breakoutNow,
-                    held_seconds: heldSec,
-                    pnl_gross_pct: pnlGross,
-                  },
-                  tick_lease: myLease,
-                }),
-              );
-              console.info(
-                JSON.stringify({
-                  tag: "LIVE_PLACEBUY_ATTEMPT",
-                  ts: new Date().toISOString(),
-                  market,
-                  path: "early_promote_fill",
-                  order_krw: promoteFillKrw,
-                  strategy_type: "momentum",
-                  tick_lease: myLease,
-                }),
-              );
-              if (!assertLiveOrderAuthority("early_promote_before_placebuy")) {
-                /* race: lease revoked between logs */
+                  currentPrice,
+                  stopPrice: targetStopPrice,
+                  takeProfitPrice: targetTakeProfitPrice,
+                  riskReward: targetRiskReward,
+                  reason: "Invalid exit policy values before early_promote_fill placeBuy",
+                  blocked_before_placebuy: true
+                }));
               } else {
-                await opts.trade.placeBuy(market, true, promoteFillKrw, "momentum", "strategy", {
-                  __early_promote_fill: true,
-                  __early_promote_fill_krw: promoteFillKrw,
-                });
+                console.info(JSON.stringify({
+                  tag: "ENTRY_EXIT_POLICY_ATTACHED_PROOF",
+                  market,
+                  path: "early_promote_fill",
+                  currentPrice,
+                  stopPrice: targetStopPrice,
+                  takeProfitPrice: targetTakeProfitPrice,
+                  riskPct: 0,
+                  riskReward: targetRiskReward,
+                  strict_exit: true,
+                  exit_policy_attached: true,
+                  trailingStartPct: ep.surge_trailing_start_pct ?? 2.0,
+                  trailingGapPct: ep.surge_trailing_gap_pct ?? 1.5,
+                }));
+                console.info(
+                  JSON.stringify({
+                    tag: "LIVE_PLACEBUY_ATTEMPT_FINAL_GATE",
+                    ts: new Date().toISOString(),
+                    market,
+                    path: "early_promote_fill",
+                    final_block_reason: null,
+                    candidate_meta_missing_reason: null,
+                    entry_mode: "EARLY_PROMOTE_FILL",
+                    preclearance_snapshot: {
+                      promote_fill_krw: promoteFillKrw,
+                      breakout_promote: breakoutNow,
+                      held_seconds: heldSec,
+                      pnl_gross_pct: pnlGross,
+                    },
+                    tick_lease: myLease,
+                  }),
+                );
+                console.info(
+                  JSON.stringify({
+                    tag: "LIVE_PLACEBUY_ATTEMPT",
+                    ts: new Date().toISOString(),
+                    market,
+                    path: "early_promote_fill",
+                    order_krw: promoteFillKrw,
+                    strategy_type: "momentum",
+                    tick_lease: myLease,
+                  }),
+                );
+                if (!assertLiveOrderAuthority("early_promote_before_placebuy")) {
+                  /* race: lease revoked between logs */
+                } else {
+                  await opts.trade.placeBuy(market, true, promoteFillKrw, "momentum", "strategy", {
+                    __early_promote_fill: true,
+                    __early_promote_fill_krw: promoteFillKrw,
+                  });
+                }
               }
             }
           } catch {
@@ -8150,6 +8271,77 @@ export function createLiveDataStrategy(opts: {
               tick_lease: myLease,
             }),
           );
+
+          let targetStopPrice = 0;
+          let targetTakeProfitPrice = 0;
+          let targetRiskReward = 0;
+          const metaFromGuard = candidateMetaFromSetup;
+          if (metaFromGuard?.stopPrice && metaFromGuard?.targetPrice && metaFromGuard.stopPrice > 0) {
+             targetStopPrice = metaFromGuard.stopPrice;
+             targetTakeProfitPrice = metaFromGuard.targetPrice;
+             targetRiskReward = metaFromGuard.riskReward ?? 0;
+          } else {
+             const metaMapCnd = candidateMetaMap.get(market);
+             if (metaMapCnd?.stopPrice && metaMapCnd?.targetPrice && metaMapCnd.stopPrice > 0) {
+               targetStopPrice = metaMapCnd.stopPrice;
+               targetTakeProfitPrice = metaMapCnd.targetPrice;
+               targetRiskReward = metaMapCnd.riskReward ?? 0;
+             }
+          }
+
+          if (!(
+             currentPrice > 0 &&
+             targetStopPrice > 0 &&
+             targetTakeProfitPrice > 0 &&
+             targetStopPrice < currentPrice &&
+             targetTakeProfitPrice > currentPrice &&
+             targetRiskReward > 0
+          )) {
+            console.info(JSON.stringify({
+              tag: "ENTRY_EXIT_POLICY_MISSING_BLOCK",
+              market,
+              path: "early_entry",
+              currentPrice,
+              stopPrice: targetStopPrice,
+              takeProfitPrice: targetTakeProfitPrice,
+              riskReward: targetRiskReward,
+              reason: "Invalid exit policy values before early_entry placeBuy",
+              blocked_before_placebuy: true
+            }));
+            bumpSkip("early_entry_exit_policy_missing");
+            continue;
+          }
+
+          console.info(JSON.stringify({
+             tag: "ENTRY_EXIT_POLICY_ATTACHED_PROOF",
+             market,
+             path: "early_entry",
+             currentPrice,
+             stopPrice: targetStopPrice,
+             takeProfitPrice: targetTakeProfitPrice,
+             riskPct: Number((((currentPrice - targetStopPrice) / currentPrice) * 100).toFixed(4)),
+             riskReward: targetRiskReward,
+             strict_exit: true,
+             exit_policy_attached: true,
+             trailingStartPct: 2.0,
+             trailingGapPct: 1.5,
+          }));
+
+          const earlyExitPolicyPayload = {
+            strict_exit: true,
+            exit_policy_attached: true,
+            surge_entry_mode: "FAST_SURGE_PROBE",
+            surge_stop_price: targetStopPrice,
+            surge_take_profit_price: targetTakeProfitPrice,
+            surge_trailing_start_pct: 2.0,
+            surge_trailing_gap_pct: 1.5,
+            entry_stop_price: targetStopPrice,
+            entry_target_price: targetTakeProfitPrice,
+            entry_risk_reward: targetRiskReward,
+            __surge_stop_price: targetStopPrice,
+            __surge_risk_pct: Number((((currentPrice - targetStopPrice) / currentPrice) * 100).toFixed(4)),
+            __surge_stop_reason: "early_entry_exit_policy"
+          };
           if (!assertLiveOrderAuthority("early_entry_before_placebuy")) {
             /* lease lost — fall through to normal path */
           } else {
@@ -8158,6 +8350,7 @@ export function createLiveDataStrategy(opts: {
                 ...sig.p,
                 __early_entry: true,
                 __early_entry_size_ratio: LIVE_EARLY_ENTRY_SIZE_RATIO,
+                ...earlyExitPolicyPayload
               });
               if (!leaseOk()) {
                 console.info(
@@ -8197,6 +8390,16 @@ export function createLiveDataStrategy(opts: {
                 target_budget_krw: Math.floor(baseBudget),
                 filled_entry_krw: earlyOrderKrw,
                 engine_bucket: isCoreMarket ? "core" : "surge",
+                strict_exit: earlyExitPolicyPayload.strict_exit,
+                exit_policy_attached: earlyExitPolicyPayload.exit_policy_attached,
+                surge_entry_mode: earlyExitPolicyPayload.surge_entry_mode,
+                surge_stop_price: earlyExitPolicyPayload.surge_stop_price,
+                surge_take_profit_price: earlyExitPolicyPayload.surge_take_profit_price,
+                surge_trailing_start_pct: earlyExitPolicyPayload.surge_trailing_start_pct,
+                surge_trailing_gap_pct: earlyExitPolicyPayload.surge_trailing_gap_pct,
+                entry_stop_price: earlyExitPolicyPayload.entry_stop_price,
+                entry_target_price: earlyExitPolicyPayload.entry_target_price,
+                entry_risk_reward: earlyExitPolicyPayload.entry_risk_reward,
               };
               console.info(
                 JSON.stringify({
@@ -9703,6 +9906,54 @@ export function createLiveDataStrategy(opts: {
         let placeBuyOk = false;
         let placeBuyReason = "unknown";
         try {
+          const targetStopPrice = isSurgeSource ? surgeStopPrice : (metaForGuard?.stopPrice ?? metaForGuard?.setup?.stopPrice ?? 0);
+          const targetTakeProfitPrice = isSurgeSource ? surgeTakeProfitPrice : (metaForGuard?.targetPrice ?? metaForGuard?.setup?.targetPrice ?? 0);
+          const targetRiskReward = metaForGuard?.riskReward ?? metaForGuard?.setup?.riskReward ?? 0;
+          
+          if (!(
+            currentPrice > 0 &&
+            targetStopPrice > 0 &&
+            targetTakeProfitPrice > 0 &&
+            targetStopPrice < currentPrice &&
+            targetTakeProfitPrice > currentPrice &&
+            targetRiskReward > 0
+          )) {
+            console.info(JSON.stringify({
+              tag: "ENTRY_EXIT_POLICY_MISSING_BLOCK",
+              market,
+              path: isSurgeSource ? "surge_normal" : "normal",
+              currentPrice,
+              stopPrice: targetStopPrice,
+              takeProfitPrice: targetTakeProfitPrice,
+              riskReward: targetRiskReward,
+              reason: "Invalid exit policy values before normal placeBuy",
+              blocked_before_placebuy: true
+            }));
+            placeBuyReason = "EXIT_POLICY_MISSING";
+            throw new Error("EXIT_POLICY_MISSING");
+          }
+
+          console.info(JSON.stringify({
+            tag: "ENTRY_EXIT_POLICY_ATTACHED_PROOF",
+            market,
+            path: isSurgeSource ? "surge_normal" : "normal",
+            currentPrice,
+            stopPrice: targetStopPrice,
+            takeProfitPrice: targetTakeProfitPrice,
+            riskPct: isSurgeSource ? surgeRiskPct : 0,
+            riskReward: targetRiskReward,
+            strict_exit: true,
+            exit_policy_attached: true,
+            trailingStartPct: isSurgeSource ? (surgeDecisionMetrics?.trailingGapPct ?? 2.0) : 2.0,
+            trailingGapPct: isSurgeSource ? (surgeDecisionMetrics?.trailingGapPct ?? 1.5) : 1.5,
+          }));
+
+          signalPayloadForBuy.strict_exit = true;
+          signalPayloadForBuy.exit_policy_attached = true;
+          signalPayloadForBuy.entry_stop_price = targetStopPrice;
+          signalPayloadForBuy.entry_target_price = targetTakeProfitPrice;
+          signalPayloadForBuy.entry_risk_reward = targetRiskReward;
+
           if (!leaseOk()) {
             throw new Error("TICK_LEASE_REVOKED");
           }
