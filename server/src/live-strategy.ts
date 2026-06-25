@@ -7966,7 +7966,12 @@ export function createLiveDataStrategy(opts: {
           !upperWickHeavy &&
           !boxBreakoutFailed &&
           !volumeSpikeCloseFail &&
-          hasValidStopLoss;
+          hasValidStopLoss &&
+          (recent1mRet === null || recent1mRet <= 1.2) &&
+          (recent3mRet === null || recent3mRet <= 2.0) &&
+          (recent5mRet === null || recent5mRet <= 3.5) &&
+          (volumeRatio1m5 !== null && volumeRatio1m5 >= 1.2) &&
+          (Number(metaForGuard?.riskReward ?? 0) >= 1.2);
 
         const nearHighProblem =
           distanceFromLocalHighPct !== null && distanceFromLocalHighPct < LIVE_MAX_ENTRY_NEAR_HIGH_PCT;
@@ -8082,7 +8087,52 @@ export function createLiveDataStrategy(opts: {
         }
       }
 
-      let entryAllowedByTiming = isSurgeSource || !lateEntryGuardTriggered;
+      // [수정1] SURGE도 hard block은 반드시 통과해야 함
+      const surgeHardBlockReasons = new Set([
+        "signal_stale", "chase_from_signal", "too_near_local_high", "volume_fade_after_spike",
+      ]);
+      const surgeHardBlockTriggered = isSurgeSource && lateEntryGuardTriggered &&
+        (lateTimingTier === "hard_block") &&
+        (lateEntryGuardReason !== null) &&
+        (surgeHardBlockReasons.has((lateEntryGuardReason ?? "").split(":")[0]));
+
+      // [수정2] 급등 추격 차단 필터 — 최근 구간 누적 상승률 기준
+      const lateChaseBy3m = recent3mRet !== null && recent3mRet >= 3.0;
+      const lateChaseBy5m = recent5mRet !== null && recent5mRet >= 5.0;
+      const lateChaseBy15m = recent5mRet !== null && recent5mRet >= 8.0; // 15m 데이터 없을 경우 5m으로 보수적 판단
+      const lateChaseNearHighAndRising =
+        distanceFromLocalHighPct !== null && distanceFromLocalHighPct < 0.15 &&
+        recent3mRet !== null && recent3mRet >= 2.0;
+      const isLateChase = lateChaseBy3m || lateChaseBy5m || lateChaseBy15m || lateChaseNearHighAndRising;
+
+      if (isLateChase) {
+        const lateChaseReason = lateChaseBy3m
+          ? `recent3m_surge:${(recent3mRet ?? 0).toFixed(2)}pct>=3.0`
+          : lateChaseBy5m
+          ? `recent5m_surge:${(recent5mRet ?? 0).toFixed(2)}pct>=5.0`
+          : lateChaseBy15m
+          ? `recent5m_as_15m_proxy:${(recent5mRet ?? 0).toFixed(2)}pct>=8.0`
+          : `near_high_and_rising:dist=${(distanceFromLocalHighPct ?? 0).toFixed(3)}pct,3m=${(recent3mRet ?? 0).toFixed(2)}pct`;
+        console.info(JSON.stringify({
+          tag: "SURGE_LATE_CHASE_BLOCK",
+          ts: new Date().toISOString(),
+          market,
+          currentPrice,
+          recent3mRet,
+          recent5mRet,
+          recent15mRet: null, // 별도 15m 데이터 없음, 5m으로 대체 판단
+          distanceFromLocalHighPct,
+          secondsSinceSignal,
+          priceChangeSinceSignalPct,
+          reason: lateChaseReason,
+          blocked_before_placebuy: true,
+        }));
+        lateEntryGuardTriggered = true;
+        lateTimingTier = "hard_block";
+        lateEntryGuardReason = `late_chase_block:${lateChaseReason}`;
+      }
+
+      let entryAllowedByTiming = !lateEntryGuardTriggered && !surgeHardBlockTriggered;
       if (btcTierNow === "weak" && !isSurgeSource) {
         if (score < LIVE_WEAK_MARKET_MIN_SCORE) {
           entryAllowedByTiming = false;
@@ -8170,8 +8220,17 @@ export function createLiveDataStrategy(opts: {
         const weakTier = btcTierNow === "weak";
         const weakOk = !weakTier || (score >= LIVE_WEAK_MARKET_MIN_SCORE && (volumeRatio1m5 ?? 0) >= Math.max(LIVE_EARLY_ENTRY_MIN_VOLUME_RATIO, 1.45));
 
+        // [수정4] 급등 추격 차단 — early_entry도 동일하게 적용
+        const notLateChase = !isLateChase;
+        const earlyChaseOk =
+          notLateChase &&
+          (recent3mRet === null || recent3mRet <= 2.0) &&
+          (recent5mRet === null || recent5mRet <= 3.5) &&
+          (priceChangeSinceSignalPct === null || priceChangeSinceSignalPct <= (LIVE_MAX_CHASE_FROM_SIGNAL_PCT ?? 3.0)) &&
+          !(distanceFromLocalHighPct !== null && distanceFromLocalHighPct < 0.15 && recent3mRet !== null && recent3mRet >= 2.0);
+
         const earlyAllowed =
-          realSignalPresent && notAlready && earlySlotOk && weakOk && secondsFreshOk && nearHighOk && volOk && scoreOk && currentPrice > 0 && localHigh !== null;
+          realSignalPresent && notAlready && earlySlotOk && weakOk && secondsFreshOk && nearHighOk && volOk && scoreOk && currentPrice > 0 && localHigh !== null && earlyChaseOk;
         const rawEarlyReason = !realSignalPresent
           ? "missing_real_signal"
           : !notAlready
@@ -8188,9 +8247,11 @@ export function createLiveDataStrategy(opts: {
                       ? "volume_faded"
                       : !scoreOk
                         ? "base_gate_failed"
-                        : currentPrice <= 0
-                          ? "base_gate_failed"
-                          : "none";
+                        : !earlyChaseOk
+                          ? "late_chase_block"
+                          : currentPrice <= 0
+                            ? "base_gate_failed"
+                            : "none";
         const earlyDecision = earlyAllowed ? "enter" : "block";
         const earlyBlockReason = earlyAllowed ? null : stdBlockReason(rawEarlyReason);
 
@@ -8284,17 +8345,7 @@ export function createLiveDataStrategy(opts: {
               tick_lease: myLease,
             }),
           );
-          console.info(
-            JSON.stringify({
-              tag: "LIVE_PLACEBUY_ATTEMPT",
-              ts: new Date().toISOString(),
-              market,
-              path: "early_entry",
-              order_krw: earlyOrderKrw,
-              strategy_type: "momentum",
-              tick_lease: myLease,
-            }),
-          );
+          // [수정5] LIVE_PLACEBUY_ATTEMPT는 exit policy 검증 통과 후에 찍힘 — 아래로 이동
 
           let targetStopPrice = 0;
           let targetTakeProfitPrice = 0;
@@ -8350,6 +8401,19 @@ export function createLiveDataStrategy(opts: {
              trailingStartPct: 2.0,
              trailingGapPct: 1.5,
           }));
+
+          // [수정5] exit policy 검증 통과 후에 LIVE_PLACEBUY_ATTEMPT 찍기
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_PLACEBUY_ATTEMPT",
+              ts: new Date().toISOString(),
+              market,
+              path: "early_entry",
+              order_krw: earlyOrderKrw,
+              strategy_type: "momentum",
+              tick_lease: myLease,
+            }),
+          );
 
           const earlyExitPolicyPayload = {
             strict_exit: true,
