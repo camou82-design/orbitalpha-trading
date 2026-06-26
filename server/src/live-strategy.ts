@@ -4624,14 +4624,23 @@ export function createLiveDataStrategy(opts: {
 
       // Helper to log block reasons
       const logBlocked = (reason: string) => {
-        console.info(JSON.stringify({
-          tag: "RESCUE_ADD_EVAL_PROOF",
+        const payload = {
           ts: nowIso,
           market,
           decision: "block",
           reason,
           pnl_gross: pnlGross,
           hold_minutes: holdMin,
+        };
+
+        console.info(JSON.stringify({
+          tag: "RESCUE_ADD_EVAL_PROOF",
+          ...payload,
+        }));
+
+        console.info(JSON.stringify({
+          tag: "RESCUE_ADD_BLOCKED",
+          ...payload,
         }));
       };
 
