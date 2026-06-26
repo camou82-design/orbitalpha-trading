@@ -2734,19 +2734,100 @@ export function createLiveDataStrategy(opts: {
 
     for (const m of new Set([...Object.keys(state.positions), ...Object.keys(state.early_positions)])) {
       const p1 = state.positions[m];
-      if (p1 && (!p1.surge_stop_price || !p1.surge_take_profit_price || !p1.strict_exit || !p1.exit_policy_attached)) {
+      // [수정 3] engine_bucket=surge 또는 strict_exit=true 포지션 — 누락 필드 강제 보정
+      if (p1 && (p1.engine_bucket === "surge" || p1.strict_exit)) {
+          const entry_price = p1.entry_price;
+          let repairedFields: Record<string, unknown> = {};
+          let needsRepair = false;
+
+          // 필수 정래 필드 보정
+          if (!p1.entry_origin) { (p1 as any).entry_origin = "auto_trade"; repairedFields.entry_origin = "auto_trade"; needsRepair = true; }
+          if (!(p1 as any).entry_mode) { (p1 as any).entry_mode = "SURGE_V2"; repairedFields.entry_mode = "SURGE_V2"; needsRepair = true; }
+          if (!p1.exit_policy_attached) { p1.exit_policy_attached = true; repairedFields.exit_policy_attached = true; needsRepair = true; }
+          if (!p1.strict_exit) { p1.strict_exit = true; repairedFields.strict_exit = true; needsRepair = true; }
+
+          if (entry_price > 0) {
+              // entry_stop_price / surge_stop_price 크로스 보정
+              if (!p1.entry_stop_price && (p1 as any).surge_stop_price) {
+                  p1.entry_stop_price = (p1 as any).surge_stop_price;
+                  repairedFields.entry_stop_price = p1.entry_stop_price;
+                  needsRepair = true;
+              } else if (!p1.entry_stop_price) {
+                  p1.entry_stop_price = entry_price * 0.982;
+                  repairedFields.entry_stop_price = p1.entry_stop_price;
+                  needsRepair = true;
+              }
+              if (!(p1 as any).surge_stop_price && p1.entry_stop_price) {
+                  (p1 as any).surge_stop_price = p1.entry_stop_price;
+                  repairedFields.surge_stop_price = (p1 as any).surge_stop_price;
+                  needsRepair = true;
+              } else if (!(p1 as any).surge_stop_price) {
+                  (p1 as any).surge_stop_price = entry_price * 0.982;
+                  repairedFields.surge_stop_price = (p1 as any).surge_stop_price;
+                  needsRepair = true;
+              }
+
+              // entry_target_price / surge_take_profit_price 크로스 보정
+              const stopRef = Number(p1.entry_stop_price ?? (p1 as any).surge_stop_price ?? entry_price * 0.982);
+              const defaultTp = entry_price + (entry_price - stopRef) * 1.4;
+              if (!p1.entry_target_price && (p1 as any).surge_take_profit_price) {
+                  p1.entry_target_price = (p1 as any).surge_take_profit_price;
+                  repairedFields.entry_target_price = p1.entry_target_price;
+                  needsRepair = true;
+              } else if (!p1.entry_target_price) {
+                  p1.entry_target_price = defaultTp;
+                  repairedFields.entry_target_price = p1.entry_target_price;
+                  needsRepair = true;
+              }
+              if (!(p1 as any).surge_take_profit_price && p1.entry_target_price) {
+                  (p1 as any).surge_take_profit_price = p1.entry_target_price;
+                  repairedFields.surge_take_profit_price = (p1 as any).surge_take_profit_price;
+                  needsRepair = true;
+              } else if (!(p1 as any).surge_take_profit_price) {
+                  (p1 as any).surge_take_profit_price = defaultTp;
+                  repairedFields.surge_take_profit_price = (p1 as any).surge_take_profit_price;
+                  needsRepair = true;
+              }
+
+              // trailing/stop 선택적 세팅
+              if (!p1.surge_trailing_start_pct) { (p1 as any).surge_trailing_start_pct = 2.0; needsRepair = true; }
+              if (!p1.surge_trailing_gap_pct) { (p1 as any).surge_trailing_gap_pct = 1.5; needsRepair = true; }
+              if (!(p1 as any).surge_entry_mode) { (p1 as any).surge_entry_mode = "RECOVERED_SURGE_POLICY"; needsRepair = true; }
+          }
+
+          if (needsRepair) {
+              console.info(JSON.stringify({
+                  tag: "SURGE_POSITION_EXIT_POLICY_REPAIRED",
+                  ts: new Date().toISOString(),
+                  market: m,
+                  entry_price,
+                  entry_origin: p1.entry_origin,
+                  entry_mode: (p1 as any).entry_mode,
+                  engine_bucket: p1.engine_bucket,
+                  strict_exit: p1.strict_exit,
+                  exit_policy_attached: p1.exit_policy_attached,
+                  entry_stop_price: p1.entry_stop_price,
+                  surge_stop_price: (p1 as any).surge_stop_price,
+                  entry_target_price: p1.entry_target_price,
+                  surge_take_profit_price: (p1 as any).surge_take_profit_price,
+                  repaired_fields: repairedFields,
+                  reason: "surge_position_exit_policy_repaired_on_reconcile",
+              }));
+          }
+      } else if (p1 && (!p1.surge_stop_price || !(p1 as any).surge_take_profit_price || !p1.strict_exit || !p1.exit_policy_attached)) {
+          // 기존 로직 유지: 일반 포지션 처리
           const entry_price = p1.entry_price;
           if (entry_price > 0) {
               const stopPrice = entry_price * 0.982;
               const takeProfitPrice = entry_price + (entry_price - stopPrice) * 1.4;
-              p1.surge_stop_price = stopPrice;
-              p1.surge_take_profit_price = takeProfitPrice;
-              p1.surge_trailing_start_pct = 2.0;
-              p1.surge_trailing_gap_pct = 1.5;
+              (p1 as any).surge_stop_price = stopPrice;
+              (p1 as any).surge_take_profit_price = takeProfitPrice;
+              (p1 as any).surge_trailing_start_pct = 2.0;
+              (p1 as any).surge_trailing_gap_pct = 1.5;
               p1.strict_exit = true;
               p1.exit_policy_attached = true;
-              if (!p1.surge_entry_mode) p1.surge_entry_mode = "RECOVERED_SURGE_POLICY";
-              
+              if (!(p1 as any).surge_entry_mode) (p1 as any).surge_entry_mode = "RECOVERED_SURGE_POLICY";
+
               console.info(JSON.stringify({
                   tag: "MISSING_EXIT_POLICY_REPAIRED_ON_RESTORE",
                   ts: new Date().toISOString(),
@@ -2760,19 +2841,86 @@ export function createLiveDataStrategy(opts: {
       }
 
       const p2 = state.early_positions[m];
-      if (p2 && (!p2.surge_stop_price || !p2.surge_take_profit_price || !p2.strict_exit || !p2.exit_policy_attached)) {
+      // [수정 3] early_positions 동일 적용
+      if (p2 && (p2.engine_bucket === "surge" || p2.strict_exit)) {
+          const entry_price = p2.entry_price;
+          let repairedFields2: Record<string, unknown> = {};
+          let needsRepair2 = false;
+
+          if (!p2.entry_origin) { (p2 as any).entry_origin = "auto_trade"; repairedFields2.entry_origin = "auto_trade"; needsRepair2 = true; }
+          if (!(p2 as any).entry_mode) { (p2 as any).entry_mode = "SURGE_V2"; repairedFields2.entry_mode = "SURGE_V2"; needsRepair2 = true; }
+          if (!p2.exit_policy_attached) { p2.exit_policy_attached = true; repairedFields2.exit_policy_attached = true; needsRepair2 = true; }
+          if (!p2.strict_exit) { p2.strict_exit = true; repairedFields2.strict_exit = true; needsRepair2 = true; }
+
+          if (entry_price > 0) {
+              if (!p2.entry_stop_price && (p2 as any).surge_stop_price) {
+                  p2.entry_stop_price = (p2 as any).surge_stop_price;
+                  repairedFields2.entry_stop_price = p2.entry_stop_price; needsRepair2 = true;
+              } else if (!p2.entry_stop_price) {
+                  p2.entry_stop_price = entry_price * 0.982;
+                  repairedFields2.entry_stop_price = p2.entry_stop_price; needsRepair2 = true;
+              }
+              if (!(p2 as any).surge_stop_price && p2.entry_stop_price) {
+                  (p2 as any).surge_stop_price = p2.entry_stop_price;
+                  repairedFields2.surge_stop_price = (p2 as any).surge_stop_price; needsRepair2 = true;
+              } else if (!(p2 as any).surge_stop_price) {
+                  (p2 as any).surge_stop_price = entry_price * 0.982;
+                  repairedFields2.surge_stop_price = (p2 as any).surge_stop_price; needsRepair2 = true;
+              }
+              const stopRef2 = Number(p2.entry_stop_price ?? (p2 as any).surge_stop_price ?? entry_price * 0.982);
+              const defaultTp2 = entry_price + (entry_price - stopRef2) * 1.4;
+              if (!p2.entry_target_price && (p2 as any).surge_take_profit_price) {
+                  p2.entry_target_price = (p2 as any).surge_take_profit_price;
+                  repairedFields2.entry_target_price = p2.entry_target_price; needsRepair2 = true;
+              } else if (!p2.entry_target_price) {
+                  p2.entry_target_price = defaultTp2;
+                  repairedFields2.entry_target_price = p2.entry_target_price; needsRepair2 = true;
+              }
+              if (!(p2 as any).surge_take_profit_price && p2.entry_target_price) {
+                  (p2 as any).surge_take_profit_price = p2.entry_target_price;
+                  repairedFields2.surge_take_profit_price = (p2 as any).surge_take_profit_price; needsRepair2 = true;
+              } else if (!(p2 as any).surge_take_profit_price) {
+                  (p2 as any).surge_take_profit_price = defaultTp2;
+                  repairedFields2.surge_take_profit_price = (p2 as any).surge_take_profit_price; needsRepair2 = true;
+              }
+              if (!(p2 as any).surge_trailing_start_pct) { (p2 as any).surge_trailing_start_pct = 2.0; needsRepair2 = true; }
+              if (!(p2 as any).surge_trailing_gap_pct) { (p2 as any).surge_trailing_gap_pct = 1.5; needsRepair2 = true; }
+              if (!(p2 as any).surge_entry_mode) { (p2 as any).surge_entry_mode = "RECOVERED_SURGE_POLICY"; needsRepair2 = true; }
+          }
+
+          if (needsRepair2) {
+              console.info(JSON.stringify({
+                  tag: "SURGE_POSITION_EXIT_POLICY_REPAIRED",
+                  ts: new Date().toISOString(),
+                  market: m,
+                  position_type: "early",
+                  entry_price,
+                  entry_origin: (p2 as any).entry_origin,
+                  entry_mode: (p2 as any).entry_mode,
+                  engine_bucket: p2.engine_bucket,
+                  strict_exit: p2.strict_exit,
+                  exit_policy_attached: p2.exit_policy_attached,
+                  entry_stop_price: p2.entry_stop_price,
+                  surge_stop_price: (p2 as any).surge_stop_price,
+                  entry_target_price: p2.entry_target_price,
+                  surge_take_profit_price: (p2 as any).surge_take_profit_price,
+                  repaired_fields: repairedFields2,
+                  reason: "surge_early_position_exit_policy_repaired_on_reconcile",
+              }));
+          }
+      } else if (p2 && (!(p2 as any).surge_stop_price || !(p2 as any).surge_take_profit_price || !p2.strict_exit || !p2.exit_policy_attached)) {
           const entry_price = p2.entry_price;
           if (entry_price > 0) {
               const stopPrice = entry_price * 0.982;
               const takeProfitPrice = entry_price + (entry_price - stopPrice) * 1.4;
-              p2.surge_stop_price = stopPrice;
-              p2.surge_take_profit_price = takeProfitPrice;
-              p2.surge_trailing_start_pct = 2.0;
-              p2.surge_trailing_gap_pct = 1.5;
+              (p2 as any).surge_stop_price = stopPrice;
+              (p2 as any).surge_take_profit_price = takeProfitPrice;
+              (p2 as any).surge_trailing_start_pct = 2.0;
+              (p2 as any).surge_trailing_gap_pct = 1.5;
               p2.strict_exit = true;
               p2.exit_policy_attached = true;
-              if (!p2.surge_entry_mode) p2.surge_entry_mode = "RECOVERED_SURGE_POLICY";
-              
+              if (!(p2 as any).surge_entry_mode) (p2 as any).surge_entry_mode = "RECOVERED_SURGE_POLICY";
+
               console.info(JSON.stringify({
                   tag: "MISSING_EXIT_POLICY_REPAIRED_ON_RESTORE",
                   ts: new Date().toISOString(),
@@ -4517,7 +4665,18 @@ export function createLiveDataStrategy(opts: {
       }
       const holdMin = minutesSince(p.entry_ts);
       const isSurge = isSurgePosition(p);
-      const surgePolicyApplies = isSurge && p.entry_origin === "auto_trade" && p.entry_mode === "SURGE_V2" && p.strict_exit === true;
+      // [수정 1] surgePolicyApplies 조건 완화:
+      // entry_mode===SURGE_V2 OR engine_bucket===surge OR reason_enter includes surge
+      // + strict_exit=true 이면 surge exit engine을 적용한다.
+      // 기존에 entry_origin=auto_trade 를 필수로 요구해 복구/장부보정 포지션이 사각지대에 빠지던 문제 해소.
+      const surgePolicyApplies =
+        isSurge &&
+        p.strict_exit === true &&
+        (
+          (p as any).entry_mode === "SURGE_V2" ||
+          p.engine_bucket === "surge" ||
+          p.reason_enter?.includes("surge")
+        );
 
       if (isSurge && !surgePolicyApplies) {
         console.info(
@@ -4526,11 +4685,46 @@ export function createLiveDataStrategy(opts: {
             ts: new Date().toISOString(),
             market,
             applies: false,
-            reason: "surge_policy_skipped_non_auto_trade_or_missing_mode",
+            reason: "surge_policy_skipped_strict_exit_false_or_no_surge_marker",
             entry_origin: p.entry_origin ?? null,
             entry_mode: (p as any).entry_mode ?? null,
+            engine_bucket: p.engine_bucket ?? null,
+            strict_exit: p.strict_exit ?? null,
           }),
         );
+        // [수정 2] isSurge && !surgePolicyApplies 인 포지션 — fallback exit (사각지대 방지)
+        // strict_exit=false 이거나 surge 마커가 없는 surge 포지션이라도
+        // 급락 시 반드시 청산 경로를 거치도록 fallback을 부여한다.
+        if (!reasonExit) {
+          if (p.entry_stop_price && now <= p.entry_stop_price) {
+            reasonExit = "fallback_entry_stop_loss";
+          } else if ((p as any).surge_stop_price && now <= (p as any).surge_stop_price) {
+            reasonExit = "fallback_surge_stop_loss";
+          } else if (p.strict_exit && pnlGross <= -2.0) {
+            reasonExit = "fallback_strict_surge_loss_cut";
+          } else if (pnlGross <= -3.0) {
+            reasonExit = "fallback_emergency_surge_loss_cut";
+          }
+          if (reasonExit) {
+            ratio = 1;
+            stopTriggerKind = "price_stop";
+            exitAuthorityClass = "emergency_exit";
+            exitReasonDetail = "surge_policy_fallback_exit";
+            console.info(
+              JSON.stringify({
+                tag: "SURGE_POLICY_FALLBACK_EXIT_TRIGGERED",
+                ts: new Date().toISOString(),
+                market,
+                reasonExit,
+                pnl_pct: pnlGross,
+                now,
+                entry_stop_price: p.entry_stop_price ?? null,
+                surge_stop_price: (p as any).surge_stop_price ?? null,
+                strict_exit: p.strict_exit ?? null,
+              }),
+            );
+          }
+        }
       } else if (surgePolicyApplies) {
         console.info(
           JSON.stringify({
@@ -4539,7 +4733,8 @@ export function createLiveDataStrategy(opts: {
             market,
             applies: true,
             entry_origin: p.entry_origin,
-            entry_mode: p.entry_mode,
+            entry_mode: (p as any).entry_mode ?? null,
+            engine_bucket: p.engine_bucket ?? null,
             market_state_at_entry: p.market_state_at_entry ?? null,
             btc_tier_at_entry: p.btc_tier_at_entry ?? null,
             volatility_pct_at_entry: Number(p.volatility_pct_at_entry ?? 0),

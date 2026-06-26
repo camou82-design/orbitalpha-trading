@@ -3283,8 +3283,38 @@ export default function HomePage() {
                           · {line}
                         </div>
                       ))}
+                      {/* [수정 4] Surge Exit Policy 상세 필드 표시 */}
+                      <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: "1fr auto", gap: "2px 8px", fontSize: "0.62rem" }}>
+                        <span style={{ color: UI.mutedSoft }}>entry_mode</span>
+                        <span style={{ color: UI.body, fontFamily: "ui-monospace,monospace", textAlign: "right" }}>{String(posRow?.entry_mode ?? "—")}</span>
+                        <span style={{ color: UI.mutedSoft }}>entry_origin</span>
+                        <span style={{ color: UI.body, fontFamily: "ui-monospace,monospace", textAlign: "right" }}>{String(posRow?.entry_origin ?? "—")}</span>
+                        <span style={{ color: UI.mutedSoft }}>exit_policy_attached</span>
+                        <span style={{ color: posRow?.exit_policy_attached ? "#22c55e" : "#ef4444", fontWeight: 900, textAlign: "right" }}>
+                          {posRow?.exit_policy_attached != null ? String(posRow.exit_policy_attached) : "—"}
+                        </span>
+                        <span style={{ color: UI.mutedSoft }}>entry_stop_price</span>
+                        <span style={{ color: "#f87171", fontFamily: "ui-monospace,monospace", textAlign: "right" }}>
+                          {posRow?.entry_stop_price != null ? Number(posRow.entry_stop_price).toLocaleString() : "—"}
+                        </span>
+                        <span style={{ color: UI.mutedSoft }}>surge_stop_price</span>
+                        <span style={{ color: "#f87171", fontFamily: "ui-monospace,monospace", textAlign: "right" }}>
+                          {posRow?.surge_stop_price != null ? Number(posRow.surge_stop_price).toLocaleString() : "—"}
+                        </span>
+                        <span style={{ color: UI.mutedSoft }}>surge_take_profit</span>
+                        <span style={{ color: "#4ade80", fontFamily: "ui-monospace,monospace", textAlign: "right" }}>
+                          {posRow?.surge_take_profit_price != null ? Number(posRow.surge_take_profit_price).toLocaleString() : "—"}
+                        </span>
+                        <span style={{ color: UI.mutedSoft }}>현재가→stop 거리</span>
+                        <span style={{
+                          color: posRow?.stop_distance_pct_from_entry != null && Number(posRow.stop_distance_pct_from_entry) <= -1.5 ? "#f87171" : UI.body,
+                          fontWeight: 900, textAlign: "right"
+                        }}>
+                          {posRow?.stop_distance_pct_from_entry != null ? `${Number(posRow.stop_distance_pct_from_entry).toFixed(2)}%` : "—"}
+                        </span>
+                      </div>
                       <div style={{ marginTop: 6, fontSize: "0.6rem", color: UI.muted, fontFamily: "ui-monospace,monospace" }}>
-                        engine_bucket={String(posRow?.engine_bucket ?? "—")} · strict_exit={String(posRow?.strict_exit_managed ?? "—")}
+                        engine_bucket={String(posRow?.engine_bucket ?? "—")} · strict_exit={String(posRow?.strict_exit_managed ?? "—")} · origin={String(posRow?.entry_origin ?? "—")}
                       </div>
                     </div>
                   ) : (

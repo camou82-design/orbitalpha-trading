@@ -102,10 +102,32 @@ export function buildPositionSourceSummary(
       ui_hints.push("last_order 기준 최근 매수 성공 기록이 있습니다 — 장부/관리 상태를 교차 확인하세요.");
     }
 
+    const entry_mode = pos && typeof (pos as any).entry_mode === "string" ? (pos as any).entry_mode : null;
+    const entry_origin = pos && typeof pos.entry_origin === "string" ? pos.entry_origin : null;
+    const exit_policy_attached = Boolean(pos?.exit_policy_attached ?? false);
+    const entry_stop_price = pos && Number(pos.entry_stop_price) > 0 ? Number(pos.entry_stop_price) : null;
+    const surge_stop_price = pos && Number((pos as any).surge_stop_price) > 0 ? Number((pos as any).surge_stop_price) : null;
+    const surge_take_profit_price = pos && Number((pos as any).surge_take_profit_price) > 0 ? Number((pos as any).surge_take_profit_price) : null;
+    const entry_price_for_pct = pos && Number(pos.entry_price) > 0 ? Number(pos.entry_price) : null;
+
+    // 현재가 대비 stop 거리 % (stop이 있고 entry_price가 있을 때만 계산)
+    const stopRef = entry_stop_price ?? surge_stop_price;
+    const stop_distance_pct_from_entry: number | null =
+      entry_price_for_pct && stopRef
+        ? Number((((stopRef - entry_price_for_pct) / entry_price_for_pct) * 100).toFixed(2))
+        : null;
+
     byMarket[mk] = {
       classification,
       engine_bucket,
       strict_exit_managed: strict_exit,
+      entry_mode,
+      entry_origin,
+      exit_policy_attached,
+      entry_stop_price,
+      surge_stop_price,
+      surge_take_profit_price,
+      stop_distance_pct_from_entry,
       spot_qty: qty,
       strategy_book_qty: strategyQty,
       reconcile_zeroed: zeroed.has(mk),
