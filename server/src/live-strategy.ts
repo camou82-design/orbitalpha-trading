@@ -4658,11 +4658,13 @@ export function createLiveDataStrategy(opts: {
         logBlocked("not_in_rescue_zone_yet");
         return { executed: false };
       }
-      if (pnlGross < -2.2) {
-        logBlocked("too_deep_loss");
+      if (pnlGross < -1.6) {
+        logBlocked("rescue_zone_too_deep");
         return { executed: false };
       }
-      if (now <= (p.entry_stop_price ?? 0)) {
+      const entryStop = p.entry_stop_price ?? 0;
+      const surgeStop = Number((p as any).surge_stop_price ?? 0);
+      if (pnlGross <= -2.0 || now <= entryStop || (surgeStop > 0 && now <= surgeStop)) {
         logBlocked("stop_price_breached");
         return { executed: false };
       }
