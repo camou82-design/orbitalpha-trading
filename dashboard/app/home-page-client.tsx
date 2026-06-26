@@ -3312,6 +3312,20 @@ export default function HomePage() {
                         }}>
                           {posRow?.stop_distance_pct_from_entry != null ? `${Number(posRow.stop_distance_pct_from_entry).toFixed(2)}%` : "—"}
                         </span>
+                        {Number(posRow?.rescue_add_count ?? 0) > 0 && (
+                          <>
+                            <span style={{ color: UI.mutedSoft }}>rescue_add_count</span>
+                            <span style={{ color: UI.body, fontFamily: "ui-monospace,monospace", textAlign: "right" }}>{Number(posRow?.rescue_add_count)}회</span>
+                            <span style={{ color: UI.mutedSoft }}>rescue_avg_before</span>
+                            <span style={{ color: UI.body, fontFamily: "ui-monospace,monospace", textAlign: "right" }}>{posRow?.rescue_add_avg_before ? Number(posRow.rescue_add_avg_before).toLocaleString() : "—"}</span>
+                            <span style={{ color: UI.mutedSoft }}>rescue_avg_after</span>
+                            <span style={{ color: UI.body, fontFamily: "ui-monospace,monospace", textAlign: "right" }}>{posRow?.rescue_add_avg_after_est ? Number(posRow.rescue_add_avg_after_est).toLocaleString() : "—"}</span>
+                            <span style={{ color: UI.mutedSoft }}>rescue_stop_rebased</span>
+                            <span style={{ color: posRow?.rescue_add_stop_rebased ? "#22c55e" : UI.body, fontWeight: 900, textAlign: "right" }}>{String(posRow?.rescue_add_stop_rebased ?? "—")}</span>
+                            <span style={{ color: UI.mutedSoft }}>rescue_add_at</span>
+                            <span style={{ color: UI.body, fontFamily: "ui-monospace,monospace", textAlign: "right" }}>{posRow?.last_rescue_add_at ? formatTsLocal(String(posRow.last_rescue_add_at)) : "—"}</span>
+                          </>
+                        )}
                       </div>
                       <div style={{ marginTop: 6, fontSize: "0.6rem", color: UI.muted, fontFamily: "ui-monospace,monospace" }}>
                         engine_bucket={String(posRow?.engine_bucket ?? "—")} · strict_exit={String(posRow?.strict_exit_managed ?? "—")} · origin={String(posRow?.entry_origin ?? "—")}

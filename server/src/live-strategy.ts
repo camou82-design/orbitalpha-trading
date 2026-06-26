@@ -204,6 +204,15 @@ type StrategyPosition = {
   volumeRatio?: number;
   is_relaxed_probe?: boolean;
   softened_reasons?: string[];
+  // Rescue Add (Pre-Stop Average Down)
+  rescue_add_count?: number;
+  last_rescue_add_at?: string | null;
+  rescue_add_total_krw?: number;
+  rescue_add_reason?: string | null;
+  rescue_add_avg_before?: number;
+  rescue_add_avg_after_est?: number;
+  rescue_add_stop_rebased?: boolean;
+  rescue_add_cooldown_until?: string | null;
 };
 
 type EarlyEntryPosition = {
@@ -4600,6 +4609,255 @@ export function createLiveDataStrategy(opts: {
       state.cooldown_until[market] = new Date(Date.now() + LIVE_REENTRY_COOLDOWN_EARLY_FAIL_SECONDS * 1000).toISOString();
     }
 
+    async function evaluateRescueAdd(
+      p: StrategyPosition,
+      now: number,
+      pnlGross: number,
+      holdMin: number,
+      state: PersistedState,
+      marketState: Awaited<ReturnType<MarketStateApi["evaluate"]>>,
+      latestAllSignals: Map<string, any>,
+      market: string,
+      opts: any,
+    ): Promise<{ executed: boolean }> {
+      const nowIso = new Date().toISOString();
+
+      // Helper to log block reasons
+      const logBlocked = (reason: string) => {
+        console.info(JSON.stringify({
+          tag: "RESCUE_ADD_EVAL_PROOF",
+          ts: nowIso,
+          market,
+          decision: "block",
+          reason,
+          pnl_gross: pnlGross,
+          hold_minutes: holdMin,
+        }));
+      };
+
+      // Step 1. 즉시 차단 (emergency guard)
+      const entryMode = (p as any).entry_mode;
+      
+      if (p.strict_exit !== true) {
+        logBlocked("not_strict_exit");
+        return { executed: false };
+      }
+      if (p.exit_policy_attached !== true) {
+        logBlocked("not_exit_policy_attached");
+        return { executed: false };
+      }
+      if (p.engine_bucket !== "surge" && entryMode !== "SURGE_V2") {
+        logBlocked("not_surge_position");
+        return { executed: false };
+      }
+      if ((p.rescue_add_count ?? 0) >= 1) {
+        logBlocked("max_count_exceeded");
+        return { executed: false };
+      }
+      if (pnlGross > -0.7) {
+        logBlocked("not_in_rescue_zone_yet");
+        return { executed: false };
+      }
+      if (pnlGross < -2.2) {
+        logBlocked("too_deep_loss");
+        return { executed: false };
+      }
+      if (now <= (p.entry_stop_price ?? 0)) {
+        logBlocked("stop_price_breached");
+        return { executed: false };
+      }
+      if (holdMin < 1 || holdMin > 20) {
+        logBlocked("hold_min_out_of_range");
+        return { executed: false };
+      }
+      if (p.rescue_add_cooldown_until && nowIso < p.rescue_add_cooldown_until) {
+        logBlocked("in_cooldown");
+        return { executed: false };
+      }
+
+      // Step 2. 시장 조건 필터
+      if (marketState.market_state === "risk_off") {
+        logBlocked("market_risk_off");
+        return { executed: false };
+      }
+      if ((state.regime?.btc_filter_state as any) === "panic") {
+        logBlocked("btc_panic");
+        return { executed: false };
+      }
+
+      // Step 3. 가격 여유 확인
+      const stopPrice = p.entry_stop_price ?? 0;
+      if (stopPrice <= 0) {
+        logBlocked("stop_price_invalid");
+        return { executed: false };
+      }
+      const stopGap = ((now - stopPrice) / stopPrice) * 100;
+      if (stopGap < 0.25) {
+        logBlocked("stop_too_close");
+        return { executed: false };
+      }
+
+      // Step 4. 신호 데이터 확인
+      const sig = latestAllSignals.get(market);
+      const volumeRatioNow = sig?.p?.volume_ratio ?? 0;
+      if (volumeRatioNow < 0.8) {
+        logBlocked("low_volume_ratio");
+        return { executed: false };
+      }
+      const recent1mRet = sig?.p?.rise_1m_pct ?? null;
+      const recent3mRet = sig?.p?.rise_3m_pct ?? null;
+      if (recent1mRet !== null && recent1mRet < 0 && recent3mRet !== null && recent3mRet < 0) {
+        logBlocked("negative_returns");
+        return { executed: false };
+      }
+      const filters = Array.isArray(sig?.p?.filters) ? (sig!.p!.filters as Array<{ id: string; passed: boolean }>) : [];
+      const hasFailed = (re: RegExp) => filters.some((f) => re.test(String(f.id)) && f.passed === false);
+      if (hasFailed(/upper_wick|high_rejected/i)) {
+        logBlocked("failed_upper_wick_high_rejected");
+        return { executed: false };
+      }
+      if (hasFailed(/retest|pullback/i)) {
+        logBlocked("failed_retest_pullback");
+        return { executed: false };
+      }
+      if (hasFailed(/volume_fade/i)) {
+        logBlocked("failed_volume_fade");
+        return { executed: false };
+      }
+
+      // Step 5. 금액 산출
+      const originalOrderKrw = p.filled_entry_krw ?? p.order_krw ?? 0;
+      const maxRescueKrw = originalOrderKrw * 0.35;
+      
+      const availableKrw = Math.max(0, Number(tstatus.strategy_available_krw ?? tstatus.live_order_available_krw ?? tstatus.krw_available ?? 0));
+      
+      const targetBudget = p.target_budget_krw ?? 0;
+      const remainingBudget = targetBudget > 0 ? Math.max(0, targetBudget - originalOrderKrw) : Infinity;
+
+      const isCore = p.engine_bucket === "core";
+      const bucketCapRemaining = isCore
+        ? (typeof coreRemainingInTick === "number" ? coreRemainingInTick : Infinity)
+        : (typeof surgeRemainingInTick === "number" ? surgeRemainingInTick : Infinity);
+
+      let rescueAddKrw = Math.min(
+        maxRescueKrw,
+        availableKrw,
+        remainingBudget,
+        bucketCapRemaining
+      );
+      rescueAddKrw = Math.floor(rescueAddKrw / 1000) * 1000;
+
+      if (rescueAddKrw < 5000) {
+        logBlocked("below_min_order");
+        return { executed: false };
+      }
+
+      // Step 6. 예산 cap 확인
+      if ((p.rescue_add_total_krw ?? 0) + rescueAddKrw > maxRescueKrw) {
+        logBlocked("budget_cap_exceeded");
+        return { executed: false };
+      }
+
+      // Step 7. 로그 RESCUE_ADD_EVAL_PROOF (decision: "allow")
+      console.info(JSON.stringify({
+        tag: "RESCUE_ADD_EVAL_PROOF",
+        ts: nowIso,
+        market,
+        decision: "allow",
+        pnl_gross: pnlGross,
+        hold_minutes: holdMin,
+        amount_krw: rescueAddKrw,
+      }));
+
+      // Step 8. ALLOW면 실행
+      try {
+        console.info(JSON.stringify({
+          tag: "RESCUE_ADD_PLACEBUY_ATTEMPT",
+          ts: new Date().toISOString(),
+          market,
+          amount_krw: rescueAddKrw,
+          strategy_type: p.strategy_type,
+        }));
+
+        await opts.trade.placeBuy(
+          market,
+          true,
+          rescueAddKrw,
+          p.strategy_type,
+          "strategy",
+          {
+            __rescue_add: true,
+            __rescue_add_reason: "pre_stop_average_down_valid_setup",
+            strict_exit: true,
+            exit_policy_attached: true,
+            surge_entry_mode: p.surge_entry_mode ?? "RESCUE_ADD",
+            surge_stop_price: p.entry_stop_price,
+            surge_take_profit_price: p.entry_target_price,
+            entry_stop_price: p.entry_stop_price,
+            entry_target_price: p.entry_target_price,
+            entry_risk_reward: p.entry_risk_reward,
+          }
+        );
+      } catch (e: any) {
+        console.info(JSON.stringify({
+          tag: "RESCUE_ADD_BLOCKED",
+          ts: new Date().toISOString(),
+          market,
+          reason: `place_buy_throw: ${e?.message ?? e}`,
+        }));
+        return { executed: false };
+      }
+
+      // 체결 후 상태 재조회
+      const postStatus = await raceTradeStatus("rescue_add_post_buy");
+      const posInfo = postStatus?.strategy_positions?.[market];
+      let newAvg = 0;
+      let newQty = 0;
+      if (posInfo && posInfo.qty > 0) {
+        newQty = posInfo.qty;
+        newAvg = (posInfo.invested_krw_total ?? 0) / posInfo.qty;
+      }
+
+      if (newAvg <= 0 || newQty <= 0) {
+        const currentQty = p.qty ?? 0;
+        const currentAvg = p.entry_price ?? 0;
+        const addedQty = rescueAddKrw / now;
+        newQty = currentQty + addedQty;
+        newAvg = (currentQty * currentAvg + rescueAddKrw) / newQty;
+      }
+
+      const oldStopPrice = p.entry_stop_price ?? 0;
+      const newStopPrice = Math.max(oldStopPrice, newAvg * 0.982);
+      const newTargetPrice = newAvg + (newAvg - newStopPrice) * 1.4;
+
+      p.rescue_add_count = 1;
+      p.last_rescue_add_at = new Date().toISOString();
+      p.rescue_add_total_krw = rescueAddKrw;
+      p.rescue_add_reason = "pre_stop_average_down_valid_setup";
+      p.rescue_add_avg_before = p.entry_price;
+      p.rescue_add_avg_after_est = newAvg;
+      p.rescue_add_stop_rebased = newStopPrice > oldStopPrice;
+      p.entry_price = newAvg;
+      p.entry_stop_price = newStopPrice;
+      p.entry_target_price = newTargetPrice;
+      p.rescue_add_cooldown_until = new Date(Date.now() + 60_000).toISOString();
+      p.qty = newQty;
+      p.max_pnl_pct = Math.max(p.max_pnl_pct, grossPnlPct(newAvg, now));
+
+      console.info(JSON.stringify({
+        tag: "RESCUE_ADD_FILLED_PROOF",
+        ts: new Date().toISOString(),
+        market,
+        qty: newQty,
+        avg: newAvg,
+        stop_price: newStopPrice,
+        target_price: newTargetPrice,
+        rescue_add_count: 1,
+      }));
+
+      return { executed: true };
+    }
+
     // exits — 익절/손절 판단은 업비트 보유 화면과 동일한 평단 대비 가격 변동률(gross) 기준
     for (const market of Object.keys(state.positions)) {
       const p = state.positions[market]!;
@@ -4617,6 +4875,13 @@ export function createLiveDataStrategy(opts: {
       p.max_pnl_pct = Math.max(p.max_pnl_pct, pnlGross);
       p.min_pnl_pct = Math.min(Number(p.min_pnl_pct ?? 0), pnlGross);
       p.current_net_pnl_pct = pnlGross;
+
+      const holdMin = minutesSince(p.entry_ts);
+      // ── [RESCUE ADD] Pre-Stop Average Down Evaluation ──────────────────
+      const rescueAddAllowed = await evaluateRescueAdd(p, now, pnlGross, holdMin, state, marketState, latestAllSignals, market, opts);
+      if (rescueAddAllowed.executed) {
+        continue;
+      }
 
       let reasonExit = "";
       let stopTriggerKind: StopTriggerKind | null = null;
@@ -4663,7 +4928,7 @@ export function createLiveDataStrategy(opts: {
           partial_tp_at: p.partial_tp_at,
         });
       }
-      const holdMin = minutesSince(p.entry_ts);
+      // holdMin은 루프 상단에서 이미 정의됨
       const isSurge = isSurgePosition(p);
       // [수정 1] surgePolicyApplies 조건 완화:
       // entry_mode===SURGE_V2 OR engine_bucket===surge OR reason_enter includes surge
@@ -5268,6 +5533,20 @@ export function createLiveDataStrategy(opts: {
         }
       }
       if (!reasonExit) continue;
+
+      // rescue add 쿨다운 중이면 일반 손절 보류
+      // 단 아래는 예외 허용
+      const inRescueCooldown = p.rescue_add_cooldown_until && new Date().toISOString() < p.rescue_add_cooldown_until;
+      const rescueCooldownOverride =
+        (p.entry_stop_price && now <= p.entry_stop_price) ||
+        pnlGross <= -2.2 ||
+        reasonExit === "fallback_emergency_surge_loss_cut" ||
+        reasonExit?.includes("volume_fade") ||
+        reasonExit?.includes("high_rejected") ||
+        reasonExit?.includes("retest_fail");
+      if (inRescueCooldown && !rescueCooldownOverride) {
+        continue; // 손절 보류
+      }
 
       // Early micro-loss guard: avoid selling on tiny negative noise immediately after entry.
       const isStopLike =
