@@ -5277,12 +5277,16 @@ export function createLiveDataStrategy(opts: {
       const blockedByMicroLoss = withinEarlyLossGuard && isStopLike && netPnlPctEst > LIVE_MIN_EXIT_LOSS_PCT && reasonExit !== "emergency_stop_loss";
 
       const emergencyExit =
+        reasonExit.startsWith("SURGE_") ||
         reasonExit.startsWith("surge_") ||
-        isSurgeExitDecision ||
+        reasonExit.startsWith("fallback_") ||
+        reasonExit === "original_setup_stop_loss" ||
         reasonExit === "emergency_stop_loss" ||
         reasonExit === "weak_market_price_stop" ||
         reasonExit === "strict_hard_stop_loss" ||
-        reasonExit === "strict_early_loss_cut";
+        reasonExit === "strict_early_loss_cut" ||
+        isSurgeExitDecision ||
+        exitAuthorityClass === "emergency_exit";
 
       const exitBlockedByGrace = withinGracePeriod && !emergencyExit;
       const exitAllowed = !exitBlockedByGrace && !blockedByMicroLoss;
