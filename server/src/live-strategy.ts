@@ -5538,22 +5538,43 @@ export function createLiveDataStrategy(opts: {
 
       // rescue add 쿨다운 중이면 일반 손절 보류
       // 단 아래는 예외 허용
-      const inRescueCooldown = p.rescue_add_cooldown_until && new Date().toISOString() < p.rescue_add_cooldown_until;
-      const rescueCooldownOverride =
-        (p.entry_stop_price && now <= p.entry_stop_price) ||
-        pnlGross <= -2.2 ||
-        reasonExit === "fallback_emergency_surge_loss_cut" ||
-        reasonExit?.includes("volume_fade") ||
-        reasonExit?.includes("high_rejected") ||
-        reasonExit?.includes("retest_fail");
-      if (inRescueCooldown && !rescueCooldownOverride) {
-        continue; // 손절 보류
-      }
-
-      // Early micro-loss guard: avoid selling on tiny negative noise immediately after entry.
       const isStopLike =
         /stop|loss|catastrophic|time_stop_weak_rebound|momentum_time_stop|residual_full_exit_escalation/i.test(reasonExit) ||
         stopTriggerKind === "price_stop";
+
+      const inRescueCooldown =
+        !!p.rescue_add_cooldown_until &&
+        new Date().toISOString() < p.rescue_add_cooldown_until;
+
+      const rescueCooldownOverride =
+        (p.entry_stop_price && now <= p.entry_stop_price) ||
+        ((p as any).surge_stop_price && now <= (p as any).surge_stop_price) ||
+        pnlGross <= -2.2 ||
+        reasonExit.startsWith("fallback_") ||
+        reasonExit === "original_setup_stop_loss" ||
+        reasonExit.startsWith("SURGE_") ||
+        reasonExit.startsWith("surge_") ||
+        reasonExit.includes("volume_fade") ||
+        reasonExit.includes("high_rejected") ||
+        reasonExit.includes("retest_fail") ||
+        exitAuthorityClass === "emergency_exit";
+
+      if (inRescueCooldown && isStopLike && !rescueCooldownOverride) {
+        console.info(JSON.stringify({
+          tag: "RESCUE_ADD_COOLDOWN_HOLD",
+          ts: new Date().toISOString(),
+          market,
+          currentPrice: now,
+          entry_stop_price: p.entry_stop_price ?? null,
+          surge_stop_price: (p as any).surge_stop_price ?? null,
+          pnlGross,
+          reasonExit,
+          cooldown_until: p.rescue_add_cooldown_until,
+        }));
+        continue;
+      }
+
+      // Early micro-loss guard: avoid selling on tiny negative noise immediately after entry.
       const withinEarlyLossGuard = heldMs < LIVE_EXIT_EARLY_LOSS_GUARD_SECONDS * 1000;
       const blockedByMicroLoss = withinEarlyLossGuard && isStopLike && netPnlPctEst > LIVE_MIN_EXIT_LOSS_PCT && reasonExit !== "emergency_stop_loss";
 
