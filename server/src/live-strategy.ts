@@ -76,6 +76,14 @@ type UpbitBalance = {
   avg_buy_price: string | number;
 };
 
+function getKstTime(date: Date = new Date()) {
+  const kstMs = date.getTime() + (9 * 60 * 60 * 1000);
+  const kstDate = new Date(kstMs);
+  const hour = kstDate.getUTCHours();
+  const minute = kstDate.getUTCMinutes();
+  return { hour, minute };
+}
+
 type TradeStatus = {
   auto_trade_enabled: boolean;
   api_connected: boolean;
@@ -88,6 +96,8 @@ type TradeStatus = {
   live_order_available_krw?: number;
   strategy_available_krw?: number;
   last_order?: any;
+  entry_time_window_open?: boolean;
+  next_entry_allowed_at_kst?: string;
 };
 
 type SignalPayloadV2 = {
@@ -122,6 +132,7 @@ type TradeApi = {
     strategyType?: StrategyType,
     bucket?: "strategy" | "legacy",
     signalPayload?: unknown,
+    path?: string,
   ) => Promise<{ ok?: boolean; reason?: string } | Record<string, unknown>>;
   placeSell: (market: string, confirm: boolean, ratio?: number) => Promise<{ ok?: boolean; reason?: string } | Record<string, unknown>>;
   placeLegacyDcaBuy?: (market: string, confirm: boolean, amountKrw?: number, signalPayload?: unknown) => Promise<{ ok?: boolean; reason?: string } | Record<string, unknown>>;
@@ -4506,7 +4517,7 @@ export function createLiveDataStrategy(opts: {
                       ? ((currentPrice - ep.entry_stop_price) / currentPrice) * 100
                       : 0,
                     __surge_stop_reason: "early_promote_exit_policy",
-                  });
+                  }, "early_promote_fill");
                 }
               }
             }
@@ -4643,6 +4654,14 @@ export function createLiveDataStrategy(opts: {
           ...payload,
         }));
       };
+
+      // KST 새벽 시간(00:00~08:30) 차단 검사
+      const { hour: kstHour, minute: kstMin } = getKstTime(new Date());
+      const kstMinutes = kstHour * 60 + kstMin;
+      if (kstMinutes >= 0 && kstMinutes < 510) {
+        logBlocked("night_low_liquidity_window");
+        return { executed: false };
+      }
 
       // Step 1. 즉시 차단 (emergency guard)
       const entryMode = (p as any).entry_mode;
@@ -4807,7 +4826,8 @@ export function createLiveDataStrategy(opts: {
             entry_stop_price: p.entry_stop_price,
             entry_target_price: p.entry_target_price,
             entry_risk_reward: p.entry_risk_reward,
-          }
+          },
+          "rescue_add"
         );
       } catch (e: any) {
         console.info(JSON.stringify({
@@ -8949,7 +8969,7 @@ export function createLiveDataStrategy(opts: {
                 __early_entry: true,
                 __early_entry_size_ratio: LIVE_EARLY_ENTRY_SIZE_RATIO,
                 ...earlyExitPolicyPayload
-              });
+              }, "early_entry");
               if (!leaseOk()) {
                 console.info(
                   JSON.stringify({
@@ -10560,7 +10580,7 @@ export function createLiveDataStrategy(opts: {
             __surge_stop_price: isSurgeSource ? surgeStopPrice : undefined,
             __surge_risk_pct: isSurgeSource ? surgeRiskPct : undefined,
             __surge_stop_reason: isSurgeSource ? surgeStopReason : undefined,
-          });
+          }, isSurgeSource ? "surge_normal" : "normal");
           placeBuyOk = true;
           placeBuyReason = "success";
         } catch (innerErr) {

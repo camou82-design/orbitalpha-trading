@@ -176,6 +176,23 @@ type ConnectionResult = {
   access_key_fingerprint: string | null;
 };
 
+function getKstTime(date: Date = new Date()) {
+  const kstMs = date.getTime() + (9 * 60 * 60 * 1000);
+  const kstDate = new Date(kstMs);
+  const hour = kstDate.getUTCHours();
+  const minute = kstDate.getUTCMinutes();
+  return { hour, minute };
+}
+
+function getKstDateString(date: Date) {
+  const kstMs = date.getTime() + (9 * 60 * 60 * 1000);
+  const kstDate = new Date(kstMs);
+  const year = kstDate.getUTCFullYear();
+  const month = String(kstDate.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(kstDate.getUTCDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
 type LightweightStatus = {
   api_connected: boolean;
   api_reason: string | null;
@@ -189,6 +206,8 @@ type LightweightStatus = {
   env_secret_key_present: boolean;
   krw_available: number;
   balances: ConnectionBalances;
+  entry_time_window_open: boolean;
+  next_entry_allowed_at_kst: string;
 };
 
 const TRADE_CONTROL_STATE_FILE = path.join(process.cwd(), "data", "runtime", "trade-control-state.json");
@@ -440,6 +459,19 @@ export function createTradeControl(
       reconcileAuthoritativeStrategyBook(conn.balances);
     }
     syncLegacyBuckets(conn.balances);
+
+    const now = new Date();
+    const { hour: kstHour, minute: kstMin } = getKstTime(now);
+    const kstMinutes = kstHour * 60 + kstMin;
+    const entry_time_window_open = !(kstMinutes >= 0 && kstMinutes < 510);
+    let next_entry_allowed_at_kst = "";
+    if (!entry_time_window_open) {
+      next_entry_allowed_at_kst = `${getKstDateString(now)} 08:30:00 KST`;
+    } else {
+      const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+      next_entry_allowed_at_kst = `${getKstDateString(tomorrow)} 08:30:00 KST`;
+    }
+
     return {
       api_connected: conn.connected,
       api_reason: conn.reason,
@@ -453,6 +485,8 @@ export function createTradeControl(
       env_secret_key_present: Boolean(env.upbitSecretKey),
       krw_available: conn.krw_available,
       balances: conn.balances,
+      entry_time_window_open,
+      next_entry_allowed_at_kst,
     };
   };
 
@@ -653,7 +687,43 @@ export function createTradeControl(
     strategyType: StrategyType = "stable",
     bucket: PositionBucket = "strategy",
     signalPayload?: unknown,
+    path?: string,
   ) => {
+    // 00:00 ~ 08:30 KST 신규 진입 차단 필터
+    const now = new Date();
+    const { hour: kstHour, minute: kstMin } = getKstTime(now);
+    const kstMinutes = kstHour * 60 + kstMin;
+    const isNightBlocked = kstMinutes >= 0 && kstMinutes < 510;
+
+    if (isNightBlocked) {
+      let finalPath = path;
+      if (!finalPath) {
+        if (signalPayload && typeof signalPayload === "object") {
+          const sp = signalPayload as any;
+          if (sp.__early_promote_fill) finalPath = "early_promote_fill";
+          else if (sp.__rescue_add) finalPath = "rescue_add";
+          else if (sp.__early_entry) finalPath = "early_entry";
+          else if (sp.surge_entry_mode || sp.__surge_stop_price) finalPath = "surge_normal";
+          else finalPath = "normal";
+        } else {
+          finalPath = "normal";
+        }
+      }
+
+      console.info(
+        JSON.stringify({
+          tag: "ENTRY_TIME_WINDOW_BLOCK",
+          ts: now.toISOString(),
+          market,
+          path: finalPath,
+          kst_hour: kstHour,
+          kst_minute: kstMin,
+          blocked_before_placebuy: true,
+          reason: "night_low_liquidity_window",
+        })
+      );
+      throw new Error("night_low_liquidity_window");
+    }
     const posPre = state.strategyPositions[market as keyof typeof state.strategyPositions];
     const strategyQtyPre = Number(posPre?.qty ?? 0);
     const isAdditionalBuy = bucket === "legacy" || strategyQtyPre > 0;
@@ -1171,6 +1241,21 @@ export function createTradeControl(
       surgePendingBuyReserved: capitalV4.surgePendingBuyReservedKrw,
       coreRemaining: capitalV4.coreRemainingKrw,
       surgeRemaining: capitalV4.surgeRemainingKrw,
+      entry_time_window_open: (() => {
+        const { hour, minute } = getKstTime(new Date());
+        return !(hour * 60 + minute >= 0 && hour * 60 + minute < 510);
+      })(),
+      next_entry_allowed_at_kst: (() => {
+        const now = new Date();
+        const { hour, minute } = getKstTime(now);
+        const isOpen = !(hour * 60 + minute >= 0 && hour * 60 + minute < 510);
+        if (!isOpen) {
+          return `${getKstDateString(now)} 08:30:00 KST`;
+        } else {
+          const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+          return `${getKstDateString(tomorrow)} 08:30:00 KST`;
+        }
+      })(),
     };
   };
 
