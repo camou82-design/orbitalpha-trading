@@ -139,6 +139,7 @@ type TradeApi = {
   placeLegacyExitSell?: (market: string, confirm: boolean, ratio?: number) => Promise<{ ok?: boolean; reason?: string } | Record<string, unknown>>;
   setAutoTradeEnabled?: (enabled: boolean) => Promise<void>;
   syncManagedPosition?: (market: string, qty: number, avg: number, strategyType: StrategyType, stopLossPct?: number, stopLossPrice?: number) => Promise<boolean>;
+  setDailyRiskKillSwitch?: (active: boolean) => void;
 };
 
 type MarketStateApi = {
@@ -326,6 +327,7 @@ type StrategyTradeRow = {
   ema50?: number;
   ema200?: number;
   volumeRatio?: number;
+  rescue_add_count?: number;
 };
 
 type OriginalSetupMode = "safe" | "aggressive" | "none" | "relaxed_probe";
@@ -522,6 +524,35 @@ type DailyStats = {
   stop_by_market: Record<string, number>;
 };
 
+type SurgeWatchItem = {
+  market: string;
+  first_detected_at: string;
+  first_detected_price: number;
+  day_change_pct: number;
+  volume_24h_krw: number;
+  local_high_price: number;
+  local_high_at: string;
+  pullback_low_price: number | null;
+  pullback_low_at: string | null;
+  max_day_change_pct: number;
+  last_seen_price: number;
+  last_seen_at: string;
+  status: "watching" | "pullback_seen" | "reclaim_ready" | "entered" | "expired";
+  reason: string;
+  expire_at: string;
+  // metrics for dashboard
+  reclaim_ready?: boolean;
+  morning_reentry_candidate?: boolean;
+  entry_block_reason?: string;
+  next_valid_entry_condition?: string;
+  recent1mRet?: number;
+  recent3mRet?: number;
+  recent5mRet?: number;
+  volumeRatio1m5?: number;
+  distanceFromLocalHighPct?: number;
+  riskReward?: number;
+};
+
 type PersistedState = {
   positions: Record<string, StrategyPosition>;
   early_positions: Record<string, EarlyEntryPosition>;
@@ -553,6 +584,9 @@ type PersistedState = {
   entry_profile_stats?: Record<string, LiveEntryProfileStats>;
   coarse_profile_stats?: Record<string, LiveEntryProfileStats>;
   fine_profile_stats?: Record<string, LiveEntryProfileStats>;
+  surge_watchlist?: Record<string, SurgeWatchItem>;
+  morning_surge_watchlist?: Record<string, SurgeWatchItem>;
+  daily_risk_kill_switch_triggered?: boolean;
 };
 
 const CORE_TRADE_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-TRX", "KRW-DOGE"] as const;
@@ -622,6 +656,7 @@ type LastGoodCandleCacheRow = {
 };
 const lastGoodMinuteCandleCache = new Map<string, LastGoodCandleCacheRow>();
 const lastGoodTickerCache = new Map<string, { ts_ms: number; row: any }>();
+const watchlistCandleCache = new Map<string, { ts: number; c1: UpbitCandle[]; c5: UpbitCandle[] }>();
 
 type LiveTickerPriceSourceTag =
   | "ticker_batch"
@@ -1256,6 +1291,93 @@ function buildLiveSignalMissingDetail(market: string, logs: SignalLogEntry[]): R
 
 function todayKst() {
   return new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" });
+}
+
+function getKstDateString(isoString: string): string {
+  try {
+    const d = new Date(isoString);
+    if (isNaN(d.getTime())) return "";
+    return d.toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" });
+  } catch {
+    return "";
+  }
+}
+
+function calculateTotalAsset(balances: UpbitBalance[], priceBy: Map<string, number>): number {
+  let total = 0;
+  for (const b of balances) {
+    const currency = String(b.currency ?? "").toUpperCase();
+    const qty = Number(b.balance ?? 0) + Number(b.locked ?? 0);
+    if (currency === "KRW") {
+      total += qty;
+    } else {
+      const mk = `KRW-${currency}`;
+      const px = Number(priceBy.get(mk) ?? b.avg_buy_price ?? 0);
+      total += qty * px;
+    }
+  }
+  return total > 0 ? total : 10_000_000; // fallback to 10M KRW
+}
+
+function checkDailyRiskKillSwitch(state: PersistedState, balances: UpbitBalance[], priceBy: Map<string, number>): boolean {
+  const totalAsset = calculateTotalAsset(balances, priceBy);
+  const todaySells = state.trades
+    .filter(t => 
+      t.action === "sell" && 
+      getKstDateString(t.timestamp) === todayKst() &&
+      (t.filled_qty ?? 0) > 0 &&
+      (t.order_krw ?? 0) > 0 &&
+      t.reason_exit !== "highest_price_update"
+    )
+    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+  // 1. 하루 실현손익 -2.0% 도달 여부
+  const todayPnlSum = todaySells.reduce((sum, t) => sum + (t.pnl_krw ?? 0), 0);
+  if (totalAsset > 0 && todayPnlSum / totalAsset <= -0.02) {
+    return true;
+  }
+
+  // 2. 연속 손절 3회
+  let consecutiveLossCount = 0;
+  for (let i = todaySells.length - 1; i >= 0; i--) {
+    if (todaySells[i].pnl_krw < 0) {
+      consecutiveLossCount++;
+    } else {
+      break;
+    }
+  }
+  if (consecutiveLossCount >= 3) {
+    return true;
+  }
+
+  // 3. rescue add 후 손절 1회
+  const hasRescueAddLoss = todaySells.some(t => t.pnl_krw < 0 && t.rescue_add_count !== undefined && t.rescue_add_count > 0);
+  if (hasRescueAddLoss) {
+    return true;
+  }
+
+  // 4. 급등주 포지션 3개 연속 실패
+  const todaySurgeSells = todaySells.filter(t => t.strategy_type === "momentum" || t.reason_enter === "SURGE_V2" || t.reason_enter === "surge_reclaim_entry" || t.reason_enter.includes("surge"));
+  let surgeConsecutiveLossCount = 0;
+  for (let i = todaySurgeSells.length - 1; i >= 0; i--) {
+    if (todaySurgeSells[i].pnl_krw < 0) {
+      surgeConsecutiveLossCount++;
+    } else {
+      break;
+    }
+  }
+  if (surgeConsecutiveLossCount >= 3) {
+    return true;
+  }
+
+  // 5. 1시간 내 손절 2회 이상
+  const oneHourAgo = Date.now() - 3600 * 1000;
+  const recentLossesIn1h = todaySells.filter(t => t.pnl_krw < 0 && new Date(t.timestamp).getTime() >= oneHourAgo);
+  if (recentLossesIn1h.length >= 2) {
+    return true;
+  }
+
+  return false;
 }
 
 function resolveFreshestIsoTs(candidates: Array<string | null | undefined>): string | null {
@@ -2206,6 +2328,9 @@ export function createLiveDataStrategy(opts: {
       last_updated_at: new Date().toISOString(),
     },
     entry_profile_stats: {},
+    surge_watchlist: {},
+    morning_surge_watchlist: {},
+    daily_risk_kill_switch_triggered: false,
   };
 
   let runTickInFlight = false;
@@ -2233,6 +2358,9 @@ export function createLiveDataStrategy(opts: {
           legacy: state.legacy,
           regime: state.regime,
           entry_profile_stats: state.entry_profile_stats,
+          surge_watchlist: state.surge_watchlist,
+          morning_surge_watchlist: state.morning_surge_watchlist,
+          daily_risk_kill_switch_triggered: state.daily_risk_kill_switch_triggered,
         },
         null,
         2,
@@ -2256,6 +2384,9 @@ export function createLiveDataStrategy(opts: {
       state.legacy = d.legacy ?? state.legacy;
       state.regime = d.regime ?? state.regime;
       state.entry_profile_stats = d.entry_profile_stats ?? state.entry_profile_stats ?? {};
+      state.surge_watchlist = d.surge_watchlist ?? state.surge_watchlist ?? {};
+      state.morning_surge_watchlist = d.morning_surge_watchlist ?? state.morning_surge_watchlist ?? {};
+      state.daily_risk_kill_switch_triggered = d.daily_risk_kill_switch_triggered ?? state.daily_risk_kill_switch_triggered ?? false;
     } catch {}
     state.safety_guard.state = "정상";
     state.safety_guard.reason = null;
@@ -2315,6 +2446,8 @@ export function createLiveDataStrategy(opts: {
       reentry_cooldowns: state.cooldown_until,
       legacy_management: state.legacy,
       regime: state.regime,
+      surge_watchlist: state.surge_watchlist,
+      morning_surge_watchlist: state.morning_surge_watchlist,
     };
   };
 
@@ -4037,6 +4170,23 @@ export function createLiveDataStrategy(opts: {
         }),
       );
     }
+
+    // Daily Risk Kill Switch Sync and Check
+    const dailyRiskKillSwitchActive = checkDailyRiskKillSwitch(state, Array.isArray(tstatus.balances) ? tstatus.balances : [], priceBy);
+    opts.trade.setDailyRiskKillSwitch?.(dailyRiskKillSwitchActive);
+    if (dailyRiskKillSwitchActive && !state.daily_risk_kill_switch_triggered) {
+      state.daily_risk_kill_switch_triggered = true;
+      console.info(
+        JSON.stringify({
+          tag: "DAILY_RISK_KILL_SWITCH_TRIGGERED",
+          ts: new Date().toISOString(),
+          reason: "daily_risk_limits_exceeded",
+        })
+      );
+    } else if (!dailyRiskKillSwitchActive) {
+      state.daily_risk_kill_switch_triggered = false;
+    }
+
     const minute1CandleCache = new Map<string, UpbitCandle[]>();
     const minute5CandleCache = new Map<string, UpbitCandle[]>();
     const fetchMinuteCandlesCached = async (market: string, unit: 1 | 5, count: number): Promise<UpbitCandle[]> => {
@@ -5928,6 +6078,7 @@ export function createLiveDataStrategy(opts: {
         trailing_stop_price: p.trailing_stop_price,
         breakeven_armed_at: p.breakeven_armed_at,
         partial_tp_at: p.partial_tp_at,
+        rescue_add_count: p.rescue_add_count,
         position_id: p.position_id ?? `${market}|${p.entry_ts}`,
         entry_profile_key: p.entry_profile_key,
         entry_profile_decision: p.entry_profile_decision,
@@ -7827,6 +7978,309 @@ export function createLiveDataStrategy(opts: {
       }),
     );
 
+    // --- Watchlist State Machine and Reclaim Entry Engine ---
+    if (!state.surge_watchlist) state.surge_watchlist = {};
+    if (!state.morning_surge_watchlist) state.morning_surge_watchlist = {};
+
+    const watchListItems = Object.values(state.surge_watchlist);
+    const morningWatchListItems = Object.values(state.morning_surge_watchlist);
+    const allWatchItems = [...watchListItems, ...morningWatchListItems];
+
+    for (const item of allWatchItems) {
+      const market = item.market;
+      const currentPrice = priceBy.get(market) || 0;
+      if (currentPrice <= 0) continue;
+
+      let c1: UpbitCandle[] = [];
+      let c5: UpbitCandle[] = [];
+      const nowMs = Date.now();
+      const cached = watchlistCandleCache.get(market);
+
+      if (cached && nowMs - cached.ts < 12000) {
+        c1 = cached.c1;
+        c5 = cached.c5;
+      } else {
+        try {
+          c1 = await fetchMinuteCandlesCached(market, 1, 12);
+          c5 = await fetchMinuteCandlesCached(market, 5, 12);
+          watchlistCandleCache.set(market, { ts: nowMs, c1, c5 });
+        } catch {
+          if (cached) {
+            c1 = cached.c1;
+            c5 = cached.c5;
+          } else {
+            continue;
+          }
+        }
+      }
+
+      if (c1.length < 5 || c5.length < 5) continue;
+
+      const closes1 = c1.map(c => Number(c.trade_price));
+      const closes5 = c5.map(c => Number(c.trade_price));
+      const lastC1 = c1[c1.length - 1];
+
+      const recent1mRet = ((currentPrice - closes1[closes1.length - 2]) / closes1[closes1.length - 2]) * 100;
+      const recent3mRet = c1.length >= 4 ? ((currentPrice - closes1[closes1.length - 4]) / closes1[closes1.length - 4]) * 100 : 0;
+      const recent5mRet = c5.length >= 2 ? ((currentPrice - closes5[closes5.length - 2]) / closes5[closes5.length - 2]) * 100 : 0;
+
+      const lastVol = Number(lastC1.candle_acc_trade_volume ?? 0);
+      const prev5Vols = c1.slice(-6, -1).map(c => Number(c.candle_acc_trade_volume ?? 0));
+      const prev5AvgVol = prev5Vols.reduce((a, b) => a + b, 0) / Math.max(1, prev5Vols.length);
+      const volumeRatio1m5 = prev5AvgVol > 0 ? lastVol / prev5AvgVol : 1.0;
+
+      const localHigh = Math.max(item.local_high_price, currentPrice);
+      if (localHigh > item.local_high_price) {
+        item.local_high_price = localHigh;
+        item.local_high_at = new Date().toISOString();
+      }
+      const distanceFromLocalHighPct = ((localHigh - currentPrice) / localHigh) * 100;
+
+      item.last_seen_price = currentPrice;
+      item.last_seen_at = new Date().toISOString();
+      item.day_change_pct = changeRateBy.get(market) !== undefined ? changeRateBy.get(market)! * 100 : item.day_change_pct;
+      item.recent1mRet = recent1mRet;
+      item.recent3mRet = recent3mRet;
+      item.recent5mRet = recent5mRet;
+      item.volumeRatio1m5 = volumeRatio1m5;
+      item.distanceFromLocalHighPct = distanceFromLocalHighPct;
+
+      const isMorning = item.morning_reentry_candidate;
+
+      // 1. 만료 조건 체크
+      const registerTime = new Date(item.first_detected_at).getTime();
+      const elapsedMin = (nowMs - registerTime) / 60000;
+      const isExpired =
+        elapsedMin >= 30 ||
+        currentPrice < localHigh * 0.97 ||
+        volumeRatio1m5 < 0.1 ||
+        marketState.market_state === "risk_off";
+
+      if (isExpired) {
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_WATCH_EXPIRED",
+            ts: new Date().toISOString(),
+            market,
+            reason: elapsedMin >= 30 ? "timeout_30m" : currentPrice < localHigh * 0.97 ? "pullback_too_deep" : "market_degraded",
+            last_price: currentPrice,
+            local_high: localHigh,
+          })
+        );
+        if (isMorning) {
+          delete state.morning_surge_watchlist![market];
+        } else {
+          delete state.surge_watchlist![market];
+        }
+        continue;
+      }
+
+      // 2. 상태 기계: watching -> pullback_seen
+      if (item.status === "watching") {
+        const pullbackPct = ((localHigh - currentPrice) / localHigh) * 100;
+        const isPullback = pullbackPct >= 0.6 && pullbackPct < 2.5;
+
+        if (isPullback && volumeRatio1m5 >= 0.1 && marketState.market_state !== "risk_off") {
+          item.status = "pullback_seen";
+          item.pullback_low_price = currentPrice;
+          item.pullback_low_at = new Date().toISOString();
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_PULLBACK_CONFIRMED",
+              ts: new Date().toISOString(),
+              market,
+              local_high_price: localHigh,
+              pullback_low_price: currentPrice,
+              pullback_pct: pullbackPct,
+              elapsed_seconds: Math.floor((nowMs - registerTime) / 1000),
+            })
+          );
+        }
+      }
+
+      // 3. 상태 기계: pullback_seen -> reclaim 진입
+      if (item.status === "pullback_seen") {
+        const isRebounding = item.pullback_low_price !== null && currentPrice > item.pullback_low_price;
+        const returnsOk = recent1mRet > 0 && recent3mRet >= 0 && recent3mRet <= 2.5;
+        const nearHigh = currentPrice >= localHigh * 0.997 && currentPrice <= localHigh * 1.003;
+
+        const ema20 = emaLast(closes1, 20) || currentPrice;
+        const isAboveEma = currentPrice >= ema20;
+
+        if (isRebounding && returnsOk && nearHigh && isAboveEma) {
+          const pullbackLow = item.pullback_low_price || currentPrice;
+          const stopCandidate1 = pullbackLow * 0.997;
+          const stopCandidate2 = currentPrice * 0.985;
+          let stopPrice = Math.max(stopCandidate1, stopCandidate2);
+
+          let lossPct = ((currentPrice - stopPrice) / currentPrice) * 100;
+          if (lossPct < 0.8) {
+            stopPrice = currentPrice * 0.992;
+            lossPct = 0.8;
+          }
+
+          const takeProfitPrice = currentPrice * 1.018;
+          const profitPct = ((takeProfitPrice - currentPrice) / currentPrice) * 100;
+          const riskReward = lossPct > 0 ? profitPct / lossPct : 0;
+
+          item.riskReward = riskReward;
+
+          const valid =
+            stopPrice > 0 &&
+            takeProfitPrice > 0 &&
+            stopPrice < currentPrice &&
+            takeProfitPrice > currentPrice &&
+            riskReward >= 1.3 &&
+            lossPct <= 2.0;
+
+          const finalPath = isMorning ? "morning_surge_reclaim_entry" : "surge_reclaim_entry";
+
+          if (!valid) {
+            console.info(
+              JSON.stringify({
+                tag: isMorning ? "MORNING_SURGE_RECLAIM_ENTRY_BLOCK" : "SURGE_RECLAIM_ENTRY_BLOCK",
+                ts: new Date().toISOString(),
+                market,
+                price: currentPrice,
+                stopPrice,
+                takeProfitPrice,
+                riskReward,
+                reason: "exit_policy_verification_failed",
+              })
+            );
+            continue;
+          }
+
+          if (dailyRiskKillSwitchActive) {
+            console.info(
+              JSON.stringify({
+                tag: isMorning ? "MORNING_SURGE_RECLAIM_ENTRY_BLOCK" : "SURGE_RECLAIM_ENTRY_BLOCK",
+                ts: new Date().toISOString(),
+                market,
+                price: currentPrice,
+                stopPrice,
+                takeProfitPrice,
+                riskReward,
+                reason: "daily_risk_kill_switch_active",
+              })
+            );
+            continue;
+          }
+
+          const nowKst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+          const kstHour = nowKst.getUTCHours();
+          const kstMinute = nowKst.getUTCMinutes();
+          const kstTimeVal = kstHour * 60 + kstMinute;
+          if (kstTimeVal >= 0 && kstTimeVal < 510) {
+            console.info(
+              JSON.stringify({
+                tag: isMorning ? "MORNING_SURGE_RECLAIM_ENTRY_BLOCK" : "SURGE_RECLAIM_ENTRY_BLOCK",
+                ts: new Date().toISOString(),
+                market,
+                reason: "night_block_time_reclaim_denied",
+              })
+            );
+            continue;
+          }
+
+          if (kstTimeVal >= 510 && kstTimeVal < 570 && !isMorning) {
+            console.info(
+              JSON.stringify({
+                tag: "MORNING_SURGE_RECLAIM_ENTRY_BLOCK",
+                ts: new Date().toISOString(),
+                market,
+                reason: "only_morning_surge_watchlist_allowed",
+              })
+            );
+            continue;
+          }
+
+          console.info(
+            JSON.stringify({
+              tag: isMorning ? "MORNING_SURGE_RECLAIM_ENTRY_ALLOW" : "SURGE_RECLAIM_ENTRY_ALLOW",
+              ts: new Date().toISOString(),
+              market,
+              price: currentPrice,
+              stopPrice,
+              takeProfitPrice,
+              riskReward,
+              strict_exit: true,
+              exit_policy_attached: true,
+            })
+          );
+
+          console.info(
+            JSON.stringify({
+              tag: "ENTRY_EXIT_POLICY_ATTACHED_PROOF",
+              market,
+              path: finalPath,
+              currentPrice,
+              stopPrice,
+              takeProfitPrice,
+              riskPct: lossPct,
+              riskReward,
+              strict_exit: true,
+              exit_policy_attached: true,
+              trailingStartPct: 1.8,
+              trailingGapPct: 1.2,
+            })
+          );
+
+          const baseOrderAmount = strategyUsableKrwForAlloc > 0 ? strategyUsableKrwForAlloc * 0.15 : 20000;
+          const orderKrw = Math.floor(baseOrderAmount * 0.5);
+
+          if (orderKrw >= 5000) {
+            try {
+              const signalPayloadForBuy = {
+                strict_exit: true,
+                exit_policy_attached: true,
+                entry_stop_price: stopPrice,
+                entry_target_price: takeProfitPrice,
+                entry_risk_reward: riskReward,
+                surge_entry_mode: finalPath,
+                surge_stop_price: stopPrice,
+                surge_take_profit_price: takeProfitPrice,
+                surge_trailing_start_pct: 1.8,
+                surge_trailing_gap_pct: 1.2
+              };
+
+              const buyRes = await opts.trade.placeBuy(
+                market,
+                true,
+                orderKrw,
+                "momentum",
+                "strategy",
+                signalPayloadForBuy,
+                finalPath
+              );
+
+              console.info(
+                JSON.stringify({
+                  tag: "LIVE_PLACEBUY_ATTEMPT",
+                  ts: new Date().toISOString(),
+                  market,
+                  path: finalPath,
+                  order_krw: orderKrw,
+                  status: buyRes && (buyRes as any).ok ? "ok" : "error",
+                })
+              );
+
+              item.status = "entered";
+
+              if (isMorning) {
+                delete state.morning_surge_watchlist![market];
+              } else {
+                delete state.surge_watchlist![market];
+              }
+
+            } catch (innerErr) {
+              console.error(`Reclaim placeBuy failed for ${market}:`, innerErr);
+            }
+          }
+        }
+      }
+    }
+
     for (const marketRaw of entryUniverse) {
       const market = typeof marketRaw === "string" ? marketRaw.trim() : "";
       if (!/^KRW-[A-Z0-9]{2,}$/.test(market)) {
@@ -8175,6 +8629,142 @@ export function createLiveDataStrategy(opts: {
             surge_shadow_setup: candidateMetaFromSetup?.surge_shadow_setup || null,
           }),
         );
+
+        // --- Immediate Entry Block & Watchlist Registration ---
+        const nowKst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+        const kstHour = nowKst.getUTCHours();
+        const kstMinute = nowKst.getUTCMinutes();
+        const kstTimeVal = kstHour * 60 + kstMinute;
+        const isMorningWindow = kstTimeVal >= 510 && kstTimeVal < 570; // 08:30 ~ 09:30 KST
+
+        let c1: UpbitCandle[] = [];
+        let c5: UpbitCandle[] = [];
+        try {
+          c1 = await fetchMinuteCandlesCached(market, 1, 12);
+          c5 = await fetchMinuteCandlesCached(market, 5, 12);
+        } catch {}
+
+        const closes1 = c1.map(c => Number(c.trade_price));
+        const closes5 = c5.map(c => Number(c.trade_price));
+        const currentPrice = Number(priceBy.get(market) ?? 0);
+
+        const recent1mRet = closes1.length >= 2 ? ((currentPrice - closes1[closes1.length - 2]) / closes1[closes1.length - 2]) * 100 : 0;
+        const recent3mRet = closes1.length >= 4 ? ((currentPrice - closes1[closes1.length - 4]) / closes1[closes1.length - 4]) * 100 : 0;
+        const recent5mRet = closes5.length >= 2 ? ((currentPrice - closes5[closes5.length - 2]) / closes5[closes5.length - 2]) * 100 : 0;
+
+        const lastC1 = c1[c1.length - 1];
+        const lastVol = lastC1 ? Number(lastC1.candle_acc_trade_volume ?? 0) : 0;
+        const prev5Vols = c1.slice(-6, -1).map(c => Number(c.candle_acc_trade_volume ?? 0));
+        const prev5AvgVol = prev5Vols.reduce((a, b) => a + b, 0) / Math.max(1, prev5Vols.length);
+        const volumeRatio1m5 = prev5AvgVol > 0 ? lastVol / prev5AvgVol : 1.0;
+
+        const day_change_pct = changeRateBy.get(market) !== undefined ? changeRateBy.get(market)! * 100 : 0;
+        const volume_24h_krw = sig?.p?.volume_24h_krw || (sig?.p as any)?.acc_trade_price_24h || 100000000;
+
+        const isSurging =
+          day_change_pct >= 5.0 ||
+          recent1mRet >= 1.2 ||
+          recent3mRet >= 2.0 ||
+          volumeRatio1m5 >= 1.5;
+
+        const btcChange = Number((tstatus as any)?.btc_change_24h ?? 0);
+        const isBtcPanic = btcChange <= -0.025;
+        const isRiskOff = marketState.market_state === "risk_off";
+
+        if (isSurging && !isBtcPanic && !isRiskOff) {
+          const currentCount = Object.keys(state.surge_watchlist || {}).length + Object.keys(state.morning_surge_watchlist || {}).length;
+          const existInWatch = (state.surge_watchlist && state.surge_watchlist[market]) || (state.morning_surge_watchlist && state.morning_surge_watchlist[market]);
+
+          if (currentCount < 20 && !existInWatch) {
+            const watchItem: SurgeWatchItem = {
+              market,
+              first_detected_at: new Date().toISOString(),
+              first_detected_price: currentPrice,
+              day_change_pct,
+              volume_24h_krw,
+              local_high_price: currentPrice,
+              local_high_at: new Date().toISOString(),
+              pullback_low_price: null,
+              pullback_low_at: null,
+              max_day_change_pct: day_change_pct,
+              last_seen_price: currentPrice,
+              last_seen_at: new Date().toISOString(),
+              status: "watching",
+              reason: "surge_detected",
+              expire_at: new Date(Date.now() + 30 * 60000).toISOString(),
+              morning_reentry_candidate: isMorningWindow,
+            };
+
+            if (isMorningWindow) {
+              state.morning_surge_watchlist![market] = watchItem;
+              console.info(
+                JSON.stringify({
+                  tag: "MORNING_SURGE_WATCH_REGISTERED",
+                  ts: new Date().toISOString(),
+                  market,
+                  price: currentPrice,
+                  day_change_pct,
+                  recent1mRet,
+                  recent3mRet,
+                  volumeRatio1m5,
+                  volume_24h_krw,
+                  reason: "surge_detected_morning",
+                })
+              );
+            } else {
+              state.surge_watchlist![market] = watchItem;
+              console.info(
+                JSON.stringify({
+                  tag: "SURGE_WATCH_REGISTERED",
+                  ts: new Date().toISOString(),
+                  market,
+                  price: currentPrice,
+                  day_change_pct,
+                  recent1mRet,
+                  recent3mRet,
+                  volumeRatio1m5,
+                  volume_24h_krw,
+                  reason: "surge_detected",
+                })
+              );
+            }
+          }
+        }
+
+        const localHigh = Math.max(currentPrice, (candidateMetaFromSetup as any)?.localHigh ?? 0);
+        const nearHigh = localHigh > 0 && ((localHigh - currentPrice) / localHigh) * 100 <= 0.2;
+        const isLateChase =
+          (day_change_pct >= 10.0 && nearHigh) ||
+          recent3mRet > 3.5 ||
+          recent5mRet > 6.0;
+
+        if (isLateChase) {
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_LATE_CHASE_BLOCK",
+              ts: new Date().toISOString(),
+              market,
+              currentPrice,
+              recent3mRet,
+              recent5mRet,
+              reason: "late_chase_conditions_met",
+              blocked_before_placebuy: true,
+            })
+          );
+        } else {
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_WATCH_ONLY_NO_ENTRY",
+              ts: new Date().toISOString(),
+              market,
+              price: currentPrice,
+              reason: "immediate_entry_forbidden_under_new_strategy",
+            })
+          );
+        }
+
+        bumpSkip("immediate_entry_forbidden_under_new_strategy");
+        continue;
       }
       const scannerBridgeScore = isSurgeSource
         ? computeScannerBridgeScore({

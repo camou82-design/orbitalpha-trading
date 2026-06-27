@@ -445,6 +445,10 @@ type StrategyStatus = {
     }
   >;
   early_positions?: Record<string, unknown>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  surge_watchlist?: Record<string, any>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  morning_surge_watchlist?: Record<string, any>;
 };
 
 /** 감시·카드에 쓸 마켓: 기본 4종 + (실제 보유·전략/레거시/오픈포지션 마켓). slice(4) 제한 없음. */
@@ -3158,6 +3162,135 @@ export default function HomePage() {
               </div>
             </div>
           )}
+        </section>
+
+        {/* 급등주 Watchlist (눌림/재돌파 감시) */}
+        <section
+          style={{
+            background: UI.cardBg,
+            border: `1px solid ${UI.border}`,
+            borderRadius: 12,
+            padding: "0.8rem 1rem",
+            marginBottom: "0.9rem",
+            boxShadow: "0 0 0 1px #1b3558 inset, 0 10px 24px rgba(2, 6, 23, 0.32)",
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.55rem" }}>
+            <div style={{ fontSize: "0.9rem", color: UI.title, fontWeight: 800, letterSpacing: "0.02em" }}>급등주 Watchlist (눌림/재돌파 감시)</div>
+            <div style={{ fontSize: "0.74rem", color: UI.mutedSoft }}>
+              감시 수: {Object.keys(strategy?.surge_watchlist || {}).length + Object.keys(strategy?.morning_surge_watchlist || {}).length} / 20
+            </div>
+          </div>
+          <div style={{ fontSize: "0.72rem", color: UI.mutedSoft, marginTop: -4, marginBottom: 12, lineHeight: 1.4 }}>
+            급등 감지 후 Watchlist에 등록되며, 고점 대비 0.6% 이상 눌림목을 거쳐 재돌파 시점에 진입합니다.
+          </div>
+          {(() => {
+            const watchlist = Object.values(strategy?.surge_watchlist || {});
+            const morningWatchlist = Object.values(strategy?.morning_surge_watchlist || {});
+            const mergedList = [...watchlist, ...morningWatchlist];
+            
+            if (mergedList.length === 0) {
+              return (
+                <div style={{ fontSize: "0.82rem", color: UI.muted, lineHeight: 1.55 }}>
+                  <p style={{ margin: "0", fontWeight: 700, color: UI.title }}>감시 중인 급등주 없음</p>
+                </div>
+              );
+            }
+            
+            return (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6, overflowX: "auto" }}>
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "80px 100px 90px 90px 90px 70px 70px 80px 70px 70px 70px 80px 70px 1fr",
+                    gap: 8,
+                    alignItems: "center",
+                    padding: "0 0.45rem",
+                    fontSize: "0.66rem",
+                    color: UI.mutedSoft,
+                    minWidth: "1100px"
+                  }}
+                >
+                  <span>코인</span>
+                  <span>상태</span>
+                  <span>최초 감지가</span>
+                  <span>최고가</span>
+                  <span>눌림저가</span>
+                  <span>눌림%</span>
+                  <span>1m수익%</span>
+                  <span>3m수익%</span>
+                  <span>5m수익%</span>
+                  <span>거래량배수</span>
+                  <span>고점대비%</span>
+                  <span>손익비</span>
+                  <span>아침후보</span>
+                  <span>진입제한/조건</span>
+                </div>
+                {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+                {mergedList.map((it: any) => {
+                  const pullbackPct = it.pullback_low_price && it.local_high_price 
+                    ? ((it.local_high_price - it.pullback_low_price) / it.local_high_price * 100).toFixed(2)
+                    : "-";
+                  const distancePct = it.local_high_price && it.last_seen_price
+                    ? ((it.local_high_price - it.last_seen_price) / it.local_high_price * 100).toFixed(2)
+                    : "-";
+                  
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  const statusColors: any = {
+                    watching: "#94a3b8",
+                    pullback_seen: "#fb7185",
+                    reclaim_ready: "#34d399",
+                    entered: "#60a5fa",
+                    expired: "#6b7280"
+                  };
+                  const color = statusColors[it.status] || UI.body;
+
+                  return (
+                    <div
+                      key={`watchlist-${it.market}`}
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "80px 100px 90px 90px 90px 70px 70px 80px 70px 70px 70px 80px 70px 1fr",
+                        gap: 8,
+                        alignItems: "center",
+                        padding: "0.35rem 0.45rem",
+                        border: "1px solid #28456f",
+                        borderRadius: 6,
+                        fontSize: "0.76rem",
+                        background: UI.cardSoftBg,
+                        minWidth: "1100px"
+                      }}
+                    >
+                      <strong style={{ color: UI.title }}>{it.market.replace("KRW-", "")}</strong>
+                      <span style={{ color, fontWeight: 900 }}>{it.status}</span>
+                      <span>{Math.round(it.first_detected_price).toLocaleString()}원</span>
+                      <span>{Math.round(it.local_high_price).toLocaleString()}원</span>
+                      <span>{it.pullback_low_price ? `${Math.round(it.pullback_low_price).toLocaleString()}원` : "-"}</span>
+                      <span>{pullbackPct}%</span>
+                      <span style={{ color: (it.recent1mRet || 0) > 0 ? UI.pass : (it.recent1mRet || 0) < 0 ? UI.fail : UI.body }}>
+                        {it.recent1mRet ? `${it.recent1mRet.toFixed(2)}%` : "0%"}
+                      </span>
+                      <span style={{ color: (it.recent3mRet || 0) > 0 ? UI.pass : (it.recent3mRet || 0) < 0 ? UI.fail : UI.body }}>
+                        {it.recent3mRet ? `${it.recent3mRet.toFixed(2)}%` : "0%"}
+                      </span>
+                      <span style={{ color: (it.recent5mRet || 0) > 0 ? UI.pass : (it.recent5mRet || 0) < 0 ? UI.fail : UI.body }}>
+                        {it.recent5mRet ? `${it.recent5mRet.toFixed(2)}%` : "0%"}
+                      </span>
+                      <span>{it.volumeRatio1m5 ? `${it.volumeRatio1m5.toFixed(2)}x` : "-"}</span>
+                      <span>{distancePct}%</span>
+                      <span>{it.riskReward ? it.riskReward.toFixed(2) : "-"}</span>
+                      <span style={{ color: it.morning_reentry_candidate ? UI.pass : UI.mutedSoft }}>
+                        {it.morning_reentry_candidate ? "Y" : "N"}
+                      </span>
+                      <span style={{ color: it.status === "pullback_seen" ? "#f43f5e" : UI.mutedSoft, fontWeight: 700 }}>
+                        {it.status === "watching" ? "눌림 감시 대기" : it.status === "pullback_seen" ? "재돌파 진입 대기" : it.reason || "—"}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
         </section>
 
         <section style={{ fontSize: "0.86rem", color: UI.muted, marginBottom: "0.45rem", fontWeight: 800, letterSpacing: "0.03em" }}>

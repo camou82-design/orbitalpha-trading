@@ -89,6 +89,7 @@ type TradeState = {
     }
   >;
   legacyBuckets: Record<ManagedMarket, LegacyBucketState>;
+  dailyRiskKillSwitchActive?: boolean;
 };
 
 const TEST_ORDER_KRW = 5000;
@@ -689,6 +690,19 @@ export function createTradeControl(
     signalPayload?: unknown,
     path?: string,
   ) => {
+    if (state.dailyRiskKillSwitchActive) {
+      console.info(
+        JSON.stringify({
+          tag: "ENTRY_DAILY_RISK_BLOCK",
+          ts: new Date().toISOString(),
+          market,
+          blocked_before_placebuy: true,
+          reason: "daily_risk_kill_switch_active",
+        })
+      );
+      throw new Error("daily_risk_kill_switch_active");
+    }
+
     // 00:00 ~ 08:30 KST 신규 진입 차단 필터
     const now = new Date();
     const { hour: kstHour, minute: kstMin } = getKstTime(now);
@@ -1265,6 +1279,9 @@ export function createTradeControl(
     connectionCheck: getConnectionStatus,
     placeBuy,
     placeSell,
+    setDailyRiskKillSwitch: (active: boolean) => {
+      state.dailyRiskKillSwitchActive = active;
+    },
     placeLegacyDcaBuy: (market: string, confirm: boolean, amountKrw = TEST_ORDER_KRW, signalPayload?: unknown) =>
       placeBuy(market, confirm, amountKrw, "stable", "legacy", signalPayload),
     placeLegacyExitSell: (market: string, confirm: boolean, ratio = 1) =>
