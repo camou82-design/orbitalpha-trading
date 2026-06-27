@@ -2649,6 +2649,8 @@ export function createLiveDataStrategy(opts: {
       state.daily = { date: todayKst(), entry_count: 0, loss_pct: 0, stop_by_market: {} };
       state.safety_guard.order_fail_count_today = 0;
       state.safety_guard.consecutive_losses = 0;
+      state.daily_risk_kill_switch_triggered = false;
+      opts.trade.setDailyRiskKillSwitch?.(false);
       if (state.safety_guard.state === "자동정지") {
         state.safety_guard.state = "주의";
         state.safety_guard.reason = "daily_reset";
