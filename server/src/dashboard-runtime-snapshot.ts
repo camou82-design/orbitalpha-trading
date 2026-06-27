@@ -1,4 +1,20 @@
 import fs from "node:fs";
+import path from "node:path";
+
+const HISTORY_FILE = path.join(process.cwd(), "portfolio_history.json");
+let portfolioHistoryCache: Array<{
+  ts: string;
+  total_asset_equity_krw: number;
+  spot_trading_equity_krw: number;
+  unrealized_pnl_krw: number;
+  realized_pnl_krw: number;
+}> = [];
+
+try {
+  if (fs.existsSync(HISTORY_FILE)) {
+    portfolioHistoryCache = JSON.parse(fs.readFileSync(HISTORY_FILE, "utf8"));
+  }
+} catch {}
 
 export type DashboardMonitorSnap = {
   monitor_instance_id: string | null;
@@ -162,6 +178,51 @@ export function finalizeDashboardTradeStatusPayload(
   const ap = rawBody.account_portfolio as Record<string, unknown> | null | undefined;
   const holdingsAsOf = ap && typeof ap.as_of === "string" ? ap.as_of : null;
 
+  // Portfolio History snapshot accumulation
+  let addedNew = false;
+  try {
+    const lastHistory = portfolioHistoryCache[portfolioHistoryCache.length - 1];
+    const currentMinuteStr = new Date(server_now).toISOString().slice(0, 16);
+    const lastMinuteStr = lastHistory ? new Date(lastHistory.ts).toISOString().slice(0, 16) : "";
+
+    if (currentMinuteStr !== lastMinuteStr || portfolioHistoryCache.length === 0) {
+      const total_asset_equity_krw = Number(rawBody.totalAssetEquityKrw ?? rawBody.total_asset_equity_krw ?? ap?.total_evaluated_krw ?? 0);
+      const spot_trading_equity_krw = Number(rawBody.spotTradingEquityKrw ?? rawBody.spot_trading_equity_krw ?? 0);
+      const realized_pnl_krw = Number(deps.strategyStatus.strategy_pnl_krw ?? 0);
+      
+      let unrealized_pnl_krw = 0;
+      try {
+        const open = (deps.strategyStatus.open_positions ?? {}) as Record<string, any>;
+        for (const k of Object.keys(open)) {
+          unrealized_pnl_krw += Number(open[k]?.pnl_krw ?? 0);
+        }
+      } catch {}
+
+      portfolioHistoryCache.push({
+        ts: server_now,
+        total_asset_equity_krw,
+        spot_trading_equity_krw,
+        unrealized_pnl_krw,
+        realized_pnl_krw,
+      });
+
+      if (portfolioHistoryCache.length > 150) {
+        portfolioHistoryCache.shift();
+      }
+      addedNew = true;
+    }
+  } catch (err) {
+    console.error("PORTFOLIO_HISTORY_PERSIST_FAILED", err);
+  }
+
+  if (addedNew) {
+    try {
+      fs.writeFileSync(HISTORY_FILE, JSON.stringify(portfolioHistoryCache, null, 2), "utf8");
+    } catch (err) {
+      console.error("PORTFOLIO_HISTORY_PERSIST_FAILED", err);
+    }
+  }
+
   const position_source_summary = buildPositionSourceSummary(rawBody, deps.strategyStatus);
   const lastOrder = rawBody.last_order as Record<string, unknown> | null | undefined;
 
@@ -202,6 +263,7 @@ export function finalizeDashboardTradeStatusPayload(
     server_now,
     api_response_at: server_now,
     process_pid: deps.monitor.process_pid,
+    portfolio_history: portfolioHistoryCache,
     git_head:
       (typeof process.env.ORBITALPHA_GIT_HEAD === "string" && process.env.ORBITALPHA_GIT_HEAD.trim()) ||
       (typeof process.env.GIT_COMMIT === "string" && process.env.GIT_COMMIT.trim().slice(0, 12)) ||
