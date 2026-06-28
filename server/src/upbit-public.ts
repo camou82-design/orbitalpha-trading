@@ -55,6 +55,8 @@ export type FetchTickersOptions = {
   totalTimeoutMs?: number;
   /** 실제 보유잔고/관리종목 조회 여부 (우선순위 큐 락 선점용) */
   isPriority?: boolean;
+  /** 캐시를 무시하고 최신 REST API로 강제 조회할지 여부 */
+  forceRefresh?: boolean;
 };
 
 function sleep(ms: number): Promise<void> {
@@ -600,7 +602,7 @@ type TickerCacheEntry = {
 };
 
 export const lastGoodTickerCache = new Map<string, UpbitTicker>();
-export const tickerSourceMap = new Map<string, "live" | "last_good_cache" | "candle_fallback" | "missing">();
+export const tickerSourceMap = new Map<string, "live" | "last_good_cache" | "candle_fallback" | "missing" | "fresh_cache" | "cache">();
 export const tickerAgeMap = new Map<string, number>();
 
 const tickerCache = new Map<string, TickerCacheEntry>();
@@ -841,10 +843,10 @@ export async function fetchTickers(markets: string[], opts?: FetchTickersOptions
       continue;
     }
     
-    // TTL 이내의 캐시가 있으면 그것을 사용
-    if (c && now0 <= c.expiresAtMs) {
+    // TTL 이내의 캐시가 있으면 그것을 사용 (forceRefresh가 아닐 때만)
+    if (c && now0 <= c.expiresAtMs && opts?.forceRefresh !== true) {
       cachedOut.push(c.value);
-      tickerSourceMap.set(m, "live"); // fresh cache is treated as live
+      tickerSourceMap.set(m, "fresh_cache"); // fresh cache는 live가 아닌 fresh_cache로 설정
       tickerAgeMap.set(m, now0 - c.fetchedAtMs);
       continue;
     }

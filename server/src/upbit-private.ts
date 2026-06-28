@@ -131,3 +131,19 @@ export function placeMarketSell(args: {
     body,
   });
 }
+
+export function fetchOrderDetails(
+  accessKey: string,
+  secretKey: string,
+  uuid: string,
+): Promise<any> {
+  const query = new URLSearchParams();
+  query.set("uuid", uuid);
+  return upbitFetch<any>({
+    method: "GET",
+    path: "/v1/order",
+    accessKey,
+    secretKey,
+    query,
+  });
+}

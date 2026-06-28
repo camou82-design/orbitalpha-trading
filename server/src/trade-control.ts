@@ -1229,7 +1229,7 @@ export function createTradeControl(
       const avg = Number(b.avg_buy_price ?? 0);
       
       let currentPrice: number | null = null;
-      let priceSource: "live" | "last_good_cache" | "candle_fallback" | "missing" = "missing";
+      let priceSource: "live" | "last_good_cache" | "candle_fallback" | "missing" | "fresh_cache" | "cache" = "missing";
       let priceStatus: "live" | "stale" | "missing" = "missing";
       
       // pricing_debug 또는 state.lastGoodMarkPrices 에서 가격 획득
