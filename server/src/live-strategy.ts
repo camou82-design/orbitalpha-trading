@@ -4772,13 +4772,238 @@ export function createLiveDataStrategy(opts: {
           pnl_gross_pct: pnlGross,
         }),
       );
+      // [보완] 매도 전 공통 Sell Guard 검증
+      const guard = await validateSellGuardBeforePlaceSell({
+        market,
+        ratio: 1, // 100% 매도
+        entryPrice: ep.entry_price,
+        reasonExit: exitReason,
+        exitAuthorityClass: "emergency_exit",
+        stopTriggerKind: "price_stop",
+        heldMs: heldSec * 1000,
+      });
+
+      if (!guard.allowed) {
+        console.info(
+          JSON.stringify({
+            tag: "SELL_GUARD_BLOCKED",
+            market,
+            reason_exit: exitReason,
+            block_reason: guard.blockReason,
+            decision_price: guard.decisionPrice,
+            entry_price: ep.entry_price,
+            pnl_pct_decision: guard.decisionPnlPct,
+            sell_ratio: 1,
+            price_source: guard.forceRefreshSource,
+            hold_ms: heldSec * 1000,
+          })
+        );
+        continue; // 매도 skip
+      }
+
+      console.info(
+        JSON.stringify({
+          tag: "SELL_GUARD_PASSED",
+          market,
+          reason_exit: exitReason,
+          decision_price: guard.decisionPrice,
+          pnl_pct_decision: guard.decisionPnlPct,
+          sell_ratio: 1,
+          price_source: guard.forceRefreshSource,
+        })
+      );
+
+      const decisionPrice = guard.decisionPrice;
+      const decisionPnlPct = guard.decisionPnlPct;
+      const forceRefreshSource = guard.forceRefreshSource;
+
+      let placeSellOk = false;
+      let placeSellReason = "unknown";
+      let snap: any = null;
       try {
-        await opts.trade.placeSell(market, true, 1);
-      } catch {
+        snap = await opts.trade.placeSell(market, true, 1);
+        placeSellOk = true;
+        placeSellReason = "success";
+      } catch (e) {
+        placeSellOk = false;
+        placeSellReason = e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200);
         continue;
       }
+
+      // 실제 체결가 추적 (체결 지연 고려 최대 5회 300ms 간격 재시도)
+      const uuid = snap?.order_uuid ?? snap?.uuid;
+      let actualFillPrice = decisionPrice;
+      let actualFillFetchOk = false;
+      let actualFillFetchAttempts = 0;
+
+      if (placeSellOk && uuid) {
+        const maxAttempts = 5;
+        while (actualFillFetchAttempts < maxAttempts) {
+          actualFillFetchAttempts++;
+          try {
+            const orderDetails = await fetchOrderDetails(
+              process.env.UPBIT_ACCESS_KEY ?? "",
+              process.env.UPBIT_SECRET_KEY ?? "",
+              uuid
+            );
+            if (orderDetails) {
+              if (Array.isArray(orderDetails.trades) && orderDetails.trades.length > 0) {
+                let totalFunds = 0;
+                let totalVolume = 0;
+                for (const t of orderDetails.trades) {
+                  const pr = Number(t.price);
+                  const vl = Number(t.volume);
+                  if (Number.isFinite(pr) && Number.isFinite(vl)) {
+                    totalFunds += pr * vl;
+                    totalVolume += vl;
+                  }
+                }
+                if (totalVolume > 0) {
+                  actualFillPrice = totalFunds / totalVolume;
+                  actualFillFetchOk = true;
+                  break;
+                }
+              } else {
+                const execFunds = Number(orderDetails.executed_funds ?? 0);
+                const execVolume = Number(orderDetails.executed_volume ?? 0);
+                if (execFunds > 0 && execVolume > 0) {
+                  actualFillPrice = execFunds / execVolume;
+                  actualFillFetchOk = true;
+                  break;
+                }
+              }
+            }
+          } catch (err) {
+            console.warn(`[actual-fill-price] Attempt ${actualFillFetchAttempts} failed for early fail ${market}:`, err);
+          }
+          if (actualFillFetchAttempts < maxAttempts) {
+            await new Promise((resolve) => setTimeout(resolve, 300));
+          }
+        }
+        if (!actualFillFetchOk) {
+          console.warn(`[actual-fill-price] Failed to fetch actual average fill price for early fail ${market} using uuid=${uuid} after ${actualFillFetchAttempts} attempts. Fallback to decision_price=${decisionPrice}`);
+        }
+      } else {
+        console.warn(`[actual-fill-price] No uuid found for early fail ${market} sell order. Using decision_price=${decisionPrice} as fallback.`);
+      }
+
+      console.info(
+        JSON.stringify({
+          tag: "LIVE_PLACESELL_RESULT",
+          ts: new Date().toISOString(),
+          market,
+          exit_reason: exitReason,
+          hold_ms: heldSec * 1000,
+          entry_price: ep.entry_price,
+          decision_price: decisionPrice,
+          actual_fill_price: actualFillPrice,
+          pnl_pct_decision: decisionPnlPct,
+          sell_ratio: 1,
+          price_source: forceRefreshSource,
+          place_sell_ok: placeSellOk,
+          place_sell_reason: placeSellReason,
+          actual_fill_fetch_attempts: actualFillFetchAttempts,
+          actual_fill_fetch_ok: actualFillFetchOk,
+          uuid: uuid ?? null,
+        }),
+      );
+
       delete state.early_positions[market];
       state.cooldown_until[market] = new Date(Date.now() + LIVE_REENTRY_COOLDOWN_EARLY_FAIL_SECONDS * 1000).toISOString();
+    }
+
+    async function validateSellGuardBeforePlaceSell(params: {
+      market: string;
+      ratio: number;
+      entryPrice: number;
+      reasonExit: string;
+      exitAuthorityClass: string;
+      stopTriggerKind: StopTriggerKind | null;
+      heldMs: number;
+    }): Promise<{
+      allowed: boolean;
+      blockReason: string;
+      decisionPrice: number;
+      decisionPnlPct: number;
+      forceRefreshSource: string;
+    }> {
+      let forceRefreshedTicker: any = null;
+      let forceRefreshSource = "missing";
+      try {
+        const res = await fetchTickers([params.market], { isPriority: true, forceRefresh: true, debugCaller: "exit_force_refresh" });
+        forceRefreshedTicker = res.find((t) => t.market === params.market);
+        forceRefreshSource = tickerSourceMap.get(params.market) ?? "missing";
+      } catch (err) {
+        console.warn(`[exit-force-refresh] Failed to force-refresh ticker for ${params.market}:`, err);
+      }
+
+      // 1. 가격 및 소스 검증
+      const isValidSource = forceRefreshSource === "live" || forceRefreshSource === "ticker_batch" || forceRefreshSource === "per_symbol_fetch";
+      if (!forceRefreshedTicker || forceRefreshedTicker.trade_price <= 0 || !isValidSource) {
+        return {
+          allowed: false,
+          blockReason: "invalid_source_or_price",
+          decisionPrice: forceRefreshedTicker?.trade_price ?? 0,
+          decisionPnlPct: 0,
+          forceRefreshSource,
+        };
+      }
+
+      const decisionPrice = forceRefreshedTicker.trade_price;
+      const decisionPnlPct = ((decisionPrice - params.entryPrice) / params.entryPrice) * 100;
+
+      // 2. 부분매도(ratio < 1) 가드 검사
+      if (params.ratio < 1) {
+        const feeRoundTripPct = UPBIT_FEE_RATE * 2 * 100;
+        const minProfitThreshold = feeRoundTripPct + LIVE_EXIT_FEE_BUFFER_PCT;
+        
+        // 비상 손절 예외 보강 조건
+        const isEmergencyStopLoss =
+          decisionPnlPct <= -3.0 &&
+          (
+            params.exitAuthorityClass === "emergency_exit" ||
+            params.stopTriggerKind === "price_stop" ||
+            /emergency|hard|strict|stop|loss/i.test(params.reasonExit)
+          );
+
+        const isUnderFeeBuffer = decisionPnlPct < minProfitThreshold;
+
+        // TP1/TP2 등 익절성 부분매도는 -3% 이하 손실 상태에서도 예외 허용하지 않는다.
+        const isTakeProfitPartial = /tp[12]_partial|take_profit/i.test(params.reasonExit);
+        const effectiveEmergency = isEmergencyStopLoss && !isTakeProfitPartial;
+
+        let shouldBlock = false;
+        let blockReason = "";
+
+        // 2.1. 보유시간과 무관하게 손실 부분매도 전면 차단
+        if (decisionPnlPct <= 0 && !effectiveEmergency) {
+          shouldBlock = true;
+          blockReason = "loss_partial_sell_blocked";
+        }
+        // 2.2. 수수료와 슬리피지를 감안한 최소 수익 버퍼 미만 부분매도 금지
+        else if (isUnderFeeBuffer && !effectiveEmergency) {
+          shouldBlock = true;
+          blockReason = "under_fee_buffer_block";
+        }
+
+        if (shouldBlock) {
+          return {
+            allowed: false,
+            blockReason,
+            decisionPrice,
+            decisionPnlPct,
+            forceRefreshSource,
+          };
+        }
+      }
+
+      return {
+        allowed: true,
+        blockReason: "",
+        decisionPrice,
+        decisionPnlPct,
+        forceRefreshSource,
+      };
     }
 
     async function evaluateRescueAdd(
@@ -5891,80 +6116,51 @@ export function createLiveDataStrategy(opts: {
       }
 
       // ────────────────────────────────────────────────────────────────
-      // [보완] 청산 직전 최신 가격 강제 재조회 및 검증 (429 & 손실 부분매도 차단)
+      // [보완] 공통 Sell Guard 검증
       // ────────────────────────────────────────────────────────────────
-      let forceRefreshedTicker: any = null;
-      let forceRefreshSource = "missing";
-      try {
-        const res = await fetchTickers([market], { isPriority: true, forceRefresh: true, debugCaller: "exit_force_refresh" });
-        forceRefreshedTicker = res.find((t) => t.market === market);
-        forceRefreshSource = tickerSourceMap.get(market) ?? "missing";
-      } catch (err) {
-        console.warn(`[exit-force-refresh] Failed to force-refresh ticker for ${market}:`, err);
-      }
+      const guard = await validateSellGuardBeforePlaceSell({
+        market,
+        ratio,
+        entryPrice: p.entry_price,
+        reasonExit,
+        exitAuthorityClass,
+        stopTriggerKind,
+        heldMs,
+      });
 
-      // 1. 가격 소스 검증: live, ticker_batch, per_symbol_fetch 만 허용 (stale, cache, candle_fallback 차단)
-      const isValidSource = forceRefreshSource === "live" || forceRefreshSource === "ticker_batch" || forceRefreshSource === "per_symbol_fetch";
-      if (!forceRefreshedTicker || forceRefreshedTicker.trade_price <= 0 || !isValidSource) {
+      if (!guard.allowed) {
         console.info(
           JSON.stringify({
-            tag: "EXIT_FORCE_REFRESH_FAILED_SKIP",
-            ts: new Date().toISOString(),
+            tag: "SELL_GUARD_BLOCKED",
             market,
             reason_exit: reasonExit,
-            force_refresh_source: forceRefreshSource,
-            decision_price: forceRefreshedTicker?.trade_price ?? 0,
-            message: "Skipping placeSell due to ticker refresh failure, invalid source, or 429 cooldown"
+            block_reason: guard.blockReason,
+            decision_price: guard.decisionPrice,
+            entry_price: p.entry_price,
+            pnl_pct_decision: guard.decisionPnlPct,
+            sell_ratio: ratio,
+            price_source: guard.forceRefreshSource,
+            hold_ms: heldMs,
           })
         );
         continue; // 매도 주문 금지 및 skip/hold
       }
 
-      const decisionPrice = forceRefreshedTicker.trade_price;
-      const decisionPnlPct = ((decisionPrice - p.entry_price) / p.entry_price) * 100;
+      console.info(
+        JSON.stringify({
+          tag: "SELL_GUARD_PASSED",
+          market,
+          reason_exit: reasonExit,
+          decision_price: guard.decisionPrice,
+          pnl_pct_decision: guard.decisionPnlPct,
+          sell_ratio: ratio,
+          price_source: guard.forceRefreshSource,
+        })
+      );
 
-      // 2. 부분매도(ratio < 1) 제한 가드
-      if (ratio < 1) {
-        const feeRoundTripPct = UPBIT_FEE_RATE * 2 * 100;
-        const exitFeeBufferPct = LIVE_EXIT_FEE_BUFFER_PCT;
-        const minProfitThreshold = feeRoundTripPct + exitFeeBufferPct;
-        const isEmergencyStopLoss = decisionPnlPct <= -3.0;
-        const isUnderFeeBuffer = decisionPnlPct < minProfitThreshold;
-
-        let shouldBlock = false;
-        let blockReason = "";
-
-        // 2.1. 매수 후 3분 이내 손실 부분매도 차단 (비상손절 예외)
-        if (heldMs < 180000 && decisionPnlPct < 0 && !isEmergencyStopLoss) {
-          shouldBlock = true;
-          blockReason = "3min_loss_block";
-        }
-        // 2.2. 보유시간과 무관하게 수수료 버퍼 미만의 부분매도 무조건 차단 (비상손절 예외)
-        else if (isUnderFeeBuffer && !isEmergencyStopLoss) {
-          shouldBlock = true;
-          blockReason = "under_fee_buffer_block";
-        }
-
-        if (shouldBlock) {
-          console.info(
-            JSON.stringify({
-              tag: "EXIT_PARTIAL_SELL_BLOCKED",
-              ts: new Date().toISOString(),
-              market,
-              reason_exit: reasonExit,
-              block_reason: blockReason,
-              held_ms: heldMs,
-              pnl_pct_decision: decisionPnlPct,
-              decision_price: decisionPrice,
-              entry_price: p.entry_price,
-              sell_ratio: ratio,
-              fee_buffer_threshold: minProfitThreshold,
-              message: `Blocking partial sell for ${blockReason}`
-            })
-          );
-          continue; // 매도 주문 금지 및 skip/hold
-        }
-      }
+      const decisionPrice = guard.decisionPrice;
+      const decisionPnlPct = guard.decisionPnlPct;
+      const forceRefreshSource = guard.forceRefreshSource;
 
       let placeSellOk = false;
       let placeSellReason = "unknown";
@@ -6064,43 +6260,61 @@ export function createLiveDataStrategy(opts: {
         continue;
       }
 
-      // 실제 체결가 추적 (체결 지연 고려 최대 5회 100ms 간격 재시도)
+      // 실제 체결가 추적 (체결 지연 고려 최대 5회 300ms 간격 재시도)
+      const uuid = snap?.order_uuid ?? snap?.uuid;
       let actualFillPrice = decisionPrice;
-      if (placeSellOk && snap && snap.order_uuid) {
-        const uuid = snap.order_uuid;
-        let attempts = 0;
+      let actualFillFetchOk = false;
+      let actualFillFetchAttempts = 0;
+
+      if (placeSellOk && uuid) {
         const maxAttempts = 5;
-        while (attempts < maxAttempts) {
-          attempts++;
+        while (actualFillFetchAttempts < maxAttempts) {
+          actualFillFetchAttempts++;
           try {
             const orderDetails = await fetchOrderDetails(
               process.env.UPBIT_ACCESS_KEY ?? "",
               process.env.UPBIT_SECRET_KEY ?? "",
               uuid
             );
-            if (orderDetails && Array.isArray(orderDetails.trades) && orderDetails.trades.length > 0) {
-              let totalFunds = 0;
-              let totalVolume = 0;
-              for (const t of orderDetails.trades) {
-                const pr = Number(t.price);
-                const vl = Number(t.volume);
-                if (Number.isFinite(pr) && Number.isFinite(vl)) {
-                  totalFunds += pr * vl;
-                  totalVolume += vl;
+            if (orderDetails) {
+              if (Array.isArray(orderDetails.trades) && orderDetails.trades.length > 0) {
+                let totalFunds = 0;
+                let totalVolume = 0;
+                for (const t of orderDetails.trades) {
+                  const pr = Number(t.price);
+                  const vl = Number(t.volume);
+                  if (Number.isFinite(pr) && Number.isFinite(vl)) {
+                    totalFunds += pr * vl;
+                    totalVolume += vl;
+                  }
                 }
-              }
-              if (totalVolume > 0) {
-                actualFillPrice = totalFunds / totalVolume;
-                break;
+                if (totalVolume > 0) {
+                  actualFillPrice = totalFunds / totalVolume;
+                  actualFillFetchOk = true;
+                  break;
+                }
+              } else {
+                const execFunds = Number(orderDetails.executed_funds ?? 0);
+                const execVolume = Number(orderDetails.executed_volume ?? 0);
+                if (execFunds > 0 && execVolume > 0) {
+                  actualFillPrice = execFunds / execVolume;
+                  actualFillFetchOk = true;
+                  break;
+                }
               }
             }
           } catch (err) {
-            console.warn(`[actual-fill-price] Attempt ${attempts} failed to fetch order details for ${market}:`, err);
+            console.warn(`[actual-fill-price] Attempt ${actualFillFetchAttempts} failed to fetch order details for ${market}:`, err);
           }
-          if (attempts < maxAttempts) {
-            await new Promise((resolve) => setTimeout(resolve, 100));
+          if (actualFillFetchAttempts < maxAttempts) {
+            await new Promise((resolve) => setTimeout(resolve, 300));
           }
         }
+        if (!actualFillFetchOk) {
+          console.warn(`[actual-fill-price] Failed to fetch actual average fill price for ${market} using uuid=${uuid} after ${actualFillFetchAttempts} attempts. Fallback to decision_price=${decisionPrice}`);
+        }
+      } else {
+        console.warn(`[actual-fill-price] No uuid found for ${market} sell order. Using decision_price=${decisionPrice} as fallback.`);
       }
 
       console.info(
@@ -6121,6 +6335,9 @@ export function createLiveDataStrategy(opts: {
           engine_bucket: isSurge ? "surge" : "core",
           place_sell_ok: placeSellOk,
           place_sell_reason: placeSellReason,
+          actual_fill_fetch_attempts: actualFillFetchAttempts,
+          actual_fill_fetch_ok: actualFillFetchOk,
+          uuid: uuid ?? null,
         }),
       );
 
@@ -6153,38 +6370,38 @@ export function createLiveDataStrategy(opts: {
           }));
         }
 
-          console.info(
-            JSON.stringify({
-              tag: "SURGE_PLACESELL_RESULT_PROOF",
-              ts: new Date().toISOString(),
-              market,
-              reason_exit: reasonExit,
-              ratio,
-              stop_trigger_kind: stopTriggerKind,
-              authority_class: exitAuthorityClass,
-              execution_layer: "live-strategy",
-              place_sell_called: true,
-              place_sell_ok: placeSellOk,
-              place_sell_reason: placeSellReason,
-            }),
-          );
-        } else {
-          console.info(
-            JSON.stringify({
-              tag: "CORE_EXIT_FINAL_DECISION_PROOF",
-              ts: new Date().toISOString(),
-              market,
-              reason_exit: reasonExit,
-              ratio,
-              stop_trigger_kind: stopTriggerKind,
-              authority_class: "core",
-              execution_layer: "live-strategy",
-              place_sell_called: true,
-              place_sell_ok: placeSellOk,
-              place_sell_reason: placeSellReason,
-            }),
-          );
-        }
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_PLACESELL_RESULT_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            reason_exit: reasonExit,
+            ratio,
+            stop_trigger_kind: stopTriggerKind,
+            authority_class: exitAuthorityClass,
+            execution_layer: "live-strategy",
+            place_sell_called: true,
+            place_sell_ok: placeSellOk,
+            place_sell_reason: placeSellReason,
+          }),
+        );
+      } else {
+        console.info(
+          JSON.stringify({
+            tag: "CORE_EXIT_FINAL_DECISION_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            reason_exit: reasonExit,
+            ratio,
+            stop_trigger_kind: stopTriggerKind,
+            authority_class: "core",
+            execution_layer: "live-strategy",
+            place_sell_called: true,
+            place_sell_ok: placeSellOk,
+            place_sell_reason: placeSellReason,
+          }),
+        );
+      }
 
       const after = await raceTradeStatus("exit_after_place_sell");
       const qtyAfter = Number(after.strategy_positions?.[market]?.qty ?? 0);
