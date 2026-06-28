@@ -4521,6 +4521,52 @@ export function createLiveDataStrategy(opts: {
           });
           return false;
         }
+
+        // [보완] 매도 전 공통 Sell Guard 검증
+        const guard = await validateSellGuardBeforePlaceSell({
+          market,
+          ratio,
+          entryPrice: legacyAvg,
+          reasonExit: `legacy_exit_stage_${stage}`,
+          exitAuthorityClass: "core",
+          stopTriggerKind: null,
+          heldMs: 0,
+        });
+
+        if (!guard.allowed) {
+          console.info(
+            JSON.stringify({
+              tag: "SELL_GUARD_BLOCKED",
+              market,
+              reason_exit: `legacy_exit_stage_${stage}`,
+              block_reason: guard.blockReason,
+              decision_price: guard.decisionPrice,
+              entry_price: legacyAvg,
+              pnl_pct_decision: guard.decisionPnlPct,
+              sell_ratio: ratio,
+              price_source: guard.forceRefreshSource,
+              hold_ms: 0,
+            })
+          );
+          return false;
+        }
+
+        console.info(
+          JSON.stringify({
+            tag: "SELL_GUARD_PASSED",
+            market,
+            reason_exit: `legacy_exit_stage_${stage}`,
+            decision_price: guard.decisionPrice,
+            pnl_pct_decision: guard.decisionPnlPct,
+            sell_ratio: ratio,
+            price_source: guard.forceRefreshSource,
+          })
+        );
+
+        const decisionPrice = guard.decisionPrice;
+        const decisionPnlPct = guard.decisionPnlPct;
+        const forceRefreshSource = guard.forceRefreshSource;
+
         const vol = legacyQty * Math.min(1, Math.max(0.01, ratio));
         if (vol * now < UPBIT_MIN_ORDER_KRW) {
           await appendLog({
@@ -4539,12 +4585,99 @@ export function createLiveDataStrategy(opts: {
           });
           return false;
         }
+
+        let placeSellOk = false;
+        let placeSellReason = "unknown";
+        let snap: any = null;
         try {
-          await opts.trade.placeLegacyExitSell!(market, true, ratio);
-          return true;
-        } catch {
+          snap = await opts.trade.placeLegacyExitSell!(market, true, ratio);
+          placeSellOk = true;
+          placeSellReason = "success";
+        } catch (e) {
+          placeSellOk = false;
+          placeSellReason = e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200);
           return false;
         }
+
+        // 실제 체결가 추적 (체결 지연 고려 최대 5회 300ms 간격 재시도)
+        const uuid = snap?.order_uuid ?? snap?.uuid;
+        let actualFillPrice = decisionPrice;
+        let actualFillFetchOk = false;
+        let actualFillFetchAttempts = 0;
+
+        if (placeSellOk && uuid) {
+          const maxAttempts = 5;
+          while (actualFillFetchAttempts < maxAttempts) {
+            actualFillFetchAttempts++;
+            try {
+              const orderDetails = await fetchOrderDetails(
+                process.env.UPBIT_ACCESS_KEY ?? "",
+                process.env.UPBIT_SECRET_KEY ?? "",
+                uuid
+              );
+              if (orderDetails) {
+                if (Array.isArray(orderDetails.trades) && orderDetails.trades.length > 0) {
+                  let totalFunds = 0;
+                  let totalVolume = 0;
+                  for (const t of orderDetails.trades) {
+                    const pr = Number(t.price);
+                    const vl = Number(t.volume);
+                    if (Number.isFinite(pr) && Number.isFinite(vl)) {
+                      totalFunds += pr * vl;
+                      totalVolume += vl;
+                    }
+                  }
+                  if (totalVolume > 0) {
+                    actualFillPrice = totalFunds / totalVolume;
+                    actualFillFetchOk = true;
+                    break;
+                  }
+                } else {
+                  const execFunds = Number(orderDetails.executed_funds ?? 0);
+                  const execVolume = Number(orderDetails.executed_volume ?? 0);
+                  if (execFunds > 0 && execVolume > 0) {
+                    actualFillPrice = execFunds / execVolume;
+                    actualFillFetchOk = true;
+                    break;
+                  }
+                }
+              }
+            } catch (err) {
+              console.warn(`[actual-fill-price] Attempt ${actualFillFetchAttempts} failed for legacy fail ${market}:`, err);
+            }
+            if (actualFillFetchAttempts < maxAttempts) {
+              await new Promise((resolve) => setTimeout(resolve, 300));
+            }
+          }
+          if (!actualFillFetchOk) {
+            console.warn(`[actual-fill-price] Failed to fetch actual average fill price for legacy fail ${market} using uuid=${uuid} after ${actualFillFetchAttempts} attempts. Fallback to decision_price=${decisionPrice}`);
+          }
+        } else {
+          console.warn(`[actual-fill-price] No uuid found for legacy fail ${market} sell order. Using decision_price=${decisionPrice} as fallback.`);
+        }
+
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_PLACESELL_RESULT",
+            ts: new Date().toISOString(),
+            market,
+            exit_reason: `legacy_exit_stage_${stage}`,
+            hold_ms: 0,
+            entry_price: legacyAvg,
+            decision_price: decisionPrice,
+            actual_fill_price: actualFillPrice,
+            pnl_pct_decision: decisionPnlPct,
+            sell_ratio: ratio,
+            price_source: forceRefreshSource,
+            place_sell_ok: placeSellOk,
+            place_sell_reason: placeSellReason,
+            actual_fill_fetch_attempts: actualFillFetchAttempts,
+            actual_fill_fetch_ok: actualFillFetchOk,
+            uuid: uuid ?? null,
+          }),
+        );
+
+        return placeSellOk;
       };
       try {
         if (shouldStage1) {
