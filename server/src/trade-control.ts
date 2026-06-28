@@ -7,6 +7,12 @@ import {
   sanitizeAccountPortfolioSnapshot,
   type AccountPortfolioSnapshot,
 } from "./account-portfolio.js";
+import {
+  peekMinuteCandleCache,
+  lastGoodTickerCache,
+  tickerSourceMap,
+  tickerAgeMap,
+} from "./upbit-public.js";
 import { appendLog } from "./log-store.js";
 import { fetchAccounts, placeMarketBuy, placeMarketSell, type UpbitAccount } from "./upbit-private.js";
 import { companyIdSchema, serviceIdSchema } from "@orbitalpha/shared";
@@ -17,6 +23,8 @@ import { computeLiveCapitalPolicyV4 } from "./live-capital-policy-v4.js";
 import crypto from "node:crypto";
 import path from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+
+const marketCodeForCurrency = (currency: string) => `KRW-${normalizeBalanceCurrency(currency)}`;
 
 type TradeOrderSide = "buy" | "sell";
 type PositionBucket = "strategy" | "legacy";
@@ -1082,22 +1090,48 @@ export function createTradeControl(
           const snap = computeAccountValuationFromPrices(balanceRows, effective, new Date().toISOString());
           account_portfolio = sanitizeAccountPortfolioSnapshot(snap.portfolio);
           mark_prices = snap.mark_prices;
-          const dbg: Record<string, PricingDebugRow> = {};
-          for (const m of MANAGED_MARKETS) {
+          const dbg: Record<string, any> = {};
+          const marketsToEvaluate = new Set<string>(MANAGED_MARKETS);
+          for (const row of balanceRows) {
+            if (row.currency === "KRW") continue;
+            marketsToEvaluate.add(marketCodeForCurrency(row.currency));
+          }
+
+          for (const m of marketsToEvaluate) {
             const cur = m.replace("KRW-", "");
             const row = balanceRows.find((r) => r.currency === cur);
             const qty = row ? row.balance + row.locked : 0;
             const avg = row ? row.avg_buy_price : 0;
-            const mark = effective[m] ?? 0;
+            
+            // 0원 표시 방지용 Fallback 체인 적용
+            let mark = effective[m] ?? 0;
             const fromRest = rest_fresh_markets.has(m);
+            
+            // 만약 보유/관리 종목인데도 가격을 구하지 못했다면 lastGoodTickerCache나 candle close를 강제 적용
+            if (mark <= 0 && (MANAGED_MARKETS.includes(m as any) || qty > 0)) {
+              const lg = lastGoodTickerCache.get(m);
+              if (lg && lg.trade_price > 0) {
+                mark = lg.trade_price;
+              } else {
+                const candle = peekMinuteCandleCache(m, 1, 1);
+                if (candle && candle.rows.length > 0) {
+                  mark = candle.rows[0].trade_price;
+                }
+              }
+            }
+            
             if (qty > 0 && mark > 0 && !fromRest) mark_prices_stale = true;
+            
+            // missing 판정
+            const isMissing = mark <= 0;
+            
             const gd = qty > 0 && avg > 0 && mark > 0 ? grossPnlPct(avg, mark) : 0;
             const nd = qty > 0 && avg > 0 && mark > 0 ? netPnlPctPerUnit(avg, mark) : 0;
             dbg[m] = {
               avg_buy_price: avg,
               quantity: qty,
-              current_price_used_for_display: mark,
-              current_price_used_for_sell_decision: mark,
+              current_price_used_for_display: isMissing ? null : mark, // 0 대신 null
+              current_price_used_for_sell_decision: isMissing ? null : mark,
               pnl_percent_display: gd,
               pnl_percent_sell_decision: gd,
               net_pnl_percent_after_fees: nd,
@@ -1106,6 +1140,8 @@ export function createTradeControl(
               intended_sell_value_krw: null,
               blocked_reason: null,
               ticker_from_rest_this_request: fromRest,
+              price_status: isMissing ? "missing" : (fromRest ? "live" : "stale"),
+              price_source: isMissing ? "missing" : (fromRest ? "live" : (tickerSourceMap.get(m) ?? "last_good_cache")),
             };
           }
           pricing_debug = dbg;
@@ -1172,6 +1208,83 @@ export function createTradeControl(
       inFlightMarket: state.inFlightBuyMarket,
       inFlight: state.inFlight && state.inFlightBuyMarket != null,
     });
+    let missing_count = 0;
+    const missing_markets: string[] = [];
+
+    const mappedBalances = (conn.balances ?? []).map((b) => {
+      const isKrw = b.currency === "KRW";
+      if (isKrw) {
+        return {
+          ...b,
+          qty: Number(b.balance) + Number(b.locked),
+          current_price: 1,
+          pnl_krw: 0,
+          pnl_pct: 0,
+          price_status: "live" as const,
+          price_source: "live" as const,
+        };
+      }
+      const m = marketCodeForCurrency(b.currency);
+      const qty = Number(b.balance) + Number(b.locked);
+      const avg = Number(b.avg_buy_price ?? 0);
+      
+      let currentPrice: number | null = null;
+      let priceSource: "live" | "last_good_cache" | "candle_fallback" | "missing" = "missing";
+      let priceStatus: "live" | "stale" | "missing" = "missing";
+      
+      // pricing_debug 또는 state.lastGoodMarkPrices 에서 가격 획득
+      if (state.lastGoodMarkPrices && state.lastGoodMarkPrices[m] && state.lastGoodMarkPrices[m] > 0) {
+        currentPrice = state.lastGoodMarkPrices[m];
+        // pricing_debug의 값과 tickerSourceMap을 대조하여 live/stale 판정
+        const sourceFromMap = tickerSourceMap.get(m);
+        priceSource = sourceFromMap === "live" ? "live" : (sourceFromMap ?? "last_good_cache");
+        priceStatus = sourceFromMap === "live" ? "live" : "stale";
+      }
+      
+      // 보유/관리종목 0원 표시 방지 강제 적용
+      if (!currentPrice && (MANAGED_MARKETS.includes(m as any) || qty > 0)) {
+        const lg = lastGoodTickerCache.get(m);
+        if (lg && lg.trade_price > 0) {
+          currentPrice = lg.trade_price;
+          priceSource = "last_good_cache";
+          priceStatus = "stale";
+        } else {
+          const candle = peekMinuteCandleCache(m, 1, 1);
+          if (candle && candle.rows.length > 0) {
+            currentPrice = candle.rows[0].trade_price;
+            priceSource = "candle_fallback";
+            priceStatus = "stale";
+          }
+        }
+      }
+      
+      if (currentPrice && currentPrice > 0) {
+        const evalPnlKrw = (currentPrice - avg) * qty;
+        const evalPnlPct = avg > 0 ? ((currentPrice - avg) / avg) * 100 : 0;
+        return {
+          ...b,
+          qty,
+          current_price: currentPrice,
+          pnl_krw: evalPnlKrw,
+          pnl_pct: evalPnlPct,
+          price_status: priceStatus,
+          price_source: priceSource,
+        };
+      } else {
+        missing_count++;
+        missing_markets.push(m);
+        return {
+          ...b,
+          qty,
+          current_price: null,
+          pnl_krw: null,
+          pnl_pct: null,
+          price_status: "missing" as const,
+          price_source: "missing" as const,
+        };
+      }
+    });
+
     return {
       trading_mode: env.tradingMode,
       live_order_confirm: env.liveOrderConfirm,
@@ -1191,7 +1304,11 @@ export function createTradeControl(
       strategy_allocated_krw: funds.strategy_allocated_krw,
       pump_paper_allocated_krw: funds.pump_paper_allocated_krw,
       protective_reserve_krw: funds.protective_reserve_krw,
-      balances: conn.balances,
+      balances: mappedBalances,
+      missing_count,
+      missing_markets,
+      price_status: market_data_degraded ? "degraded" : (mark_prices_stale ? "stale" : "live"),
+      price_source: market_data_degraded ? "degraded_fallback" : (mark_prices_stale ? "last_good_cache" : "live"),
       test_order_krw: TEST_ORDER_KRW,
       order_limits: ORDER_LIMITS,
       cooldown_ms: COOLDOWN_MS,

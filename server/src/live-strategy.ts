@@ -15,6 +15,7 @@ import {
   fetchTickers,
   partitionKrwMarketsByUpbitValidity,
   peekMinuteCandleCache,
+  tickerSourceMap,
   type UpbitCandle,
 } from "./upbit-public.js";
 import { LogDeduper } from "./log-deduper.js";
@@ -5044,6 +5045,13 @@ export function createLiveDataStrategy(opts: {
     // exits — 익절/손절 판단은 업비트 보유 화면과 동일한 평단 대비 가격 변동률(gross) 기준
     for (const market of Object.keys(state.positions)) {
       const p = state.positions[market]!;
+      
+      const priceSource = (tickerPriceHydrationForCandidates?.sourceByMarket[market] ?? tickerSourceMap.get(market) ?? "missing") as string;
+      const isLivePrice = priceSource === "ticker_batch" || priceSource === "per_symbol_fetch" || priceSource === "live";
+      if (!isLivePrice) {
+        continue;
+      }
+
       const rawPx = priceBy.get(market);
       const hasTicker = typeof rawPx === "number" && Number.isFinite(rawPx) && rawPx > 0;
       if (!hasTicker) {
@@ -8285,6 +8293,13 @@ export function createLiveDataStrategy(opts: {
 
     for (const marketRaw of entryUniverse) {
       const market = typeof marketRaw === "string" ? marketRaw.trim() : "";
+      
+      const priceSource = (tickerPriceHydrationForCandidates?.sourceByMarket[market] ?? tickerSourceMap.get(market) ?? "missing") as string;
+      const isLivePrice = priceSource === "ticker_batch" || priceSource === "per_symbol_fetch" || priceSource === "live";
+      if (!isLivePrice) {
+        continue;
+      }
+
       if (!/^KRW-[A-Z0-9]{2,}$/.test(market)) {
         console.info(
           JSON.stringify({

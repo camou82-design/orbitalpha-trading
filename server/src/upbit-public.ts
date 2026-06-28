@@ -53,6 +53,8 @@ export type FetchTickersOptions = {
   batchTimeoutMs?: number;
   /** 전체 fetchTickers 호출의 하드 예산(ms). 초과 시 남은 배치는 드랍하고 현재까지 결과만 반환. */
   totalTimeoutMs?: number;
+  /** 실제 보유잔고/관리종목 조회 여부 (우선순위 큐 락 선점용) */
+  isPriority?: boolean;
 };
 
 function sleep(ms: number): Promise<void> {
@@ -576,15 +578,15 @@ function numTradePrice(v: unknown): number {
 }
 
 const TICKER_MAX_MARKETS_PER_TICK = Number(process.env.UPBIT_TICKER_MAX_MARKETS_PER_TICK ?? 25);
-const TICKER_BATCH_SIZE = Number(process.env.UPBIT_TICKER_BATCH_SIZE ?? 15);
+const TICKER_BATCH_SIZE = Number(process.env.UPBIT_TICKER_BATCH_SIZE ?? 10);
 const TICKER_BATCH_DELAY_MS = Number(process.env.UPBIT_TICKER_BATCH_DELAY_MS ?? 400); // 배치 간 간격 대폭 축소
 const TICKER_429_MAX_ATTEMPTS = Number(process.env.UPBIT_TICKER_429_MAX_ATTEMPTS ?? 1); // 기본: 재시도 없음(429 과호출 방지)
 const TICKER_429_RETRY_DELAY_MS = Number(process.env.UPBIT_TICKER_429_RETRY_DELAY_MS ?? 3_000); // 재시도 시 최소 대기
 
 // ticker REST 과호출/429 완화를 위한 공용 캐시/쿨다운 (프로세스 내).
-const TICKER_CACHE_TTL_MS = Number(process.env.UPBIT_TICKER_CACHE_TTL_MS ?? 12_000); // 8~15s 권장
+const TICKER_CACHE_TTL_MS = Number(process.env.UPBIT_TICKER_CACHE_TTL_MS ?? 60_000); // 캐시 TTL 60초
 const TICKER_CACHE_STALE_GRACE_MS = Number(process.env.UPBIT_TICKER_CACHE_STALE_GRACE_MS ?? 30_000); // 429 시 마지막 값 서빙
-const TICKER_429_COOLDOWN_MS = Number(process.env.UPBIT_TICKER_429_COOLDOWN_MS ?? 20_000); // 10~30s 권장
+const TICKER_429_COOLDOWN_MS = Number(process.env.UPBIT_TICKER_429_COOLDOWN_MS ?? 10_000); // 10초 쿨다운
 const TICKER_429_LOG_INTERVAL_MS = Number(process.env.UPBIT_TICKER_429_LOG_INTERVAL_MS ?? 60_000);
 const UPBIT_FETCH_CIRCUIT_BREAKER_FAIL_THRESHOLD = Math.max(1, Number(process.env.UPBIT_FETCH_CIRCUIT_BREAKER_FAIL_THRESHOLD ?? 3));
 const UPBIT_FETCH_CIRCUIT_BREAKER_COOLDOWN_MS = Math.max(1_000, Number(process.env.UPBIT_FETCH_CIRCUIT_BREAKER_COOLDOWN_MS ?? 60_000));
@@ -597,12 +599,65 @@ type TickerCacheEntry = {
   staleUntilMs: number;
 };
 
+export const lastGoodTickerCache = new Map<string, UpbitTicker>();
+export const tickerSourceMap = new Map<string, "live" | "last_good_cache" | "candle_fallback" | "missing">();
+export const tickerAgeMap = new Map<string, number>();
+
 const tickerCache = new Map<string, TickerCacheEntry>();
 const tickerCooldownUntilMs = new Map<string, number>();
+let tickerGlobalCooldownUntilMs = 0; // 429 10초 차단용 전역 쿨다운
 const ticker429LastLogAtMs = new Map<string, number>();
 const tickerFailureCountByMarket = new Map<string, number>();
 const tickerCircuitOpenUntilByMarket = new Map<string, number>();
 const tickerFailureLastLogAtMs = new Map<string, number>();
+
+// 동시성 제어를 위한 우선순위 락 큐
+interface TickerRequestTask {
+  resolve: () => void;
+  priority: boolean;
+}
+const tickerQueue: TickerRequestTask[] = [];
+let tickerActiveRequests = 0;
+const UPBIT_TICKER_MAX_CONCURRENCY = Number(process.env.UPBIT_TICKER_MAX_CONCURRENCY ?? 1);
+
+function acquireTickerLock(priority = false): Promise<() => void> {
+  return new Promise((resolve) => {
+    const task: TickerRequestTask = {
+      resolve: () => {},
+      priority,
+    };
+    task.resolve = () => {
+      resolve(() => {
+        tickerActiveRequests--;
+        processNextTickerRequest();
+      });
+    };
+    
+    if (tickerActiveRequests < UPBIT_TICKER_MAX_CONCURRENCY) {
+      tickerActiveRequests++;
+      task.resolve();
+    } else {
+      if (priority) {
+        const firstNonPriorityIndex = tickerQueue.findIndex((t) => !t.priority);
+        if (firstNonPriorityIndex !== -1) {
+          tickerQueue.splice(firstNonPriorityIndex, 0, task);
+        } else {
+          tickerQueue.push(task);
+        }
+      } else {
+        tickerQueue.push(task);
+      }
+    }
+  });
+}
+
+function processNextTickerRequest() {
+  if (tickerQueue.length > 0 && tickerActiveRequests < UPBIT_TICKER_MAX_CONCURRENCY) {
+    tickerActiveRequests++;
+    const next = tickerQueue.shift();
+    if (next) next.resolve();
+  }
+}
 
 function tickerDebugEnabled(): boolean {
   return (
@@ -709,6 +764,7 @@ async function fetchTickerBatchGroup(args: {
       if (is429) {
         const now = Date.now();
         for (const m of group) tickerCooldownUntilMs.set(m, now + TICKER_429_COOLDOWN_MS);
+        tickerGlobalCooldownUntilMs = now + TICKER_429_COOLDOWN_MS; // 전역 429 쿨다운 세팅
         if (tickerDebugEnabled()) {
           maybeLogTicker429(now, {
             cooldown_key: `batch:${group.length}`,
@@ -753,8 +809,11 @@ export async function fetchTickers(markets: string[], opts?: FetchTickersOptions
   if (sanitized.length === 0) return [];
   const now0 = Date.now();
   const dbgOn = tickerDebugEnabled();
-  const sourceByMarket = new Map<string, "live" | "cache" | "fallback" | "cooldown_skip">();
-  const ageByMarketMs = new Map<string, number>();
+  const isPriority = opts?.isPriority === true;
+  
+  // 글로벌 429 쿨다운 확인: 비우선순위(스캐너) 요청이고 쿨다운 중이면 REST API 호출을 원천 차단
+  const isGlobalCooldown = now0 < tickerGlobalCooldownUntilMs;
+  
   const maxCap = opts?.maxMarkets ?? TICKER_MAX_MARKETS_PER_TICK;
   const ordered =
     opts?.sortByCached24hVolume === false
@@ -763,100 +822,149 @@ export async function fetchTickers(markets: string[], opts?: FetchTickersOptions
   const limited =
     maxCap >= ordered.length ? ordered : ordered.slice(0, Math.max(1, maxCap));
 
-  // 1) TTL 캐시 먼저 반영 → TTL 내 중복 호출 제거.
+  // 1) 캐시 먼저 반영
   const needFetch: string[] = [];
   const cachedOut: UpbitTicker[] = [];
+  
   for (const m of limited) {
     const c = tickerCache.get(m);
     const circuitOpenUntil = tickerCircuitOpenUntilByMarket.get(m) ?? 0;
+    
     if (circuitOpenUntil > now0) {
       if (c) {
         cachedOut.push(c.value);
-        sourceByMarket.set(m, "fallback");
-        ageByMarketMs.set(m, now0 - c.fetchedAtMs);
+        tickerSourceMap.set(m, "last_good_cache");
+        tickerAgeMap.set(m, now0 - c.fetchedAtMs);
       } else {
-        sourceByMarket.set(m, "cooldown_skip");
+        tickerSourceMap.set(m, "missing");
       }
       continue;
     }
+    
+    // TTL 이내의 캐시가 있으면 그것을 사용
     if (c && now0 <= c.expiresAtMs) {
       cachedOut.push(c.value);
-      sourceByMarket.set(m, "cache");
-      ageByMarketMs.set(m, now0 - c.fetchedAtMs);
+      tickerSourceMap.set(m, "live"); // fresh cache is treated as live
+      tickerAgeMap.set(m, now0 - c.fetchedAtMs);
       continue;
     }
-    // 2) 429 쿨다운 중이면, stale grace 내 캐시가 있으면 fallback, 없으면 스킵(호출 억제)
+    
+    // 개별 마켓 쿨다운 중이거나 전역 쿨다운 중인 경우
     const cd = tickerCooldownUntilMs.get(m) ?? 0;
-    if (cd > now0) {
+    if (cd > now0 || (isGlobalCooldown && !isPriority)) {
       if (c && now0 <= c.staleUntilMs) {
         cachedOut.push(c.value);
-        sourceByMarket.set(m, "fallback");
-        ageByMarketMs.set(m, now0 - c.fetchedAtMs);
+        tickerSourceMap.set(m, "last_good_cache");
+        tickerAgeMap.set(m, now0 - c.fetchedAtMs);
       } else {
-        sourceByMarket.set(m, "cooldown_skip");
+        // 캐시도 없으면 missing
+        const lastGood = lastGoodTickerCache.get(m);
+        if (lastGood) {
+          cachedOut.push(lastGood);
+          tickerSourceMap.set(m, "last_good_cache");
+          tickerAgeMap.set(m, c ? now0 - c.fetchedAtMs : 0);
+        } else {
+          tickerSourceMap.set(m, "missing");
+        }
       }
       continue;
     }
+    
     needFetch.push(m);
   }
-  const batchSize = Math.max(1, opts?.batchSize ?? TICKER_BATCH_SIZE);
-  const batchDelayMs = opts?.batchDelayMs ?? TICKER_BATCH_DELAY_MS;
-  const parallelTickerBatches = Math.max(1, Math.min(20, opts?.parallelTickerBatches ?? 1));
-  const batches = chunk(needFetch, batchSize);
-  const tickSignal = opts?.signal;
-  const totalTimeoutMs = opts?.totalTimeoutMs ?? null;
-  const batchTimeoutMs = opts?.batchTimeoutMs ?? null;
 
+  // 2) REST 호출 진행 (needFetch 가 존재하는 경우)
   const out: UpbitTicker[] = [...cachedOut];
-  for (let i = 0; i < batches.length; i += parallelTickerBatches) {
-    if (tickSignal?.aborted) throw new DOMException("Aborted", "AbortError");
-    if (totalTimeoutMs !== null && Date.now() - now0 > totalTimeoutMs) {
-      if (String(opts?.debugCaller ?? "").includes("pump")) {
-        console.info(
-          JSON.stringify({
-            tag: "PUMP_SCANNER_TICK_BUDGET_DROPPED_PROOF",
-            ts: new Date().toISOString(),
-            phase: "fetch_tickers_total_budget",
-            elapsed_ms: Date.now() - now0,
-            total_timeout_ms: totalTimeoutMs,
-            fetched_so_far: out.length,
-            remaining_batches: Math.max(0, Math.ceil((batches.length - i) / parallelTickerBatches)),
-          }),
+  
+  if (needFetch.length > 0) {
+    // 배치 크기는 최대 10개로 제한
+    const batchSize = Math.max(1, Math.min(10, opts?.batchSize ?? TICKER_BATCH_SIZE));
+    const batchDelayMs = opts?.batchDelayMs ?? TICKER_BATCH_DELAY_MS;
+    
+    // 동시성은 무조건 1로 제한
+    const parallelTickerBatches = 1; 
+    const batches = chunk(needFetch, batchSize);
+    const tickSignal = opts?.signal;
+    const totalTimeoutMs = opts?.totalTimeoutMs ?? null;
+    const batchTimeoutMs = opts?.batchTimeoutMs ?? null;
+
+    // 동시성 제어 락 획득 (isPriority 에 따라 우선순위 적용)
+    const releaseLock = await acquireTickerLock(isPriority);
+    
+    try {
+      for (let i = 0; i < batches.length; i += parallelTickerBatches) {
+        if (tickSignal?.aborted) throw new DOMException("Aborted", "AbortError");
+        if (totalTimeoutMs !== null && Date.now() - now0 > totalTimeoutMs) {
+          break;
+        }
+        const slice = batches.slice(i, i + parallelTickerBatches);
+        const results = await Promise.all(
+          slice.map((g) =>
+            fetchTickerBatchGroup({ group: g, signal: tickSignal, batchTimeoutMs: batchTimeoutMs ?? undefined, debugCaller: opts?.debugCaller }),
+          ),
         );
+        for (const r of results) {
+          for (const t of r) {
+            const now = Date.now();
+            tickerCache.set(t.market, {
+              value: t,
+              fetchedAtMs: now,
+              expiresAtMs: now + TICKER_CACHE_TTL_MS,
+              staleUntilMs: now + TICKER_CACHE_TTL_MS + TICKER_CACHE_STALE_GRACE_MS,
+            });
+            lastGoodTickerCache.set(t.market, t); // 무기한 캐시 업데이트
+            tickerSourceMap.set(t.market, "live");
+            tickerAgeMap.set(t.market, 0);
+          }
+          out.push(...r);
+        }
+        if (i + parallelTickerBatches < batches.length) {
+          await sleepAbortable(Math.max(0, batchDelayMs), tickSignal);
+        }
       }
-      break;
+    } finally {
+      releaseLock(); // 락 해제
     }
-    const slice = batches.slice(i, i + parallelTickerBatches);
-    const results = await Promise.all(
-      slice.map((g) =>
-        fetchTickerBatchGroup({ group: g, signal: tickSignal, batchTimeoutMs: batchTimeoutMs ?? undefined, debugCaller: opts?.debugCaller }),
-      ),
-    );
-    for (const r of results) {
-      for (const t of r) {
-        const now = Date.now();
-        tickerCache.set(t.market, {
-          value: t,
-          fetchedAtMs: now,
-          expiresAtMs: now + TICKER_CACHE_TTL_MS,
-          staleUntilMs: now + TICKER_CACHE_TTL_MS + TICKER_CACHE_STALE_GRACE_MS,
-        });
-        sourceByMarket.set(t.market, "live");
-        ageByMarketMs.set(t.market, 0);
-      }
-      out.push(...r);
+  }
+
+  // 3) Fallback 보강: 요청된 limited 마켓들 중 여전히 결과 out에 없는 마켓들에 대해 순차적 fallback 적용
+  for (const m of limited) {
+    if (out.some((t) => t.market === m)) continue;
+    
+    // 3.1. lastGoodTickerCache 조회
+    const lastGood = lastGoodTickerCache.get(m);
+    if (lastGood) {
+      out.push(lastGood);
+      tickerSourceMap.set(m, "last_good_cache");
+      const c = tickerCache.get(m);
+      tickerAgeMap.set(m, c ? now0 - c.fetchedAtMs : 0);
+      continue;
     }
-    if (i + parallelTickerBatches < batches.length) {
-      await sleepAbortable(Math.max(0, batchDelayMs), tickSignal);
+    
+    // 3.2. 1분 캔들 종가 fallback
+    const candle = peekMinuteCandleCache(m, 1, 1);
+    if (candle && candle.rows.length > 0) {
+      const lastCandle = candle.rows[0];
+      const fallbackTicker: UpbitTicker = {
+        market: m,
+        trade_price: lastCandle.trade_price,
+      };
+      out.push(fallbackTicker);
+      tickerSourceMap.set(m, "candle_fallback");
+      tickerAgeMap.set(m, now0 - candle.expires_at_ms);
+      continue;
     }
+    
+    // 3.3. null / missing
+    tickerSourceMap.set(m, "missing");
+    tickerAgeMap.set(m, 0);
   }
 
   if (dbgOn) {
-    // 호출자가 live-strategy인 경우, 심볼별 데이터 소스/age를 남겨 “429로 미평가 vs 신호부족”을 구분 가능하게 함.
     for (const m of limited) {
-      const src = sourceByMarket.get(m);
+      const src = tickerSourceMap.get(m);
       if (!src) continue;
-      const age = ageByMarketMs.get(m) ?? null;
+      const age = tickerAgeMap.get(m) ?? null;
       console.info(
         JSON.stringify({
           tag: "DEBUG_LIVE_DATA_SOURCE",

@@ -72,7 +72,13 @@ export function computeAccountValuationFromPrices(balances: BalanceRow[], tradeP
     const qty = b.balance + b.locked;
     if (qty <= 0) continue;
     const market = marketCodeForCurrency(b.currency);
-    const price = tradePriceByMarket[market] ?? 0;
+    const price = tradePriceByMarket[market];
+    
+    // 가격이 없거나 0 이하이면 이 종목의 자산평가 및 평단 매수 금액을 제외한다
+    if (price === undefined || price === null || Number.isNaN(price) || price <= 0) {
+      continue;
+    }
+    
     const evalAmt = qty * price;
     const avg = Number(b.avg_buy_price ?? 0);
     const cost = qty * avg;
@@ -136,16 +142,11 @@ export function marketsForAccountValuation(balances: BalanceRow[]): string[] {
  * 티커가 있으면 항상 티커 우선.
  */
 export function buildEffectiveValuationPriceMap(balances: BalanceRow[], tickerMap: Record<string, number>): Record<string, number> {
-  const out: Record<string, number> = { ...tickerMap };
-  for (const b of balances) {
-    if (b.currency === "KRW") continue;
-    const qty = b.balance + b.locked;
-    if (qty <= 0) continue;
-    const m = marketCodeForCurrency(b.currency);
-    const tp = out[m];
-    if (typeof tp === "number" && Number.isFinite(tp) && tp > 0) continue;
-    const avg = Number(b.avg_buy_price ?? 0);
-    if (Number.isFinite(avg) && avg > 0) out[m] = avg;
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(tickerMap)) {
+    if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+      out[k] = v;
+    }
   }
   return out;
 }
@@ -176,9 +177,9 @@ function parseTickerRow(t: { market?: unknown; trade_price?: unknown }): { marke
 }
 
 /** 공개 티커 조회 실패 시 throw — 호출부에서 마지막 정상 가격맵으로 폴백한다. */
-export async function fetchTickerPriceMap(markets: string[]): Promise<Record<string, number>> {
+export async function fetchTickerPriceMap(markets: string[], isPriority = true): Promise<Record<string, number>> {
   if (markets.length === 0) return {};
-  const tickerRows = await fetchTickers(markets);
+  const tickerRows = await fetchTickers(markets, { isPriority });
   const tradePriceByMarket: Record<string, number> = {};
   for (const t of tickerRows) {
     const parsed = parseTickerRow(t as { market?: unknown; trade_price?: unknown });
@@ -200,14 +201,14 @@ function heldMarketsNeedingPrice(balances: BalanceRow[], priceMap: Record<string
   return miss;
 }
 
-const TICKER_CHUNK = 18;
+const TICKER_CHUNK = 10; // Chunk 크기를 10 이하로 조정
 
-async function fetchTickerPriceMapChunked(markets: string[]): Promise<Record<string, number>> {
+async function fetchTickerPriceMapChunked(markets: string[], isPriority = true): Promise<Record<string, number>> {
   const out: Record<string, number> = {};
   for (let i = 0; i < markets.length; i += TICKER_CHUNK) {
     const chunk = markets.slice(i, i + TICKER_CHUNK);
     try {
-      const part = await fetchTickerPriceMap(chunk);
+      const part = await fetchTickerPriceMap(chunk, isPriority);
       Object.assign(out, part);
     } catch {
       /* 청크 단위 실패는 무시 — 단건 보충에서 이어짐 */
@@ -240,7 +241,7 @@ export async function resolveTickerPricesForBalances(
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const fresh = markets.length <= TICKER_CHUNK ? await fetchTickerPriceMap(markets) : await fetchTickerPriceMapChunked(markets);
+      const fresh = markets.length <= TICKER_CHUNK ? await fetchTickerPriceMap(markets, true) : await fetchTickerPriceMapChunked(markets, true);
       absorb(fresh);
       break;
     } catch {
@@ -250,7 +251,7 @@ export async function resolveTickerPricesForBalances(
 
   for (const m of heldMarketsNeedingPrice(balances, merged)) {
     try {
-      const one = await fetchTickerPriceMap([m]);
+      const one = await fetchTickerPriceMap([m], true);
       absorb(one);
     } catch {
       /* 다음 종목 */
