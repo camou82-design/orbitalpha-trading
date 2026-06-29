@@ -83,6 +83,14 @@ type TradeState = {
       partial_take_profit_pct: number;
       trailing_from_peak_pct: number;
       
+      // Profit Protect
+      profit_protected?: boolean;
+      partial_tp_count?: number;
+      realized_partial_profit?: number;
+      last_realized_profit_order_uuid?: string;
+      last_profit_protect_exit_attempt_ms?: number;
+      last_dust_log_ms?: number;
+      
       // SURGE V2 specific
       strict_exit?: boolean;
       exit_policy_attached?: boolean;
@@ -1428,6 +1436,9 @@ export function createTradeControl(
           breakeven_arm_pct: rule.breakeven_arm_pct,
           partial_take_profit_pct: rule.partial_take_profit_pct,
           trailing_from_peak_pct: rule.trailing_from_peak_pct,
+          profit_protected: false,
+          partial_tp_count: 0,
+          realized_partial_profit: 0,
         };
         persistAutoTradeState();
         return true;

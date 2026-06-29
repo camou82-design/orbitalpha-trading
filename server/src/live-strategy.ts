@@ -16,6 +16,7 @@ import {
   partitionKrwMarketsByUpbitValidity,
   peekMinuteCandleCache,
   tickerSourceMap,
+  tickerAgeMap,
   type UpbitCandle,
 } from "./upbit-public.js";
 import { LogDeduper } from "./log-deduper.js";
@@ -185,6 +186,11 @@ type StrategyPosition = {
   stop_loss_price?: number;
   stop_loss_pct?: number;
   realized_partial_profit: number;
+  profit_protected?: boolean;
+  partial_tp_count?: number;
+  last_profit_protect_exit_attempt_ms?: number;
+  last_realized_profit_order_uuid?: string;
+  last_dust_log_ms?: number;
   remaining_qty: number;
   current_net_pnl_pct: number;
   breakeven_armed_at: string | null;
@@ -5446,6 +5452,66 @@ export function createLiveDataStrategy(opts: {
       let exitAuthorityClass: ExitAuthorityDecision["authorityClass"] = "none";
       let exitReasonDetail = "legacy_flow";
 
+      // ────────────────────────────────────────────────────────────────
+      // [PROFIT PROTECT] 부분익절 이후 잔량 보호 청산 로직
+      // ────────────────────────────────────────────────────────────────
+      const hasPartialTp = p.profit_protected === true || (p.partial_tp_count ?? 0) > 0 || p.partial_tp_done === true;
+      if (hasPartialTp && !reasonExit) {
+        const ageMs = tickerAgeMap.get(market);
+        const isReliableSource = (priceSource as string) === "live" || (priceSource as string) === "fresh_cache" || (priceSource as string) === "ticker_batch" || (priceSource as string) === "per_symbol_fetch";
+        const isValidAge = typeof ageMs === "number" && !Number.isNaN(ageMs) && ageMs >= 0 && ageMs <= 10000;
+        const isPriceReliable = isReliableSource && isValidAge;
+
+        const PROFIT_LOCK_BUFFER = 0.001; // 0.1%
+        const breakEvenProtectPrice = p.entry_price * (1 + UPBIT_FEE_RATE * 2 + PROFIT_LOCK_BUFFER);
+        
+        const remainingQty = p.qty;
+        const unrealizedPnlOfRemainingQty = remainingQty * now * (1 - UPBIT_FEE_RATE) - remainingQty * p.entry_price * (1 + UPBIT_FEE_RATE);
+        const realizedPnlFromPartialExits = p.realized_partial_profit ?? 0;
+        const totalTradePnl = realizedPnlFromPartialExits + unrealizedPnlOfRemainingQty;
+        const PROFIT_PROTECT_MIN_PNL = 0; // 2단계 기준값 (0원)
+
+        const isStep1Triggered = now <= breakEvenProtectPrice;
+        const isStep2Triggered = realizedPnlFromPartialExits > 0 && totalTradePnl <= PROFIT_PROTECT_MIN_PNL;
+
+        if (isStep1Triggered || isStep2Triggered) {
+          if (!isPriceReliable) {
+            console.info(`[PROFIT PROTECT PRICE_SKIPPED] market=${market} source=${priceSource} ageMs=${ageMs ?? "null"}`);
+          } else {
+            const nowMs = Date.now();
+            const COOLDOWN_PROTECT_MS = 60_000;
+            const isAttempting = p.last_profit_protect_exit_attempt_ms && (nowMs - p.last_profit_protect_exit_attempt_ms < COOLDOWN_PROTECT_MS);
+
+            if (!isAttempting) {
+              const intendedSellQty = remainingQty;
+              const intendedSellValueKrw = intendedSellQty * now;
+
+              if (intendedSellValueKrw < UPBIT_MIN_ORDER_KRW) {
+                const isDustLogCooldown = p.last_dust_log_ms && (nowMs - p.last_dust_log_ms < 60_000);
+                if (!isDustLogCooldown) {
+                  p.last_dust_log_ms = nowMs;
+                  console.info(`[PROFIT PROTECT EXIT] market=${market} currentPrice=${now} breakEvenProtectPrice=${breakEvenProtectPrice} remainingQty=${remainingQty} reason=profit_protect_break_even_exit`);
+                  console.info(`[PROFIT PROTECT DUST_SKIPPED] market=${market} remainingQty=${remainingQty} valueKrw=${intendedSellValueKrw} reason=below_min_order_amount`);
+                  await persist();
+                }
+              } else {
+                p.last_profit_protect_exit_attempt_ms = nowMs;
+                p.profit_protected = true;
+
+                reasonExit = "profit_protect_break_even_exit";
+                ratio = 1;
+                stopTriggerKind = "breakeven_protect";
+                exitAuthorityClass = "breakeven_protect";
+                exitReasonDetail = "profit_protect_exit";
+
+                console.info(`[PROFIT PROTECT EXIT] market=${market} currentPrice=${now} breakEvenProtectPrice=${breakEvenProtectPrice} remainingQty=${remainingQty} reason=profit_protect_break_even_exit`);
+                await persist();
+              }
+            }
+          }
+        }
+      }
+
       // [ORIGINAL SETUP] Primary Exit Authority Enforcement
       if (p.entry_stop_price && now <= p.entry_stop_price) {
         reasonExit = "original_setup_stop_loss";
@@ -6619,6 +6685,12 @@ export function createLiveDataStrategy(opts: {
           position_still_open: isPartial,
         }),
       );
+
+      if (reasonExit === "profit_protect_break_even_exit") {
+        const finalRealizedPnl = (p.realized_partial_profit ?? 0) + Math.round(netPnlKrw);
+        console.info(`[PROFIT PROTECT DONE] market=${market} soldQty=${soldQty} finalRealizedPnl=${finalRealizedPnl}`);
+      }
+
       await opts.onEvent?.({
         timestamp: row.timestamp,
         event_type:
@@ -6747,10 +6819,14 @@ export function createLiveDataStrategy(opts: {
           );
         }
       } else {
+        const alreadyProcessed = uuid && p.last_realized_profit_order_uuid === uuid;
+
         if (!p.partial_tp_done && (reasonExit === "partial_take_profit" || reasonExit === "partial_take_profit_1st_strict")) {
           p.partial_tp_done = true;
           p.partial_tp_at = new Date().toISOString();
-          p.realized_partial_profit += Math.round(netPnlKrw);
+          if (!alreadyProcessed) {
+            p.realized_partial_profit = (p.realized_partial_profit ?? 0) + Math.round(netPnlKrw);
+          }
           const prevStage = p.position_stage ?? "normal_active";
           p.position_stage = "scaled_out_partial";
           emitStageChange({
@@ -6781,7 +6857,9 @@ export function createLiveDataStrategy(opts: {
         if (reasonExit === "SURGE_TP1_PARTIAL" && !(p as any).surge_tp1_done) {
           (p as any).surge_tp1_done = true;
           p.partial_tp_at = new Date().toISOString();
-          p.realized_partial_profit += Math.round(netPnlKrw);
+          if (!alreadyProcessed) {
+            p.realized_partial_profit = (p.realized_partial_profit ?? 0) + Math.round(netPnlKrw);
+          }
           p.position_stage = "scaled_out_partial";
           console.info(JSON.stringify({
             tag: "DEBUG_SURGE_PARTIAL_TAKE_PROFIT_TP1",
@@ -6794,7 +6872,9 @@ export function createLiveDataStrategy(opts: {
         } else if (reasonExit === "SURGE_TP2_PARTIAL" && !(p as any).surge_tp2_done) {
           (p as any).surge_tp2_done = true;
           p.partial_tp_at = new Date().toISOString();
-          p.realized_partial_profit += Math.round(netPnlKrw);
+          if (!alreadyProcessed) {
+            p.realized_partial_profit = (p.realized_partial_profit ?? 0) + Math.round(netPnlKrw);
+          }
           p.position_stage = "scaled_out_partial";
           console.info(JSON.stringify({
             tag: "DEBUG_SURGE_PARTIAL_TAKE_PROFIT_TP2",
@@ -6804,6 +6884,43 @@ export function createLiveDataStrategy(opts: {
             pnl_krw: Math.round(netPnlKrw),
             stage: "scaled_out_partial_tp2"
           }));
+        }
+
+        // ────────────────────────────────────────────────────────────
+        // [PROFIT PROTECT UPDATE] 익절성 부분매도 시 상태 갱신
+        // ────────────────────────────────────────────────────────────
+        const isProfitExit = 
+          reasonExit === "partial_take_profit" ||
+          reasonExit === "partial_take_profit_1st_strict" ||
+          reasonExit === "SURGE_TP1_PARTIAL" ||
+          reasonExit === "SURGE_TP2_PARTIAL" ||
+          reasonExit === "original_setup_target_tp" ||
+          reasonExit === "trailing_take_profit" ||
+          reasonExit === "trailing_runner_exit_strict" ||
+          reasonExit === "SURGE_RUNNER_TRAILING_EXIT";
+
+        if (isProfitExit && !alreadyProcessed) {
+          p.profit_protected = true;
+          p.partial_tp_count = (p.partial_tp_count ?? 0) + 1;
+          
+          const isCoreTp =
+            reasonExit === "partial_take_profit" ||
+            reasonExit === "partial_take_profit_1st_strict" ||
+            reasonExit === "SURGE_TP1_PARTIAL" ||
+            reasonExit === "SURGE_TP2_PARTIAL";
+          
+          if (!isCoreTp) {
+            p.realized_partial_profit = (p.realized_partial_profit ?? 0) + Math.round(netPnlKrw);
+            p.partial_tp_at = new Date().toISOString();
+          }
+
+          console.info(`[PROFIT PROTECT ON] market=${market} avgBuyPrice=${p.entry_price} realizedPnl=${p.realized_partial_profit} remainingQty=${qtyAfter}`);
+          await persist();
+        }
+        
+        if (uuid && !alreadyProcessed) {
+          p.last_realized_profit_order_uuid = uuid;
+          await persist();
         }
 
         p.qty = qtyAfter;
