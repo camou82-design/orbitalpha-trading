@@ -2715,6 +2715,42 @@ export function createLiveDataStrategy(opts: {
     const strategyPosSnap: Record<string, any> = {
       ...(typeof tstatus.strategy_positions === "object" && tstatus.strategy_positions ? tstatus.strategy_positions : {}),
     };
+
+    // [보완] 이미 state.positions에 auto_trade_recovered로 들어간 항목 정리
+    const isLiveOrderConfirm = process.env.ORBITALPHA_TRADING_LIVE_ORDER_CONFIRM === "true" || process.env.LIVE_ORDER_CONFIRM === "true";
+    const isAutoTradeEnabled = tstatus.auto_trade_enabled === true;
+
+    if (!isLiveOrderConfirm || !isAutoTradeEnabled) {
+      let removedAny = false;
+      for (const m of Object.keys(state.positions)) {
+        const pos = state.positions[m];
+        if (pos && pos.entry_origin === "auto_trade_recovered") {
+          console.warn(
+            JSON.stringify({
+              tag: "AUTO_TRADE_RECOVERED_REMOVED_TO_PASSIVE",
+              ts: new Date().toISOString(),
+              market: m,
+              reason: "liveOrderConfirm or autoTradeEnabled is false, removing from managed positions",
+              live_order_confirm: isLiveOrderConfirm,
+              auto_trade_enabled: isAutoTradeEnabled,
+            })
+          );
+          delete state.positions[m];
+          delete strategyPosSnap[m];
+          try {
+            await opts.trade.syncManagedPosition?.(m, 0, 0, "stable");
+          } catch (syncErr) {
+            console.error(`[reconcile-cleanup] Failed to sync deleted recovered position for ${m}:`, syncErr);
+          }
+          reconcileActions.push(`${m}:removed_recovered_position_due_to_config`);
+          removedAny = true;
+        }
+      }
+      if (removedAny) {
+        await racePersist("after_recovered_cleanup");
+      }
+    }
+
     // holdings_universe: 현재 계좌 보유 종목(관리/청산/표시용). discovery/entry_universe/precheck 경로에서는 제외한다.
     const heldSymbols = balArr
       .map((b) => {
@@ -2744,18 +2780,17 @@ export function createLiveDataStrategy(opts: {
 
     if (passiveForRecoveryEval.length > 0) {
       for (const pm of passiveForRecoveryEval) {
-        const hasTradeState = Boolean(strategyPosSnap[pm]);
-        const recentBuyTrade = state.trades.slice().reverse().find(t => t.market === pm && t.action === "buy");
-        const hasStrategyBuy = Boolean(recentBuyTrade && recentBuyTrade.remaining_qty > 0);
-        const ageMs = lastOrder?.ts ? Date.now() - Date.parse(String(lastOrder.ts)) : Infinity;
-        
-        // [안전화] 단순히 업비트 balance와 last_order가 buy라는 것만으로는 복구하지 않는다.
-        const cond1 = false; // pm은 state.positions에 존재하지 않음
-        const cond2 = Boolean(recentBuyTrade && recentBuyTrade.remaining_qty > 0 && recentBuyTrade.position_id);
-        
         const totalSpot = accountTotalSpotQtyForMarket(pm, balArr);
         const avgBuy = accountAvgBuyPriceForMarket(pm, balArr);
         const tcPos = strategyPosSnap[pm];
+
+        const recentBuyTrade = state.trades.slice().reverse().find(t => t.market === pm && t.action === "buy");
+        const hasRecentBuyTrade = Boolean(recentBuyTrade && recentBuyTrade.remaining_qty > 0);
+        const buyTradeAgeMs = recentBuyTrade ? Date.now() - Date.parse(recentBuyTrade.timestamp) : Infinity;
+        const isWithin24Hours = buyTradeAgeMs <= 24 * 60 * 60 * 1000;
+        const ageMs = buyTradeAgeMs;
+
+        const cond2 = Boolean(hasRecentBuyTrade && isWithin24Hours && recentBuyTrade.position_id);
         const cond3 = Boolean(
           tcPos &&
           tcPos.qty > 0 &&
@@ -2763,36 +2798,44 @@ export function createLiveDataStrategy(opts: {
           (tcPos.avg > 0 && Math.abs(tcPos.avg - avgBuy) < 10)
         );
 
-        if (!cond2 && !cond3) {
+        // 1 & 5. 기본적으로 복구는 금지되며 RECOVERY_SKIPPED reason="managed_recovery_disabled_by_default" 상태여야 함
+        const isRecoveryEnabled =
+          process.env.ORBITALPHA_TRADING_ENABLE_MANAGED_RECOVERY === "true" &&
+          tstatus.auto_trade_enabled === true &&
+          (process.env.ORBITALPHA_TRADING_LIVE_ORDER_CONFIRM === "true" || process.env.LIVE_ORDER_CONFIRM === "true");
+
+        if (!isRecoveryEnabled) {
+          recoveryEvalItems.push({
+            market: pm,
+            result: "RECOVERY_SKIPPED",
+            reason: "managed_recovery_disabled_by_default",
+            detail: {
+              enable_managed_recovery_env: process.env.ORBITALPHA_TRADING_ENABLE_MANAGED_RECOVERY === "true",
+              auto_trade_enabled: tstatus.auto_trade_enabled,
+              live_order_confirm: process.env.ORBITALPHA_TRADING_LIVE_ORDER_CONFIRM === "true" || process.env.LIVE_ORDER_CONFIRM === "true"
+            }
+          });
+          continue;
+        }
+
+        // 3. 모든 허용 조건을 만족하는지 확인 (tcPos 존재 여부, cond2, cond3 모두)
+        if (!tcPos || !cond2 || !cond3) {
           recoveryEvalItems.push({
             market: pm,
             result: "RECOVERY_SKIPPED",
             reason: "no_evidence_of_managed_entry",
             detail: {
-              last_order_present: Boolean(lastOrder),
-              trade_state_present: hasTradeState,
-              strategy_buy_present: hasStrategyBuy,
-              recovery_condition_2_passed: cond2,
-              recovery_condition_3_passed: cond3,
+              tc_pos_exists: Boolean(tcPos),
+              recent_buy_trade_exists: hasRecentBuyTrade,
+              is_within_24_hours: isWithin24Hours,
+              cond2_passed: cond2,
+              cond3_passed: cond3,
             },
           });
           continue;
         }
+
         if (!(totalSpot > 0)) {
-          const ep = strategyPosSnap[pm];
-          const recoveredPolicy = ep ? {
-            engine_bucket: ep.engine_bucket,
-            strict_exit: ep.strict_exit,
-            exit_policy_attached: ep.exit_policy_attached,
-            surge_entry_mode: ep.surge_entry_mode,
-            surge_stop_price: ep.surge_stop_price,
-            surge_take_profit_price: ep.surge_take_profit_price,
-            surge_trailing_start_pct: ep.surge_trailing_start_pct,
-            surge_trailing_gap_pct: ep.surge_trailing_gap_pct,
-            entry_stop_price: ep.entry_stop_price,
-            entry_target_price: ep.entry_target_price,
-            entry_risk_reward: ep.entry_risk_reward,
-          } : {};
           recoveryEvalItems.push({
             market: pm,
             result: "RECOVERY_SKIPPED",
@@ -5516,6 +5559,11 @@ export function createLiveDataStrategy(opts: {
     // exits — 익절/손절 판단은 업비트 보유 화면과 동일한 평단 대비 가격 변동률(gross) 기준
     for (const market of Object.keys(state.positions)) {
       const p = state.positions[market]!;
+      
+      // [보완] passive_holding 또는 auto_trade_recovered 복구 포지션은 sell decision 단계에 들어가지 않도록 함
+      if (p && p.entry_origin === "auto_trade_recovered") {
+        continue;
+      }
       
       const priceSource = (tickerPriceHydrationForCandidates?.sourceByMarket[market] ?? tickerSourceMap.get(market) ?? "missing") as string;
       const isLivePrice = priceSource === "ticker_batch" || priceSource === "per_symbol_fetch" || priceSource === "live";
