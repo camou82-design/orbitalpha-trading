@@ -2778,7 +2778,6 @@ export function createLiveDataStrategy(opts: {
           });
           continue;
         }
-        const totalSpot = accountTotalSpotQtyForMarket(pm, balArr);
         if (!(totalSpot > 0)) {
           const ep = strategyPosSnap[pm];
           const recoveredPolicy = ep ? {
@@ -2803,7 +2802,6 @@ export function createLiveDataStrategy(opts: {
           continue;
         }
 
-        const avgBuy = accountAvgBuyPriceForMarket(pm, balArr);
         let recoveryTs = new Date().toISOString();
         let recoveryOrderKrw = 0;
         let recoveryPositionId = `${pm}|RECOVERED|${recoveryTs}`;
