@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { DEFAULT_TRADING_COMPANY_ID, DEFAULT_TRADING_SERVICE_ID } from "@orbitalpha/shared";
+import fs from "node:fs";
+import path from "node:path";
 
 /**
  * 환경변수는 `ORBITALPHA_TRADING_*` 네임스페이스만 사용한다 (shopping / homepage / jj-admin 과 분리).
@@ -151,6 +153,51 @@ export function loadEnv(): Env {
   const placeholders = ["PLACEHOLDER", "CHANGE_ME", "ADMIN", "1234"];
   if (placeholders.includes(e.adminLoginId.toUpperCase()) || e.adminPasswordHash.length < 32) {
     throw new Error("CRITICAL: Insecure or placeholder ADMIN credentials detected. Server boot aborted for security.");
+  }
+
+  // live mode 안전 검증
+  if (e.tradingMode === "live" && e.liveOrderConfirm === true) {
+    // 1. Upbit API Key 검증
+    if (!e.upbitAccessKey || !e.upbitSecretKey) {
+      throw new Error("CRITICAL: UPBIT_ACCESS_KEY and UPBIT_SECRET_KEY must be configured in live trading mode with live order confirm enabled.");
+    }
+    // 2. Admin ID & Password 존재 여부 검증
+    if (!e.adminLoginId || !e.adminPasswordHash) {
+      throw new Error("CRITICAL: Admin login ID and password hash must be configured for live trading.");
+    }
+    // 3. process.cwd()가 repo root인지 검증
+    const packageJsonPath = path.join(process.cwd(), "package.json");
+    if (!fs.existsSync(packageJsonPath)) {
+      throw new Error(`CRITICAL: process.cwd() is not the repo root (missing package.json). Current CWD: ${process.cwd()}`);
+    }
+    try {
+      const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+      if (pkg.name !== "orbitalpha-trading") {
+        throw new Error(`CRITICAL: process.cwd() package name is not 'orbitalpha-trading' (got '${pkg.name}'). Current CWD: ${process.cwd()}`);
+      }
+    } catch (err: any) {
+      throw new Error(`CRITICAL: Failed to read/parse package.json at process.cwd(). CWD: ${process.cwd()}. Error: ${err.message}`);
+    }
+    // 4. data/runtime 및 data/orbitalpha-trading 경로 접근 검증
+    const runtimePath = path.join(process.cwd(), "data", "runtime");
+    const dataRootPath = path.join(process.cwd(), "data", "orbitalpha-trading");
+    
+    try {
+      if (!fs.existsSync(runtimePath)) fs.mkdirSync(runtimePath, { recursive: true });
+      if (!fs.existsSync(dataRootPath)) fs.mkdirSync(dataRootPath, { recursive: true });
+      
+      const testFileRuntime = path.join(runtimePath, ".boot_write_test");
+      fs.writeFileSync(testFileRuntime, "test");
+      fs.readFileSync(testFileRuntime, "utf8");
+      fs.unlinkSync(testFileRuntime);
+
+      const testFileDataRoot = path.join(dataRootPath, ".boot_write_test");
+      fs.writeFileSync(testFileDataRoot, "test");
+      fs.readFileSync(testFileDataRoot, "utf8");
+      fs.unlinkSync(testFileDataRoot);
+    } catch (err: any) {
+      throw new Error(`CRITICAL: Cannot read/write data storage paths. Check permissions for 'data/runtime' and 'data/orbitalpha-trading'. Error: ${err.message}`);
+    }
   }
 
   return { ...e, corsAllowlist };

@@ -2635,6 +2635,65 @@ export default function HomePage() {
           </div>
         </header>
 
+        {/* 긴급 운영 수정 상태 배너 */}
+        <div
+          style={{
+            marginBottom: "1rem",
+            padding: "0.85rem 1.1rem",
+            borderRadius: 12,
+            background: "#1e1b4b",
+            border: "1px solid #4338ca",
+            display: "flex",
+            flexDirection: "column",
+            gap: "0.4rem",
+            boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", flexWrap: "wrap" }}>
+            <span style={{
+              fontSize: "0.72rem",
+              background: trade?.live_order_confirm ? "#b91c1c" : "#0f766e",
+              color: "#ffffff",
+              padding: "0.15rem 0.45rem",
+              borderRadius: 6,
+              fontWeight: 800,
+              letterSpacing: "0.02em"
+            }}>
+              {trade?.live_order_confirm ? "LIVE ORDER ACTIVE (실주문 기동)" : "LIVE ORDER CONFIRM OFF (실주문 잠금)"}
+            </span>
+            <span style={{
+              fontSize: "0.72rem",
+              background: autoTradeEnabled ? "#b91c1c" : "#1e293b",
+              color: "#ffffff",
+              padding: "0.15rem 0.45rem",
+              borderRadius: 6,
+              fontWeight: 800,
+            }}>
+              자동매매: {autoTradeEnabled ? "ON" : "OFF (정지)"}
+            </span>
+            <span style={{
+              fontSize: "0.72rem",
+              background: "#6b21a8",
+              color: "#ffffff",
+              padding: "0.15rem 0.45rem",
+              borderRadius: 6,
+              fontWeight: 800,
+            }}>
+              보호 상태: 비관리 보유분(passive_holding) 청산 대상 제외 보장
+            </span>
+          </div>
+          <div style={{ fontSize: "0.76rem", color: "#cbd5e1", fontWeight: 500, lineHeight: 1.4 }}>
+            {!trade?.live_order_confirm ? (
+              <span>⚠️ <strong>현재 실주문 잠금 상태 (LIVE_ORDER_CONFIRM=false)</strong>입니다. 어떠한 경우에도 실제 매수/매도 주문이 거래소로 전송되지 않고 Mocking 처리됩니다.</span>
+            ) : (
+              <span>🔴 <strong>실주문 활성화 상태</strong>입니다. 환경 변수와 자동매매 설정을 확인하십시오.</span>
+            )}
+            {!autoTradeEnabled && (
+              <span style={{ marginLeft: "0.5rem" }}>🤖 <strong>자동매매 OFF</strong> 상태로 봇이 자동으로 진입이나 청산을 수행하지 않습니다.</span>
+            )}
+          </div>
+        </div>
+
         {/* 2. 상단 KPI 카드 4개만 유지 */}
         <section
           style={{

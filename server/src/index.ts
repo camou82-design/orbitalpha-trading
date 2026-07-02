@@ -26,6 +26,7 @@ import { createPaperTradingEngine } from "./paper-trading.js";
 import { readLiveStrategyTradesRecent } from "./recent-strategy-trades.js";
 import { liveExecutionStateRuntimePath, runtimeRoot, surgeCandidatesRuntimePath } from "./runtime-paths.js";
 import { finalizeDashboardTradeStatusPayload } from "./dashboard-runtime-snapshot.js";
+import { normalizeBalanceCurrency } from "./account-portfolio.js";
 
 const cwd = process.cwd();
 const runtimeDir = runtimeRoot();
@@ -888,6 +889,83 @@ async function main() {
     trading_mode: env.tradingMode,
     live_order_confirm: env.liveOrderConfirm,
   }));
+
+  app.get("/api/v1/debug/reconcile", async (req, reply) => {
+    const t0 = Date.now();
+    const tradeStatus = await trade.status();
+    const strategyStatus = strategy.status() as any;
+    const balances = Array.isArray(tradeStatus?.balances) ? tradeStatus.balances : [];
+
+    const DUST_NOTIONAL_KRW = 1000;
+    const held = balances
+      .map((b: any) => {
+        const currency = String(b?.currency ?? "").toUpperCase();
+        if (!currency || currency === "KRW") return null;
+        const qty = Number(b?.balance ?? 0) + Number(b?.locked ?? 0);
+        const avg = Number(b?.avg_buy_price ?? 0);
+        const notional = qty * avg;
+        if (!(qty > 0) || !(notional >= DUST_NOTIONAL_KRW)) return null;
+        return { market: `KRW-${currency}`, currency, qty, avg };
+      })
+      .filter((x: any): x is { market: string; currency: string; qty: number; avg: number } => Boolean(x));
+
+    const openPositions = (strategyStatus?.open_positions ?? {}) as Record<string, any>;
+    const earlyPositions = (strategyStatus?.early_positions ?? {}) as Record<string, any>;
+
+    const passive_holdings: string[] = [];
+    const managed_positions: string[] = [];
+    const mismatches: Array<{ market: string; spotQty: number; strategyQty: number; diff: number }> = [];
+
+    for (const h of held) {
+      const pos = openPositions[h.market] ?? earlyPositions[h.market] ?? null;
+      if (pos) {
+        managed_positions.push(h.market);
+        const stratQty = Number(pos.qty ?? 0);
+        if (Math.abs(h.qty - stratQty) > 1e-6) {
+          mismatches.push({
+            market: h.market,
+            spotQty: h.qty,
+            strategyQty: stratQty,
+            diff: h.qty - stratQty,
+          });
+        }
+      } else {
+        passive_holdings.push(h.market);
+      }
+    }
+
+    // reverse check
+    for (const mk of Object.keys(openPositions)) {
+      const pos = openPositions[mk];
+      const stratQty = Number(pos?.qty ?? 0);
+      if (stratQty > 0) {
+        const hasHeld = held.find((h) => h.market === mk);
+        if (!hasHeld) {
+          mismatches.push({
+            market: mk,
+            spotQty: 0,
+            strategyQty: stratQty,
+            diff: -stratQty,
+          });
+        }
+      }
+    }
+
+    return {
+      ok: true,
+      timestamp: new Date().toISOString(),
+      auto_trade_enabled: Boolean(tradeStatus.auto_trade_enabled),
+      live_order_confirm: Boolean(env.liveOrderConfirm),
+      upbit_balances: balances,
+      trade_control_strategy_positions: tradeStatus.strategy_positions ?? {},
+      live_strategy_open_positions: openPositions,
+      live_strategy_early_positions: earlyPositions,
+      passive_holdings,
+      managed_positions,
+      mismatches,
+      ms: Date.now() - t0,
+    };
+  });
 
   /** 동일 페이로드(account_portfolio 포함) — 레거시 클라이언트가 /account/status 를 호출하는 경우 대비. */
   const finalizeDashboardTradePayload = (raw: unknown) =>

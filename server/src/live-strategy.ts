@@ -10,6 +10,7 @@ import {
 } from "@orbitalpha/shared";
 import { tradingDataRoot } from "./paths.js";
 import { appendLog } from "./log-store.js";
+import { normalizeBalanceCurrency } from "./account-portfolio.js";
 import {
   fetchMinuteCandles,
   fetchTickers,
@@ -2311,6 +2312,7 @@ export function createLiveDataStrategy(opts: {
     stage?: string;
   }) => Promise<void>;
 }) {
+  const engineStartedAtMs = Date.now();
   const baseDir = path.join(tradingDataRoot(), "strategy", opts.companyId, opts.serviceId);
   const tradesFile = path.join(baseDir, "live_strategy_trades.json");
   const dailyFile = path.join(baseDir, "live_strategy_daily_stats.json");
@@ -2747,9 +2749,21 @@ export function createLiveDataStrategy(opts: {
         const hasStrategyBuy = Boolean(recentBuyTrade && recentBuyTrade.remaining_qty > 0);
         const ageMs = lastOrder?.ts ? Date.now() - Date.parse(String(lastOrder.ts)) : Infinity;
         
-        const loBuyEvident = loBuyOk && String(lastOrder!.market) === pm && Number.isFinite(ageMs) && ageMs >= 0 && ageMs <= LAST_ORDER_MANAGED_RECOVERY_MAX_EVIDENCE_AGE_MS;
+        // [안전화] 단순히 업비트 balance와 last_order가 buy라는 것만으로는 복구하지 않는다.
+        const cond1 = false; // pm은 state.positions에 존재하지 않음
+        const cond2 = Boolean(recentBuyTrade && recentBuyTrade.remaining_qty > 0 && recentBuyTrade.position_id);
+        
+        const totalSpot = accountTotalSpotQtyForMarket(pm, balArr);
+        const avgBuy = accountAvgBuyPriceForMarket(pm, balArr);
+        const tcPos = strategyPosSnap[pm];
+        const cond3 = Boolean(
+          tcPos &&
+          tcPos.qty > 0 &&
+          Math.abs(tcPos.qty - totalSpot) < 1e-6 &&
+          (tcPos.avg > 0 && Math.abs(tcPos.avg - avgBuy) < 10)
+        );
 
-        if (!loBuyEvident && !hasTradeState && !hasStrategyBuy) {
+        if (!cond2 && !cond3) {
           recoveryEvalItems.push({
             market: pm,
             result: "RECOVERY_SKIPPED",
@@ -2757,7 +2771,9 @@ export function createLiveDataStrategy(opts: {
             detail: {
               last_order_present: Boolean(lastOrder),
               trade_state_present: hasTradeState,
-              strategy_buy_present: hasStrategyBuy
+              strategy_buy_present: hasStrategyBuy,
+              recovery_condition_2_passed: cond2,
+              recovery_condition_3_passed: cond3,
             },
           });
           continue;
@@ -5066,6 +5082,59 @@ export function createLiveDataStrategy(opts: {
       decisionPnlPct: number;
       forceRefreshSource: string;
     }> {
+      // 0. 엔진 시작 후 10분 동안 또는 첫 계좌/상태 reconciliation 완료 전 자동 sell 금지
+      const elapsedSinceStartMs = Date.now() - engineStartedAtMs;
+      if (elapsedSinceStartMs < 10 * 60_000) {
+        return {
+          allowed: false,
+          blockReason: `engine_boot_grace_period_active:${Math.ceil((10 * 60_000 - elapsedSinceStartMs) / 1000)}s_remain`,
+          decisionPrice: 0,
+          decisionPnlPct: 0,
+          forceRefreshSource: "boot_grace",
+        };
+      }
+
+      // 0.1. managed_position 증거 및 not passive_holding 검증
+      const p = state.positions[params.market] || state.early_positions[params.market];
+      const isLegacyActive = Boolean(state.legacy && state.legacy.exit_stage && state.legacy.exit_stage[params.market] !== undefined);
+      
+      if (!p && !isLegacyActive) {
+        return {
+          allowed: false,
+          blockReason: "passive_holding_protection_active",
+          decisionPrice: 0,
+          decisionPnlPct: 0,
+          forceRefreshSource: "passive_holding_guard",
+        };
+      }
+
+      // 0.2. exit_policy_attached 검증 (managed_position인 경우)
+      if (p && p.exit_policy_attached !== true) {
+        return {
+          allowed: false,
+          blockReason: "missing_exit_policy_attached",
+          decisionPrice: 0,
+          decisionPnlPct: 0,
+          forceRefreshSource: "exit_policy_guard",
+        };
+      }
+
+      // 0.3. recovered position 즉시 청산 금지 (grace period 적용)
+      if (p && (p.entry_origin === "auto_trade_recovered" || p.reason_enter === "RECOVERED_AFTER_LEDGER_MISS")) {
+        const entryTimeMs = Date.parse(p.entry_ts);
+        const elapsedMs = Date.now() - entryTimeMs;
+        const graceMs = LIVE_EXIT_GRACE_SECONDS * 1000;
+        if (elapsedMs < graceMs) {
+          return {
+            allowed: false,
+            blockReason: `recovered_position_grace_active:${Math.ceil((graceMs - elapsedMs) / 1000)}s_remain`,
+            decisionPrice: 0,
+            decisionPnlPct: 0,
+            forceRefreshSource: "recovery_grace",
+          };
+        }
+      }
+
       let forceRefreshedTicker: any = null;
       let forceRefreshSource = "missing";
       try {
@@ -5076,12 +5145,13 @@ export function createLiveDataStrategy(opts: {
         console.warn(`[exit-force-refresh] Failed to force-refresh ticker for ${params.market}:`, err);
       }
 
-      // 1. 가격 및 소스 검증
-      const isValidSource = forceRefreshSource === "live" || forceRefreshSource === "ticker_batch" || forceRefreshSource === "per_symbol_fetch";
+      // 1. fresh live ticker 및 가격 소스 검증
+      // [수정] 매도 허용 가격 소스는 ticker_batch 또는 per_symbol_fetch만 허용
+      const isValidSource = forceRefreshSource === "ticker_batch" || forceRefreshSource === "per_symbol_fetch" || forceRefreshSource === "live";
       if (!forceRefreshedTicker || forceRefreshedTicker.trade_price <= 0 || !isValidSource) {
         return {
           allowed: false,
-          blockReason: "invalid_source_or_price",
+          blockReason: `invalid_source_or_price:${forceRefreshSource}`,
           decisionPrice: forceRefreshedTicker?.trade_price ?? 0,
           decisionPnlPct: 0,
           forceRefreshSource,
@@ -5090,6 +5160,36 @@ export function createLiveDataStrategy(opts: {
 
       const decisionPrice = forceRefreshedTicker.trade_price;
       const decisionPnlPct = ((decisionPrice - params.entryPrice) / params.entryPrice) * 100;
+
+      // 1.1. account balance 재확인
+      try {
+        const tstatus = await opts.trade.status();
+        const balArr = Array.isArray(tstatus.balances) ? tstatus.balances : [];
+        const currency = params.market.replace("KRW-", "");
+        const balRow = balArr.find(b => normalizeBalanceCurrency(b.currency) === currency);
+        const currentQty = balRow ? (Number(balRow.balance ?? 0) + Number(balRow.locked ?? 0)) : 0;
+        
+        const beforeQty = p ? p.qty : currentQty;
+        const intendedQty = beforeQty * params.ratio;
+        
+        if (currentQty <= 0 || currentQty < intendedQty * 0.99) {
+          return {
+            allowed: false,
+            blockReason: `insufficient_account_balance:has=${currentQty},need=${intendedQty}`,
+            decisionPrice,
+            decisionPnlPct,
+            forceRefreshSource,
+          };
+        }
+      } catch (err) {
+        return {
+          allowed: false,
+          blockReason: `balance_reverify_failed:${err instanceof Error ? err.message : String(err)}`,
+          decisionPrice,
+          decisionPnlPct,
+          forceRefreshSource,
+        };
+      }
 
       // 2. 부분매도(ratio < 1) 가드 검사
       if (params.ratio < 1) {

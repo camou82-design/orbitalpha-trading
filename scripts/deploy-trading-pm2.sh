@@ -27,7 +27,7 @@ echo "[deploy] restart pm2 apps"
 pm2 delete orbitalpha-trading || true
 pm2 delete orbitalpha-trading-api || true
 pm2 delete orbitalpha-trading-dashboard || true
-pm2 start ecosystem.trading.config.cjs --env production
+pm2 start ecosystem.trading.config.cjs --env production --update-env
 pm2 save
 
 echo "[deploy] verify process and ports"
