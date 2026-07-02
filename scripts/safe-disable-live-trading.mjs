@@ -28,30 +28,32 @@ for (const file of envFiles) {
     backupFile(envPath);
 
     let content = fs.readFileSync(envPath, 'utf8');
-    const key = 'ORBITALPHA_TRADING_LIVE_ORDER_CONFIRM';
+    const keys = ['ORBITALPHA_TRADING_LIVE_ORDER_CONFIRM', 'LIVE_ORDER_CONFIRM'];
     
     // 안전한 라인별 처리로 중복이나 주석 여부 상관없이 덮어씀
     let lines = content.split(/\r?\n/);
-    let found = false;
-    lines = lines.map(line => {
-      const trimmed = line.trim();
-      if (trimmed.startsWith(`${key}=`) || trimmed.startsWith(`#${key}=`) || trimmed.startsWith(`# ${key}=`)) {
-        found = true;
-        return `${key}=false`;
+    for (const key of keys) {
+      let found = false;
+      lines = lines.map(line => {
+        const trimmed = line.trim();
+        if (trimmed.startsWith(`${key}=`) || trimmed.startsWith(`#${key}=`) || trimmed.startsWith(`# ${key}=`)) {
+          found = true;
+          return `${key}=false`;
+        }
+        return line;
+      });
+      if (!found) {
+        lines.push(`${key}=false`);
       }
-      return line;
-    });
-    if (!found) {
-      lines.push(`${key}=false`);
     }
     content = lines.join('\n');
     fs.writeFileSync(envPath, content, 'utf8');
-    console.log(`[safe-disable] Updated ${file} with ORBITALPHA_TRADING_LIVE_ORDER_CONFIRM=false`);
+    console.log(`[safe-disable] Updated ${file} with ORBITALPHA_TRADING_LIVE_ORDER_CONFIRM=false and LIVE_ORDER_CONFIRM=false`);
   } else {
     // 만약 파일이 아예 없다면 .env.local을 생성
     if (file === '.env.local') {
-      fs.writeFileSync(envPath, 'ORBITALPHA_TRADING_LIVE_ORDER_CONFIRM=false\n', 'utf8');
-      console.log(`[safe-disable] Created new ${file} with ORBITALPHA_TRADING_LIVE_ORDER_CONFIRM=false`);
+      fs.writeFileSync(envPath, 'ORBITALPHA_TRADING_LIVE_ORDER_CONFIRM=false\nLIVE_ORDER_CONFIRM=false\n', 'utf8');
+      console.log(`[safe-disable] Created new ${file} with ORBITALPHA_TRADING_LIVE_ORDER_CONFIRM=false and LIVE_ORDER_CONFIRM=false`);
     }
   }
 }
