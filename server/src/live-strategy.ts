@@ -2808,16 +2808,17 @@ export function createLiveDataStrategy(opts: {
         let recoveryStopPrice = avgBuy > 0 ? avgBuy * 0.98 : 0;
         let recoveryStopPct = -2;
 
-        if (loBuyEvident) {
-          recoveryTs = String(lastOrder!.ts);
-          recoveryOrderKrw = Number(lastOrder!.amount_krw ?? 0);
-          recoveryPositionId = `${pm}|RECOVERED|${recoveryTs}`;
-        } else if (recentBuyTrade) {
+        if (recentBuyTrade) {
           recoveryTs = recentBuyTrade.timestamp;
           recoveryOrderKrw = Number(recentBuyTrade.order_krw ?? 0);
           recoveryPositionId = recentBuyTrade.position_id ?? `${pm}|RECOVERED|${recoveryTs}`;
           if (recentBuyTrade.stop_loss_price) recoveryStopPrice = recentBuyTrade.stop_loss_price;
           if (recentBuyTrade.stop_loss_pct) recoveryStopPct = recentBuyTrade.stop_loss_pct;
+        } else {
+          // cond3/장부 일치 case: tcPos 또는 현재 시각 기준 (lastOrder는 사용하지 않음)
+          recoveryTs = tcPos?.entry_ts || new Date().toISOString();
+          recoveryOrderKrw = tcPos?.order_krw || 0;
+          recoveryPositionId = tcPos?.position_id || `${pm}|RECOVERED|${recoveryTs}`;
         }
 
         const stratSnapStopPct = strategyPosSnap[pm]?.stop_loss_pct;
