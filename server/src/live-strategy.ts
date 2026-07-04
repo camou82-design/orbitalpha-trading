@@ -1125,6 +1125,99 @@ const LIVE_EARLY_PROMOTION_MAX_SECONDS = (() => {
   return Number.isFinite(n) ? Math.max(10, Math.min(600, Math.floor(n))) : 120;
 })();
 
+const LIVE_MIN_HOLDING_MINUTES = (() => {
+  const raw = process.env.LIVE_MIN_HOLDING_MINUTES;
+  const n = raw === undefined || raw === "" ? 5 : Number(raw);
+  return Number.isFinite(n) ? Math.max(0, Math.min(60, Math.floor(n))) : 5;
+})();
+const LIVE_REENTRY_COOLDOWN_LOSS_SECONDS = (() => {
+  const raw = process.env.LIVE_REENTRY_COOLDOWN_LOSS_SECONDS;
+  const n = raw === undefined || raw === "" ? 60 * 60 : Number(raw);
+  return Number.isFinite(n) ? Math.max(60, Math.min(24 * 3600, Math.floor(n))) : 60 * 60;
+})();
+const CONSECUTIVE_LOSS_LIMIT_3_COOLDOWN_SECONDS = (() => {
+  const raw = process.env.CONSECUTIVE_LOSS_LIMIT_3_COOLDOWN_HOURS;
+  const h = raw === undefined || raw === "" ? 3 : Number(raw);
+  return h * 3600;
+})();
+const CONSECUTIVE_LOSS_LIMIT_5_COOLDOWN_SECONDS = (() => {
+  const raw = process.env.CONSECUTIVE_LOSS_LIMIT_5_COOLDOWN_HOURS;
+  const h = raw === undefined || raw === "" ? 12 : Number(raw);
+  return h * 3600;
+})();
+
+function checkConsecutiveLossCooldown(
+  market: string,
+  trades: Array<{ market: string; pnl_pct?: number | null; timestamp?: string; action?: string; state?: string }>,
+  now = Date.now()
+): { blocked: boolean; remainingMs: number; lossCount: number } {
+  const marketTrades = trades.filter((t) => t.market === market && t.action === "sell");
+  let consecutiveLosses = 0;
+  let lastLossTimeMs = 0;
+  for (let i = marketTrades.length - 1; i >= 0; i--) {
+    const t = marketTrades[i]!;
+    const isLoss = (t.pnl_pct ?? 0) < 0;
+    if (isLoss) {
+      consecutiveLosses++;
+      if (lastLossTimeMs === 0) {
+        lastLossTimeMs = Date.parse(t.timestamp || new Date().toISOString());
+      }
+    } else {
+      break;
+    }
+  }
+  if (consecutiveLosses >= 3) {
+    const limit3Ms = CONSECUTIVE_LOSS_LIMIT_3_COOLDOWN_SECONDS * 1000;
+    const limit5Ms = CONSECUTIVE_LOSS_LIMIT_5_COOLDOWN_SECONDS * 1000;
+    const cooldownDuration = consecutiveLosses >= 5 ? limit5Ms : limit3Ms;
+    const elapsed = now - lastLossTimeMs;
+    if (elapsed < cooldownDuration) {
+      return { blocked: true, remainingMs: cooldownDuration - elapsed, lossCount: consecutiveLosses };
+    }
+  }
+  return { blocked: false, remainingMs: 0, lossCount: consecutiveLosses };
+}
+
+function evaluateGlobalKillSwitch(
+  trades: Array<{ market: string; pnl_pct?: number | null; timestamp?: string; action?: string; note?: string }>
+): { active: boolean; reason: string | null } {
+  const completed = trades.filter((t) => t.action === "sell");
+  if (completed.length === 0) return { active: false, reason: null };
+  const recent10 = completed.slice(-10);
+  if (recent10.length >= 5) {
+    const wins = recent10.filter((t) => (t.pnl_pct ?? 0) > 0).length;
+    const winRate = wins / recent10.length;
+    if (winRate < 0.20) {
+      return { active: true, reason: `Win rate under 20% in recent ${recent10.length} trades (${(winRate * 100).toFixed(1)}%)` };
+    }
+  }
+  if (recent10.length >= 3) {
+    const totalPnlPct = recent10.reduce((acc, t) => acc + (t.pnl_pct ?? 0), 0);
+    if (totalPnlPct <= -5.0) {
+      return { active: true, reason: `Cumulative PnL under -5% in recent ${recent10.length} trades (${totalPnlPct.toFixed(2)}%)` };
+    }
+  }
+  const oneDayAgo = Date.now() - 24 * 3600 * 1000;
+  const recent24h = completed.filter((t) => {
+    return Date.parse(t.timestamp || new Date().toISOString()) >= oneDayAgo;
+  });
+  const losses24h = recent24h.filter((t) => (t.pnl_pct ?? 0) < 0).length;
+  if (losses24h >= 5) {
+    return { active: true, reason: `5 or more loss trades in the last 24 hours (${losses24h} losses)` };
+  }
+  if (recent10.length >= 5) {
+    const surgeStopLosses = recent10.filter((t) => {
+      const note = (t.note || "").toLowerCase();
+      return note.includes("surge_stop_loss");
+    }).length;
+    const totalPnl = recent10.reduce((acc, t) => acc + (t.pnl_pct ?? 0), 0);
+    if (surgeStopLosses / recent10.length >= 0.5 && totalPnl < 0) {
+      return { active: true, reason: `surge_stop_loss ratio >= 50% (${(surgeStopLosses / recent10.length * 100).toFixed(1)}%) and negative cumulative PnL (${totalPnl.toFixed(2)}%)` };
+    }
+  }
+  return { active: false, reason: null };
+}
+
 // --- Early entry (pre-breakout small scout slot) ---
 const LIVE_EARLY_ENTRY_ENABLED = String(process.env.LIVE_EARLY_ENTRY_ENABLED ?? "false").toLowerCase() === "true";
 const LIVE_EARLY_ENTRY_MAX_OPEN = (() => {
@@ -2724,7 +2817,7 @@ export function createLiveDataStrategy(opts: {
       let removedAny = false;
       for (const m of Object.keys(state.positions)) {
         const pos = state.positions[m];
-        if (pos && pos.entry_origin === "auto_trade_recovered") {
+        if (pos && (pos.entry_origin as string) === "auto_trade_recovered") {
           console.warn(
             JSON.stringify({
               tag: "AUTO_TRADE_RECOVERED_REMOVED_TO_PASSIVE",
@@ -2790,7 +2883,7 @@ export function createLiveDataStrategy(opts: {
         const isWithin24Hours = buyTradeAgeMs <= 24 * 60 * 60 * 1000;
         const ageMs = buyTradeAgeMs;
 
-        const cond2 = Boolean(hasRecentBuyTrade && isWithin24Hours && recentBuyTrade.position_id);
+        const cond2 = Boolean(hasRecentBuyTrade && isWithin24Hours && recentBuyTrade?.position_id);
         const cond3 = Boolean(
           tcPos &&
           tcPos.qty > 0 &&
@@ -5162,7 +5255,7 @@ export function createLiveDataStrategy(opts: {
       }
 
       // 0.3. recovered position 즉시 청산 금지 (grace period 적용)
-      if (p && (p.entry_origin === "auto_trade_recovered" || p.reason_enter === "RECOVERED_AFTER_LEDGER_MISS")) {
+      if (p && ((p.entry_origin as string) === "auto_trade_recovered" || p.reason_enter === "RECOVERED_AFTER_LEDGER_MISS")) {
         const entryTimeMs = Date.parse(p.entry_ts);
         const elapsedMs = Date.now() - entryTimeMs;
         const graceMs = LIVE_EXIT_GRACE_SECONDS * 1000;
@@ -5276,6 +5369,43 @@ export function createLiveDataStrategy(opts: {
             forceRefreshSource,
           };
         }
+      }
+
+      // 3. 공통 매도 가드 (전량 및 부분매도 통합 적용)
+      const isStopLossExit = params.exitAuthorityClass === "emergency_exit" || params.stopTriggerKind === "price_stop" || /emergency|hard|strict|stop|loss/i.test(params.reasonExit);
+      
+      // 3.1) 최소 보유 시간 검증 (기본 5분, stop loss 탈출은 제외)
+      if (params.heldMs < LIVE_MIN_HOLDING_MINUTES * 60000 && !isStopLossExit) {
+        return {
+          allowed: false,
+          blockReason: `holding_time_under_min_limit:held=${Math.floor(params.heldMs / 1000)}s_need=${LIVE_MIN_HOLDING_MINUTES * 60}s`,
+          decisionPrice,
+          decisionPnlPct,
+          forceRefreshSource,
+        };
+      }
+
+      // 3.2) 수수료 및 안전 마진 확보 검증 (왕복수수료 0.1% + 버퍼 0.02% = 0.12% 미만 익절 차단)
+      const isProfitExit = params.exitAuthorityClass === "profit_protect" || params.exitAuthorityClass === "take_profit" || /tp1|tp2|profit|trail/i.test(params.reasonExit);
+      if (isProfitExit && decisionPnlPct < 0.12) {
+        return {
+          allowed: false,
+          blockReason: `profit_under_fee_safe_margin:pnl=${decisionPnlPct.toFixed(3)}%_need>=0.12%`,
+          decisionPrice,
+          decisionPnlPct,
+          forceRefreshSource,
+        };
+      }
+
+      // 3.3) stale 가격 검증 (live 가격 소스가 아니거나 missing인 경우, stop loss는 탈출 허용)
+      if (!isStopLossExit && (forceRefreshSource === "missing" || forceRefreshSource === "stale")) {
+        return {
+          allowed: false,
+          blockReason: `stale_price_source_blocked:${forceRefreshSource}`,
+          decisionPrice,
+          decisionPnlPct,
+          forceRefreshSource,
+        };
       }
 
       return {
@@ -5561,7 +5691,7 @@ export function createLiveDataStrategy(opts: {
       const p = state.positions[market]!;
       
       // [보완] passive_holding 또는 auto_trade_recovered 복구 포지션은 sell decision 단계에 들어가지 않도록 함
-      if (p && p.entry_origin === "auto_trade_recovered") {
+      if (p && (p.entry_origin as string) === "auto_trade_recovered") {
         continue;
       }
       
@@ -6385,6 +6515,16 @@ export function createLiveDataStrategy(opts: {
           market_state: state.regime?.btc_filter_state ?? null,
           exit_reason: exitBlockedByGrace ? "blocked_by_grace_period" : blockedByMicroLoss ? "blocked_by_micro_loss_guard" : reasonExit,
           exit_authority_class: exitAuthorityClass,
+          avgBuyPrice: p.entry_price,
+          currentPrice: now,
+          tickerSource: tickerSourceMap.get(market) ?? "missing",
+          grossProfitPct: pnlGross,
+          estimatedFeePct: feeRoundTripPct,
+          netProfitPct: netPnlPctEst,
+          exitReason: reasonExit,
+          blockedReason: exitBlockedByGrace ? "blocked_by_grace_period" : blockedByMicroLoss ? "blocked_by_micro_loss_guard" : null,
+          holdingMinutes: Math.floor(heldMs / 60000),
+          marketRegime: state.regime?.btc_filter_state ?? null,
           exit_reason_detail: {
             chosen_reason: reasonExit,
             authority_class: exitAuthorityClass,
@@ -6487,6 +6627,17 @@ export function createLiveDataStrategy(opts: {
             sell_ratio: ratio,
             price_source: guard.forceRefreshSource,
             hold_ms: heldMs,
+            symbol: market,
+            avgBuyPrice: p.entry_price,
+            currentPrice: guard.decisionPrice,
+            tickerSource: guard.forceRefreshSource,
+            grossProfitPct: guard.decisionPnlPct,
+            estimatedFeePct: UPBIT_FEE_RATE * 2 * 100,
+            netProfitPct: guard.decisionPnlPct - (UPBIT_FEE_RATE * 2 * 100),
+            exitReason: reasonExit,
+            blockedReason: guard.blockReason,
+            holdingMinutes: heldMs / 60000,
+            marketRegime: state.regime?.btc_filter_state ?? "neutral",
           })
         );
         continue; // 매도 주문 금지 및 skip/hold
@@ -6916,7 +7067,8 @@ export function createLiveDataStrategy(opts: {
           state.entry_profile_stats[p.entry_profile_key] = next;
         }
         delete state.positions[market];
-        const baseCdSec = LIVE_REENTRY_COOLDOWN_SECONDS;
+        const isLoss = netPnlPctValue <= 0;
+        const baseCdSec = isLoss ? LIVE_REENTRY_COOLDOWN_LOSS_SECONDS : LIVE_REENTRY_COOLDOWN_SECONDS;
         state.cooldown_until[market] = new Date(Date.now() + baseCdSec * 1000).toISOString();
         emitStageChange({
           symbol: market,
@@ -9265,6 +9417,73 @@ export function createLiveDataStrategy(opts: {
           note: "open_strategy_position_does_not_skip_pipeline_or_order_attempt",
         });
       }
+      // 1) 전체 Kill Switch 체크
+      const killSwitch = evaluateGlobalKillSwitch(state.trades);
+      if (killSwitch.active) {
+        (state as any).global_kill_switch_active = true;
+        (state as any).global_kill_switch_reason = killSwitch.reason;
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "global_kill_switch_active", reason_detail: killSwitch.reason });
+        logPlacebuyFinalGateBlocked("global_kill_switch_active", { reason_detail: killSwitch.reason });
+        bumpSkip("global_kill_switch_active");
+        continue;
+      } else {
+        (state as any).global_kill_switch_active = false;
+        (state as any).global_kill_switch_reason = null;
+      }
+
+      // 2) 동일 코인 연속 손실 쿨다운 체크
+      const lossCd = checkConsecutiveLossCooldown(market, state.trades);
+      if (lossCd.blocked) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "consecutive_loss_cooldown_active", loss_count: lossCd.lossCount });
+        logPlacebuyFinalGateBlocked("consecutive_loss_cooldown_active", { loss_count: lossCd.lossCount, remaining_sec: Math.floor(lossCd.remainingMs / 1000) });
+        bumpSkip("consecutive_loss_cooldown_active");
+        continue;
+      }
+
+      // 3.1) 시간당 진입 제한 (최근 1시간 이내 진입 최대 2회)
+      const oneHourAgo = Date.now() - 3600 * 1000;
+      const recent1hEntries = state.trades.filter((t) => {
+        return t.action === "buy" && Date.parse(t.timestamp || new Date().toISOString()) >= oneHourAgo;
+      }).length;
+      const active1hEntries = Object.values(state.positions).filter((p) => {
+        return Date.now() - Date.parse(p.entry_ts) < 3600 * 1000;
+      }).length;
+      const total1hEntries = recent1hEntries + active1hEntries;
+      if (total1hEntries >= 2) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "hourly_entry_limit_reached", entries_count: total1hEntries });
+        logPlacebuyFinalGateBlocked("hourly_entry_limit_reached", { entries_count: total1hEntries });
+        bumpSkip("hourly_entry_limit_reached");
+        continue;
+      }
+
+      // 3.2) 하루 손실 거래 제한 (KST 09:00 이후 손실 거래 5회 이상 시 차단)
+      const today0900 = new Date();
+      today0900.setUTCHours(0, 0, 0, 0); // KST 09:00
+      const today0900Ms = today0900.getTime();
+      const dailyLossTrades = state.trades.filter((t) => {
+        const timeMs = Date.parse(t.timestamp || new Date().toISOString());
+        return timeMs >= today0900Ms && t.action === "sell" && (t.pnl_pct ?? 0) < 0;
+      }).length;
+      if (dailyLossTrades >= 5) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "daily_loss_limit_reached", loss_count: dailyLossTrades });
+        logPlacebuyFinalGateBlocked("daily_loss_limit_reached", { loss_count: dailyLossTrades });
+        bumpSkip("daily_loss_limit_reached");
+        continue;
+      }
+
+      // 3.3) 하루 누적 손익 제한 (KST 09:00 이후 누적 손익률 -3% 이하 시 차단)
+      const dailyTrades = state.trades.filter((t) => {
+        const timeMs = Date.parse(t.timestamp || new Date().toISOString());
+        return timeMs >= today0900Ms && t.action === "sell";
+      });
+      const dailyPnlPctSum = dailyTrades.reduce((acc, t) => acc + (t.pnl_pct ?? 0), 0);
+      if (dailyPnlPctSum <= -3.0) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "daily_pnl_limit_reached", daily_pnl_pct: dailyPnlPctSum });
+        logPlacebuyFinalGateBlocked("daily_pnl_limit_reached", { daily_pnl_pct: dailyPnlPctSum });
+        bumpSkip("daily_pnl_limit_reached");
+        continue;
+      }
+
       const cool = state.cooldown_until[market];
       if (cool && Date.now() < Date.parse(cool)) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "cooldown_active", cooldown_until: cool });

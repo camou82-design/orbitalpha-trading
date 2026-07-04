@@ -258,6 +258,7 @@ export function createTradeControl(
       bucket: PositionBucket;
       isAdditionalBuy: boolean;
       signalPayload: unknown | undefined;
+      strategyType?: string;
     }) => Promise<void>;
   },
 ) {
@@ -762,6 +763,7 @@ export function createTradeControl(
       bucket,
       isAdditionalBuy,
       signalPayload,
+      strategyType,
     });
     if (bucket === "legacy") {
       const lb = state.legacyBuckets[market as ManagedMarket];

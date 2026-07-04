@@ -23,6 +23,8 @@ export type MarketStateSnapshot = {
   conservative_mode: boolean;
   /** risk_off에서도 강한 대표 코인에 한해 신규 진입 예외 허용 */
   exception_entry_allowed: boolean;
+  /** BTC RSI 14일 연산값 */
+  btc_rsi?: number;
 };
 
 /** 주문 직전 게이트용 — UI `market-state` 와 동일 스냅샷 기준. */
@@ -142,6 +144,37 @@ export function createMarketStateFilter(args: {
 
     const closes5 = c5.map((c) => c.trade_price);
     const closes15 = c15.map((c) => c.trade_price);
+    
+    // 14일 RSI 연산 (5분봉 14개 기준의 RSI 계산 헬퍼)
+    const btcRsi = (() => {
+      if (closes5.length < 15) return undefined;
+      let gains = 0;
+      let losses = 0;
+      for (let i = 1; i <= 14; i++) {
+        const diff = Number(closes5[closes5.length - 15 + i]) - Number(closes5[closes5.length - 15 + i - 1]);
+        if (diff > 0) gains += diff;
+        else losses -= diff;
+      }
+      let avgGain = gains / 14;
+      let avgLoss = losses / 14;
+      if (avgLoss === 0) return 100;
+      let rs = avgGain / avgLoss;
+      let rsi = 100 - 100 / (1 + rs);
+      
+      // 와일더(Wilder) 스무딩 적용 (나머지 캔들 대상)
+      const remainingStart = closes5.length - 14;
+      for (let i = remainingStart; i < closes5.length; i++) {
+        const diff = Number(closes5[i]) - Number(closes5[i - 1]);
+        const gain = diff > 0 ? diff : 0;
+        const loss = diff < 0 ? -diff : 0;
+        avgGain = (avgGain * 13 + gain) / 14;
+        avgLoss = (avgLoss * 13 + loss) / 14;
+      }
+      if (avgLoss === 0) return 100;
+      rs = avgGain / avgLoss;
+      return 100 - 100 / (1 + rs);
+    })();
+
     const btc5 = trendByEma(closes5, 5, 13);
     const btc15 = trendByEma(closes15, 4, 10);
     const r5 = closes5.length > 6 ? (closes5[closes5.length - 1]! / closes5[closes5.length - 6]! - 1) * 100 : 0;
@@ -192,6 +225,7 @@ export function createMarketStateFilter(args: {
       recent_close_bias: flowUp ? "up" : flowDown ? "down" : "flat",
       conservative_mode: conservativeMode,
       exception_entry_allowed: conservativeMode,
+      btc_rsi: btcRsi,
     };
 
     if (!state.latest || state.latest.market_state !== snap.market_state) {
@@ -245,7 +279,7 @@ export function createMarketStateFilter(args: {
  */
 export function assertOrderBuyAllowed(
   snap: MarketStateSnapshot,
-  args: { kind: "new_entry" | "add_to_position"; signalPayload: unknown | undefined },
+  args: { kind: "new_entry" | "add_to_position"; signalPayload: unknown | undefined; strategyType?: string; market?: string },
 ): OrderBuyGateResult {
   const { market_state, entry_policy } = snap;
   const size_scale = market_state === "risk_on" ? 1 : market_state === "neutral" ? 0.72 : 0.45;
@@ -264,9 +298,20 @@ export function assertOrderBuyAllowed(
     size_scale: 0,
   });
 
+  const isSurgeStrategy = args.strategyType === "momentum" || (args.market && args.market.toLowerCase().includes("surge"));
+
   if (args.kind === "new_entry") {
     if (market_state === "risk_off") {
       return deny("risk_off: 신규 진입 금지", true, false);
+    }
+    // Surge 전략인 경우 약세/중립 필터 적용
+    if (isSurgeStrategy) {
+      if (market_state === "neutral") {
+        return deny("neutral_market_surge_blocked: 중립 장세에서는 surge 진입 차단", true, false);
+      }
+      if (snap.btc_rsi !== undefined && snap.btc_rsi < 50) {
+        return deny(`btc_rsi_low_surge_blocked: BTC RSI가 50 미만이라 진입 차단 (${snap.btc_rsi.toFixed(1)})`, true, false);
+      }
     }
     const g = runEntryScoreGate(market_state, snap.min_entry_score, snap.market_bonus, args.signalPayload);
     if (!g.ok) {

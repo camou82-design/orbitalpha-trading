@@ -7,6 +7,7 @@ import { buildSurgeV2ShadowJudgment } from "./surge-v2/index.js";
 import { readJsonFile } from "./runtime-file-io.js";
 import { surgeCandidatesRuntimePath } from "./runtime-paths.js";
 import { LogDeduper } from "./log-deduper.js";
+import { assertOrderBuyAllowed } from "./market-state-filter.js";
 
 type PaperStateValue = "SIGNAL" | "OPEN" | "PARTIAL_EXIT" | "CLOSED_WIN" | "CLOSED_LOSS" | "CLOSED_TIMEOUT" | "SKIPPED";
 
@@ -296,7 +297,7 @@ const SURGE_STOP_LOSS_PCT = (() => {
   const raw = process.env.PAPER_SURGE_STOP_LOSS_PCT;
   const n = raw === undefined || raw === "" ? -0.75 : Number(raw);
   if (!Number.isFinite(n)) return -0.75;
-  return Math.max(-1, Math.min(-0.5, n));
+  return Math.max(-3.5, Math.min(-0.5, n));
 })();
 const SURGE_COOLDOWN_MS = 25 * 60_000;
 const SURGE_COOLDOWN_AFTER_LOSS_MS = 30 * 60_000;
@@ -314,6 +315,90 @@ const PAPER_HISTORY_MAX = 1000;
 const PAPER_SEEN_SIGNAL_MAX = 500;
 const PAPER_BTC_NEUTRAL_ENTRY_SCALE = 0.75;
 const PAPER_BTC_WEAK_ENTRY_SCALE = 0.5;
+
+const CONSECUTIVE_LOSS_LIMIT_3_COOLDOWN_MS = (() => {
+  const raw = process.env.CONSECUTIVE_LOSS_LIMIT_3_COOLDOWN_HOURS;
+  const h = raw === undefined || raw === "" ? 3 : Number(raw);
+  return h * 3600 * 1000;
+})();
+const CONSECUTIVE_LOSS_LIMIT_5_COOLDOWN_MS = (() => {
+  const raw = process.env.CONSECUTIVE_LOSS_LIMIT_5_COOLDOWN_HOURS;
+  const h = raw === undefined || raw === "" ? 12 : Number(raw);
+  return h * 3600 * 1000;
+})();
+
+function checkConsecutiveLossCooldown(
+  market: string,
+  history: Array<{ market: string; pnl_pct?: number | null; ts?: string; state?: string }>,
+  now = Date.now()
+): { blocked: boolean; remainingMs: number; lossCount: number } {
+  const marketTrades = history.filter((t) => t.market === market && (t.state === "CLOSED_LOSS" || t.state === "CLOSED_WIN" || t.state === "CLOSED_TIMEOUT" || t.pnl_pct !== undefined));
+  let consecutiveLosses = 0;
+  let lastLossTimeMs = 0;
+  for (let i = marketTrades.length - 1; i >= 0; i--) {
+    const t = marketTrades[i]!;
+    const pnl = t.pnl_pct ?? 0;
+    const isLoss = pnl < 0 || t.state === "CLOSED_LOSS";
+    if (isLoss) {
+      consecutiveLosses++;
+      if (lastLossTimeMs === 0) {
+        lastLossTimeMs = Date.parse(t.ts || new Date().toISOString());
+      }
+    } else {
+      break;
+    }
+  }
+  if (consecutiveLosses >= 3) {
+    const limit3Ms = CONSECUTIVE_LOSS_LIMIT_3_COOLDOWN_MS;
+    const limit5Ms = CONSECUTIVE_LOSS_LIMIT_5_COOLDOWN_MS;
+    const cooldownDuration = consecutiveLosses >= 5 ? limit5Ms : limit3Ms;
+    const elapsed = now - lastLossTimeMs;
+    if (elapsed < cooldownDuration) {
+      return { blocked: true, remainingMs: cooldownDuration - elapsed, lossCount: consecutiveLosses };
+    }
+  }
+  return { blocked: false, remainingMs: 0, lossCount: consecutiveLosses };
+}
+
+function evaluateGlobalKillSwitch(
+  history: Array<{ market: string; pnl_pct?: number | null; ts?: string; state?: string; note?: string }>
+): { active: boolean; reason: string | null } {
+  const completed = history.filter((t) => t.state === "CLOSED_LOSS" || t.state === "CLOSED_WIN" || t.state === "CLOSED_TIMEOUT" || t.pnl_pct !== undefined);
+  if (completed.length === 0) return { active: false, reason: null };
+  const recent10 = completed.slice(-10);
+  if (recent10.length >= 5) {
+    const wins = recent10.filter((t) => (t.pnl_pct ?? 0) > 0).length;
+    const winRate = wins / recent10.length;
+    if (winRate < 0.20) {
+      return { active: true, reason: `Win rate under 20% in recent ${recent10.length} trades (${(winRate*100).toFixed(1)}%)` };
+    }
+  }
+  if (recent10.length >= 3) {
+    const totalPnlPct = recent10.reduce((acc, t) => acc + (t.pnl_pct ?? 0), 0);
+    if (totalPnlPct <= -5.0) {
+      return { active: true, reason: `Cumulative PnL under -5% in recent ${recent10.length} trades (${totalPnlPct.toFixed(2)}%)` };
+    }
+  }
+  const oneDayAgo = Date.now() - 24 * 3600 * 1000;
+  const recent24h = completed.filter((t) => {
+    return Date.parse(t.ts || new Date().toISOString()) >= oneDayAgo;
+  });
+  const losses24h = recent24h.filter((t) => (t.pnl_pct ?? 0) < 0 || t.state === "CLOSED_LOSS").length;
+  if (losses24h >= 5) {
+    return { active: true, reason: `5 or more loss trades in the last 24 hours (${losses24h} losses)` };
+  }
+  if (recent10.length >= 5) {
+    const surgeStopLosses = recent10.filter((t) => {
+      const note = (t.note || "").toLowerCase();
+      return note.includes("surge_stop_loss");
+    }).length;
+    const totalPnl = recent10.reduce((acc, t) => acc + (t.pnl_pct ?? 0), 0);
+    if (surgeStopLosses / recent10.length >= 0.5 && totalPnl < 0) {
+      return { active: true, reason: `surge_stop_loss ratio >= 50% (${(surgeStopLosses/recent10.length*100).toFixed(1)}%) and negative cumulative PnL (${totalPnl.toFixed(2)}%)` };
+    }
+  }
+  return { active: false, reason: null };
+}
 
 function toNum(v: unknown, d = 0): number {
   const n = Number(v);
@@ -579,6 +664,7 @@ export function createPaperTradingEngine(opts: {
     add_entry_eligible?: boolean;
     exclude_reasons?: string[];
   }>;
+  marketState?: any;
 }) {
   const baseDir = path.join(tradingDataRoot(), "paper", opts.companyId, opts.serviceId);
   const stateFile = path.join(baseDir, "paper_state.json");
@@ -1778,6 +1864,76 @@ export function createPaperTradingEngine(opts: {
     for (const [market, sig] of orderedSignals) {
       const px = priceByMarket[market] ?? 0;
       if (!(px > 0)) continue;
+
+      // 1) 전체 Kill Switch 체크
+      const killSwitch = evaluateGlobalKillSwitch(state.history);
+      if (killSwitch.active) {
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: `global_kill_switch_active:${killSwitch.reason}`, stage: "global_kill_switch" });
+        continue;
+      }
+
+      // 2) 동일 코인 연속 손실 쿨다운 체크
+      const lossCd = checkConsecutiveLossCooldown(market, state.history);
+      if (lossCd.blocked) {
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: `consecutive_loss_cooldown_active:count_${lossCd.lossCount}`, stage: "consecutive_loss_cooldown" });
+        continue;
+      }
+
+      // 3.1) 시간당 진입 제한 (최근 1시간 이내 진입 최대 2회)
+      const oneHourAgo = Date.now() - 3600 * 1000;
+      const recent1hEntries = state.history.filter((t) => {
+        return t.state !== "SKIPPED" && Date.parse(t.ts || new Date().toISOString()) >= oneHourAgo;
+      }).length;
+      const active1hEntries = Object.values(state.positions).filter((p) => {
+        return Date.now() - Date.parse(p.entry_ts) < 3600 * 1000;
+      }).length;
+      const total1hEntries = recent1hEntries + active1hEntries;
+      if (total1hEntries >= 2) {
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "hourly_entry_limit_reached", stage: "hourly_limit" });
+        continue;
+      }
+
+      // 3.2) 하루 손실 거래 제한 (당일 KST 09:00 이후 손실 거래 5회 이상 시 차단)
+      const today0900 = new Date();
+      today0900.setUTCHours(0, 0, 0, 0); // KST 09:00
+      const today0900Ms = today0900.getTime();
+      const dailyLossTrades = state.history.filter((t) => {
+        const timeMs = Date.parse(t.ts || new Date().toISOString());
+        return timeMs >= today0900Ms && (t.state === "CLOSED_LOSS" || t.state === "CLOSED_TIMEOUT" || (t.pnl_pct ?? 0) < 0);
+      }).length;
+      if (dailyLossTrades >= 5) {
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "daily_loss_limit_reached", stage: "daily_loss_limit" });
+        continue;
+      }
+
+      // 3.3) 하루 누적 손익 제한 (당일 KST 09:00 이후 누적 손익률 -3% 이하 시 차단)
+      const dailyTrades = state.history.filter((t) => {
+        const timeMs = Date.parse(t.ts || new Date().toISOString());
+        return timeMs >= today0900Ms && (t.state === "CLOSED_WIN" || t.state === "CLOSED_LOSS" || t.state === "CLOSED_TIMEOUT");
+      });
+      const dailyPnlPctSum = dailyTrades.reduce((acc, t) => acc + (t.pnl_pct ?? 0), 0);
+      if (dailyPnlPctSum <= -3.0) {
+        emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "daily_pnl_limit_reached", stage: "daily_pnl_limit" });
+        continue;
+      }
+
+      // 5) market-state-filter 연동 검증
+      if (opts.marketState) {
+        const snap = opts.marketState.status();
+        if (snap) {
+          const isSurge = sig.signal_strength === "SURGE_SCANNER";
+          const r = assertOrderBuyAllowed(snap, {
+            kind: "new_entry",
+            signalPayload: sig,
+            strategyType: isSurge ? "momentum" : "stable",
+            market,
+          });
+          if (!r.ok) {
+            emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: r.blocked_reason, stage: "market_state_filter" });
+            continue;
+          }
+        }
+      }
 
       // [ORIGINAL SETUP] Primary Filter for Paper Trading
       let setupResult: OriginalSpotSetupResult | null = null;

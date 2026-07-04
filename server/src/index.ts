@@ -415,6 +415,8 @@ async function main() {
       const r = assertOrderBuyAllowed(snap, {
         kind: ctx.isAdditionalBuy ? "add_to_position" : "new_entry",
         signalPayload: ctx.signalPayload,
+        strategyType: ctx.strategyType,
+        market: ctx.market,
       });
       const btcState = snap.market_state === "risk_on" ? "strong" : snap.market_state === "neutral" ? "neutral" : "weak";
       app.log.info(
@@ -461,6 +463,7 @@ async function main() {
     companyId: env.companyId,
     serviceId: env.serviceId,
     getScannerSignals: () => pumpScanner.signalFeed(),
+    marketState: marketFilter,
   });
   await paper.init();
   trade.setRecoveryReady(true);

@@ -339,14 +339,11 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
           const prevAvgNotional = prev5_1m.reduce((a, b) => a + num(b.trade_price)*num(b.candle_acc_trade_volume), 0) / Math.max(1, prev5_1m.length);
           const volume_accel_1m = prevAvgNotional > 0 ? lastNotional / prevAvgNotional : 1.0;
           
-          // Simplified late chase window: apply post-reset values only between 09:15 (555) and 09:45 (585) KST.
-          const LATE_CHASE_START = 555; // 09:15 KST
-          const LATE_CHASE_END = 585;   // 09:45 KST
-          const isResetLateChaseWindow = kstTotalMins >= LATE_CHASE_START && kstTotalMins < LATE_CHASE_END;
-          const LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX ?? (isResetLateChaseWindow ? 3.0 : 4.5));
-          const LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX ?? (isResetLateChaseWindow ? 2.5 : 3.5));
-          const LIVE_SURGE_LATE_CHASE_WICK_RATIO_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_WICK_RATIO_MAX ?? (isResetLateChaseWindow ? 0.45 : 0.6));
-          const LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX ?? (isResetLateChaseWindow ? 0.6 : 0.4));
+          // 모든 시간대에 고점 추격 매수 방지 가드를 상시 가동
+          const LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX ?? 3.0); // 3% 이상 급등 시 차단
+          const LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX ?? 2.5); // EMA 1m 이격도 2.5% 이상 차단
+          const LIVE_SURGE_LATE_CHASE_WICK_RATIO_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_WICK_RATIO_MAX ?? 0.45); // 윗꼬리 45% 이상 차단
+          const LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX = Number(process.env.LIVE_SURGE_LATE_CHASE_VOL_DROP_MAX ?? 0.6);   // 거래량 60% 이하 감속 시 차단
 
           let chaseCondCount = 0;
           if (recent_1m_return_3bar_pct >= LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX) { chaseCondCount++; chaseBlockReasons.push("recent_1m_return_3bar_pct_high"); }
@@ -365,7 +362,7 @@ export function evaluateSurgeEntryPipeline(input: Readonly<{
                 kst_time: kstTimeStr,
                 age_seconds: input.ageSeconds,
                 source_kind: sourceKind,
-                is_reset_late_chase_window: isResetLateChaseWindow,
+                is_reset_late_chase_window: true,
                 thresholds: {
                     return_max: LIVE_SURGE_LATE_CHASE_1M_RETURN_MAX,
                     ema_dist_max: LIVE_SURGE_LATE_CHASE_EMA1M_DIST_MAX,
