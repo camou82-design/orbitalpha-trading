@@ -28,6 +28,7 @@ import {
   processSurgeCaptureQueue,
   saveCaptureQueue,
 } from "./surge-v2/surge-capture-layer.js";
+import { assertOrderBuyAllowed } from "./market-state-filter.js";
 import {
   LIVE_ENTRY_SIGNAL_GATES,
   RECOVERY_EXIT_CONFIG,
@@ -1216,6 +1217,170 @@ function evaluateGlobalKillSwitch(
     }
   }
   return { active: false, reason: null };
+}
+
+async function validateLiveBuyPrecheck(params: {
+  market: string;
+  trades: Array<{ market: string; pnl_pct?: number | null; timestamp?: string; action?: string; note?: string }>,
+  positions: Record<string, any>;
+  cooldown_until: Record<string, string>;
+  marketState: any;
+  signalPayload: any;
+  strategyType: string;
+  entryPath: string;
+  isAdditionalBuy: boolean;
+}): Promise<{
+  allowed: boolean;
+  blockReason: string | null;
+  killSwitchReason: string | null;
+  cooldownRemainingSec: number;
+  dailyLossCount: number;
+  dailyPnlPct: number;
+  marketStateStr: string;
+  btcRsi: number | null;
+}> {
+  const result = {
+    allowed: true,
+    blockReason: null as string | null,
+    killSwitchReason: null as string | null,
+    cooldownRemainingSec: 0,
+    dailyLossCount: 0,
+    dailyPnlPct: 0,
+    marketStateStr: "unknown",
+    btcRsi: null as number | null,
+  };
+
+  let snap: any = null;
+  if (params.marketState) {
+    try {
+      snap = params.marketState.status() || await params.marketState.evaluate();
+      if (snap) {
+        result.marketStateStr = snap.market_state;
+        result.btcRsi = snap.btc_rsi ?? null;
+      }
+    } catch (e) {
+      snap = params.marketState.status();
+      if (snap) {
+        result.marketStateStr = snap.market_state;
+        result.btcRsi = snap.btc_rsi ?? null;
+      }
+    }
+  }
+
+  const today0900 = new Date();
+  today0900.setUTCHours(0, 0, 0, 0); // KST 09:00
+  const today0900Ms = today0900.getTime();
+  
+  const dailyTrades = params.trades.filter((t) => {
+    const timeMs = Date.parse(t.timestamp || new Date().toISOString());
+    return timeMs >= today0900Ms && t.action === "sell";
+  });
+  
+  result.dailyLossCount = dailyTrades.filter((t) => (t.pnl_pct ?? 0) < 0).length;
+  result.dailyPnlPct = dailyTrades.reduce((acc, t) => acc + (t.pnl_pct ?? 0), 0);
+
+  const cool = params.cooldown_until[params.market];
+  if (cool) {
+    result.cooldownRemainingSec = Math.max(0, Math.floor((Date.parse(cool) - Date.now()) / 1000));
+  }
+
+  if (!params.isAdditionalBuy) {
+    const killSwitch = evaluateGlobalKillSwitch(params.trades);
+    if (killSwitch.active) {
+      result.allowed = false;
+      result.blockReason = "global_kill_switch_active";
+      result.killSwitchReason = killSwitch.reason;
+      return result;
+    }
+
+    const lossCd = checkConsecutiveLossCooldown(params.market, params.trades);
+    if (lossCd.blocked) {
+      result.allowed = false;
+      result.blockReason = "consecutive_loss_cooldown_active";
+      return result;
+    }
+
+    const oneHourAgo = Date.now() - 3600 * 1000;
+    const recent1hEntries = params.trades.filter((t) => {
+      return t.action === "buy" && Date.parse(t.timestamp || new Date().toISOString()) >= oneHourAgo;
+    }).length;
+    const active1hEntries = Object.values(params.positions).filter((p) => {
+      return Date.now() - Date.parse(p.entry_ts) < 3600 * 1000;
+    }).length;
+    const total1hEntries = recent1hEntries + active1hEntries;
+    if (total1hEntries >= 2) {
+      result.allowed = false;
+      result.blockReason = "hourly_entry_limit_reached";
+      return result;
+    }
+
+    if (result.dailyLossCount >= 5) {
+      result.allowed = false;
+      result.blockReason = "daily_loss_limit_reached";
+      return result;
+    }
+
+    if (result.dailyPnlPct <= -3.0) {
+      result.allowed = false;
+      result.blockReason = "daily_pnl_limit_reached";
+      return result;
+    }
+
+    if (cool && Date.now() < Date.parse(cool)) {
+      result.allowed = false;
+      result.blockReason = "cooldown_active";
+      return result;
+    }
+  }
+
+  if (snap) {
+    const r = assertOrderBuyAllowed(snap, {
+      kind: params.isAdditionalBuy ? "add_to_position" : "new_entry",
+      signalPayload: params.signalPayload,
+      strategyType: params.strategyType,
+      market: params.market,
+    });
+    if (!r.ok) {
+      result.allowed = false;
+      result.blockReason = r.blocked_reason || "market_state_filter_blocked";
+      return result;
+    }
+  }
+
+  return result;
+}
+
+function logPlacebuyFinalGateBlocked(
+  reason: string,
+  meta: {
+    market: string;
+    path: string;
+    strategyType: string;
+    killSwitchReason: string | null;
+    cooldownRemaining: number;
+    dailyLossCount: number;
+    dailyPnlPct: number;
+    marketState: string;
+    btcRsi: number | null;
+  }
+) {
+  console.warn(
+    JSON.stringify({
+      tag: "LIVE_PLACEBUY_ATTEMPT_FINAL_GATE",
+      ts: new Date().toISOString(),
+      market: meta.market,
+      path: meta.path,
+      strategyType: meta.strategyType,
+      final_block_reason: reason,
+      blocked_before_placebuy: true,
+      kill_switch_reason: meta.killSwitchReason,
+      cooldown_remaining: meta.cooldownRemaining,
+      daily_loss_count: meta.dailyLossCount,
+      daily_pnl_pct: meta.dailyPnlPct,
+      market_state: meta.marketState,
+      btc_rsi: meta.btcRsi,
+    })
+  );
 }
 
 // --- Early entry (pre-breakout small scout slot) ---
@@ -4877,12 +5042,34 @@ export function createLiveDataStrategy(opts: {
         const promoteFillKrw = Math.max(0, Math.floor(targetBudget - filledSoFar));
         if (promoteFillKrw >= UPBIT_MIN_ORDER_KRW) {
           try {
-            if (!assertLiveOrderAuthority("early_promote_before_attempt")) {
-              /* revoked — no fill; keep early position state */
+            const currentPrice = now;
+            const targetStopPrice = ep.entry_stop_price ?? 0;
+            const targetTakeProfitPrice = ep.entry_target_price ?? 0;
+
+            const guard = await validateLiveBuyPrecheck({
+              market,
+              trades: state.trades,
+              positions: state.positions,
+              cooldown_until: state.cooldown_until,
+              marketState: opts.marketState,
+              signalPayload: undefined,
+              strategyType: "momentum",
+              entryPath: "early_promote_fill",
+              isAdditionalBuy: true,
+            });
+            if (!guard.allowed) {
+              logPlacebuyFinalGateBlocked(guard.blockReason!, {
+                market,
+                path: "early_promote_fill",
+                strategyType: "momentum",
+                killSwitchReason: guard.killSwitchReason,
+                cooldownRemaining: guard.cooldownRemainingSec,
+                dailyLossCount: guard.dailyLossCount,
+                dailyPnlPct: guard.dailyPnlPct,
+                marketState: guard.marketStateStr,
+                btcRsi: guard.btcRsi,
+              });
             } else {
-              const currentPrice = now;
-              const targetStopPrice = ep.entry_stop_price ?? 0;
-              const targetTakeProfitPrice = ep.entry_target_price ?? 0;
               const targetRiskReward = ep.entry_risk_reward ?? 0;
               if (!(
                 currentPrice > 0 &&
@@ -5598,6 +5785,32 @@ export function createLiveDataStrategy(opts: {
 
       // Step 8. ALLOW면 실행
       try {
+        const guard = await validateLiveBuyPrecheck({
+          market,
+          trades: state.trades,
+          positions: state.positions,
+          cooldown_until: state.cooldown_until,
+          marketState: opts.marketState,
+          signalPayload: undefined,
+          strategyType: p.strategy_type || "stable",
+          entryPath: "rescue_add",
+          isAdditionalBuy: true,
+        });
+        if (!guard.allowed) {
+          logPlacebuyFinalGateBlocked(guard.blockReason!, {
+            market,
+            path: "rescue_add",
+            strategyType: p.strategy_type || "stable",
+            killSwitchReason: guard.killSwitchReason,
+            cooldownRemaining: guard.cooldownRemainingSec,
+            dailyLossCount: guard.dailyLossCount,
+            dailyPnlPct: guard.dailyPnlPct,
+            marketState: guard.marketStateStr,
+            btcRsi: guard.btcRsi,
+          });
+          return { executed: false };
+        }
+
         console.info(JSON.stringify({
           tag: "RESCUE_ADD_PLACEBUY_ATTEMPT",
           ts: new Date().toISOString(),
@@ -9147,6 +9360,37 @@ export function createLiveDataStrategy(opts: {
 
           if (orderKrw >= 5000) {
             try {
+              const guard = await validateLiveBuyPrecheck({
+                market,
+                trades: state.trades,
+                positions: state.positions,
+                cooldown_until: state.cooldown_until,
+                marketState: opts.marketState,
+                signalPayload: undefined,
+                strategyType: "momentum",
+                entryPath: finalPath,
+                isAdditionalBuy: false,
+              });
+              if (!guard.allowed) {
+                logPlacebuyFinalGateBlocked(guard.blockReason!, {
+                  market,
+                  path: finalPath,
+                  strategyType: "momentum",
+                  killSwitchReason: guard.killSwitchReason,
+                  cooldownRemaining: guard.cooldownRemainingSec,
+                  dailyLossCount: guard.dailyLossCount,
+                  dailyPnlPct: guard.dailyPnlPct,
+                  marketState: guard.marketStateStr,
+                  btcRsi: guard.btcRsi,
+                });
+                if (isMorning) {
+                  delete state.morning_surge_watchlist![market];
+                } else {
+                  delete state.surge_watchlist![market];
+                }
+                continue;
+              }
+
               const signalPayloadForBuy = {
                 strict_exit: true,
                 exit_policy_attached: true,
@@ -9417,131 +9661,55 @@ export function createLiveDataStrategy(opts: {
           note: "open_strategy_position_does_not_skip_pipeline_or_order_attempt",
         });
       }
-      // 1) 전체 Kill Switch 체크
-      const killSwitch = evaluateGlobalKillSwitch(state.trades);
-      if (killSwitch.active) {
-        (state as any).global_kill_switch_active = true;
-        (state as any).global_kill_switch_reason = killSwitch.reason;
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "global_kill_switch_active", reason_detail: killSwitch.reason });
-        logPlacebuyFinalGateBlocked("global_kill_switch_active", { reason_detail: killSwitch.reason });
-        bumpSkip("global_kill_switch_active");
+      // 공통 Buy Safety Guard 검사
+      const guard = await validateLiveBuyPrecheck({
+        market,
+        trades: state.trades,
+        positions: state.positions,
+        cooldown_until: state.cooldown_until,
+        marketState: opts.marketState,
+        signalPayload: sigPre?.p,
+        strategyType: "momentum",
+        entryPath: "precheck",
+        isAdditionalBuy: false,
+      });
+      if (!guard.allowed) {
+        if (guard.blockReason === "global_kill_switch_active") {
+          (state as any).global_kill_switch_active = true;
+          (state as any).global_kill_switch_reason = guard.killSwitchReason;
+        }
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: guard.blockReason, reason_detail: guard.killSwitchReason });
+        logPlacebuyFinalGateBlocked(guard.blockReason!, {
+          market,
+          path: "precheck",
+          strategyType: "momentum",
+          killSwitchReason: guard.killSwitchReason,
+          cooldownRemaining: guard.cooldownRemainingSec,
+          dailyLossCount: guard.dailyLossCount,
+          dailyPnlPct: guard.dailyPnlPct,
+          marketState: guard.marketStateStr,
+          btcRsi: guard.btcRsi,
+        });
+        bumpSkip(guard.blockReason!);
+        if (guard.blockReason === "cooldown_active") {
+          const cool = state.cooldown_until[market];
+          console.info(
+            JSON.stringify({
+              tag: "DEBUG_LIVE_REENTRY_BLOCKED",
+              ts: new Date().toISOString(),
+              symbol: market,
+              cooldown_until: cool,
+              seconds_remaining: guard.cooldownRemainingSec,
+              prior_exit_reason: null,
+            }),
+          );
+        }
         continue;
       } else {
         (state as any).global_kill_switch_active = false;
         (state as any).global_kill_switch_reason = null;
       }
 
-      // 2) 동일 코인 연속 손실 쿨다운 체크
-      const lossCd = checkConsecutiveLossCooldown(market, state.trades);
-      if (lossCd.blocked) {
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "consecutive_loss_cooldown_active", loss_count: lossCd.lossCount });
-        logPlacebuyFinalGateBlocked("consecutive_loss_cooldown_active", { loss_count: lossCd.lossCount, remaining_sec: Math.floor(lossCd.remainingMs / 1000) });
-        bumpSkip("consecutive_loss_cooldown_active");
-        continue;
-      }
-
-      // 3.1) 시간당 진입 제한 (최근 1시간 이내 진입 최대 2회)
-      const oneHourAgo = Date.now() - 3600 * 1000;
-      const recent1hEntries = state.trades.filter((t) => {
-        return t.action === "buy" && Date.parse(t.timestamp || new Date().toISOString()) >= oneHourAgo;
-      }).length;
-      const active1hEntries = Object.values(state.positions).filter((p) => {
-        return Date.now() - Date.parse(p.entry_ts) < 3600 * 1000;
-      }).length;
-      const total1hEntries = recent1hEntries + active1hEntries;
-      if (total1hEntries >= 2) {
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "hourly_entry_limit_reached", entries_count: total1hEntries });
-        logPlacebuyFinalGateBlocked("hourly_entry_limit_reached", { entries_count: total1hEntries });
-        bumpSkip("hourly_entry_limit_reached");
-        continue;
-      }
-
-      // 3.2) 하루 손실 거래 제한 (KST 09:00 이후 손실 거래 5회 이상 시 차단)
-      const today0900 = new Date();
-      today0900.setUTCHours(0, 0, 0, 0); // KST 09:00
-      const today0900Ms = today0900.getTime();
-      const dailyLossTrades = state.trades.filter((t) => {
-        const timeMs = Date.parse(t.timestamp || new Date().toISOString());
-        return timeMs >= today0900Ms && t.action === "sell" && (t.pnl_pct ?? 0) < 0;
-      }).length;
-      if (dailyLossTrades >= 5) {
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "daily_loss_limit_reached", loss_count: dailyLossTrades });
-        logPlacebuyFinalGateBlocked("daily_loss_limit_reached", { loss_count: dailyLossTrades });
-        bumpSkip("daily_loss_limit_reached");
-        continue;
-      }
-
-      // 3.3) 하루 누적 손익 제한 (KST 09:00 이후 누적 손익률 -3% 이하 시 차단)
-      const dailyTrades = state.trades.filter((t) => {
-        const timeMs = Date.parse(t.timestamp || new Date().toISOString());
-        return timeMs >= today0900Ms && t.action === "sell";
-      });
-      const dailyPnlPctSum = dailyTrades.reduce((acc, t) => acc + (t.pnl_pct ?? 0), 0);
-      if (dailyPnlPctSum <= -3.0) {
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "daily_pnl_limit_reached", daily_pnl_pct: dailyPnlPctSum });
-        logPlacebuyFinalGateBlocked("daily_pnl_limit_reached", { daily_pnl_pct: dailyPnlPctSum });
-        bumpSkip("daily_pnl_limit_reached");
-        continue;
-      }
-
-      const cool = state.cooldown_until[market];
-      if (cool && Date.now() < Date.parse(cool)) {
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "cooldown_active", cooldown_until: cool });
-        logPlacebuyFinalGateBlocked("cooldown_active", { cooldown_until: cool });
-        console.info(
-          JSON.stringify({
-            tag: "DEBUG_LIVE_REENTRY_BLOCKED",
-            ts: new Date().toISOString(),
-            symbol: market,
-            cooldown_until: cool,
-            seconds_remaining: Math.max(0, Math.floor((Date.parse(cool) - Date.now()) / 1000)),
-            prior_exit_reason: null,
-          }),
-        );
-        if (LIVE_EARLY_ENTRY_ENABLED) {
-          const scoreCd = gatePre ? Number(gatePre.score ?? 0) : null;
-          const vrCd = sigPre ? Number(sigPre.p.volume_ratio ?? 0) : null;
-          const momCd = sigPre
-            ? Number(sigPre.p.momentum_3m_pct ?? sigPre.p.price_change_3m_pct ?? 0)
-            : null;
-          console.info(
-            JSON.stringify({
-              tag: "DEBUG_LIVE_EARLY_CANDIDATE",
-              ts: new Date().toISOString(),
-              symbol: market,
-              score: scoreCd,
-              volume_ratio: vrCd,
-              price_position: null,
-              ema_gap: null,
-              momentum: momCd,
-              market_state: marketState.market_state,
-            }),
-          );
-          console.info(
-            JSON.stringify({
-              tag: "DEBUG_LIVE_EARLY_ENTRY_DECISION",
-              ts: new Date().toISOString(),
-              symbol: market,
-              decision: "block",
-              block_reason: "cooldown_active",
-              block_reason_detail: `cooldown_until:${cool}`,
-              timing_state: "late",
-              volume_state: "alive",
-              position_state: state.positions[market] ? "holding" : "empty",
-            }),
-          );
-          console.info(
-            JSON.stringify({
-              tag: "DEBUG_LIVE_ENTRY_SUMMARY",
-              ts: new Date().toISOString(),
-              symbol: market,
-              line: `${market} | early_candidate=yes | decision=block | reason=cooldown_active | score=${scoreCd === null ? "na" : Math.round(scoreCd)} | vr=${vrCd === null ? "na" : Number(vrCd).toFixed(2)}`,
-            }),
-          );
-        }
-        bumpSkip("cooldown_active");
-        continue;
-      }
       if ((state.daily.stop_by_market[market] ?? 0) >= 2) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "stop_count_limit_reached" });
         logPlacebuyFinalGateBlocked("stop_count_limit_reached", { stop_count: state.daily.stop_by_market[market] });
@@ -10511,6 +10679,33 @@ export function createLiveDataStrategy(opts: {
              trailingStartPct: 2.0,
              trailingGapPct: 1.5,
           }));
+
+          const guard = await validateLiveBuyPrecheck({
+            market,
+            trades: state.trades,
+            positions: state.positions,
+            cooldown_until: state.cooldown_until,
+            marketState: opts.marketState,
+            signalPayload: sigPre?.p || sig?.p,
+            strategyType: "momentum",
+            entryPath: "early_entry",
+            isAdditionalBuy: false,
+          });
+          if (!guard.allowed) {
+            logPlacebuyFinalGateBlocked(guard.blockReason!, {
+              market,
+              path: "early_entry",
+              strategyType: "momentum",
+              killSwitchReason: guard.killSwitchReason,
+              cooldownRemaining: guard.cooldownRemainingSec,
+              dailyLossCount: guard.dailyLossCount,
+              dailyPnlPct: guard.dailyPnlPct,
+              marketState: guard.marketStateStr,
+              btcRsi: guard.btcRsi,
+            });
+            bumpSkip("early_entry_safety_guard_blocked");
+            continue;
+          }
 
           // [수정5] exit policy 검증 통과 후에 LIVE_PLACEBUY_ATTEMPT 찍기
           console.info(
@@ -12151,6 +12346,32 @@ export function createLiveDataStrategy(opts: {
           signalPayloadForBuy.entry_stop_price = targetStopPrice;
           signalPayloadForBuy.entry_target_price = targetTakeProfitPrice;
           signalPayloadForBuy.entry_risk_reward = targetRiskReward;
+
+          const guard = await validateLiveBuyPrecheck({
+            market,
+            trades: state.trades,
+            positions: state.positions,
+            cooldown_until: state.cooldown_until,
+            marketState: opts.marketState,
+            signalPayload: sigPre?.p || sig?.p,
+            strategyType,
+            entryPath: isSurgeSource ? "surge_normal" : "normal",
+            isAdditionalBuy: false,
+          });
+          if (!guard.allowed) {
+            logPlacebuyFinalGateBlocked(guard.blockReason!, {
+              market,
+              path: isSurgeSource ? "surge_normal" : "normal",
+              strategyType,
+              killSwitchReason: guard.killSwitchReason,
+              cooldownRemaining: guard.cooldownRemainingSec,
+              dailyLossCount: guard.dailyLossCount,
+              dailyPnlPct: guard.dailyPnlPct,
+              marketState: guard.marketStateStr,
+              btcRsi: guard.btcRsi,
+            });
+            throw new Error(`precheck_safety_guard_blocked:${guard.blockReason}`);
+          }
 
           if (!leaseOk()) {
             throw new Error("TICK_LEASE_REVOKED");
