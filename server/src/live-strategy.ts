@@ -2574,6 +2574,17 @@ export function createLiveDataStrategy(opts: {
   const baseDir = path.join(tradingDataRoot(), "strategy", opts.companyId, opts.serviceId);
   const tradesFile = path.join(baseDir, "live_strategy_trades.json");
   const dailyFile = path.join(baseDir, "live_strategy_daily_stats.json");
+  let lastDiagnostics = {
+    universe_count: 0,
+    scanned_count: 0,
+    candidate_count: 0,
+    watchlist_added_count: 0,
+    watchlist_watching_count: 0,
+    surge_v2_eval_count: 0,
+    final_buy_attempt_count: 0,
+    skipped_by_reason: {} as Record<string, number>,
+    updated_at: "",
+  };
   const state: PersistedState = {
     positions: {},
     early_positions: {},
@@ -2723,6 +2734,7 @@ export function createLiveDataStrategy(opts: {
       regime: state.regime,
       surge_watchlist: state.surge_watchlist,
       morning_surge_watchlist: state.morning_surge_watchlist,
+      diagnostics: lastDiagnostics,
     };
   };
 
@@ -2788,6 +2800,8 @@ export function createLiveDataStrategy(opts: {
     liveTickAbort = tickAbort;
     const tickSignal = tickAbort.signal;
     const surgeCaptureQueue = loadCaptureQueue();
+    let surgeV2EvalCount = 0;
+    let finalBuyAttemptCount = 0;
     const myLease = (liveTickLeaseSeq += 1);
     liveTickValidLease = myLease;
 
@@ -5137,6 +5151,7 @@ export function createLiveDataStrategy(opts: {
                 if (!assertLiveOrderAuthority("early_promote_before_placebuy")) {
                   /* race: lease revoked between logs */
                 } else {
+                  finalBuyAttemptCount++;
                   await opts.trade.placeBuy(market, true, promoteFillKrw, "momentum", "strategy", {
                     __early_promote_fill: true,
                     __early_promote_fill_krw: promoteFillKrw,
@@ -10739,6 +10754,7 @@ export function createLiveDataStrategy(opts: {
             /* lease lost — fall through to normal path */
           } else {
             try {
+              finalBuyAttemptCount++;
               await opts.trade.placeBuy(market, true, earlyOrderKrw, "momentum", "strategy", {
                 ...sig.p,
                 __early_entry: true,
@@ -11367,6 +11383,7 @@ export function createLiveDataStrategy(opts: {
              continue;
           }
 
+          surgeV2EvalCount++;
           const decision = evaluateSurgeEntryPipeline({
             market,
             payload: sig.p,
@@ -11426,6 +11443,15 @@ export function createLiveDataStrategy(opts: {
           );
 
           if (decision.action === "reject") {
+            console.info(
+              JSON.stringify({
+                tag: "SURGE_ENTRY_REJECTED",
+                ts: new Date().toISOString(),
+                market,
+                reason: decision.reason,
+                detail: decision.detail,
+              })
+            );
             if (decision.reason === "blocked_surge_late_chase") {
                 const chaseBlockReasons = (decision.detail?.chase_block_reasons as string[]) || [];
                 const cScore = isPromoted ? Number((sig.p as any).surge_capture_score || 0) : 0;
@@ -12376,6 +12402,7 @@ export function createLiveDataStrategy(opts: {
           if (!leaseOk()) {
             throw new Error("TICK_LEASE_REVOKED");
           }
+          finalBuyAttemptCount++;
           await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", {
             ...signalPayloadForBuy,
             __surge_stop_price: isSurgeSource ? surgeStopPrice : undefined,
@@ -12812,6 +12839,17 @@ export function createLiveDataStrategy(opts: {
         }),
       );
     }
+    lastDiagnostics = {
+      universe_count: entryUniverse.length,
+      scanned_count: scannedCount,
+      candidate_count: candidateCount,
+      watchlist_added_count: Object.keys(state.surge_watchlist || {}).length + Object.keys(state.morning_surge_watchlist || {}).length,
+      watchlist_watching_count: Object.keys(state.surge_watchlist || {}).length + Object.keys(state.morning_surge_watchlist || {}).length,
+      surge_v2_eval_count: surgeV2EvalCount,
+      final_buy_attempt_count: finalBuyAttemptCount,
+      skipped_by_reason: skippedByReason,
+      updated_at: new Date().toISOString(),
+    };
     await racePersist("tick_tail_before_return");
       },
     );

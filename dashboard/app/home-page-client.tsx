@@ -432,6 +432,17 @@ type StrategyStatus = {
   consecutive_losses?: number;
   max_positions?: number;
   reentry_cooldowns?: Record<string, string>;
+  diagnostics?: {
+    universe_count: number;
+    scanned_count: number;
+    candidate_count: number;
+    watchlist_added_count: number;
+    watchlist_watching_count: number;
+    surge_v2_eval_count: number;
+    final_buy_attempt_count: number;
+    skipped_by_reason: Record<string, number>;
+    updated_at: string;
+  } | null;
   open_positions?: Record<
     string,
     {
@@ -2486,6 +2497,30 @@ export default function HomePage() {
     });
   }, [trade?.balances, strategy?.open_positions, strategy?.early_positions]);
 
+  const managedSymbolsSet = useMemo(() => {
+    const openKeys = Object.keys(strategy?.open_positions ?? {});
+    const earlyKeys = Object.keys(strategy?.early_positions ?? {});
+    return new Set([...openKeys, ...earlyKeys]);
+  }, [strategy?.open_positions, strategy?.early_positions]);
+
+  const visibleBalances = useMemo(() => {
+    const MIN_VISIBLE_BALANCE_KRW = 1000;
+    return actualBalances.filter((row) => {
+      if (row.currency === "KRW") return true;
+      const currencyKey = `KRW-${row.currency}`;
+      const isManaged = row.is_managed === true || managedSymbolsSet.has(currencyKey);
+      if (isManaged) return true;
+      const valueKrw = Number(row.qty ?? 0) * Number(row.current_price ?? 0);
+      return valueKrw >= MIN_VISIBLE_BALANCE_KRW;
+    });
+  }, [actualBalances, managedSymbolsSet]);
+
+  const managedPositionsKeys = useMemo(() => {
+    const openKeys = Object.keys(strategy?.open_positions ?? {});
+    const earlyKeys = Object.keys(strategy?.early_positions ?? {});
+    return Array.from(new Set([...openKeys, ...earlyKeys]));
+  }, [strategy?.open_positions, strategy?.early_positions]);
+
   // 3. 손실 현황 패널 요약 데이터 계산
   const lossSummary = useMemo(() => {
     let totalPnlKrw = 0;
@@ -2799,7 +2834,12 @@ export default function HomePage() {
               overflow: "hidden"
             }}
           >
-            <div style={{ fontSize: "0.9rem", color: UI.title, fontWeight: 900, marginBottom: "0.7rem" }}>실제 보유 현황 (Balances)</div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.7rem", flexWrap: "wrap", gap: 8 }}>
+              <div style={{ fontSize: "0.9rem", color: UI.title, fontWeight: 900 }}>실제 보유 현황 (Balances)</div>
+              <div style={{ fontSize: "0.7rem", color: UI.mutedSoft, fontWeight: 500 }}>
+                ※ 1,000원 미만 비관리 잔고는 화면에서만 숨김 처리되며, 총자산/평가손익/합계에는 포함됩니다.
+              </div>
+            </div>
             
             <div style={{ overflowX: "auto" }}>
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.76rem", textAlign: "left" }}>
@@ -2814,7 +2854,7 @@ export default function HomePage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {actualBalances.map((item, idx) => {
+                  {visibleBalances.map((item, idx) => {
                     const isKrw = item.currency === "KRW";
                     return (
                       <tr key={idx} style={{ borderBottom: "1px solid #1e293b33", background: idx % 2 === 0 ? "transparent" : "#0d1525" }}>
@@ -2868,7 +2908,7 @@ export default function HomePage() {
                     );
                   })}
                   <tr style={{ background: "#0a1220", borderTop: "2px solid #1e293b", fontWeight: 800 }}>
-                    <td style={{ padding: "0.6rem 0.4rem", color: UI.title }}>합계</td>
+                    <td style={{ padding: "0.6rem 0.4rem", color: UI.title }}>합계 (숨김 잔고 포함)</td>
                     <td colSpan={3} />
                     <td style={{ 
                       padding: "0.6rem 0.4rem", 
@@ -2957,14 +2997,14 @@ export default function HomePage() {
             >
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.55rem" }}>
                 <div style={{ fontSize: "0.82rem", color: UI.title, fontWeight: 900 }}>자동 관리 포지션 요약</div>
-                <div style={{ fontSize: "0.72rem", color: UI.mutedSoft }}>관리 수: {accountPositionsCount}</div>
+                <div style={{ fontSize: "0.72rem", color: UI.mutedSoft }}>관리 수: {managedPositionsKeys.length}</div>
               </div>
 
-              {accountPositionsCount > 0 ? (
+              {managedPositionsKeys.length > 0 ? (
                 <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: "0.74rem" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", color: UI.mutedSoft }}>
                     <span>현재 가동 중인 자동매매 수:</span>
-                    <strong style={{ color: UI.title }}>{accountPositionsCount}개 종목</strong>
+                    <strong style={{ color: UI.title }}>{managedPositionsKeys.length}개 종목</strong>
                   </div>
                   <a 
                     href="#managed-positions-section"
@@ -2998,7 +3038,7 @@ export default function HomePage() {
                 boxShadow: "0 4px 20px rgba(0,0,0,0.25)",
               }}
             >
-              <div style={{ fontSize: "0.82rem", color: UI.title, fontWeight: 900, marginBottom: "0.55rem" }}>스캐너 요약</div>
+              <div style={{ fontSize: "0.82rem", color: UI.title, fontWeight: 900, marginBottom: "0.55rem" }}>스캐너 요약 (24시간 누계)</div>
               
               <div style={{ display: "flex", flexDirection: "column", gap: 5, fontSize: "0.74rem", color: UI.mutedSoft }}>
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
@@ -3018,6 +3058,73 @@ export default function HomePage() {
                   <strong>{logs.length}건</strong>
                 </div>
               </div>
+            </div>
+
+            {/* 7-2. 스캐너 진단 */}
+            <div
+              style={{
+                background: UI.cardBg,
+                border: `1px solid ${UI.border}`,
+                borderRadius: 12,
+                padding: "0.9rem 1rem",
+                boxShadow: "0 4px 20px rgba(0,0,0,0.25)",
+              }}
+            >
+              <div style={{ fontSize: "0.82rem", color: UI.title, fontWeight: 900, marginBottom: "0.55rem" }}>스캐너 진단 (최근 틱 기준)</div>
+              
+              {strategy?.diagnostics ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: 5, fontSize: "0.74rem", color: UI.mutedSoft }}>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>전체 감시 대상:</span>
+                    <strong style={{ color: UI.title }}>{strategy.diagnostics.universe_count ?? 0}개</strong>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>최근 신호 평가:</span>
+                    <strong style={{ color: UI.title }}>{strategy.diagnostics.scanned_count ?? 0}개</strong>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>Watchlist 편입:</span>
+                    <strong style={{ color: UI.title }}>{strategy.diagnostics.watchlist_added_count ?? 0}개</strong>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>Watchlist 감시 중:</span>
+                    <strong style={{ color: UI.title }}>{strategy.diagnostics.watchlist_watching_count ?? 0}개</strong>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>실거래 후보:</span>
+                    <strong style={{ color: (strategy.diagnostics.candidate_count ?? 0) > 0 ? UI.pass : UI.body }}>
+                      {strategy.diagnostics.candidate_count ?? 0}개
+                    </strong>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>V2 엔진 판단:</span>
+                    <strong style={{ color: UI.title }}>{strategy.diagnostics.surge_v2_eval_count ?? 0}회</strong>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>최종 매수 시도:</span>
+                    <strong style={{ color: UI.title }}>{strategy.diagnostics.final_buy_attempt_count ?? 0}회</strong>
+                  </div>
+                  {strategy.diagnostics.skipped_by_reason && Object.keys(strategy.diagnostics.skipped_by_reason).length > 0 && (
+                    <div style={{ marginTop: 6, borderTop: "1px solid #1e293b", paddingTop: 6 }}>
+                      <div style={{ fontWeight: 800, color: UI.title, marginBottom: 4 }}>주요 탈락 사유:</div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 120, overflowY: "auto", paddingRight: 4 }}>
+                        {Object.entries(strategy.diagnostics.skipped_by_reason)
+                          .sort((a, b) => b[1] - a[1])
+                          .map(([reason, count]) => (
+                            <div key={reason} style={{ display: "flex", justifyContent: "space-between", fontSize: "0.7rem" }}>
+                              <span style={{ fontFamily: "monospace" }}>{reason}:</span>
+                              <strong style={{ color: UI.watch }}>{count}건</strong>
+                            </div>
+                          ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div style={{ fontSize: "0.74rem", color: UI.mutedSoft, textAlign: "center", padding: "0.4rem 0" }}>
+                  진단 데이터 대기 중...
+                </div>
+              )}
             </div>
 
           </div>
@@ -3098,11 +3205,7 @@ export default function HomePage() {
             
             <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
               {(() => {
-                const openKeys = Object.keys(strategy?.open_positions ?? {});
-                const earlyKeys = Object.keys(strategy?.early_positions ?? {});
-                const allKeys = Array.from(new Set([...openKeys, ...earlyKeys]));
-
-                if (allKeys.length === 0) {
+                if (managedPositionsKeys.length === 0) {
                   return (
                     <div style={{ fontSize: "0.78rem", color: UI.mutedSoft, padding: "0.8rem", textAlign: "center" }}>
                       현재 로봇 엔진이 실시간 추적 및 자동 대응 중인 포지션이 없습니다.
@@ -3110,7 +3213,7 @@ export default function HomePage() {
                   );
                 }
 
-                return allKeys.map((mk) => {
+                return managedPositionsKeys.map((mk) => {
                   // eslint-disable-next-line @typescript-eslint/no-explicit-any
                   const p = (strategy?.open_positions?.[mk] ?? strategy?.early_positions?.[mk]) as any;
                   if (!p) return null;
