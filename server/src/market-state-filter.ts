@@ -279,7 +279,13 @@ export function createMarketStateFilter(args: {
  */
 export function assertOrderBuyAllowed(
   snap: MarketStateSnapshot,
-  args: { kind: "new_entry" | "add_to_position"; signalPayload: unknown | undefined; strategyType?: string; market?: string },
+  args: {
+    kind: "new_entry" | "add_to_position";
+    signalPayload: unknown | undefined;
+    strategyType?: string;
+    market?: string;
+    entrySignalType?: string;
+  },
 ): OrderBuyGateResult {
   const { market_state, entry_policy } = snap;
   const size_scale = market_state === "risk_on" ? 1 : market_state === "neutral" ? 0.72 : 0.45;
@@ -298,17 +304,31 @@ export function assertOrderBuyAllowed(
     size_scale: 0,
   });
 
-  const isSurgeStrategy = args.strategyType === "momentum" || (args.market && args.market.toLowerCase().includes("surge"));
+  const strategyType = args.strategyType || "";
+  const entrySignalType = args.entrySignalType || "";
+
+  const isAggressiveSurgeStrategy =
+    strategyType === "momentum" ||
+    strategyType === "surge_breakout" ||
+    strategyType === "surge_chase";
+
+  const isReclaimStrategy =
+    strategyType === "reclaim" ||
+    strategyType === "surge_reclaim" ||
+    entrySignalType === "reclaim";
 
   if (args.kind === "new_entry") {
     if (market_state === "risk_off") {
       return deny("risk_off: 신규 진입 금지", true, false);
     }
-    // Surge 전략인 경우 약세/중립 필터 적용
-    if (isSurgeStrategy) {
+    // neutral_market_surge_blocked: aggressive surge(momentum/surge_breakout/surge_chase)에만 적용
+    if (isAggressiveSurgeStrategy) {
       if (market_state === "neutral") {
         return deny("neutral_market_surge_blocked: 중립 장세에서는 surge 진입 차단", true, false);
       }
+    }
+    // BTC RSI < 50 차단: aggressive surge + reclaim 계열 모두에 적용 (기존 안전장치 유지)
+    if (isAggressiveSurgeStrategy || isReclaimStrategy) {
       if (snap.btc_rsi !== undefined && snap.btc_rsi < 50) {
         return deny(`btc_rsi_low_surge_blocked: BTC RSI가 50 미만이라 진입 차단 (${snap.btc_rsi.toFixed(1)})`, true, false);
       }

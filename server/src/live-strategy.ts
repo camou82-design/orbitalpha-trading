@@ -1229,6 +1229,7 @@ async function validateLiveBuyPrecheck(params: {
   strategyType: string;
   entryPath: string;
   isAdditionalBuy: boolean;
+  entrySignalType?: string;
 }): Promise<{
   allowed: boolean;
   blockReason: string | null;
@@ -1339,6 +1340,7 @@ async function validateLiveBuyPrecheck(params: {
       signalPayload: params.signalPayload,
       strategyType: params.strategyType,
       market: params.market,
+      entrySignalType: params.entrySignalType,
     });
     if (!r.ok) {
       result.allowed = false;
@@ -2574,7 +2576,7 @@ export function createLiveDataStrategy(opts: {
   const baseDir = path.join(tradingDataRoot(), "strategy", opts.companyId, opts.serviceId);
   const tradesFile = path.join(baseDir, "live_strategy_trades.json");
   const dailyFile = path.join(baseDir, "live_strategy_daily_stats.json");
-  let lastDiagnostics = {
+  let lastDiagnostics: any = {
     universe_count: 0,
     scanned_count: 0,
     candidate_count: 0,
@@ -7998,6 +8000,56 @@ export function createLiveDataStrategy(opts: {
     ]);
     const candidateMetaMap = new Map<string, CandidateMeta>();
     const evaluationDroppedReasons: Record<string, string> = {};
+    const evaluationDiagnostics: Record<string, any> = {};
+
+    const buildFailedConditionsDetail = (
+      failedArr: string[],
+      setup: any,
+      currentPx: number,
+      minScore: number,
+      volThreshold: number
+    ): Array<{ code: string; actual: any; required: any }> => {
+      if (!Array.isArray(failedArr)) return [];
+      return failedArr.map(fc => {
+        let actual: any = "unknown";
+        let required: any = "unknown";
+        if (fc === "safePriceAboveEma200") {
+          actual = currentPx;
+          required = `> ema200 (${setup.ema200?.toFixed(1) ?? "0"})`;
+        } else if (fc === "aggressiveEmaStack") {
+          actual = `ema50 (${setup.ema50?.toFixed(1) ?? "0"}) <= ema200 (${setup.ema200?.toFixed(1) ?? "0"})`;
+          required = "ema50 > ema200";
+        } else if (fc === "aggressivePriceAbove") {
+          actual = currentPx;
+          required = `> ema50 (${setup.ema50?.toFixed(1) ?? "0"})`;
+        } else if (fc === "rsiBullish") {
+          actual = setup.rsi?.toFixed(1) ?? "0";
+          required = "rsi > 45 || rsi > prevRsi";
+        } else if (fc.startsWith("volRatio") || fc === "volume_ratio_low") {
+          actual = setup.volumeRatio?.toFixed(2) ?? "0";
+          required = `>= ${volThreshold.toFixed(2)}`;
+        } else if (fc.startsWith("rsi_") && fc.includes(">=")) {
+          actual = setup.rsi?.toFixed(1) ?? "0";
+          required = `< ${LIVE_CORE_TREND_RSI_CAP}`;
+        } else if (fc === "not_above_ema200_and_not_recovery_stack") {
+          actual = `price: ${currentPx}, ema50: ${setup.ema50?.toFixed(1)}, ema200: ${setup.ema200?.toFixed(1)}`;
+          required = "price > ema200 or recovery stack active";
+        } else if (fc.startsWith("bar_")) {
+          actual = fc;
+          required = "no steep candle drop & no heavy upper wick";
+        } else if (fc === "risk_nonpositive") {
+          actual = `stopPrice: ${setup.stopPrice?.toFixed(1)}`;
+          required = `price (${currentPx}) > stopPrice`;
+        } else if (fc.startsWith("rr_")) {
+          actual = setup.riskReward?.toFixed(3) ?? "0";
+          required = ">= 1.15";
+        } else {
+          actual = "condition_unmet";
+          required = "passed";
+        }
+        return { code: fc, actual, required };
+      });
+    };
 
     const surgeCaptureMarketMap = new Map<string, any>();
     if (surgeCaptureQueue.length > 0) {
@@ -8114,6 +8166,14 @@ export function createLiveDataStrategy(opts: {
 
         if (!realSignalPresent && !isFallbackSource) {
           evaluationDroppedReasons[m] = "missing_signal_payload";
+          evaluationDiagnostics[m] = {
+            marketState: marketState.market_state,
+            setup: { ok: false, reason: "missing_signal_payload", score: null, requiredScore: marketState.min_entry_score, failedConditions: [] },
+            watchlist: { entered: false, reason: "missing_signal_payload" },
+            candidate: { created: false, reason: "missing_signal_payload" },
+            buyGate: { checked: false, allowed: null, reason: null },
+            final: { action: "blocked", reason: "missing_signal_payload" }
+          };
           emitCoreCandidateReject(m, "missing_signal_payload");
           return null;
         }
@@ -8143,6 +8203,14 @@ export function createLiveDataStrategy(opts: {
             }),
           );
           evaluationDroppedReasons[m] = "missing_ticker_price";
+          evaluationDiagnostics[m] = {
+            marketState: marketState.market_state,
+            setup: { ok: false, reason: "missing_ticker_price", score: null, requiredScore: marketState.min_entry_score, failedConditions: [] },
+            watchlist: { entered: false, reason: "missing_ticker_price" },
+            candidate: { created: false, reason: "missing_ticker_price" },
+            buyGate: { checked: false, allowed: null, reason: null },
+            final: { action: "blocked", reason: "missing_ticker_price" }
+          };
           emitCoreCandidateReject(m, "missing_ticker_price");
           return null;
         }
@@ -8199,6 +8267,14 @@ export function createLiveDataStrategy(opts: {
         } catch (e) {
           if (isAbortLike(e)) {
             evaluationDroppedReasons[m] = "candle_fetch_aborted";
+            evaluationDiagnostics[m] = {
+              marketState: marketState.market_state,
+              setup: { ok: false, reason: "candle_fetch_aborted", score: null, requiredScore: marketState.min_entry_score, failedConditions: [] },
+              watchlist: { entered: false, reason: "candle_fetch_aborted" },
+              candidate: { created: false, reason: "candle_fetch_aborted" },
+              buyGate: { checked: false, allowed: null, reason: null },
+              final: { action: "blocked", reason: "candle_fetch_aborted" }
+            };
             console.info(
               JSON.stringify({
                 tag: "LIVE_CANDIDATE_META_MARKET_DROPPED_PROOF",
@@ -8221,6 +8297,14 @@ export function createLiveDataStrategy(opts: {
           }
           if (isLiveTickPhaseTimeout(e) && e.phase.startsWith("candidate_meta_fetch_minute_candles:")) {
             evaluationDroppedReasons[m] = "candle_fetch_timeout";
+            evaluationDiagnostics[m] = {
+              marketState: marketState.market_state,
+              setup: { ok: false, reason: "candle_fetch_timeout", score: null, requiredScore: marketState.min_entry_score, failedConditions: [] },
+              watchlist: { entered: false, reason: "candle_fetch_timeout" },
+              candidate: { created: false, reason: "candle_fetch_timeout" },
+              buyGate: { checked: false, allowed: null, reason: null },
+              final: { action: "blocked", reason: "candle_fetch_timeout" }
+            };
             console.info(
               JSON.stringify({
                 tag: "LIVE_CANDIDATE_META_MARKET_DROPPED_PROOF",
@@ -8245,6 +8329,14 @@ export function createLiveDataStrategy(opts: {
             return null;
           }
           evaluationDroppedReasons[m] = "candle_fetch_error";
+          evaluationDiagnostics[m] = {
+            marketState: marketState.market_state,
+            setup: { ok: false, reason: "candle_fetch_error", score: null, requiredScore: marketState.min_entry_score, failedConditions: [] },
+            watchlist: { entered: false, reason: "candle_fetch_error" },
+            candidate: { created: false, reason: "candle_fetch_error" },
+            buyGate: { checked: false, allowed: null, reason: null },
+            final: { action: "blocked", reason: "candle_fetch_error" }
+          };
           console.info(
             JSON.stringify({
               tag: "LIVE_CANDIDATE_META_MARKET_DROPPED_PROOF",
@@ -8490,6 +8582,36 @@ export function createLiveDataStrategy(opts: {
           const blockReason = setup.reason ?? "setup_conditions_not_met";
           const dedupeKey = `DEBUG_ORIGINAL_SPOT_SETUP_BLOCK|live_strategy_tick|${m}|${blockReason}|live`;
           evaluationDroppedReasons[m] = `setup_blocked:${blockReason}${setup.failed_conditions?.length ? ': ' + setup.failed_conditions.join(',') : ''}`;
+          
+          const volThresholdForFc = setup.reason === "CORE_TREND_ENTRY" ? (setup.effective_volume_threshold ?? LIVE_CORE_TREND_MIN_VOLUME_RATIO) : 0.95;
+          evaluationDiagnostics[m] = {
+            marketState: marketState.market_state,
+            setup: {
+              ok: false,
+              reason: blockReason,
+              score: scoreForRelaxed,
+              requiredScore: marketState.min_entry_score,
+              failedConditions: buildFailedConditionsDetail(setup.failed_conditions ?? [], setup, currentPx, marketState.min_entry_score, volThresholdForFc)
+            },
+            watchlist: {
+              entered: false,
+              reason: "setup_failed"
+            },
+            candidate: {
+              created: false,
+              reason: "setup_failed"
+            },
+            buyGate: {
+              checked: false,
+              allowed: null,
+              reason: null
+            },
+            final: {
+              action: isSurgeCandidate ? "pending" : "blocked",
+              reason: `setup_blocked:${blockReason}`
+            }
+          };
+
           if (setupBlockLogDeduper.shouldLog(dedupeKey)) {
             console.info(JSON.stringify({
               tag: "DEBUG_ORIGINAL_SPOT_SETUP_BLOCK",
@@ -8718,6 +8840,33 @@ export function createLiveDataStrategy(opts: {
           engine_bucket: isSurgeCandidate ? "surge" : isCoreMarket ? "core" : "other"
         }));
 
+        evaluationDiagnostics[m] = {
+          marketState: marketState.market_state,
+          setup: {
+            ok: setup.ok,
+            reason: setup.reason,
+            score: score,
+            requiredScore: marketState.min_entry_score,
+            failedConditions: []
+          },
+          watchlist: {
+            entered: false,
+            reason: "none"
+          },
+          candidate: {
+            created: true,
+            reason: "none"
+          },
+          buyGate: {
+            checked: false,
+            allowed: null,
+            reason: null
+          },
+          final: {
+            action: "pending",
+            reason: "none"
+          }
+        };
         candidateMetaMap.set(m, meta);
         return meta;
         }),
@@ -8728,6 +8877,14 @@ export function createLiveDataStrategy(opts: {
         const m = entryUniverse[idx]!;
         if (r.status === "rejected") {
           evaluationDroppedReasons[m] = evaluationDroppedReasons[m] ?? "candidate_meta_unhandled_rejection";
+          evaluationDiagnostics[m] = {
+            marketState: marketState.market_state,
+            setup: { ok: false, reason: "candidate_meta_unhandled_rejection", score: null, requiredScore: marketState.min_entry_score, failedConditions: [] },
+            watchlist: { entered: false, reason: "setup_failed" },
+            candidate: { created: false, reason: "setup_failed" },
+            buyGate: { checked: false, allowed: null, reason: null },
+            final: { action: "blocked", reason: "candidate_meta_unhandled_rejection" }
+          };
           console.info(
             JSON.stringify({
               tag: "LIVE_CANDIDATE_META_MARKET_DROPPED_PROOF",
@@ -9382,7 +9539,8 @@ export function createLiveDataStrategy(opts: {
                 cooldown_until: state.cooldown_until,
                 marketState: opts.marketState,
                 signalPayload: undefined,
-                strategyType: "momentum",
+                strategyType: "surge_reclaim",
+                entrySignalType: "reclaim",
                 entryPath: finalPath,
                 isAdditionalBuy: false,
               });
@@ -9390,7 +9548,7 @@ export function createLiveDataStrategy(opts: {
                 logPlacebuyFinalGateBlocked(guard.blockReason!, {
                   market,
                   path: finalPath,
-                  strategyType: "momentum",
+                  strategyType: "surge_reclaim",
                   killSwitchReason: guard.killSwitchReason,
                   cooldownRemaining: guard.cooldownRemainingSec,
                   dailyLossCount: guard.dailyLossCount,
@@ -9423,7 +9581,7 @@ export function createLiveDataStrategy(opts: {
                 market,
                 true,
                 orderKrw,
-                "momentum",
+                "surge_reclaim",
                 "strategy",
                 signalPayloadForBuy,
                 finalPath
@@ -9582,6 +9740,17 @@ export function createLiveDataStrategy(opts: {
         }),
       );
       const candidateMetaEvalDropReason = evaluationDroppedReasons[market];
+      if (!evaluationDiagnostics[market]) {
+        evaluationDiagnostics[market] = {
+          marketState: marketState.market_state,
+          setup: { ok: false, reason: "unknown", score: null, requiredScore: marketState.min_entry_score, failedConditions: [] },
+          watchlist: { entered: false, reason: "none" },
+          candidate: { created: false, reason: "none" },
+          buyGate: { checked: false, allowed: null, reason: null },
+          final: { action: "blocked", reason: "unknown" }
+        };
+      }
+
       if (!candidateMetaFromSetup) {
         if (candidateMetaEvalDropReason) {
           const skipStatKey =
@@ -9599,6 +9768,13 @@ export function createLiveDataStrategy(opts: {
             source_kind: sourceMeta?.source_kind ?? null,
           });
           bumpSkip(skipStatKey);
+          
+          if (evaluationDiagnostics[market]) {
+            evaluationDiagnostics[market].final = {
+              action: "blocked",
+              reason: candidateMetaEvalDropReason
+            };
+          }
           continue;
         }
         emitEval("DEBUG_LIVE_PRECHECK", {
@@ -9611,6 +9787,13 @@ export function createLiveDataStrategy(opts: {
           source_kind: sourceMeta?.source_kind ?? null,
         });
         bumpSkip("candidate_meta_absent_no_drop_reason");
+        
+        if (evaluationDiagnostics[market]) {
+          evaluationDiagnostics[market].final = {
+            action: "blocked",
+            reason: "candidate_meta_absent_no_drop_reason"
+          };
+        }
         continue;
       }
 
@@ -9629,6 +9812,13 @@ export function createLiveDataStrategy(opts: {
             source_kind: sourceMeta?.source_kind ?? null,
           });
           bumpSkip("missing_real_signal");
+          
+          if (evaluationDiagnostics[market]) {
+            evaluationDiagnostics[market].final = {
+              action: "blocked",
+              reason: "missing_real_signal:no_signal_payload"
+            };
+          }
           continue;
         }
         emitEval("DEBUG_LIVE_PRECHECK", {
@@ -9642,12 +9832,31 @@ export function createLiveDataStrategy(opts: {
           source_kind: sourceMeta?.source_kind ?? null,
         });
         bumpSkip("missing_real_signal");
+        
+        if (evaluationDiagnostics[market]) {
+          evaluationDiagnostics[market].final = {
+            action: "blocked",
+            reason: "missing_real_signal:watch_or_diagnostic"
+          };
+        }
         continue;
       }
       if (Object.keys(state.positions).length >= state.safety_guard.max_positions) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "max_positions_reached" });
         logPlacebuyFinalGateBlocked("max_positions_reached", { open_count: Object.keys(state.positions).length, max_positions: state.safety_guard.max_positions });
         bumpSkip("max_positions_reached");
+        
+        if (evaluationDiagnostics[market]) {
+          evaluationDiagnostics[market].buyGate = {
+            checked: true,
+            allowed: false,
+            reason: "max_positions_reached"
+          };
+          evaluationDiagnostics[market].final = {
+            action: "blocked",
+            reason: "max_positions_reached"
+          };
+        }
         console.info(
           JSON.stringify({
             tag: "DEBUG_LIVE_EARLY_EXIT",
@@ -9677,6 +9886,8 @@ export function createLiveDataStrategy(opts: {
         });
       }
       // 공통 Buy Safety Guard 검사
+      // 공통 Buy Safety Guard 검사
+      const isSurgeSourceLocal = candidateMetaFromSetup?.engine_bucket === "surge";
       const guard = await validateLiveBuyPrecheck({
         market,
         trades: state.trades,
@@ -9684,7 +9895,8 @@ export function createLiveDataStrategy(opts: {
         cooldown_until: state.cooldown_until,
         marketState: opts.marketState,
         signalPayload: sigPre?.p,
-        strategyType: "momentum",
+        strategyType: isSurgeSourceLocal ? "surge_reclaim" : "momentum",
+        entrySignalType: isSurgeSourceLocal ? "reclaim" : undefined,
         entryPath: "precheck",
         isAdditionalBuy: false,
       });
@@ -9697,7 +9909,7 @@ export function createLiveDataStrategy(opts: {
         logPlacebuyFinalGateBlocked(guard.blockReason!, {
           market,
           path: "precheck",
-          strategyType: "momentum",
+          strategyType: isSurgeSourceLocal ? "surge_reclaim" : "momentum",
           killSwitchReason: guard.killSwitchReason,
           cooldownRemaining: guard.cooldownRemainingSec,
           dailyLossCount: guard.dailyLossCount,
@@ -9706,6 +9918,18 @@ export function createLiveDataStrategy(opts: {
           btcRsi: guard.btcRsi,
         });
         bumpSkip(guard.blockReason!);
+        
+        if (evaluationDiagnostics[market]) {
+          evaluationDiagnostics[market].buyGate = {
+            checked: true,
+            allowed: false,
+            reason: guard.blockReason
+          };
+          evaluationDiagnostics[market].final = {
+            action: "blocked",
+            reason: guard.blockReason
+          };
+        }
         if (guard.blockReason === "cooldown_active") {
           const cool = state.cooldown_until[market];
           console.info(
@@ -9729,6 +9953,18 @@ export function createLiveDataStrategy(opts: {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "stop_count_limit_reached" });
         logPlacebuyFinalGateBlocked("stop_count_limit_reached", { stop_count: state.daily.stop_by_market[market] });
         bumpSkip("stop_count_limit_reached");
+        
+        if (evaluationDiagnostics[market]) {
+          evaluationDiagnostics[market].buyGate = {
+            checked: true,
+            allowed: false,
+            reason: "stop_count_limit_reached"
+          };
+          evaluationDiagnostics[market].final = {
+            action: "blocked",
+            reason: "stop_count_limit_reached"
+          };
+        }
         continue;
       }
       const isExceptionMarket = !LEADER_MARKETS.has(market);
@@ -9937,6 +10173,17 @@ export function createLiveDataStrategy(opts: {
         }
 
         bumpSkip("immediate_entry_forbidden_under_new_strategy");
+        if (evaluationDiagnostics[market]) {
+          const existInWatch = (state.surge_watchlist && state.surge_watchlist[market]) || (state.morning_surge_watchlist && state.morning_surge_watchlist[market]);
+          evaluationDiagnostics[market].watchlist = {
+            entered: Boolean(existInWatch),
+            reason: existInWatch ? "surge_detected" : "watchlist_full_or_other"
+          };
+          evaluationDiagnostics[market].final = {
+            action: "watchlist_only",
+            reason: "immediate_entry_forbidden_under_new_strategy"
+          };
+        }
         continue;
       }
       const scannerBridgeScore = isSurgeSource
@@ -10895,6 +11142,17 @@ export function createLiveDataStrategy(opts: {
               });
             }
             bumpSkip("late_entry_guard");
+            if (evaluationDiagnostics[market]) {
+              evaluationDiagnostics[market].buyGate = {
+                checked: true,
+                allowed: false,
+                reason: lateEntryGuardReason ?? "late_entry_guard"
+              };
+              evaluationDiagnostics[market].final = {
+                action: "blocked",
+                reason: lateEntryGuardReason ?? "late_entry_guard"
+              };
+            }
             continue;
           }
         }
@@ -10929,6 +11187,10 @@ export function createLiveDataStrategy(opts: {
         });
         emitEval("entry_blocked_signal_strength", { symbol: market, signal_type: "LOW" });
         if (!isSurgeSource) {
+          if (evaluationDiagnostics[market]) {
+            evaluationDiagnostics[market].buyGate = { checked: true, allowed: false, reason: "LOW_never_enters" };
+            evaluationDiagnostics[market].final = { action: "blocked", reason: "LOW_never_enters" };
+          }
           continue;
         }
       }
@@ -10958,6 +11220,10 @@ export function createLiveDataStrategy(opts: {
             raw_strength: rawStrength,
             composite_score: composite,
           });
+          if (evaluationDiagnostics[market]) {
+            evaluationDiagnostics[market].buyGate = { checked: true, allowed: false, reason: "score_below_threshold" };
+            evaluationDiagnostics[market].final = { action: "blocked", reason: "score_below_threshold" };
+          }
           continue;
         }
       }
@@ -11040,6 +11306,10 @@ export function createLiveDataStrategy(opts: {
           payload: { symbol: market, entry_profile_key, profile_decision: "block" },
         });
         if (!isSurgeSource) {
+          if (evaluationDiagnostics[market]) {
+            evaluationDiagnostics[market].buyGate = { checked: true, allowed: false, reason: "profile_block" };
+            evaluationDiagnostics[market].final = { action: "blocked", reason: profileInfo.reason };
+          }
           continue;
         }
       }
@@ -11267,6 +11537,10 @@ export function createLiveDataStrategy(opts: {
             base_gate_blocked_detail: baseGateBlockedDetailForBypass,
           });
           bumpSkip("exception_not_selected");
+          if (evaluationDiagnostics[market]) {
+            evaluationDiagnostics[market].buyGate = { checked: true, allowed: false, reason: "exception_not_selected" };
+            evaluationDiagnostics[market].final = { action: "blocked", reason: "exception_not_selected" };
+          }
           continue;
         }
       }
@@ -11284,6 +11558,10 @@ export function createLiveDataStrategy(opts: {
             base_gate_blocked_detail: detailedReason ?? "base_gate_failed",
           });
           bumpSkip(detailedReason ?? "base_gate_failed");
+          if (evaluationDiagnostics[market]) {
+            evaluationDiagnostics[market].buyGate = { checked: true, allowed: false, reason: detailedReason ?? "base_gate_failed" };
+            evaluationDiagnostics[market].final = { action: "blocked", reason: detailedReason ?? "base_gate_failed" };
+          }
           continue;
         }
         // Surge source bypasses core gate for non-hard blocks: 반드시 최종 게이트(soft bypass) 로그를 남긴다.
@@ -12037,6 +12315,10 @@ export function createLiveDataStrategy(opts: {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "order_krw_below_min", order_krw: orderKrw });
         bumpSkip("order_krw_below_min");
         emitFinalBlocked("order_krw_below_min", { order_krw: orderKrw });
+        if (evaluationDiagnostics[market]) {
+          evaluationDiagnostics[market].buyGate = { checked: true, allowed: false, reason: "order_krw_below_min" };
+          evaluationDiagnostics[market].final = { action: "blocked", reason: "order_krw_below_min" };
+        }
         continue;
       }
       if (liveOrderAvailableKrw < orderKrw) {
@@ -12047,6 +12329,10 @@ export function createLiveDataStrategy(opts: {
         });
         bumpSkip("insufficient_live_order_krw");
         emitFinalBlocked("insufficient_live_order_krw", { live_order_available_krw: liveOrderAvailableKrw, order_krw: orderKrw });
+        if (evaluationDiagnostics[market]) {
+          evaluationDiagnostics[market].buyGate = { checked: true, allowed: false, reason: "insufficient_live_order_krw" };
+          evaluationDiagnostics[market].final = { action: "blocked", reason: "insufficient_live_order_krw" };
+        }
         continue;
       }
       const strategyType: StrategyType = marketState.market_state === "risk_on" ? "momentum" : "stable";
@@ -12170,6 +12456,10 @@ export function createLiveDataStrategy(opts: {
             entry_mode: metaForGuard?.setupReason ?? "CORE",
             stopPrice: coreStopPrice,
           });
+          if (evaluationDiagnostics[market]) {
+            evaluationDiagnostics[market].buyGate = { checked: true, allowed: false, reason: "core_stop_missing" };
+            evaluationDiagnostics[market].final = { action: "blocked", reason: "core_stop_missing" };
+          }
           continue;
         }
       }
@@ -12193,6 +12483,10 @@ export function createLiveDataStrategy(opts: {
       if (!assertLiveOrderAuthority("core_entry_before_attempt")) {
         bumpSkip("tick_lease_revoked");
         emitFinalBlocked("tick_lease_revoked", { order_krw: orderKrw });
+        if (evaluationDiagnostics[market]) {
+          evaluationDiagnostics[market].buyGate = { checked: true, allowed: false, reason: "tick_lease_revoked" };
+          evaluationDiagnostics[market].final = { action: "blocked", reason: "tick_lease_revoked" };
+        }
         continue;
       }
       const isNearHighProbeAllowedAtGate = !lateEntryGuardTriggered && lateEntryGuardReason === "near_high_probe_allowed";
@@ -12411,9 +12705,17 @@ export function createLiveDataStrategy(opts: {
           }, isSurgeSource ? "surge_normal" : "normal");
           placeBuyOk = true;
           placeBuyReason = "success";
+          if (evaluationDiagnostics[market]) {
+            evaluationDiagnostics[market].buyGate = { checked: true, allowed: true, reason: "none" };
+            evaluationDiagnostics[market].final = { action: "place_buy_attempt", reason: "none" };
+          }
         } catch (innerErr) {
           placeBuyOk = false;
           placeBuyReason = innerErr instanceof Error ? innerErr.message.slice(0, 200) : String(innerErr).slice(0, 200);
+          if (evaluationDiagnostics[market]) {
+            evaluationDiagnostics[market].buyGate = { checked: true, allowed: false, reason: placeBuyReason };
+            evaluationDiagnostics[market].final = { action: "blocked", reason: placeBuyReason };
+          }
           throw innerErr;
         } finally {
           const proofTag = isSurgeSource ? "SURGE_V2_LIVE_ENTRY_EXECUTION_PROOF" : "CORE_LIVE_ENTRY_EXECUTION_PROOF";
@@ -12848,6 +13150,7 @@ export function createLiveDataStrategy(opts: {
       surge_v2_eval_count: surgeV2EvalCount,
       final_buy_attempt_count: finalBuyAttemptCount,
       skipped_by_reason: skippedByReason,
+      market_diagnostics: evaluationDiagnostics,
       updated_at: new Date().toISOString(),
     };
     await racePersist("tick_tail_before_return");

@@ -1,4 +1,4 @@
-export type StrategyType = "stable" | "momentum";
+export type StrategyType = "stable" | "momentum" | "surge_reclaim";
 export type StopTriggerKind = "price_stop" | "pattern_break" | "time_stop" | "breakeven_protect";
 
 export const UPBIT_FEE_RATE = 0.0005;
@@ -41,6 +41,11 @@ export const RECOVERY_EXIT_CONFIG = {
     min_peak_pct_to_skip_catastrophic: 0.5,
     catastrophic_exit_pct: -12,
   },
+  surge_reclaim: {
+    giveup_minutes: 480,
+    min_peak_pct_to_skip_catastrophic: 0.4,
+    catastrophic_exit_pct: -11,
+  },
 } as const;
 
 export const STRATEGY_RISK_CONFIG = {
@@ -64,6 +69,16 @@ export const STRATEGY_RISK_CONFIG = {
     trailing_from_peak_pct: 2.2,
     time_stop_min_minutes: 3,
     time_stop_max_minutes: 5,
+  },
+  surge_reclaim: {
+    stop_loss_pct: -2.0,
+    breakeven_arm_pct: 2.2,
+    breakeven_floor_pct: 0.35,
+    partial_take_profit_pct: 3.0,
+    partial_take_profit_ratio: 0.25,
+    trailing_from_peak_pct: 2.2,
+    reentry_cooldown_minutes_after_stop: 20,
+    weak_hold_stop_minutes: 12,
   },
 } as const;
 
@@ -120,6 +135,22 @@ export const STRICT_NEW_POSITION_EXIT = {
     catastrophic_exit_pct: -6.4,
     giveup_minutes: 95,
     min_peak_pct_skip_catastrophic: 0.42,
+  },
+  surge_reclaim: {
+    hard_stop_pct: -1.45,
+    hard_stop_min_hold_min: 2,
+    early_cut_minutes: 22,
+    early_cut_max_peak_pct: 0.32,
+    early_cut_pnl_pct: -0.95,
+    breakeven_arm_pct: 2.2,
+    breakeven_floor_pct: 0.35,
+    partial_tp_pct: 3.0,
+    partial_tp_ratio: 0.25,
+    trailing_peak_pct: 2.2,
+    weak_hold_stop_minutes: 7,
+    catastrophic_exit_pct: -5.8,
+    giveup_minutes: 150,
+    min_peak_pct_skip_catastrophic: 0.34,
   },
   /** 전량 청산 후 동일 심볼 재진입 쿨다운(분) */
   reentry_cooldown_minutes_after_close: 42,
