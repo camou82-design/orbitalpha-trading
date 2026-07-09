@@ -14,7 +14,7 @@ import {
   tickerAgeMap,
 } from "./upbit-public.js";
 import { appendLog } from "./log-store.js";
-import { fetchAccounts, placeMarketBuy, placeMarketSell, type UpbitAccount } from "./upbit-private.js";
+import { fetchAccounts, placeMarketBuy, placeMarketSell, fetchOrderDetails, type UpbitAccount } from "./upbit-private.js";
 import { companyIdSchema, serviceIdSchema } from "@orbitalpha/shared";
 import type { StrategyType } from "./strategy-risk-config.js";
 import { ORDER_LIMITS } from "@orbitalpha/shared";
@@ -821,7 +821,70 @@ export function createTradeControl(
         order_uuid: rsp.uuid,
       };
       markOrderResult(snap);
-      const executed = Number(rsp.executed_volume ?? "0");
+      let executed = Number(rsp.executed_volume ?? "0");
+
+      // [FIX] executed_volume=0 시 UUID 기반 주문 재조회로 실제 체결량 확인 (최대 2회, 300ms 간격)
+      if (bucket === "strategy" && !(executed > 0) && rsp.uuid && env.upbitAccessKey && env.upbitSecretKey) {
+        console.error(
+          JSON.stringify({
+            tag: "TRADE_CONTROL_EXECUTED_VOLUME_ZERO_WARNING",
+            ts: new Date().toISOString(),
+            market,
+            order_uuid: rsp.uuid,
+            raw_executed_volume: rsp.executed_volume,
+            amount_krw: amountKrw,
+            reason: "executed_volume_zero_on_initial_response_attempting_retry",
+          }),
+        );
+        for (let retryIdx = 0; retryIdx < 2; retryIdx++) {
+          await new Promise((r) => setTimeout(r, 300));
+          try {
+            const orderDetail = await fetchOrderDetails(env.upbitAccessKey, env.upbitSecretKey, rsp.uuid);
+            const retryExecuted = Number(orderDetail?.executed_volume ?? "0");
+            console.info(
+              JSON.stringify({
+                tag: "TRADE_CONTROL_BUY_FILL_RESOLVED_AFTER_RETRY",
+                ts: new Date().toISOString(),
+                market,
+                order_uuid: rsp.uuid,
+                retry_index: retryIdx,
+                retry_executed_volume: retryExecuted,
+                order_state: orderDetail?.state ?? null,
+                resolved: retryExecuted > 0,
+              }),
+            );
+            if (retryExecuted > 0) {
+              executed = retryExecuted;
+              break;
+            }
+          } catch (retryErr) {
+            console.error(
+              JSON.stringify({
+                tag: "TRADE_CONTROL_BUY_FILL_RETRY_FETCH_ERROR",
+                ts: new Date().toISOString(),
+                market,
+                order_uuid: rsp.uuid,
+                retry_index: retryIdx,
+                error: retryErr instanceof Error ? retryErr.message.slice(0, 200) : String(retryErr).slice(0, 200),
+              }),
+            );
+          }
+        }
+        if (!(executed > 0)) {
+          console.error(
+            JSON.stringify({
+              tag: "TRADE_CONTROL_BUY_FILL_UNRESOLVED_PENDING",
+              ts: new Date().toISOString(),
+              market,
+              order_uuid: rsp.uuid,
+              amount_krw: amountKrw,
+              reason: "executed_volume_still_zero_after_2_retries_skipping_qty_registration",
+              action: "strategyPositions qty NOT updated to avoid phantom zero-qty position",
+            }),
+          );
+        }
+      }
+
       if (bucket === "strategy" && !state.strategyPositions[market]) {
         state.strategyPositions[market] = {
           qty: 0, avg: 0, entries: 0, invested_krw_total: 0, realized_pnl: 0,

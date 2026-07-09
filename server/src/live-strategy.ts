@@ -2864,7 +2864,11 @@ export function createLiveDataStrategy(opts: {
       live_order_available_krw: 0,
       strategy_available_krw: 0,
     });
-    const raceTradeStatusSafe = async (phase: string): Promise<TradeStatus> => {
+    const raceTradeStatusSafe = async (phase: string, forceFresh = false): Promise<TradeStatus> => {
+      if (forceFresh) {
+        // [FIX] forceFresh: 실시간 새 조회를 위해 캐시 강제 무효화
+        lastGoodTradeStatusAtMs = 0;
+      }
       try {
         const st = await racePhase(`trade_status:${phase}`, PHASE_MS.trade_status, () => opts.trade.status());
         if (st && typeof st === "object") {
@@ -2893,6 +2897,10 @@ export function createLiveDataStrategy(opts: {
         return fallback;
       }
     };
+
+    // Backward-compatible alias for the rest of the tick code.
+    const raceTradeStatus = (phase: string) => raceTradeStatusSafe(phase);
+    const racePersist = (phase: string) => racePhase(`persist:${phase}`, PHASE_MS.persist, () => persist());
     let lastGoodLogs: SignalLogEntry[] = [];
     let lastGoodLogsAtMs = 0;
     let logsRefreshInFlight: Promise<void> | null = null;
@@ -2917,9 +2925,6 @@ export function createLiveDataStrategy(opts: {
 
     requestLogsRefreshNonBlocking();
 
-    // Backward-compatible alias for the rest of the tick code.
-    const raceTradeStatus = (phase: string) => raceTradeStatusSafe(phase);
-    const racePersist = (phase: string) => racePhase(`persist:${phase}`, PHASE_MS.persist, () => persist());
 
 
     await liveTickRacePhase(
@@ -3092,22 +3097,81 @@ export function createLiveDataStrategy(opts: {
           continue;
         }
 
-        // 3. 모든 허용 조건을 만족하는지 확인 (tcPos 존재 여부, cond2, cond3 모두)
-        if (!tcPos || !cond2 || !cond3) {
+        // [FIX] 에어드랍·잔돈성 종목 복구 제외
+        const RECOVERY_EXCLUDE_MARKETS = new Set([
+          "KRW-VTHO", "KRW-SOLO", "KRW-XCORE", "KRW-BTT", "KRW-STRX",
+        ]);
+        if (RECOVERY_EXCLUDE_MARKETS.has(pm)) {
           recoveryEvalItems.push({
             market: pm,
             result: "RECOVERY_SKIPPED",
-            reason: "no_evidence_of_managed_entry",
-            detail: {
-              tc_pos_exists: Boolean(tcPos),
-              recent_buy_trade_exists: hasRecentBuyTrade,
-              is_within_24_hours: isWithin24Hours,
-              cond2_passed: cond2,
-              cond3_passed: cond3,
-            },
+            reason: "airdrop_or_dust_market_excluded",
+            detail: { market: pm },
           });
           continue;
         }
+
+        // [FIX] 봇 buy 기록 필수 검증 (strategy_tag + position_id + order_krw)
+        const botBuyTrade = state.trades.slice().reverse().find(
+          t => t.market === pm &&
+               t.action === "buy" &&
+               (t as any).strategy_tag === "live_data_mode_v1" &&
+               Boolean((t as any).position_id) &&
+               Number((t as any).order_krw ?? 0) >= 5000
+        );
+        const botBuyTradeAgeMs = botBuyTrade ? Date.now() - Date.parse(botBuyTrade.timestamp) : Infinity;
+        const isBotBuyWithin24h = botBuyTradeAgeMs <= 24 * 60 * 60 * 1000;
+
+        if (!botBuyTrade || !isBotBuyWithin24h) {
+          recoveryEvalItems.push({
+            market: pm,
+            result: "RECOVERY_SKIPPED",
+            reason: "MANAGED_POSITION_RECOVERY_SKIPPED_NO_BOT_BUY_EVIDENCE",
+            detail: {
+              market: pm,
+              bot_buy_trade_found: Boolean(botBuyTrade),
+              bot_buy_age_ms: botBuyTrade ? botBuyTradeAgeMs : null,
+              is_within_24h: isBotBuyWithin24h,
+              note: "No live_data_mode_v1 buy trade with position_id and order_krw>=5000 in last 24h",
+            },
+          });
+          console.info(JSON.stringify({
+            tag: "MANAGED_POSITION_RECOVERY_SKIPPED_NO_BOT_BUY_EVIDENCE",
+            ts: new Date().toISOString(),
+            market: pm,
+            totalSpot,
+            avgBuy,
+            reason: "no_bot_buy_trade_with_valid_evidence",
+          }));
+          continue;
+        }
+
+        // [FIX] cond2: 봇 buy 기록 기반 (기존 cond2/cond3 대신 botBuyTrade 사용)
+        const hasBotBuyEvidence = Boolean(botBuyTrade && isBotBuyWithin24h);
+
+        if (!hasBotBuyEvidence) {
+          recoveryEvalItems.push({
+            market: pm,
+            result: "RECOVERY_SKIPPED",
+            reason: "MANAGED_POSITION_RECOVERY_SKIPPED_MANUAL_HOLDING_RISK",
+            detail: {
+              market: pm,
+              tc_pos_exists: Boolean(tcPos),
+              cond2_passed: cond2,
+              cond3_passed: cond3,
+              note: "manual holding risk: no bot buy evidence",
+            },
+          });
+          console.info(JSON.stringify({
+            tag: "MANAGED_POSITION_RECOVERY_SKIPPED_MANUAL_HOLDING_RISK",
+            ts: new Date().toISOString(),
+            market: pm,
+            totalSpot,
+            reason: "no_bot_buy_evidence_may_be_manual_holding",
+          }));
+          continue;
+        }
+
 
         if (!(totalSpot > 0)) {
           recoveryEvalItems.push({
@@ -3119,23 +3183,28 @@ export function createLiveDataStrategy(opts: {
           continue;
         }
 
-        let recoveryTs = new Date().toISOString();
-        let recoveryOrderKrw = 0;
-        let recoveryPositionId = `${pm}|RECOVERED|${recoveryTs}`;
+        let recoveryTs = botBuyTrade.timestamp;
+        let recoveryOrderKrw = Number(botBuyTrade.order_krw ?? 0);
+        let recoveryPositionId = (botBuyTrade as any).position_id ?? `${pm}|RECOVERED|${recoveryTs}`;
+        const recoveryStrategyType: string = (botBuyTrade as any).strategy_type ?? "stable";
+        // filled_qty=0이면 totalSpot으로 보정
+        const recoveryQty = Number(botBuyTrade.filled_qty ?? 0) > 0
+          ? Number(botBuyTrade.filled_qty)
+          : totalSpot;
         let recoveryStopPrice = avgBuy > 0 ? avgBuy * 0.98 : 0;
         let recoveryStopPct = -2;
+        const filledQtyWasZero = !(Number(botBuyTrade.filled_qty ?? 0) > 0);
 
-        if (recentBuyTrade) {
-          recoveryTs = recentBuyTrade.timestamp;
-          recoveryOrderKrw = Number(recentBuyTrade.order_krw ?? 0);
-          recoveryPositionId = recentBuyTrade.position_id ?? `${pm}|RECOVERED|${recoveryTs}`;
-          if (recentBuyTrade.stop_loss_price) recoveryStopPrice = recentBuyTrade.stop_loss_price;
-          if (recentBuyTrade.stop_loss_pct) recoveryStopPct = recentBuyTrade.stop_loss_pct;
+        if ((botBuyTrade as any).stop_loss_price > 0) {
+          recoveryStopPrice = (botBuyTrade as any).stop_loss_price;
+          recoveryStopPct = avgBuy > 0 ? ((recoveryStopPrice - avgBuy) / avgBuy) * 100 : -2;
+        } else if ((botBuyTrade as any).stop_loss_pct < 0) {
+          recoveryStopPct = (botBuyTrade as any).stop_loss_pct;
+          recoveryStopPrice = avgBuy > 0 ? avgBuy * (1 + recoveryStopPct / 100) : 0;
         } else {
-          // cond3/장부 일치 case: tcPos 또는 현재 시각 기준 (lastOrder는 사용하지 않음)
-          recoveryTs = tcPos?.entry_ts || new Date().toISOString();
-          recoveryOrderKrw = tcPos?.order_krw || 0;
-          recoveryPositionId = tcPos?.position_id || `${pm}|RECOVERED|${recoveryTs}`;
+          // 원본 stop 정보 없으면 안전 기본값 적용
+          recoveryStopPct = -2;
+          recoveryStopPrice = avgBuy > 0 ? avgBuy * 0.98 : 0;
         }
 
         const stratSnapStopPct = strategyPosSnap[pm]?.stop_loss_pct;
@@ -3149,20 +3218,28 @@ export function createLiveDataStrategy(opts: {
 
         console.error(
           JSON.stringify({
-            tag: "MANAGED_POSITION_RECOVERY_HARD_WARNING",
+            tag: "MANAGED_POSITION_RECOVERY_EVIDENCE_MATCHED",
             ts: new Date().toISOString(),
             market: pm,
-            reason: "장부 복구 조건 충족 — 전략 장부 복구 시도",
-            recovery_ts: recoveryTs,
-            age_ms: ageMs,
+            reason: "봇 buy 증거 확인 — 전략 장부 복구 시도",
+            bot_buy_trade_ts: recoveryTs,
+            bot_buy_age_ms: botBuyTradeAgeMs,
             spot_qty: totalSpot,
+            recovery_qty: recoveryQty,
+            filled_qty_was_zero: filledQtyWasZero,
             order_krw: recoveryOrderKrw,
+            strategy_type: recoveryStrategyType,
+            position_id: recoveryPositionId,
+            stop_loss_price: recoveryStopPrice,
+            stop_loss_pct: recoveryStopPct,
+            avg_buy: avgBuy,
+            stop_loss_source: recoveryStopPrice > 0 ? "trade_record_or_snap" : "safe_default_2pct",
           }),
         );
 
         state.positions[pm] = {
           market: pm,
-          strategy_type: "stable",
+          strategy_type: recoveryStrategyType as any,
           engine_bucket: "surge",
           entry_origin: "auto_trade_recovered",
           entry_mode: "RECOVERED",
@@ -3173,11 +3250,11 @@ export function createLiveDataStrategy(opts: {
           is_relaxed_probe: false,
           entry_ts: recoveryTs,
           entry_price: avgBuy,
-          qty: totalSpot,
+          qty: recoveryQty,
           order_krw: recoveryOrderKrw,
           reason_enter: "RECOVERED_AFTER_LEDGER_MISS",
-          signal_strength: "MID",
-          volume_ratio: 0,
+          signal_strength: (botBuyTrade as any).signal_strength ?? "MID",
+          volume_ratio: Number((botBuyTrade as any).volume_ratio ?? 0),
           position_stage: "normal_active",
           partial_tp_done: false,
           max_pnl_pct: 0,
@@ -3188,7 +3265,7 @@ export function createLiveDataStrategy(opts: {
           stop_loss_price: recoveryStopPrice,
           stop_loss_pct: recoveryStopPct,
           realized_partial_profit: 0,
-          remaining_qty: totalSpot,
+          remaining_qty: recoveryQty,
           current_net_pnl_pct: 0,
           breakeven_armed_at: null,
           partial_tp_at: null,
@@ -3197,27 +3274,39 @@ export function createLiveDataStrategy(opts: {
           softened_reasons: [],
         } as any;
         reconcileActions.push(`${pm}:recovered_from_evidence`);
-        await opts.trade.syncManagedPosition?.(pm, totalSpot, avgBuy, "stable", recoveryStopPct, recoveryStopPrice);
+        await opts.trade.syncManagedPosition?.(pm, recoveryQty, avgBuy, recoveryStrategyType as any, recoveryStopPct, recoveryStopPrice);
         const prevSq = strategyPosSnap[pm] ?? {};
         strategyPosSnap[pm] = {
           ...prevSq,
-          qty: Math.max(Number(prevSq.qty ?? 0), totalSpot),
+          qty: Math.max(Number(prevSq.qty ?? 0), recoveryQty),
         };
         recoveryEvalItems.push({
           market: pm,
           result: "RECOVERY_APPLIED",
-          detail: { spot_qty: totalSpot, avg_buy_used: avgBuy, stop_loss_price: recoveryStopPrice },
+          detail: {
+            spot_qty: totalSpot,
+            recovery_qty: recoveryQty,
+            filled_qty_was_zero: filledQtyWasZero,
+            avg_buy_used: avgBuy,
+            stop_loss_price: recoveryStopPrice,
+            strategy_type: recoveryStrategyType,
+            position_id: recoveryPositionId,
+          },
         });
         console.info(
           JSON.stringify({
-            tag: "SPOT_MANAGED_POSITION_RECOVERY_APPLIED_PROOF",
+            tag: "MANAGED_POSITION_RECOVERY_APPLIED",
             ts: new Date().toISOString(),
             market: pm,
             spot_qty: totalSpot,
+            recovery_qty: recoveryQty,
+            filled_qty_was_zero: filledQtyWasZero,
             avg_buy_used: avgBuy,
             recovery_ts: recoveryTs,
             stop_loss_price: recoveryStopPrice,
             stop_loss_pct: recoveryStopPct,
+            strategy_type: recoveryStrategyType,
+            position_id: recoveryPositionId,
           }),
         );
         await racePersist("after_recovery_action");
@@ -3443,9 +3532,73 @@ export function createLiveDataStrategy(opts: {
           delete state.cooldown_until[m];
           reconcileActions.push(`${m}:cleared_strategy_state_account_and_ledger_zero`);
         } else if (stratQty <= 0 && totalSpot > 0) {
-          delete state.positions[m];
-          delete state.cooldown_until[m];
-          reconcileActions.push(`${m}:cleared_orphan_strategy_state_ledger_zero_nonzero_spot`);
+          // [FIX] 봇 매수 흔적 확인 후 삭제 차단 — 수동 보유분은 건드리지 않음
+          const posM = state.positions[m]!;
+          const isAutoBotPosition =
+            (posM.entry_origin as string) === "auto_trade" ||
+            Boolean(posM.position_id) ||
+            posM.managed === true ||
+            (Number(posM.order_krw ?? 0) > 0);
+          const recentBotBuyMs = (() => {
+            const recentBuy = state.trades.slice().reverse().find(
+              t => t.market === m && t.action === "buy" && (t as any).strategy_tag === "live_data_mode_v1"
+            );
+            return recentBuy ? Date.now() - Date.parse(recentBuy.timestamp) : Infinity;
+          })();
+          const isRecentBotBuy = recentBotBuyMs <= 5 * 60_000; // 5분 이내
+
+          if (isAutoBotPosition || isRecentBotBuy) {
+            // 삭제 차단 — 실물 잔고로 qty 보정
+            const avgBuyPrice = accountAvgBuyPriceForMarket(m, balArr);
+            const prevQty = posM.qty;
+            posM.qty = totalSpot;
+            posM.remaining_qty = totalSpot;
+            reconcileActions.push(`${m}:POSITION_QTY_REPAIRED_FROM_SPOT_AFTER_BUY:spot=${totalSpot}`);
+            console.error(
+              JSON.stringify({
+                tag: "STRATEGY_POSITION_SNAP_ZERO_BUT_SPOT_NONZERO_REPAIRED",
+                ts: new Date().toISOString(),
+                market: m,
+                prev_qty: prevQty,
+                repaired_qty: totalSpot,
+                avg_buy_price: avgBuyPrice,
+                trade_control_qty: stratQty,
+                entry_origin: posM.entry_origin,
+                position_id: posM.position_id ?? null,
+                managed: posM.managed,
+                order_krw: posM.order_krw ?? 0,
+                is_auto_bot_position: isAutoBotPosition,
+                is_recent_bot_buy: isRecentBotBuy,
+                recent_bot_buy_ms: isRecentBotBuy ? recentBotBuyMs : null,
+                reason: "stratQty_zero_but_spot_nonzero_with_bot_evidence_repaired_instead_of_deleted",
+              }),
+            );
+            console.info(
+              JSON.stringify({
+                tag: "POSITION_DELETE_SKIPPED_RECENT_BOT_BUY",
+                ts: new Date().toISOString(),
+                market: m,
+                reason: isRecentBotBuy
+                  ? "recent_bot_buy_within_5min"
+                  : "auto_trade_origin_or_managed_flag",
+                totalSpot,
+                stratQty,
+              }),
+            );
+            // trade-control strategyPositions도 보정
+            try {
+              await opts.trade.syncManagedPosition?.(m, totalSpot, avgBuyPrice > 0 ? avgBuyPrice : posM.entry_price, posM.strategy_type ?? "stable");
+            } catch (syncErr) {
+              console.error(`[reconcile-fix] syncManagedPosition failed for ${m}:`, syncErr);
+            }
+            await racePersist("after_position_qty_repaired_from_spot");
+          } else {
+            // 봇 매수 흔적 없음 — 기존 동작 (삭제)
+            delete state.positions[m];
+            delete state.cooldown_until[m];
+            reconcileActions.push(`${m}:cleared_orphan_strategy_state_ledger_zero_nonzero_spot`);
+          }
+
         } else if (stratQty > 0) {
           const p = state.positions[m]!;
           if ((p.remaining_qty === 0 || !p.remaining_qty) && totalSpot > 0) {
@@ -12899,9 +13052,46 @@ export function createLiveDataStrategy(opts: {
         continue;
       }
       const price = priceBy.get(market) ?? 0;
-      const st2 = await raceTradeStatus("post_core_buy_balance_snap");
-      const bFill = st2.balances?.find((x: any) => x.currency === currency);
-      const qty = Number(bFill?.balance ?? 0) + Number(bFill?.locked ?? 0);
+
+      // [FIX] placeBuy 직후 캐시 강제 무효화 후 fresh status 조회 — 최대 3회 retry
+      console.info(JSON.stringify({
+        tag: "POST_BUY_STATUS_FORCE_REFRESH_PROOF",
+        ts: new Date().toISOString(),
+        market,
+        reason: "forcing_fresh_account_status_after_placebuy",
+      }));
+      let st2 = await raceTradeStatusSafe("post_core_buy_balance_snap", true /* forceFresh */);
+      let bFill = st2.balances?.find((x: any) => x.currency === currency);
+      let qty = Number(bFill?.balance ?? 0) + Number(bFill?.locked ?? 0);
+
+      // qty=0이면 최대 2회 추가 retry (300ms 간격)
+      for (let snapRetry = 0; snapRetry < 2 && !(qty > 0); snapRetry++) {
+        await new Promise((r) => setTimeout(r, 300));
+        console.info(JSON.stringify({
+          tag: "POST_BUY_BALANCE_SNAPSHOT_RETRY",
+          ts: new Date().toISOString(),
+          market,
+          retry_index: snapRetry,
+          qty_so_far: qty,
+          reason: "qty_was_zero_retrying_account_status",
+        }));
+        st2 = await raceTradeStatusSafe(`post_core_buy_balance_snap_retry_${snapRetry}`, true /* forceFresh */);
+        bFill = st2.balances?.find((x: any) => x.currency === currency);
+        qty = Number(bFill?.balance ?? 0) + Number(bFill?.locked ?? 0);
+      }
+
+      if (!(qty > 0)) {
+        console.error(JSON.stringify({
+          tag: "BUY_FILLED_QTY_ZERO_WARNING",
+          ts: new Date().toISOString(),
+          market,
+          order_krw: orderKrw,
+          bFill_balance: bFill?.balance ?? null,
+          bFill_locked: bFill?.locked ?? null,
+          reason: "post_buy_balance_snap_returned_zero_after_retries",
+          note: "qty will be set to 0; next-tick reconcile POSITION_QTY_REPAIRED_FROM_SPOT logic expected to correct",
+        }));
+      }
       const strategyPositionExistsBefore = Boolean(state.positions[market]);
       const marketMeta = candidateMeta.find(x => x.market === market);
       state.positions[market] = {
