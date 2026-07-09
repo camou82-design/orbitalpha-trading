@@ -3097,6 +3097,8 @@ export function createLiveDataStrategy(opts: {
           continue;
         }
 
+        const isRecoverAllHoldingsMode = process.env.ORBITALPHA_TRADING_RECOVER_ALL_CURRENT_HOLDINGS === "true";
+
         // [FIX] 에어드랍·잔돈성 종목 복구 제외
         const RECOVERY_EXCLUDE_MARKETS = new Set([
           "KRW-VTHO", "KRW-SOLO", "KRW-XCORE", "KRW-BTT", "KRW-STRX",
@@ -3108,6 +3110,14 @@ export function createLiveDataStrategy(opts: {
             reason: "airdrop_or_dust_market_excluded",
             detail: { market: pm },
           });
+          if (isRecoverAllHoldingsMode) {
+            console.info(JSON.stringify({
+              tag: "MANAGED_POSITION_RECOVERY_ALL_HOLDINGS_SKIPPED_EXCLUDED_MARKET",
+              ts: new Date().toISOString(),
+              market: pm,
+              reason: "market_is_in_exclude_list",
+            }));
+          }
           continue;
         }
 
@@ -3121,18 +3131,47 @@ export function createLiveDataStrategy(opts: {
         );
         const botBuyTradeAgeMs = botBuyTrade ? Date.now() - Date.parse(botBuyTrade.timestamp) : Infinity;
         const isBotBuyWithin24h = botBuyTradeAgeMs <= 24 * 60 * 60 * 1000;
+        const hasBotBuyEvidence = Boolean(botBuyTrade && isBotBuyWithin24h);
 
-        if (!botBuyTrade || !isBotBuyWithin24h) {
+        const currentSpotValueKrw = totalSpot > 0 && avgBuy > 0 ? totalSpot * avgBuy : 0;
+
+        // Skip dust even in recover all mode
+        if (isRecoverAllHoldingsMode && !hasBotBuyEvidence && currentSpotValueKrw < 5000) {
           recoveryEvalItems.push({
             market: pm,
             result: "RECOVERY_SKIPPED",
-            reason: "MANAGED_POSITION_RECOVERY_SKIPPED_NO_BOT_BUY_EVIDENCE",
+            reason: "MANAGED_POSITION_RECOVERY_ALL_HOLDINGS_SKIPPED_DUST",
+            detail: { market: pm, currentSpotValueKrw }
+          });
+          console.info(JSON.stringify({
+            tag: "MANAGED_POSITION_RECOVERY_ALL_HOLDINGS_SKIPPED_DUST",
+            ts: new Date().toISOString(),
+            market: pm,
+            totalSpot,
+            avgBuy,
+            currentSpotValueKrw,
+            reason: "dust_amount_skipped_in_recover_all_mode",
+          }));
+          continue;
+        }
+
+        const canRecover = hasBotBuyEvidence || (isRecoverAllHoldingsMode && currentSpotValueKrw >= 5000);
+
+        if (!canRecover) {
+          recoveryEvalItems.push({
+            market: pm,
+            result: "RECOVERY_SKIPPED",
+            reason: isRecoverAllHoldingsMode
+                ? "MANAGED_POSITION_RECOVERY_SKIPPED_DUST_OR_NO_EVIDENCE"
+                : "MANAGED_POSITION_RECOVERY_SKIPPED_NO_BOT_BUY_EVIDENCE",
             detail: {
               market: pm,
               bot_buy_trade_found: Boolean(botBuyTrade),
               bot_buy_age_ms: botBuyTrade ? botBuyTradeAgeMs : null,
               is_within_24h: isBotBuyWithin24h,
-              note: "No live_data_mode_v1 buy trade with position_id and order_krw>=5000 in last 24h",
+              is_recover_all_mode: isRecoverAllHoldingsMode,
+              current_spot_value_krw: currentSpotValueKrw,
+              note: "No valid bot buy evidence and not eligible for all-holdings recovery",
             },
           });
           console.info(JSON.stringify({
@@ -3141,37 +3180,10 @@ export function createLiveDataStrategy(opts: {
             market: pm,
             totalSpot,
             avgBuy,
-            reason: "no_bot_buy_trade_with_valid_evidence",
+            reason: "no_bot_buy_trade_with_valid_evidence_and_recover_all_not_applicable",
           }));
           continue;
         }
-
-        // [FIX] cond2: 봇 buy 기록 기반 (기존 cond2/cond3 대신 botBuyTrade 사용)
-        const hasBotBuyEvidence = Boolean(botBuyTrade && isBotBuyWithin24h);
-
-        if (!hasBotBuyEvidence) {
-          recoveryEvalItems.push({
-            market: pm,
-            result: "RECOVERY_SKIPPED",
-            reason: "MANAGED_POSITION_RECOVERY_SKIPPED_MANUAL_HOLDING_RISK",
-            detail: {
-              market: pm,
-              tc_pos_exists: Boolean(tcPos),
-              cond2_passed: cond2,
-              cond3_passed: cond3,
-              note: "manual holding risk: no bot buy evidence",
-            },
-          });
-          console.info(JSON.stringify({
-            tag: "MANAGED_POSITION_RECOVERY_SKIPPED_MANUAL_HOLDING_RISK",
-            ts: new Date().toISOString(),
-            market: pm,
-            totalSpot,
-            reason: "no_bot_buy_evidence_may_be_manual_holding",
-          }));
-          continue;
-        }
-
 
         if (!(totalSpot > 0)) {
           recoveryEvalItems.push({
@@ -3183,28 +3195,58 @@ export function createLiveDataStrategy(opts: {
           continue;
         }
 
-        let recoveryTs = botBuyTrade.timestamp;
-        let recoveryOrderKrw = Number(botBuyTrade.order_krw ?? 0);
-        let recoveryPositionId = (botBuyTrade as any).position_id ?? `${pm}|RECOVERED|${recoveryTs}`;
-        const recoveryStrategyType: string = (botBuyTrade as any).strategy_type ?? "stable";
-        // filled_qty=0이면 totalSpot으로 보정
-        const recoveryQty = Number(botBuyTrade.filled_qty ?? 0) > 0
-          ? Number(botBuyTrade.filled_qty)
-          : totalSpot;
-        let recoveryStopPrice = avgBuy > 0 ? avgBuy * 0.98 : 0;
-        let recoveryStopPct = -2;
-        const filledQtyWasZero = !(Number(botBuyTrade.filled_qty ?? 0) > 0);
+        let recoveryTs: string;
+        let recoveryOrderKrw: number;
+        let recoveryPositionId: string;
+        let recoveryStrategyType: string;
+        let recoveryQty: number;
+        let recoveryStopPrice: number;
+        let recoveryStopPct: number;
+        let filledQtyWasZero = false;
+        let isRecoverAllApplied = false;
 
-        if ((botBuyTrade as any).stop_loss_price > 0) {
-          recoveryStopPrice = (botBuyTrade as any).stop_loss_price;
-          recoveryStopPct = avgBuy > 0 ? ((recoveryStopPrice - avgBuy) / avgBuy) * 100 : -2;
-        } else if ((botBuyTrade as any).stop_loss_pct < 0) {
-          recoveryStopPct = (botBuyTrade as any).stop_loss_pct;
-          recoveryStopPrice = avgBuy > 0 ? avgBuy * (1 + recoveryStopPct / 100) : 0;
+        if (hasBotBuyEvidence && botBuyTrade) {
+          recoveryTs = botBuyTrade.timestamp;
+          recoveryOrderKrw = Number(botBuyTrade.order_krw ?? 0);
+          recoveryPositionId = (botBuyTrade as any).position_id ?? `${pm}|RECOVERED|${recoveryTs}`;
+          recoveryStrategyType = (botBuyTrade as any).strategy_type ?? "stable";
+          recoveryQty = Number(botBuyTrade.filled_qty ?? 0) > 0
+            ? Number(botBuyTrade.filled_qty)
+            : totalSpot;
+          filledQtyWasZero = !(Number(botBuyTrade.filled_qty ?? 0) > 0);
+
+          if ((botBuyTrade as any).stop_loss_price > 0) {
+            recoveryStopPrice = (botBuyTrade as any).stop_loss_price;
+            recoveryStopPct = avgBuy > 0 ? ((recoveryStopPrice - avgBuy) / avgBuy) * 100 : -2;
+          } else if ((botBuyTrade as any).stop_loss_pct < 0) {
+            recoveryStopPct = (botBuyTrade as any).stop_loss_pct;
+            recoveryStopPrice = avgBuy > 0 ? avgBuy * (1 + recoveryStopPct / 100) : 0;
+          } else {
+            recoveryStopPct = -2;
+            recoveryStopPrice = avgBuy > 0 ? avgBuy * 0.98 : 0;
+          }
         } else {
-          // 원본 stop 정보 없으면 안전 기본값 적용
+          isRecoverAllApplied = true;
+          recoveryTs = new Date().toISOString();
+          recoveryOrderKrw = currentSpotValueKrw;
+          recoveryPositionId = `${pm}|RECOVERED_ALL|${recoveryTs}`;
+          recoveryStrategyType = botBuyTrade ? (botBuyTrade as any).strategy_type ?? "stable" : "stable";
+          recoveryQty = totalSpot;
           recoveryStopPct = -2;
           recoveryStopPrice = avgBuy > 0 ? avgBuy * 0.98 : 0;
+
+          console.info(JSON.stringify({
+            tag: "MANAGED_POSITION_RECOVERY_ALL_HOLDINGS_MODE_ENABLED",
+            ts: new Date().toISOString(),
+            market: pm,
+          }));
+          console.info(JSON.stringify({
+            tag: "MANAGED_POSITION_RECOVERY_ALL_HOLDINGS_CANDIDATE",
+            ts: new Date().toISOString(),
+            market: pm,
+            spot_qty: totalSpot,
+            current_value_krw: currentSpotValueKrw
+          }));
         }
 
         const stratSnapStopPct = strategyPosSnap[pm]?.stop_loss_pct;
@@ -3216,33 +3258,35 @@ export function createLiveDataStrategy(opts: {
            recoveryStopPct = avgBuy > 0 ? ((recoveryStopPrice - avgBuy) / avgBuy) * 100 : 0;
         }
 
-        console.error(
-          JSON.stringify({
-            tag: "MANAGED_POSITION_RECOVERY_EVIDENCE_MATCHED",
-            ts: new Date().toISOString(),
-            market: pm,
-            reason: "봇 buy 증거 확인 — 전략 장부 복구 시도",
-            bot_buy_trade_ts: recoveryTs,
-            bot_buy_age_ms: botBuyTradeAgeMs,
-            spot_qty: totalSpot,
-            recovery_qty: recoveryQty,
-            filled_qty_was_zero: filledQtyWasZero,
-            order_krw: recoveryOrderKrw,
-            strategy_type: recoveryStrategyType,
-            position_id: recoveryPositionId,
-            stop_loss_price: recoveryStopPrice,
-            stop_loss_pct: recoveryStopPct,
-            avg_buy: avgBuy,
-            stop_loss_source: recoveryStopPrice > 0 ? "trade_record_or_snap" : "safe_default_2pct",
-          }),
-        );
+        if (!isRecoverAllApplied) {
+          console.error(
+            JSON.stringify({
+              tag: "MANAGED_POSITION_RECOVERY_EVIDENCE_MATCHED",
+              ts: new Date().toISOString(),
+              market: pm,
+              reason: "봇 buy 증거 확인 — 전략 장부 복구 시도",
+              bot_buy_trade_ts: recoveryTs,
+              bot_buy_age_ms: botBuyTradeAgeMs,
+              spot_qty: totalSpot,
+              recovery_qty: recoveryQty,
+              filled_qty_was_zero: filledQtyWasZero,
+              order_krw: recoveryOrderKrw,
+              strategy_type: recoveryStrategyType,
+              position_id: recoveryPositionId,
+              stop_loss_price: recoveryStopPrice,
+              stop_loss_pct: recoveryStopPct,
+              avg_buy: avgBuy,
+              stop_loss_source: recoveryStopPrice > 0 ? "trade_record_or_snap" : "safe_default_2pct",
+            }),
+          );
+        }
 
         state.positions[pm] = {
           market: pm,
           strategy_type: recoveryStrategyType as any,
           engine_bucket: "surge",
-          entry_origin: "auto_trade_recovered",
-          entry_mode: "RECOVERED",
+          entry_origin: isRecoverAllApplied ? "auto_trade_recovered_all_holdings" : "auto_trade_recovered",
+          entry_mode: isRecoverAllApplied ? "RECOVERED_ALL_CURRENT_HOLDINGS" : "RECOVERED",
           managed: true,
           market_state_at_entry: "unknown",
           btc_tier_at_entry: "unknown" as any,
@@ -3252,9 +3296,9 @@ export function createLiveDataStrategy(opts: {
           entry_price: avgBuy,
           qty: recoveryQty,
           order_krw: recoveryOrderKrw,
-          reason_enter: "RECOVERED_AFTER_LEDGER_MISS",
-          signal_strength: (botBuyTrade as any).signal_strength ?? "MID",
-          volume_ratio: Number((botBuyTrade as any).volume_ratio ?? 0),
+          reason_enter: isRecoverAllApplied ? "RECOVERED_ALL_CURRENT_HOLDINGS_USER_CONFIRMED_NO_MANUAL_BUY" : "RECOVERED_AFTER_LEDGER_MISS",
+          signal_strength: isRecoverAllApplied ? "MID" : ((botBuyTrade as any)?.signal_strength ?? "MID"),
+          volume_ratio: isRecoverAllApplied ? 0 : Number((botBuyTrade as any)?.volume_ratio ?? 0),
           position_stage: "normal_active",
           partial_tp_done: false,
           max_pnl_pct: 0,
@@ -3273,42 +3317,73 @@ export function createLiveDataStrategy(opts: {
           position_id: recoveryPositionId,
           softened_reasons: [],
         } as any;
-        reconcileActions.push(`${pm}:recovered_from_evidence`);
+        reconcileActions.push(isRecoverAllApplied ? `${pm}:recovered_all_current_holdings` : `${pm}:recovered_from_evidence`);
         await opts.trade.syncManagedPosition?.(pm, recoveryQty, avgBuy, recoveryStrategyType as any, recoveryStopPct, recoveryStopPrice);
         const prevSq = strategyPosSnap[pm] ?? {};
         strategyPosSnap[pm] = {
           ...prevSq,
           qty: Math.max(Number(prevSq.qty ?? 0), recoveryQty),
         };
-        recoveryEvalItems.push({
-          market: pm,
-          result: "RECOVERY_APPLIED",
-          detail: {
-            spot_qty: totalSpot,
-            recovery_qty: recoveryQty,
-            filled_qty_was_zero: filledQtyWasZero,
-            avg_buy_used: avgBuy,
-            stop_loss_price: recoveryStopPrice,
-            strategy_type: recoveryStrategyType,
-            position_id: recoveryPositionId,
-          },
-        });
-        console.info(
-          JSON.stringify({
-            tag: "MANAGED_POSITION_RECOVERY_APPLIED",
-            ts: new Date().toISOString(),
+        if (isRecoverAllApplied) {
+          recoveryEvalItems.push({
             market: pm,
-            spot_qty: totalSpot,
-            recovery_qty: recoveryQty,
-            filled_qty_was_zero: filledQtyWasZero,
-            avg_buy_used: avgBuy,
-            recovery_ts: recoveryTs,
-            stop_loss_price: recoveryStopPrice,
-            stop_loss_pct: recoveryStopPct,
-            strategy_type: recoveryStrategyType,
-            position_id: recoveryPositionId,
-          }),
-        );
+            result: "RECOVERY_APPLIED",
+            detail: {
+              reason: "RECOVERED_ALL_CURRENT_HOLDINGS",
+              spot_qty: totalSpot,
+              recovery_qty: recoveryQty,
+              avg_buy_used: avgBuy,
+              stop_loss_price: recoveryStopPrice,
+              strategy_type: recoveryStrategyType,
+              position_id: recoveryPositionId,
+            },
+          });
+          console.info(
+            JSON.stringify({
+              tag: "MANAGED_POSITION_RECOVERY_ALL_HOLDINGS_APPLIED",
+              ts: new Date().toISOString(),
+              market: pm,
+              spot_qty: totalSpot,
+              recovery_qty: recoveryQty,
+              avg_buy_used: avgBuy,
+              recovery_ts: recoveryTs,
+              stop_loss_price: recoveryStopPrice,
+              stop_loss_pct: recoveryStopPct,
+              strategy_type: recoveryStrategyType,
+              position_id: recoveryPositionId,
+            }),
+          );
+        } else {
+          recoveryEvalItems.push({
+            market: pm,
+            result: "RECOVERY_APPLIED",
+            detail: {
+              spot_qty: totalSpot,
+              recovery_qty: recoveryQty,
+              filled_qty_was_zero: filledQtyWasZero,
+              avg_buy_used: avgBuy,
+              stop_loss_price: recoveryStopPrice,
+              strategy_type: recoveryStrategyType,
+              position_id: recoveryPositionId,
+            },
+          });
+          console.info(
+            JSON.stringify({
+              tag: "MANAGED_POSITION_RECOVERY_APPLIED",
+              ts: new Date().toISOString(),
+              market: pm,
+              spot_qty: totalSpot,
+              recovery_qty: recoveryQty,
+              filled_qty_was_zero: filledQtyWasZero,
+              avg_buy_used: avgBuy,
+              recovery_ts: recoveryTs,
+              stop_loss_price: recoveryStopPrice,
+              stop_loss_pct: recoveryStopPct,
+              strategy_type: recoveryStrategyType,
+              position_id: recoveryPositionId,
+            }),
+          );
+        }
         await racePersist("after_recovery_action");
       }
 
