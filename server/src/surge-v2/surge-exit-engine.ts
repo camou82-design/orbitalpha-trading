@@ -33,28 +33,38 @@ export function evaluateSurgeExit(pos: any, currentPx: number, rise3mPct?: numbe
   const tp2Done = pos.surge_tp2_done || false;
   let runnerTrailActive = pos.surge_runner_active || false;
   
-  const entryMode = pos.surge_entry_mode || "CONFIRMED_SURGE_ENTRY";
+  // 1. 정책 식별 우선순위 수정
+  const surgeEntryMode =
+    pos.surge_entry_mode ??
+    pos.entry_mode ??
+    "";
+  
+  // 2. 복구 Surge 정책 판별 명시적 분리
+  const isRecoveredSurgePolicy =
+    pos.surge_entry_mode === "RECOVERED_SURGE_POLICY" ||
+    (
+      (pos.entry_origin === "auto_trade_recovered" ||
+       pos.entry_origin === "auto_trade_recovered_all_holdings") &&
+      pos.engine_bucket === "surge"
+    );
 
-  // Dynamic policies
   const stopPrice = pos.surge_stop_price;
-  // takeProfitPrice is now TP2 target price!
   let tp2Price = pos.surge_take_profit_price;
 
   let tp1Target = 1.5;
-  let tp1Ratio = entryMode === "FAST_SURGE_PROBE" ? 0.4 : 0.3;
+  let tp1Ratio = surgeEntryMode === "FAST_SURGE_PROBE" ? 0.4 : 0.3;
   let tp2Ratio = 0.5;
-  let trailingStartPct = entryMode === "FAST_SURGE_PROBE" ? 2.0 : 3.0;
-  let trailingGapPct = pos.surge_trailing_gap_pct || (entryMode === "FAST_SURGE_PROBE" ? 1.5 : 2.0);
-  let breakevenProtectTrigger = entryMode === "FAST_SURGE_PROBE" ? 0.2 : 0.5;
+  let trailingStartPct = pos.surge_trailing_start_pct || (surgeEntryMode === "FAST_SURGE_PROBE" ? 2.0 : 3.0);
+  let trailingGapPct = pos.surge_trailing_gap_pct || (surgeEntryMode === "FAST_SURGE_PROBE" ? 1.5 : 2.0);
+  let breakevenProtectTrigger = surgeEntryMode === "FAST_SURGE_PROBE" ? 0.2 : 0.5;
 
-  if (entryMode === "RECOVERED_SURGE_POLICY") {
+  // 3/4. 복구 Surge 정책 강제 적용 및 stale 상태값 덮어쓰기
+  if (isRecoveredSurgePolicy) {
     tp1Target = 3.0;
     tp1Ratio = 0.25;
     trailingStartPct = 3.0;
     trailingGapPct = 2.2;
-    if (tp2Price <= entryPrice * 1.03) {
-      tp2Price = entryPrice * 1.05;
-    }
+    tp2Price = entryPrice * 1.05;
   }
 
   if (
@@ -82,44 +92,69 @@ export function evaluateSurgeExit(pos: any, currentPx: number, rise3mPct?: numbe
     runnerTrailActive = true;
   }
 
+  let decision: SurgeExitDecision | null = null;
+
   // 1. Hard Stop Loss
   if (stopPrice > 0 && currentPx <= stopPrice) {
-    return { action: "sell", reason: "SURGE_STOP_LOSS", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+    decision = { action: "sell", reason: "SURGE_STOP_LOSS", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
-
   // 2. Catastrophic Reversal
-  // Example: pnlPct <= -2% and momentum broken (rise3mPct <= 0)
-  if (pnlPct <= -2.0 && (rise3mPct !== undefined ? rise3mPct <= 0 : true)) {
-    return { action: "sell", reason: "SURGE_REVERSAL_CUT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+  else if (pnlPct <= -2.0 && (rise3mPct !== undefined ? rise3mPct <= 0 : true)) {
+    decision = { action: "sell", reason: "SURGE_REVERSAL_CUT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
-
   // 3. TP1 Partial
-  if (!tp1Done && pnlPct >= tp1Target) {
-    return { action: "sell", reason: "SURGE_TP1_PARTIAL", ratio: tp1Ratio, runnerTrailActive, authoritySource: "surge-v2" };
+  else if (isRecoveredSurgePolicy && !pos.surge_tp1_done && pnlPct >= 3.0) {
+    decision = { action: "sell", reason: "SURGE_TP1_PARTIAL", ratio: 0.25, runnerTrailActive, authoritySource: "surge-v2" };
   }
-
+  else if (!isRecoveredSurgePolicy && !tp1Done && pnlPct >= tp1Target) {
+    decision = { action: "sell", reason: "SURGE_TP1_PARTIAL", ratio: tp1Ratio, runnerTrailActive, authoritySource: "surge-v2" };
+  }
   // 4. TP2 Partial
-  if (tp1Done && !tp2Done && currentPx >= tp2Price) {
-    return { action: "sell", reason: "SURGE_TP2_PARTIAL", ratio: tp2Ratio, runnerTrailActive, authoritySource: "surge-v2" };
+  else if (tp1Done && !tp2Done && currentPx >= tp2Price) {
+    decision = { action: "sell", reason: "SURGE_TP2_PARTIAL", ratio: tp2Ratio, runnerTrailActive, authoritySource: "surge-v2" };
   }
-
   // 5. Runner Trailing Exit
-  if (runnerTrailActive) {
+  else if (runnerTrailActive) {
     const drawdownFromHighPct = ((highestPriceAfterEntry - currentPx) / highestPriceAfterEntry) * 100;
     if (drawdownFromHighPct >= trailingGapPct) {
-      return { action: "sell", reason: "SURGE_RUNNER_TRAILING_EXIT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+      decision = { action: "sell", reason: "SURGE_RUNNER_TRAILING_EXIT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
     }
   }
-
   // 6. Breakeven Protect
-  if (maxPnlPct >= trailingStartPct && pnlPct <= breakevenProtectTrigger) {
-    return { action: "sell", reason: "SURGE_BREAKEVEN_PROTECT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+  if (!decision && maxPnlPct >= trailingStartPct && pnlPct <= breakevenProtectTrigger) {
+    decision = { action: "sell", reason: "SURGE_BREAKEVEN_PROTECT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
-
   // 7. Timeout Exit
-  if (holdMinutes >= 30 && pnlPct < 1.0 && !tp1Done) {
-    return { action: "sell", reason: "SURGE_TIMEOUT_EXIT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+  if (!decision && holdMinutes >= 30 && pnlPct < 1.0 && !tp1Done) {
+    decision = { action: "sell", reason: "SURGE_TIMEOUT_EXIT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
 
-  return { action: "hold", reason: "surge_hold", ratio: 0, runnerTrailActive, authoritySource: "surge-v2" };
+  if (!decision) {
+    decision = { action: "hold", reason: "surge_hold", ratio: 0, runnerTrailActive, authoritySource: "surge-v2" };
+  }
+
+  // 8. 진단 로그 추가 (SURGE_RECOVERED_POLICY_PROOF)
+  if (isRecoveredSurgePolicy) {
+    console.info(JSON.stringify({
+      tag: "SURGE_RECOVERED_POLICY_PROOF",
+      ts: new Date().toISOString(),
+      market: pos.market ?? null,
+      entry_mode: pos.entry_mode ?? null,
+      surge_entry_mode: pos.surge_entry_mode ?? null,
+      entry_origin: pos.entry_origin ?? null,
+      engine_bucket: pos.engine_bucket ?? null,
+      is_recovered_surge_policy: true,
+      pnl_pct: Number(pnlPct.toFixed(4)),
+      tp1_target: tp1Target,
+      tp1_ratio: tp1Ratio,
+      surge_tp1_done: tp1Done,
+      decision: {
+        action: decision.action,
+        reason: decision.reason,
+        ratio: decision.ratio
+      }
+    }));
+  }
+
+  return decision;
 }

@@ -617,30 +617,78 @@ async function runTests() {
     throw new Error("Case 6.1 Failed: DCA/Rescue Add must be blocked for recovered positions");
   }
 
-  // 6.2. grace period 중일 때 Sell Guard 차단 동작 검증
-  const LIVE_EXIT_GRACE_SECONDS = 60; // 60초 가정
-  const simulateSellGuardWithGrace = (pos: any, elapsedMs: number, graceMs: number): { allowed: boolean; reason: string } => {
-    const isRecovered = pos.entry_origin === "auto_trade_recovered" || pos.entry_origin === "auto_trade_recovered_all_holdings" || pos.reason_enter === "RECOVERED_AFTER_LEDGER_MISS";
-    if (isRecovered && elapsedMs < graceMs) {
-      return { allowed: false, reason: "recovered_position_grace_active" };
+  // 6.2. 부트 유예(engine_boot_grace) 및 복구 유예(recovered_grace) 바이패스 검증
+  const simulateSellGuardWithBypass = (args: {
+    entry_origin?: string;
+    reason_enter?: string;
+    elapsedSinceStartMs: number;
+    elapsedMs: number;
+    graceMs: number;
+    exit_policy_attached?: boolean;
+    isPassive?: boolean;
+  }): { allowed: boolean; reason: string } => {
+    if (args.isPassive) {
+      return { allowed: false, reason: "passive_holding_protection_active" };
     }
+    if (args.exit_policy_attached === false) {
+      return { allowed: false, reason: "missing_exit_policy_attached" };
+    }
+
+    const isRecovered = args.entry_origin === "auto_trade_recovered" || args.entry_origin === "auto_trade_recovered_all_holdings";
+
+    // 1. boot grace check (복구 포지션은 bypass)
+    if (args.elapsedSinceStartMs < 10 * 60_000 && !isRecovered) {
+      return { allowed: false, reason: "engine_boot_grace_period_active" };
+    }
+
+    // 2. recovered grace check (복구 포지션은 bypass)
+    if (!isRecovered && (args.entry_origin === "auto_trade_recovered" || args.reason_enter === "RECOVERED_AFTER_LEDGER_MISS")) {
+      if (args.elapsedMs < args.graceMs) {
+        return { allowed: false, reason: "recovered_position_grace_active" };
+      }
+    }
+
     return { allowed: true, reason: "" };
   };
 
-  const gracePos = { entry_origin: "auto_trade_recovered", entry_ts: new Date().toISOString() };
-  const guardRes1 = simulateSellGuardWithGrace(gracePos, 10 * 1000, LIVE_EXIT_GRACE_SECONDS * 1000); // 10초 경과
-  console.log(`Grace Active Check (10s elapsed): allowed=${guardRes1.allowed}, reason=${guardRes1.reason} (Expected: false, recovered_position_grace_active)`);
-  if (guardRes1.allowed || guardRes1.reason !== "recovered_position_grace_active") {
-    throw new Error("Case 6.2 Failed: Sell Guard must block during grace period");
+  // 시나리오 1: 서버 재기동 10초 후 recovered 포지션 TP1 매도 시도 -> bypass 허용
+  const guardRes1 = simulateSellGuardWithBypass({
+    entry_origin: "auto_trade_recovered",
+    elapsedSinceStartMs: 10 * 1000, // 서버 켜진지 10초
+    elapsedMs: 10 * 1000,          // 복구된 지 10초 (grace 이내)
+    graceMs: 60 * 1000,
+  });
+  console.log(`Bypass Active Check (recovered): allowed=${guardRes1.allowed}, reason=${guardRes1.reason} (Expected: true)`);
+  if (!guardRes1.allowed) {
+    throw new Error("Case 6.2 Failed: Staging and boot grace must be bypassed for recovered positions");
   }
 
-  const guardRes2 = simulateSellGuardWithGrace(gracePos, 70 * 1000, LIVE_EXIT_GRACE_SECONDS * 1000); // 70초 경과
-  console.log(`Grace Expired Check (70s elapsed): allowed=${guardRes2.allowed} (Expected: true)`);
-  if (!guardRes2.allowed) {
-    throw new Error("Case 6.2 Failed: Sell Guard must allow after grace period expired");
+  // 시나리오 2: 서버 재기동 10초 후 일반 신규 포지션 매도 시도 -> boot grace 차단
+  const guardRes2 = simulateSellGuardWithBypass({
+    entry_origin: "auto_trade",
+    elapsedSinceStartMs: 10 * 1000, // 서버 켜진지 10초
+    elapsedMs: 10 * 1000,
+    graceMs: 60 * 1000,
+  });
+  console.log(`Bypass Check (new position under boot grace): allowed=${guardRes2.allowed}, reason=${guardRes2.reason} (Expected: false, engine_boot_grace_period_active)`);
+  if (guardRes2.allowed || guardRes2.reason !== "engine_boot_grace_period_active") {
+    throw new Error("Case 6.2 Failed: New position must be blocked under boot grace");
   }
 
-  // 6.3. grace 종료 후 +2.9% 에서 매도 없음 검증
+  // 시나리오 3: passive holding -> 차단 유지
+  const guardRes3 = simulateSellGuardWithBypass({
+    entry_origin: "passive_holding",
+    elapsedSinceStartMs: 20 * 60 * 1000, // 20분 경과
+    elapsedMs: 20 * 60 * 1000,
+    graceMs: 60 * 1000,
+    isPassive: true,
+  });
+  console.log(`Bypass Check (passive holding): allowed=${guardRes3.allowed}, reason=${guardRes3.reason} (Expected: false, passive_holding_protection_active)`);
+  if (guardRes3.allowed || guardRes3.reason !== "passive_holding_protection_active") {
+    throw new Error("Case 6.2 Failed: Passive holding must still be blocked");
+  }
+
+  // 6.3. entry_mode="RECOVERED" + surge_entry_mode="RECOVERED_SURGE_POLICY" 검증
   const surgePosUnderTP = {
     entry_origin: "auto_trade_recovered",
     entry_price: 95_000_000,
@@ -648,6 +696,7 @@ async function runTests() {
     max_pnl_pct: 2.9,
     strict_exit: true,
     engine_bucket: "surge",
+    entry_mode: "RECOVERED",
     surge_entry_mode: "RECOVERED_SURGE_POLICY",
     surge_stop_price: 90_000_000,
     surge_take_profit_price: 100_000_000,
@@ -661,8 +710,39 @@ async function runTests() {
     throw new Error("Case 6.3 Failed: No exit should be triggered at +2.9%");
   }
 
-  // 6.4. grace 종료 후 +3.0% 에서 25% 일부 익절 주문이 예약되는지 검증 (정확히 1회, sell ratio 0.25)
-  // 6.5. 기존 stale surge_take_profit_price가 +3.0%보다 낮은 가격(예: +1.5%)으로 주입되어도 3.0%가 우선 적용되는지 검증
+  const surgePosAtTP = {
+    ...surgePosUnderTP,
+    max_pnl_pct: 3.0,
+  };
+  const exitAtTPNormal = evaluateSurgeExit(surgePosAtTP, 95_000_000 * 1.030, 0); // +3.0%
+  console.log(`Surge Exit Check (+3.0%): action=${exitAtTPNormal.action}, reason=${exitAtTPNormal.reason}, ratio=${exitAtTPNormal.ratio} (Expected: sell, SURGE_TP1_PARTIAL, ratio 0.25)`);
+  if (exitAtTPNormal.action !== "sell" || exitAtTPNormal.reason !== "SURGE_TP1_PARTIAL" || exitAtTPNormal.ratio !== 0.25) {
+    throw new Error("Case 6.3 Failed: Should trigger partial TP1 with ratio 0.25 at +3.0%");
+  }
+
+  // 6.4. surge_entry_mode 누락 + entry_origin="auto_trade_recovered" + engine_bucket="surge" 검증
+  const surgePosModeMissing = {
+    entry_origin: "auto_trade_recovered",
+    entry_price: 95_000_000,
+    qty: 0.1,
+    max_pnl_pct: 3.0,
+    strict_exit: true,
+    engine_bucket: "surge",
+    entry_mode: "RECOVERED",
+    // surge_entry_mode is undefined/missing
+    surge_stop_price: 90_000_000,
+    surge_take_profit_price: 100_000_000,
+    surge_trailing_gap_pct: 2.2,
+    entry_ts: new Date(Date.now() - 70000).toISOString(),
+  };
+
+  const exitMissingMode = evaluateSurgeExit(surgePosModeMissing, 95_000_000 * 1.030, 0); // +3.0%
+  console.log(`Surge Exit Check (mode missing but origin recovered): action=${exitMissingMode.action}, reason=${exitMissingMode.reason}, ratio=${exitMissingMode.ratio} (Expected: sell, SURGE_TP1_PARTIAL, ratio 0.25)`);
+  if (exitMissingMode.action !== "sell" || exitMissingMode.reason !== "SURGE_TP1_PARTIAL" || exitMissingMode.ratio !== 0.25) {
+    throw new Error("Case 6.4 Failed: Should trigger recovery policy (TP1 3.0%, ratio 0.25) based on entry_origin and engine_bucket");
+  }
+
+  // 6.5. stale surge_take_profit_price 존재 → TP1 3.0% 정책 우선 검증
   const surgePosAtTPStale = {
     entry_origin: "auto_trade_recovered",
     entry_price: 95_000_000,
@@ -670,20 +750,32 @@ async function runTests() {
     max_pnl_pct: 3.0,
     strict_exit: true,
     engine_bucket: "surge",
+    entry_mode: "RECOVERED",
     surge_entry_mode: "RECOVERED_SURGE_POLICY",
     surge_stop_price: 90_000_000,
-    surge_take_profit_price: 95_000_000 * 1.015, // +1.5% 라는 구버전/stale TP2 가격 주입
+    surge_take_profit_price: 95_000_000 * 1.015, // +1.5% 라는 stale TP2 가격 주입
     surge_trailing_gap_pct: 2.2,
     entry_ts: new Date(Date.now() - 70000).toISOString(),
   };
 
-  const exitAtTP = evaluateSurgeExit(surgePosAtTPStale, 95_000_000 * 1.030, 0); // +3.0%
-  console.log(`Surge Exit Check (+3.0% with stale TP2): action=${exitAtTP.action}, reason=${exitAtTP.reason}, ratio=${exitAtTP.ratio} (Expected: sell, SURGE_TP1_PARTIAL, ratio 0.25)`);
-  if (exitAtTP.action !== "sell" || exitAtTP.reason !== "SURGE_TP1_PARTIAL" || exitAtTP.ratio !== 0.25) {
-    throw new Error("Case 6.4/6.5 Failed: Should trigger partial TP1 with ratio 0.25 at +3.0% even with stale TP2 price");
+  const exitAtTPStale = evaluateSurgeExit(surgePosAtTPStale, 95_000_000 * 1.030, 0); // +3.0%
+  console.log(`Surge Exit Check (+3.0% with stale TP2): action=${exitAtTPStale.action}, reason=${exitAtTPStale.reason}, ratio=${exitAtTPStale.ratio} (Expected: sell, SURGE_TP1_PARTIAL, ratio 0.25)`);
+  if (exitAtTPStale.action !== "sell" || exitAtTPStale.reason !== "SURGE_TP1_PARTIAL" || exitAtTPStale.ratio !== 0.25) {
+    throw new Error("Case 6.5 Failed: Should trigger partial TP1 with ratio 0.25 at +3.0% even with stale TP2 price");
   }
 
-  // 6.6. 일반 stable/momentum strict TP 경로가 실행되지 않고 오직 surge 전용 엔진의 리턴값으로 exit가 결정되는지 (중복 매도나 multiple exit target 방지) 검증
+  // 6.6. TP1 후 surge_tp1_done=true 상태에서 재호출 → 중복 매도 없음 (hold 반환) 검증
+  const surgePosTp1Done = {
+    ...surgePosAtTP,
+    surge_tp1_done: true,
+  };
+  const exitTp1Done = evaluateSurgeExit(surgePosTp1Done, 95_000_000 * 1.035, 0); // +3.5%
+  console.log(`Surge Exit Check (TP1 done, retry at +3.5%): action=${exitTp1Done.action}, reason=${exitTp1Done.reason} (Expected: hold, surge_hold)`);
+  if (exitTp1Done.action !== "hold") {
+    throw new Error("Case 6.6 Failed: Should hold and avoid duplicate TP1 execution when surge_tp1_done is true");
+  }
+
+  // 6.7. 일반 stable/momentum strict TP 경로가 실행되지 않고 오직 surge 전용 엔진의 리턴값으로 exit가 결정되는지 (중복 매도나 multiple exit target 방지) 검증
   const simulateCombinedExitForTest = (pos: any, currentPrice: number): { reasonExit: string; ratio: number } => {
     let reasonExit = "";
     let ratio = 1;
@@ -717,10 +809,10 @@ async function runTests() {
   const combinedRes = simulateCombinedExitForTest(surgePosAtTPStale, 95_000_000 * 1.03);
   console.log(`Combined Exit Check: reasonExit=${combinedRes.reasonExit}, ratio=${combinedRes.ratio} (Expected: SURGE_TP1_PARTIAL, 0.25)`);
   if (combinedRes.reasonExit !== "SURGE_TP1_PARTIAL" || combinedRes.ratio !== 0.25) {
-    throw new Error("Case 6.6 Failed: Surge position must only execute surge exit engine and bypass stable/momentum strict paths");
+    throw new Error("Case 6.7 Failed: Surge position must only execute surge exit engine and bypass stable/momentum strict paths");
   }
 
-  // 6.7. Passive Holding 검증
+  // 6.8. Passive Holding 검증
   const mockState = {
     positions: {
       "KRW-BTC": { entry_origin: "auto_trade_recovered" }
@@ -729,7 +821,7 @@ async function runTests() {
   const isPassiveHoldingExcluded = !Object.keys(mockState.positions).includes("KRW-ETH"); // ETH는 passive holding으로 가정
   console.log(`Passive Holding Exclusion Check: ETH excluded=${isPassiveHoldingExcluded} (Expected: true)`);
   if (!isPassiveHoldingExcluded) {
-    throw new Error("Case 6.7 Failed: Passive holding must not be in state.positions to avoid exit loop");
+    throw new Error("Case 6.8 Failed: Passive holding must not be in state.positions to avoid exit loop");
   }
 
   console.log("-> Test 6 Passed!");

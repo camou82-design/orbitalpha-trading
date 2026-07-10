@@ -5797,9 +5797,15 @@ export function createLiveDataStrategy(opts: {
       decisionPnlPct: number;
       forceRefreshSource: string;
     }> {
+      const p = state.positions[params.market] || state.early_positions[params.market];
+      const entryOriginStr = p ? (p as any).entry_origin : undefined;
+      const isRecoveredPosition =
+        entryOriginStr === "auto_trade_recovered" ||
+        entryOriginStr === "auto_trade_recovered_all_holdings";
+
       // 0. 엔진 시작 후 10분 동안 또는 첫 계좌/상태 reconciliation 완료 전 자동 sell 금지
       const elapsedSinceStartMs = Date.now() - engineStartedAtMs;
-      if (elapsedSinceStartMs < 10 * 60_000) {
+      if (elapsedSinceStartMs < 10 * 60_000 && !isRecoveredPosition) {
         return {
           allowed: false,
           blockReason: `engine_boot_grace_period_active:${Math.ceil((10 * 60_000 - elapsedSinceStartMs) / 1000)}s_remain`,
@@ -5810,7 +5816,6 @@ export function createLiveDataStrategy(opts: {
       }
 
       // 0.1. managed_position 증거 및 not passive_holding 검증
-      const p = state.positions[params.market] || state.early_positions[params.market];
       const isLegacyActive = Boolean(state.legacy && state.legacy.exit_stage && state.legacy.exit_stage[params.market] !== undefined);
       
       if (!p && !isLegacyActive) {
@@ -5834,8 +5839,8 @@ export function createLiveDataStrategy(opts: {
         };
       }
 
-      // 0.3. recovered position 즉시 청산 금지 (grace period 적용)
-      if (p && ((p.entry_origin as string) === "auto_trade_recovered" || p.reason_enter === "RECOVERED_AFTER_LEDGER_MISS")) {
+      // 0.3. recovered position 즉시 청산 금지 (grace period 적용) - 복구 포지션은 grace bypass
+      if (p && !isRecoveredPosition && ((p.entry_origin as string) === "auto_trade_recovered" || p.reason_enter === "RECOVERED_AFTER_LEDGER_MISS")) {
         const entryTimeMs = Date.parse(p.entry_ts);
         const elapsedMs = Date.now() - entryTimeMs;
         const graceMs = LIVE_EXIT_GRACE_SECONDS * 1000;
@@ -5986,6 +5991,25 @@ export function createLiveDataStrategy(opts: {
           decisionPnlPct,
           forceRefreshSource,
         };
+      }
+
+      if (isRecoveredPosition && p) {
+        const elapsedSinceStartMs = Date.now() - engineStartedAtMs;
+        const entryTimeMs = Date.parse(p.entry_ts);
+        const elapsedMs = Date.now() - entryTimeMs;
+        const graceMs = LIVE_EXIT_GRACE_SECONDS * 1000;
+
+        console.info(JSON.stringify({
+          tag: "RECOVERED_POSITION_GRACE_BYPASS_PROOF",
+          ts: new Date().toISOString(),
+          market: params.market,
+          entry_origin: entryOriginStr,
+          boot_grace_bypassed: elapsedSinceStartMs < 10 * 60_000,
+          recovered_grace_bypassed: elapsedMs < graceMs,
+          exit_reason: params.reasonExit,
+          pnl_pct: Number(decisionPnlPct.toFixed(4)),
+          sell_ratio: params.ratio,
+        }));
       }
 
       return {
@@ -7910,6 +7934,7 @@ export function createLiveDataStrategy(opts: {
 
         if (reasonExit === "SURGE_TP1_PARTIAL" && !(p as any).surge_tp1_done) {
           (p as any).surge_tp1_done = true;
+          p.partial_tp_done = true;
           p.partial_tp_at = new Date().toISOString();
           if (!alreadyProcessed) {
             p.realized_partial_profit = (p.realized_partial_profit ?? 0) + Math.round(netPnlKrw);
@@ -7925,6 +7950,7 @@ export function createLiveDataStrategy(opts: {
           }));
         } else if (reasonExit === "SURGE_TP2_PARTIAL" && !(p as any).surge_tp2_done) {
           (p as any).surge_tp2_done = true;
+          p.partial_tp_done = true;
           p.partial_tp_at = new Date().toISOString();
           if (!alreadyProcessed) {
             p.realized_partial_profit = (p.realized_partial_profit ?? 0) + Math.round(netPnlKrw);
