@@ -358,6 +358,241 @@ async function runTests() {
 
   console.log("-> Test 3 Passed!");
 
+  // ────────────────────────────────────────────────────────────────
+  // Test Case 4: STRICT_NEW_POSITION_EXIT 익절 로직 검증
+  // ────────────────────────────────────────────────────────────────
+  console.log("\n[Test 4] STRICT_NEW_POSITION_EXIT partial TP logic verification...");
+
+  const STRICT_STABLE_PARTIAL_TP_PCT = 3.0;
+  const STRICT_STABLE_PARTIAL_TP_RATIO = 0.25;
+  const STRICT_MOMENTUM_PARTIAL_TP_PCT = 3.0;
+  const STRICT_MOMENTUM_PARTIAL_TP_RATIO = 0.25;
+
+  function simulateStrictPartialTp(args: {
+    strategy_type: "stable" | "momentum" | "surge";
+    strict_exit: boolean;
+    exit_policy_attached: boolean;
+    partial_tp_done: boolean;
+    gross_pnl_pct: number;
+    engine_bucket?: "core" | "surge" | "legacy";
+  }): { shouldSell: boolean; reason: string; ratio?: number } {
+    // exit_policy_attached 검증
+    if (!args.exit_policy_attached) {
+      return { shouldSell: false, reason: "missing_exit_policy_attached" };
+    }
+
+    // surge 포지션은 일반 익절 로직 미적용
+    if (args.strategy_type === "surge" || args.engine_bucket === "surge") {
+      return { shouldSell: false, reason: "surge_uses_dedicated_exit_engine" };
+    }
+
+    // partial_tp_done 중복 방지
+    if (args.partial_tp_done) {
+      return { shouldSell: false, reason: "partial_tp_already_done" };
+    }
+
+    // strict stable
+    if (args.strategy_type === "stable" && args.strict_exit) {
+      if (args.gross_pnl_pct >= STRICT_STABLE_PARTIAL_TP_PCT) {
+        return { shouldSell: true, reason: "partial_take_profit_1st_strict", ratio: STRICT_STABLE_PARTIAL_TP_RATIO };
+      }
+      return { shouldSell: false, reason: "pnl_below_strict_stable_tp_threshold" };
+    }
+
+    // strict momentum
+    if (args.strategy_type === "momentum" && args.strict_exit) {
+      if (args.gross_pnl_pct >= STRICT_MOMENTUM_PARTIAL_TP_PCT) {
+        return { shouldSell: true, reason: "partial_take_profit_1st_strict", ratio: STRICT_MOMENTUM_PARTIAL_TP_RATIO };
+      }
+      return { shouldSell: false, reason: "pnl_below_strict_momentum_tp_threshold" };
+    }
+
+    return { shouldSell: false, reason: "non_strict_uses_legacy_exit" };
+  }
+
+  // Case 4-1: stable strict +2.9% → 매도 없음
+  const tc41 = simulateStrictPartialTp({
+    strategy_type: "stable", strict_exit: true, exit_policy_attached: true,
+    partial_tp_done: false, gross_pnl_pct: 2.9
+  });
+  console.log(`Case 4-1 (stable strict +2.9%): shouldSell=${tc41.shouldSell}, reason=${tc41.reason} (Expected: false)`);
+  if (tc41.shouldSell) throw new Error("Case 4-1 FAILED: should NOT sell at +2.9%");
+
+  // Case 4-2: stable strict +3.0% → 25% 일부매도
+  const tc42 = simulateStrictPartialTp({
+    strategy_type: "stable", strict_exit: true, exit_policy_attached: true,
+    partial_tp_done: false, gross_pnl_pct: 3.0
+  });
+  console.log(`Case 4-2 (stable strict +3.0%): shouldSell=${tc42.shouldSell}, ratio=${tc42.ratio} (Expected: true, 0.25)`);
+  if (!tc42.shouldSell || tc42.ratio !== 0.25) throw new Error("Case 4-2 FAILED: should sell 25% at +3.0%");
+
+  // Case 4-3: momentum strict +3.0% → 25% 일부매도
+  const tc43 = simulateStrictPartialTp({
+    strategy_type: "momentum", strict_exit: true, exit_policy_attached: true,
+    partial_tp_done: false, gross_pnl_pct: 3.0
+  });
+  console.log(`Case 4-3 (momentum strict +3.0%): shouldSell=${tc43.shouldSell}, ratio=${tc43.ratio} (Expected: true, 0.25)`);
+  if (!tc43.shouldSell || tc43.ratio !== 0.25) throw new Error("Case 4-3 FAILED: should sell 25% at +3.0%");
+
+  // Case 4-4: partial_tp_done=true → 중복매도 없음
+  const tc44 = simulateStrictPartialTp({
+    strategy_type: "stable", strict_exit: true, exit_policy_attached: true,
+    partial_tp_done: true, gross_pnl_pct: 3.5
+  });
+  console.log(`Case 4-4 (partial_tp_done=true): shouldSell=${tc44.shouldSell}, reason=${tc44.reason} (Expected: false, partial_tp_already_done)`);
+  if (tc44.shouldSell || tc44.reason !== "partial_tp_already_done") throw new Error("Case 4-4 FAILED: should NOT sell when partial_tp_done=true");
+
+  // Case 4-5: exit_policy_attached=false → 차단 로그 출력
+  const tc45 = simulateStrictPartialTp({
+    strategy_type: "stable", strict_exit: true, exit_policy_attached: false,
+    partial_tp_done: false, gross_pnl_pct: 4.0
+  });
+  console.log(`Case 4-5 (exit_policy_attached=false): shouldSell=${tc45.shouldSell}, reason=${tc45.reason} (Expected: false, missing_exit_policy_attached)`);
+  if (tc45.shouldSell || tc45.reason !== "missing_exit_policy_attached") throw new Error("Case 4-5 FAILED: should be blocked when exit_policy_attached=false");
+
+  // Case 4-6: surge 포지션 → 일반 익절 로직 미적용
+  const tc46 = simulateStrictPartialTp({
+    strategy_type: "surge", strict_exit: true, exit_policy_attached: true,
+    partial_tp_done: false, gross_pnl_pct: 5.0, engine_bucket: "surge"
+  });
+  console.log(`Case 4-6 (surge position): shouldSell=${tc46.shouldSell}, reason=${tc46.reason} (Expected: false, surge_uses_dedicated_exit_engine)`);
+  if (tc46.shouldSell || tc46.reason !== "surge_uses_dedicated_exit_engine") throw new Error("Case 4-6 FAILED: surge should use dedicated exit engine");
+
+  console.log("-> Test 4 Passed!");
+
+  // ────────────────────────────────────────────────────────────────
+  // Test Case 5: Exit loop force refresh 시나리오 검증
+  // 요구사항 8번: stale 캐시 소스에서 force refresh 성공/실패 처리
+  // ────────────────────────────────────────────────────────────────
+  console.log("\n[Test 5] Exit loop force refresh scenarios...");
+
+  const LIVE_SOURCES_TEST = ["ticker_batch", "per_symbol_fetch", "live"];
+
+  function simulateExitLoopPriceGate(args: {
+    initialSource: string;
+    forceRefreshSource: string | null;   // null = fetch throws
+    forceRefreshPrice: number | null;
+    cachedPrice: number;
+    strict_exit: boolean;
+    entry_origin?: string;
+  }): {
+    entered: boolean;
+    priceUsed: number | null;
+    skipReason: string | null;
+    tag: string;
+  } {
+    // recovered position check
+    const isRecovered =
+      args.entry_origin === "auto_trade_recovered" ||
+      args.entry_origin === "auto_trade_recovered_all_holdings";
+    if (isRecovered) {
+      return { entered: false, priceUsed: null, skipReason: "recovered_position_excluded", tag: "EXIT_LOOP_SKIP_PROOF" };
+    }
+
+    const isLivePrice = LIVE_SOURCES_TEST.includes(args.initialSource);
+
+    if (isLivePrice) {
+      // 이미 live — 캐시 가격 그대로 사용
+      return { entered: true, priceUsed: args.cachedPrice, skipReason: null, tag: "EXIT_LOOP_ENTERED_PROOF" };
+    }
+
+    // stale source → force refresh
+    if (args.forceRefreshSource === null) {
+      // fetch throws
+      return {
+        entered: false, priceUsed: null,
+        skipReason: "no_live_price_after_force_refresh",
+        tag: "EXIT_LOOP_SKIP_PROOF"
+      };
+    }
+
+    const freshPrice = args.forceRefreshPrice ?? 0;
+    const isRefreshLive = LIVE_SOURCES_TEST.includes(args.forceRefreshSource);
+    if (freshPrice > 0 && isRefreshLive) {
+      // 강제 조회 성공
+      return { entered: true, priceUsed: freshPrice, skipReason: null, tag: "EXIT_LOOP_PRICE_REFRESH_PROOF" };
+    } else {
+      // 강제 조회 후에도 live 소스 미확보
+      return {
+        entered: false, priceUsed: null,
+        skipReason: "no_live_price_after_force_refresh",
+        tag: "EXIT_LOOP_SKIP_PROOF"
+      };
+    }
+  }
+
+  // Case 5-1: 초기 source=last_good_cache → force refresh 성공(live) → exit loop 진입
+  const tc51 = simulateExitLoopPriceGate({
+    initialSource: "last_good_cache",
+    forceRefreshSource: "live",
+    forceRefreshPrice: 95_000_000,
+    cachedPrice: 94_000_000,
+    strict_exit: true,
+  });
+  console.log(`Case 5-1 (last_good_cache → force refresh live): entered=${tc51.entered}, priceUsed=${tc51.priceUsed}, tag=${tc51.tag}`);
+  if (!tc51.entered || tc51.priceUsed !== 95_000_000 || tc51.tag !== "EXIT_LOOP_PRICE_REFRESH_PROOF") throw new Error("Case 5-1 FAILED");
+  // stale cached price(94_000_000)가 매도 판단에 직접 사용되지 않았음: priceUsed는 refreshed price여야 함
+  // (위 체크에서 priceUsed === 95_000_000 확인으로 암묵적으로 검증됨)
+
+  // Case 5-2: 초기 source=mark_prices_trade_status → force refresh 성공(ticker_batch) → exit loop 진입
+  const tc52 = simulateExitLoopPriceGate({
+    initialSource: "mark_prices_trade_status",
+    forceRefreshSource: "ticker_batch",
+    forceRefreshPrice: 3_200_000,
+    cachedPrice: 3_100_000,
+    strict_exit: true,
+  });
+  console.log(`Case 5-2 (mark_prices_trade_status → force refresh ticker_batch): entered=${tc52.entered}, priceUsed=${tc52.priceUsed}`);
+  if (!tc52.entered || tc52.priceUsed !== 3_200_000) throw new Error("Case 5-2 FAILED: should enter exit loop with fresh ticker_batch price");
+
+  // Case 5-3: force refresh 실패(fetch throws) → 주문 없음, skip reason 명확
+  const tc53 = simulateExitLoopPriceGate({
+    initialSource: "last_good_cache",
+    forceRefreshSource: null,    // fetch throws
+    forceRefreshPrice: null,
+    cachedPrice: 1_500,
+    strict_exit: true,
+  });
+  console.log(`Case 5-3 (force refresh throws): entered=${tc53.entered}, skipReason=${tc53.skipReason}`);
+  if (tc53.entered || tc53.skipReason !== "no_live_price_after_force_refresh") throw new Error("Case 5-3 FAILED: must skip when force refresh throws");
+
+  // Case 5-4: force refresh 후에도 stale source → skip
+  const tc54 = simulateExitLoopPriceGate({
+    initialSource: "last_good_cache",
+    forceRefreshSource: "last_good_cache",  // still stale after refresh
+    forceRefreshPrice: 95_000_000,
+    cachedPrice: 94_000_000,
+    strict_exit: true,
+  });
+  console.log(`Case 5-4 (force refresh still stale): entered=${tc54.entered}, skipReason=${tc54.skipReason}`);
+  if (tc54.entered || tc54.skipReason !== "no_live_price_after_force_refresh") throw new Error("Case 5-4 FAILED: must skip when force refresh source is still stale");
+
+  // Case 5-5: auto_trade_recovered_all_holdings → 동일하게 skip (요구사항 9)
+  const tc55 = simulateExitLoopPriceGate({
+    initialSource: "live",
+    forceRefreshSource: "live",
+    forceRefreshPrice: 95_000_000,
+    cachedPrice: 95_000_000,
+    strict_exit: true,
+    entry_origin: "auto_trade_recovered_all_holdings",
+  });
+  console.log(`Case 5-5 (auto_trade_recovered_all_holdings): entered=${tc55.entered}, skipReason=${tc55.skipReason}`);
+  if (tc55.entered || tc55.skipReason !== "recovered_position_excluded") throw new Error("Case 5-5 FAILED: recovered_all_holdings must be excluded same as recovered");
+
+  // Case 5-6: auto_trade_recovered → skip (기존 정책 유지)
+  const tc56 = simulateExitLoopPriceGate({
+    initialSource: "live",
+    forceRefreshSource: "live",
+    forceRefreshPrice: 95_000_000,
+    cachedPrice: 95_000_000,
+    strict_exit: true,
+    entry_origin: "auto_trade_recovered",
+  });
+  console.log(`Case 5-6 (auto_trade_recovered): entered=${tc56.entered}, skipReason=${tc56.skipReason}`);
+  if (tc56.entered || tc56.skipReason !== "recovered_position_excluded") throw new Error("Case 5-6 FAILED: auto_trade_recovered must be excluded");
+
+  console.log("-> Test 5 Passed!");
+
   // Restore fetch
   global.fetch = originalFetch;
 

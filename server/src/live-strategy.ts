@@ -6147,21 +6147,136 @@ export function createLiveDataStrategy(opts: {
     // exits — 익절/손절 판단은 업비트 보유 화면과 동일한 평단 대비 가격 변동률(gross) 기준
     for (const market of Object.keys(state.positions)) {
       const p = state.positions[market]!;
-      
-      // [보완] passive_holding 또는 auto_trade_recovered 복구 포지션은 sell decision 단계에 들어가지 않도록 함
-      if (p && (p.entry_origin as string) === "auto_trade_recovered") {
-        continue;
-      }
-      
-      const priceSource = (tickerPriceHydrationForCandidates?.sourceByMarket[market] ?? tickerSourceMap.get(market) ?? "missing") as string;
-      const isLivePrice = priceSource === "ticker_batch" || priceSource === "per_symbol_fetch" || priceSource === "live";
-      if (!isLivePrice) {
+
+      // ── [진단] 포지션별 exit loop 진입 체크 ──────────────────────────────
+      // [보완] 수동 복구 포지션(auto_trade_recovered / auto_trade_recovered_all_holdings)은
+      // exit_policy_attached 부여 여부와 무관하게 별도 confirm 없이 즉시 청산 금지.
+      // validateSellGuardBeforePlaceSell의 recovered grace 정책과 동일하게 통일.
+      const entryOriginStr = (p as any).entry_origin as string | undefined;
+      const isRecoveredPosition =
+        entryOriginStr === "auto_trade_recovered" ||
+        entryOriginStr === "auto_trade_recovered_all_holdings";
+      if (p && isRecoveredPosition) {
+        console.info(JSON.stringify({
+          tag: "EXIT_LOOP_SKIP_PROOF",
+          ts: new Date().toISOString(),
+          market,
+          exit_loop_entered: false,
+          exit_loop_skip_reason: "recovered_position_excluded",
+          entry_origin: entryOriginStr ?? null,
+          strict_exit: p.strict_exit ?? null,
+          exit_policy_attached: p.exit_policy_attached ?? null,
+          engine_bucket: p.engine_bucket ?? null,
+          strategy_type: p.strategy_type ?? null,
+        }));
         continue;
       }
 
-      const rawPx = priceBy.get(market);
+      // ── [가격 소스 확인 + 보유 포지션 강제 실시간 조회] ──────────────────
+      // 후보 hydration 맵은 candidate 종목 중심이므로 보유 포지션이
+      // last_good_cache / mark_prices_trade_status 등으로 분류될 수 있음.
+      // 이 경우 즉시 skip하지 않고 강제 실시간 조회 후 exit 평가 계속 진행.
+      // stale 캐시 가격은 참고값만 허용 — 실제 주문 판단은 fresh ticker 확보 후.
+      const LIVE_PRICE_SOURCES = ["ticker_batch", "per_symbol_fetch", "live"] as const;
+      let priceSource = (tickerPriceHydrationForCandidates?.sourceByMarket[market] ?? tickerSourceMap.get(market) ?? "missing") as string;
+      const isLivePrice = (LIVE_PRICE_SOURCES as readonly string[]).includes(priceSource);
+
+      // 강제 조회 결과 추적
+      let refreshAttempted = false;
+      let refreshedFreshPrice: number | null = null;
+
+      if (!isLivePrice) {
+        refreshAttempted = true;
+        const cachedPriceForLog = priceBy.get(market) ?? null;
+        try {
+          const refreshRows = await fetchTickers([market], {
+            isPriority: true,
+            forceRefresh: true,
+            debugCaller: "exit_loop_force_refresh",
+          });
+          const row = refreshRows.find((t) => t.market === market);
+          const freshSrc = tickerSourceMap.get(market) ?? "missing";
+          const freshPrice = Number(row?.trade_price ?? 0);
+          const isRefreshLive = (LIVE_PRICE_SOURCES as readonly string[]).includes(freshSrc);
+
+          if (row && freshPrice > 0 && isRefreshLive) {
+            // 강제 조회 성공 — exit evaluation 계속
+            console.info(JSON.stringify({
+              tag: "EXIT_LOOP_PRICE_REFRESH_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              previous_price_source: priceSource,
+              refreshed_price_source: freshSrc,
+              previous_price: cachedPriceForLog,
+              refreshed_price: freshPrice,
+              refresh_success: true,
+              strict_exit: p.strict_exit ?? null,
+              exit_policy_attached: p.exit_policy_attached ?? null,
+              strategy_type: p.strategy_type ?? null,
+            }));
+            refreshedFreshPrice = freshPrice;
+            priceSource = freshSrc;
+            priceBy.set(market, freshPrice);
+          } else {
+            // 강제 조회 후에도 live 소스 미확보 → 이때만 skip
+            console.info(JSON.stringify({
+              tag: "EXIT_LOOP_SKIP_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              exit_loop_entered: false,
+              exit_loop_skip_reason: "no_live_price_after_force_refresh",
+              previous_price_source: priceSource,
+              refreshed_price_source: freshSrc,
+              cached_price: cachedPriceForLog,
+              refresh_attempted: true,
+              refresh_error: null,
+              strict_exit: p.strict_exit ?? null,
+              exit_policy_attached: p.exit_policy_attached ?? null,
+              engine_bucket: p.engine_bucket ?? null,
+              strategy_type: p.strategy_type ?? null,
+            }));
+            continue;
+          }
+        } catch (err) {
+          const refreshError = err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200);
+          console.info(JSON.stringify({
+            tag: "EXIT_LOOP_SKIP_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            exit_loop_entered: false,
+            exit_loop_skip_reason: "no_live_price_after_force_refresh",
+            previous_price_source: priceSource,
+            refreshed_price_source: "error",
+            cached_price: priceBy.get(market) ?? null,
+            refresh_attempted: true,
+            refresh_error: refreshError,
+            strict_exit: p.strict_exit ?? null,
+            exit_policy_attached: p.exit_policy_attached ?? null,
+            engine_bucket: p.engine_bucket ?? null,
+            strategy_type: p.strategy_type ?? null,
+          }));
+          continue;
+        }
+      }
+
+      // 가격 결정: 강제 조회 성공 시 refreshedFreshPrice, 아니면 priceBy 기존값
+      const rawPx = refreshedFreshPrice !== null ? refreshedFreshPrice : priceBy.get(market);
       const hasTicker = typeof rawPx === "number" && Number.isFinite(rawPx) && rawPx > 0;
       if (!hasTicker) {
+        console.info(JSON.stringify({
+          tag: "EXIT_LOOP_SKIP_PROOF",
+          ts: new Date().toISOString(),
+          market,
+          exit_loop_entered: false,
+          exit_loop_skip_reason: "no_ticker_price",
+          raw_px: rawPx ?? null,
+          price_source: priceSource,
+          refresh_attempted: refreshAttempted,
+          strict_exit: p.strict_exit ?? null,
+          exit_policy_attached: p.exit_policy_attached ?? null,
+          engine_bucket: p.engine_bucket ?? null,
+          strategy_type: p.strategy_type ?? null,
+        }));
         continue;
       }
       const now = rawPx;
@@ -6173,6 +6288,32 @@ export function createLiveDataStrategy(opts: {
       p.max_pnl_pct = Math.max(p.max_pnl_pct, pnlGross);
       p.min_pnl_pct = Math.min(Number(p.min_pnl_pct ?? 0), pnlGross);
       p.current_net_pnl_pct = pnlGross;
+
+      // ── [진단] exit loop 정상 진입 증명 ──────────────────────────────────
+      console.info(JSON.stringify({
+        tag: "EXIT_LOOP_ENTERED_PROOF",
+        ts: new Date().toISOString(),
+        market,
+        exit_loop_entered: true,
+        current_price: now,
+        entry_price: p.entry_price,
+        gross_pnl_pct: Number(pnlGross.toFixed(4)),
+        strategy_type: p.strategy_type ?? null,
+        strict_exit: p.strict_exit ?? null,
+        engine_bucket: p.engine_bucket ?? null,
+        entry_mode: (p as any).entry_mode ?? null,
+        partial_tp_done: p.partial_tp_done ?? false,
+        exit_policy_attached: p.exit_policy_attached ?? null,
+        hold_minutes: Math.floor(heldMs / 60000),
+        within_grace_period: withinGracePeriod,
+        price_source: priceSource,
+        // 적용될 익절 임계값 미리 출력
+        live_partial_tp_pct: LIVE_PARTIAL_TAKE_PROFIT_PCT,
+        strict_stable_partial_tp_pct: STRICT_NEW_POSITION_EXIT.stable.partial_tp_pct,
+        strict_momentum_partial_tp_pct: STRICT_NEW_POSITION_EXIT.momentum.partial_tp_pct,
+        strict_stable_partial_tp_ratio: STRICT_NEW_POSITION_EXIT.stable.partial_tp_ratio,
+        strict_momentum_partial_tp_ratio: STRICT_NEW_POSITION_EXIT.momentum.partial_tp_ratio,
+      }));
 
       const holdMin = minutesSince(p.entry_ts);
       // ── [RESCUE ADD] Pre-Stop Average Down Evaluation ──────────────────
@@ -6634,8 +6775,10 @@ export function createLiveDataStrategy(opts: {
                 stopTriggerKind = "breakeven_protect";
               }
             }
-            // partial TP (env) — before legacy strict partial/trailing
-            if (!reasonExit && !p.partial_tp_done && pnlGross >= LIVE_PARTIAL_TAKE_PROFIT_PCT) {
+            // partial TP (env) — strict 포지션은 STRICT_NEW_POSITION_EXIT 단일 권한으로 처리하므로 제외
+            // [단일 권한 구조] strict_exit=true 인 포지션은 아래 env 변수 기반 TP를 건너뛰고
+            // STRATEGY_RISK_CONFIG / STRICT_NEW_POSITION_EXIT 분기에서만 익절 처리.
+            if (!reasonExit && !p.partial_tp_done && !p.strict_exit && pnlGross >= LIVE_PARTIAL_TAKE_PROFIT_PCT) {
               reasonExit = "partial_take_profit";
               ratio = LIVE_PARTIAL_TAKE_PROFIT_RATIO;
               stopTriggerKind = null;
