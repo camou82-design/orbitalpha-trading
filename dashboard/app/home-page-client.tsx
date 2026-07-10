@@ -3242,21 +3242,60 @@ export default function HomePage() {
                   );
                 }
 
+                // actualBalances에서 currency → current_price 조회 맵 구성
+                // KRW-BTC → balances의 BTC 행 current_price 재사용 (Balances 표와 동일 소스)
+                const balancePriceMap = new Map<string, number>();
+                actualBalances.forEach((b) => {
+                  if (b.currency !== "KRW" && b.current_price > 0) {
+                    balancePriceMap.set(`KRW-${b.currency}`, b.current_price);
+                  }
+                });
+
                 return managedPositionsKeys.map((mk) => {
                   // eslint-disable-next-line @typescript-eslint/no-explicit-any
                   const p = (strategy?.open_positions?.[mk] ?? strategy?.early_positions?.[mk]) as any;
                   if (!p) return null;
-                  
+
                   const isEarly = !strategy?.open_positions?.[mk] && !!strategy?.early_positions?.[mk];
-                  const pnlColor = (p.current_net_pnl_pct ?? 0) >= 0 ? UI.pass : UI.watch;
-                  
+
+                  // ── 현재가 결정 우선순위 ──────────────────────────────────────
+                  // 1) actualBalances (Balances 표와 동일한 실시간 소스) — 최우선
+                  // 2) position의 현재가 관련 서버 필드
+                  // 3) fallback: entry_price (stale 표시)
+                  const priceFromBalances = balancePriceMap.get(mk) ?? 0;
+                  const priceFromPosition = Number(p.current_price ?? p.mark_price ?? 0);
+                  const entryPrice = Number(p.entry_price ?? p.avg ?? 0);
+
+                  const isFallbackPrice =
+                    priceFromBalances <= 0 && priceFromPosition <= 0;
+                  const currentPrice =
+                    priceFromBalances > 0
+                      ? priceFromBalances
+                      : priceFromPosition > 0
+                        ? priceFromPosition
+                        : entryPrice;
+
+                  // ── 평가손익 재계산 ───────────────────────────────────────────
+                  const qty = Number(p.remaining_qty ?? p.qty ?? 0);
+                  const pnlKrw =
+                    qty > 0 && entryPrice > 0 && currentPrice > 0 && !isFallbackPrice
+                      ? (currentPrice - entryPrice) * qty
+                      : 0;
+                  const pnlPct =
+                    entryPrice > 0 && currentPrice > 0 && !isFallbackPrice
+                      ? ((currentPrice / entryPrice) - 1) * 100
+                      : 0;
+
+                  const pnlColor = pnlPct >= 0 ? UI.pass : UI.watch;
+                  const priceColor = isFallbackPrice ? UI.mutedSoft : undefined;
+
                   return (
-                    <div 
-                      key={`pos-${mk}`} 
-                      style={{ 
-                        background: UI.cardBg, 
-                        border: `1px solid ${UI.border}`, 
-                        borderRadius: 8, 
+                    <div
+                      key={`pos-${mk}`}
+                      style={{
+                        background: UI.cardBg,
+                        border: `1px solid ${UI.border}`,
+                        borderRadius: 8,
                         padding: "0.65rem 0.85rem",
                         display: "grid",
                         gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
@@ -3268,23 +3307,31 @@ export default function HomePage() {
                         {isEarly && <span style={{ marginLeft: 6, fontSize: "0.65rem", color: "#f59e0b", border: "1px solid #f59e0b", padding: "1px 4px", borderRadius: 4 }}>Early 진입</span>}
                         <div style={{ fontSize: "0.68rem", color: UI.mutedSoft, marginTop: 3 }}>수량: {p.remaining_qty?.toLocaleString() ?? p.qty?.toLocaleString()}</div>
                       </div>
-                      
+
                       <div>
                         <div style={{ fontSize: "0.68rem", color: UI.mutedSoft }}>진입평단 / 현재가</div>
-                        <div style={{ fontSize: "0.78rem" }}>{Math.round(p.entry_price).toLocaleString()}원 / {Math.round(p.current_price ?? p.entry_price).toLocaleString()}원</div>
+                        <div style={{ fontSize: "0.78rem", color: priceColor }}>
+                          {Math.round(entryPrice).toLocaleString()}원 / {isFallbackPrice
+                            ? <span style={{ color: UI.mutedSoft, fontSize: "0.72rem" }}>수신 대기중</span>
+                            : `${Math.round(currentPrice).toLocaleString()}원`
+                          }
+                        </div>
                       </div>
 
                       <div>
                         <div style={{ fontSize: "0.68rem", color: UI.mutedSoft }}>평가 손익</div>
-                        <div style={{ fontSize: "0.8rem", color: pnlColor, fontWeight: 800 }}>
-                          {Math.round(p.pnl_krw ?? 0).toLocaleString()} KRW ({(p.current_net_pnl_pct ?? 0).toFixed(2)}%)
+                        <div style={{ fontSize: "0.8rem", color: isFallbackPrice ? UI.mutedSoft : pnlColor, fontWeight: 800 }}>
+                          {isFallbackPrice
+                            ? "— KRW (—%)"
+                            : `${Math.round(pnlKrw).toLocaleString()} KRW (${pnlPct.toFixed(2)}%)`
+                          }
                         </div>
                       </div>
 
                       <div>
                         <div style={{ fontSize: "0.68rem", color: UI.mutedSoft }}>손절가 / 트레일링 스탑</div>
                         <div style={{ fontSize: "0.74rem" }}>
-                          Stop: {p.stop_loss_price ? `${Math.round(p.stop_loss_price).toLocaleString()}원` : "없음"} 
+                          Stop: {p.stop_loss_price ? `${Math.round(p.stop_loss_price).toLocaleString()}원` : "없음"}
                           {p.trailing_stop_price ? ` / Trail: ${Math.round(p.trailing_stop_price).toLocaleString()}원` : ""}
                         </div>
                       </div>
