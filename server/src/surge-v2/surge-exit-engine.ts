@@ -38,7 +38,7 @@ export function evaluateSurgeExit(pos: any, currentPx: number, rise3mPct?: numbe
   // Dynamic policies
   const stopPrice = pos.surge_stop_price;
   // takeProfitPrice is now TP2 target price!
-  const tp2Price = pos.surge_take_profit_price;
+  let tp2Price = pos.surge_take_profit_price;
 
   let tp1Target = 1.5;
   let tp1Ratio = entryMode === "FAST_SURGE_PROBE" ? 0.4 : 0.3;
@@ -46,6 +46,16 @@ export function evaluateSurgeExit(pos: any, currentPx: number, rise3mPct?: numbe
   let trailingStartPct = entryMode === "FAST_SURGE_PROBE" ? 2.0 : 3.0;
   let trailingGapPct = pos.surge_trailing_gap_pct || (entryMode === "FAST_SURGE_PROBE" ? 1.5 : 2.0);
   let breakevenProtectTrigger = entryMode === "FAST_SURGE_PROBE" ? 0.2 : 0.5;
+
+  if (entryMode === "RECOVERED_SURGE_POLICY") {
+    tp1Target = 3.0;
+    tp1Ratio = 0.25;
+    trailingStartPct = 3.0;
+    trailingGapPct = 2.2;
+    if (tp2Price <= entryPrice * 1.03) {
+      tp2Price = entryPrice * 1.05;
+    }
+  }
 
   if (
     entryPrice <= 0 || !Number.isFinite(entryPrice) ||

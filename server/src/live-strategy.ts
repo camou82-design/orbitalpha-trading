@@ -51,6 +51,7 @@ import {
   isSurgePosition,
   evaluateSurgeEntryPipeline,
   evaluateSurgeExit,
+  type SurgeEntryDecision,
 } from "./surge-v2/index.js";
 import { computeLiveCapitalPolicyV4 } from "./live-capital-policy-v4.js";
 
@@ -155,6 +156,15 @@ type MarketStateApi = {
     btc_5m_trend?: "up" | "down" | "flat";
     btc_15m_trend?: "up" | "down" | "flat";
   }>;
+  status: () => {
+    market_state: "risk_on" | "neutral" | "risk_off";
+    min_entry_score: number;
+    market_bonus: number;
+    btc_5m_trend?: "up" | "down" | "flat";
+    btc_15m_trend?: "up" | "down" | "flat";
+    btc_rsi?: number;
+    [k: string]: any;
+  } | null;
   entryGate: (
     payload: unknown,
     s: { market_state: "risk_on" | "neutral" | "risk_off"; min_entry_score: number; market_bonus: number; [k: string]: unknown },
@@ -1230,7 +1240,154 @@ async function validateLiveBuyPrecheck(params: {
   entryPath: string;
   isAdditionalBuy: boolean;
   entrySignalType?: string;
+  reclaimScore?: number;
+  volumeAccel?: number;
+  aboveEma20?: boolean;
+  currentPrice?: number;
 }): Promise<{
+  allowed: boolean;
+  blockReason: string | null;
+  killSwitchReason: string | null;
+  cooldownRemainingSec: number;
+  dailyLossCount: number;
+  dailyPnlPct: number;
+  marketStateStr: string;
+  btcRsi: number | null;
+}> {
+  const isReclaimStrategy =
+    params.strategyType === "reclaim" ||
+    params.strategyType === "surge_reclaim" ||
+    params.entrySignalType === "reclaim";
+
+  let snap: any = null;
+  let marketStateStr = "unknown";
+  let btcRsi = null as number | null;
+  if (params.marketState) {
+    try {
+      snap = params.marketState.status() || await params.marketState.evaluate();
+      if (snap) {
+        marketStateStr = snap.market_state;
+        btcRsi = snap.btc_rsi ?? null;
+      }
+    } catch (e) {
+      snap = params.marketState.status();
+      if (snap) {
+        marketStateStr = snap.market_state;
+        btcRsi = snap.btc_rsi ?? null;
+      }
+    }
+  }
+
+  const isPromotedReclaim = params.entryPath === "precheck" || params.entryPath === "surge_normal" || Boolean(params.signalPayload?.surge_capture_promoted);
+
+  if (isReclaimStrategy) {
+    console.info(
+      JSON.stringify({
+        tag: "RECLAIM_PRECHECK_ENTER",
+        ts: new Date().toISOString(),
+        market: params.market,
+        source_path: isPromotedReclaim ? "capture_queue" : "watchlist",
+        market_state: marketStateStr,
+        btc_rsi: btcRsi,
+        strategyType: params.strategyType,
+        entrySignalType: params.entrySignalType,
+        promoted_reclaim: isPromotedReclaim,
+      }),
+    );
+  }
+
+  let rScore = params.reclaimScore ?? 0;
+  if (rScore <= 0 && params.signalPayload) {
+    const p = params.signalPayload as any;
+    rScore = Number(p.surge_capture_score ?? p.reclaim_score ?? p.scanner_score ?? p.entry_score ?? p.signal_score ?? 0);
+  }
+
+  if (isReclaimStrategy) {
+    console.info(
+      JSON.stringify({
+        tag: "RECLAIM_SCORE_EVALUATED",
+        ts: new Date().toISOString(),
+        market: params.market,
+        reclaim_score: rScore,
+        score_threshold: marketStateStr === "risk_on" ? 50 : 55,
+        strategyType: params.strategyType,
+        entrySignalType: params.entrySignalType,
+      }),
+    );
+  }
+
+  let aboveEma20Val = params.aboveEma20;
+  let volumeAccelVal = params.volumeAccel;
+
+  if (snap && isReclaimStrategy) {
+    const rsiVal = snap.btc_rsi ?? 0;
+    if (rsiVal >= 40 && rsiVal < 50) {
+      if (aboveEma20Val === undefined || volumeAccelVal === undefined) {
+        try {
+          const c1 = await fetchMinuteCandles(params.market, 1, 22);
+          const curPrice = params.currentPrice ?? 0;
+          if (c1.length >= 7) {
+            const last = c1[c1.length - 1];
+            const prev5 = c1.slice(-6, -1);
+            const lastNotional = Number(last.trade_price ?? 0) * Number(last.candle_acc_trade_volume ?? 0);
+            const prevAvg = prev5.reduce((a: number, b: any) => a + Number(b.trade_price ?? 0)*Number(b.candle_acc_trade_volume ?? 0), 0) / Math.max(1, prev5.length);
+            if (prevAvg > 0) {
+              volumeAccelVal = lastNotional / prevAvg;
+            }
+          }
+          if (c1.length >= 20) {
+            const closes = c1.map((c: any) => Number(c.trade_price));
+            const emaVal = emaLast(closes, 20) || curPrice;
+            aboveEma20Val = curPrice >= emaVal;
+          }
+        } catch (e) {
+          console.error(`[validateLiveBuyPrecheck] Failed to compute reclaim metrics for ${params.market}`, e);
+        }
+      }
+    }
+  }
+
+  const result = await _validateLiveBuyPrecheckInternal({
+    ...params,
+    reclaimScore: rScore,
+    volumeAccel: volumeAccelVal,
+    aboveEma20: aboveEma20Val
+  }, snap);
+
+  if (isReclaimStrategy && !result.allowed) {
+    console.info(
+      JSON.stringify({
+        tag: "RECLAIM_PRECHECK_BLOCKED",
+        ts: new Date().toISOString(),
+        market: params.market,
+        block_reason: result.blockReason,
+        market_state: result.marketStateStr,
+        btc_rsi: result.btcRsi,
+        reclaim_score: rScore,
+        strategyType: params.strategyType,
+        entrySignalType: params.entrySignalType,
+      }),
+    );
+  }
+
+  return result;
+}
+
+async function _validateLiveBuyPrecheckInternal(params: {
+  market: string;
+  trades: Array<{ market: string; pnl_pct?: number | null; timestamp?: string; action?: string; note?: string }>,
+  positions: Record<string, any>;
+  cooldown_until: Record<string, string>;
+  marketState: any;
+  signalPayload: any;
+  strategyType: string;
+  entryPath: string;
+  isAdditionalBuy: boolean;
+  entrySignalType?: string;
+  reclaimScore?: number;
+  volumeAccel?: number;
+  aboveEma20?: boolean;
+}, snap: any): Promise<{
   allowed: boolean;
   blockReason: string | null;
   killSwitchReason: string | null;
@@ -1251,21 +1408,9 @@ async function validateLiveBuyPrecheck(params: {
     btcRsi: null as number | null,
   };
 
-  let snap: any = null;
-  if (params.marketState) {
-    try {
-      snap = params.marketState.status() || await params.marketState.evaluate();
-      if (snap) {
-        result.marketStateStr = snap.market_state;
-        result.btcRsi = snap.btc_rsi ?? null;
-      }
-    } catch (e) {
-      snap = params.marketState.status();
-      if (snap) {
-        result.marketStateStr = snap.market_state;
-        result.btcRsi = snap.btc_rsi ?? null;
-      }
-    }
+  if (snap) {
+    result.marketStateStr = snap.market_state;
+    result.btcRsi = snap.btc_rsi ?? null;
   }
 
   const today0900 = new Date();
@@ -1341,6 +1486,9 @@ async function validateLiveBuyPrecheck(params: {
       strategyType: params.strategyType,
       market: params.market,
       entrySignalType: params.entrySignalType,
+      reclaimScore: params.reclaimScore,
+      volumeAccel: params.volumeAccel,
+      aboveEma20: params.aboveEma20,
     });
     if (!r.ok) {
       result.allowed = false;
@@ -5894,6 +6042,14 @@ export function createLiveDataStrategy(opts: {
 
       // Step 1. 즉시 차단 (emergency guard)
       const entryMode = (p as any).entry_mode;
+      const entryOriginStr = (p as any).entry_origin as string | undefined;
+      const isRecoveredPosition =
+        entryOriginStr === "auto_trade_recovered" ||
+        entryOriginStr === "auto_trade_recovered_all_holdings";
+      if (isRecoveredPosition) {
+        logBlocked("recovered_position_dca_forbidden");
+        return { executed: false };
+      }
       
       if (p.strict_exit !== true) {
         logBlocked("not_strict_exit");
@@ -6149,28 +6305,10 @@ export function createLiveDataStrategy(opts: {
       const p = state.positions[market]!;
 
       // ── [진단] 포지션별 exit loop 진입 체크 ──────────────────────────────
-      // [보완] 수동 복구 포지션(auto_trade_recovered / auto_trade_recovered_all_holdings)은
-      // exit_policy_attached 부여 여부와 무관하게 별도 confirm 없이 즉시 청산 금지.
-      // validateSellGuardBeforePlaceSell의 recovered grace 정책과 동일하게 통일.
       const entryOriginStr = (p as any).entry_origin as string | undefined;
       const isRecoveredPosition =
         entryOriginStr === "auto_trade_recovered" ||
         entryOriginStr === "auto_trade_recovered_all_holdings";
-      if (p && isRecoveredPosition) {
-        console.info(JSON.stringify({
-          tag: "EXIT_LOOP_SKIP_PROOF",
-          ts: new Date().toISOString(),
-          market,
-          exit_loop_entered: false,
-          exit_loop_skip_reason: "recovered_position_excluded",
-          entry_origin: entryOriginStr ?? null,
-          strict_exit: p.strict_exit ?? null,
-          exit_policy_attached: p.exit_policy_attached ?? null,
-          engine_bucket: p.engine_bucket ?? null,
-          strategy_type: p.strategy_type ?? null,
-        }));
-        continue;
-      }
 
       // ── [가격 소스 확인 + 보유 포지션 강제 실시간 조회] ──────────────────
       // 후보 hydration 맵은 candidate 종목 중심이므로 보유 포지션이
@@ -6288,6 +6426,22 @@ export function createLiveDataStrategy(opts: {
       p.max_pnl_pct = Math.max(p.max_pnl_pct, pnlGross);
       p.min_pnl_pct = Math.min(Number(p.min_pnl_pct ?? 0), pnlGross);
       p.current_net_pnl_pct = pnlGross;
+
+      if (isRecoveredPosition) {
+        console.info(JSON.stringify({
+          tag: "RECOVERED_POSITION_EXIT_MANAGEMENT_ENTERED",
+          ts: new Date().toISOString(),
+          market,
+          entry_origin: entryOriginStr,
+          entry_price: p.entry_price,
+          current_price: now,
+          gross_pnl_pct: Number(pnlGross.toFixed(4)),
+          grace_active: withinGracePeriod,
+          strict_exit: p.strict_exit ?? null,
+          partial_tp_done: p.partial_tp_done ?? false,
+          exit_policy_attached: p.exit_policy_attached ?? null,
+        }));
+      }
 
       // ── [진단] exit loop 정상 진입 증명 ──────────────────────────────────
       console.info(JSON.stringify({
@@ -8216,6 +8370,14 @@ export function createLiveDataStrategy(opts: {
       Number(tstatus.strategy_available_krw ?? tstatus.live_order_available_krw ?? tstatus.krw_available ?? 0),
     );
 
+    // Reclaim counters
+    let watchlist_added_count = 0;
+    let pullback_seen_count = 0;
+    let reclaim_detected_count = 0;
+    let reclaim_precheck_pass_count = 0;
+    let reclaim_final_buy_attempt_count = 0;
+    let reclaim_actual_buy_count = 0;
+
     // Account-wide equity & cap policy (SURGE_V2 / spot live entry).
     // - Total equity = KRW cash(total) + all coin evaluated value (mark price; fallback avg if missing).
     // - Cap ratio is fixed at 50%.
@@ -8490,6 +8652,25 @@ export function createLiveDataStrategy(opts: {
         }));
       }
       for (const p of processResult.promoted) {
+        const isReclaim = p.source_kind === "surge_reclaim" || (p.chase_block_reasons !== undefined && p.chase_block_reasons.length > 0);
+        if (isReclaim) {
+          reclaim_detected_count++;
+          const rsiVal = opts.marketState.status()?.btc_rsi ?? null;
+          console.info(JSON.stringify({
+            tag: "RECLAIM_CANDIDATE_CREATED",
+            ts: new Date().toISOString(),
+            market: p.market,
+            source_path: "capture_queue",
+            market_state: marketState.market_state,
+            btc_rsi: rsiVal,
+            reclaim_score: p.capture_score,
+            score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
+            strategyType: "surge_reclaim",
+            entrySignalType: "reclaim",
+            promoted_reclaim: true,
+          }));
+        }
+
         if (!latestAllSignals.has(p.market)) {
           latestAllSignals.set(p.market, {
             ts: p.last_seen_at,
@@ -8508,7 +8689,8 @@ export function createLiveDataStrategy(opts: {
               surge_capture_score: p.capture_score,
               surge_capture_confirm_count: p.confirm_count,
               surge_capture_volume_accel_1m: p.volume_accel_1m,
-              surge_capture_near_high_pct: p.near_high_pct
+              surge_capture_near_high_pct: p.near_high_pct,
+              reclaim_promoted: isReclaim
             }
           } as any);
         } else {
@@ -8519,6 +8701,7 @@ export function createLiveDataStrategy(opts: {
             (existingSig.p as any).surge_capture_confirm_count = p.confirm_count;
             (existingSig.p as any).surge_capture_volume_accel_1m = p.volume_accel_1m;
             (existingSig.p as any).surge_capture_near_high_pct = p.near_high_pct;
+            (existingSig.p as any).reclaim_promoted = isReclaim;
           }
         }
         if (!entryUniverse.includes(p.market)) entryUniverse.push(p.market);
@@ -9756,6 +9939,7 @@ export function createLiveDataStrategy(opts: {
           item.status = "pullback_seen";
           item.pullback_low_price = currentPrice;
           item.pullback_low_at = new Date().toISOString();
+          pullback_seen_count++;
           console.info(
             JSON.stringify({
               tag: "SURGE_PULLBACK_CONFIRMED",
@@ -9867,6 +10051,27 @@ export function createLiveDataStrategy(opts: {
             continue;
           }
 
+          const sig = latestAllSignals.get(market);
+          const rsiVal = opts.marketState.status()?.btc_rsi ?? null;
+          const rScore = (sig?.p as any)?.surge_capture_score ?? (sig?.p as any)?.reclaim_score ?? (sig?.p as any)?.scanner_score ?? (sig?.p as any)?.signal_score ?? 0;
+
+          reclaim_detected_count++;
+          console.info(
+            JSON.stringify({
+              tag: "RECLAIM_CANDIDATE_CREATED",
+              ts: new Date().toISOString(),
+              market,
+              source_path: "watchlist",
+              market_state: marketState.market_state,
+              btc_rsi: rsiVal,
+              reclaim_score: rScore,
+              score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
+              strategyType: "surge_reclaim",
+              entrySignalType: "reclaim",
+              promoted_reclaim: false,
+            })
+          );
+
           console.info(
             JSON.stringify({
               tag: isMorning ? "MORNING_SURGE_RECLAIM_ENTRY_ALLOW" : "SURGE_RECLAIM_ENTRY_ALLOW",
@@ -9909,11 +10114,15 @@ export function createLiveDataStrategy(opts: {
                 positions: state.positions,
                 cooldown_until: state.cooldown_until,
                 marketState: opts.marketState,
-                signalPayload: undefined,
+                signalPayload: sig?.p,
                 strategyType: "surge_reclaim",
                 entrySignalType: "reclaim",
                 entryPath: finalPath,
                 isAdditionalBuy: false,
+                currentPrice,
+                reclaimScore: rScore,
+                volumeAccel: volumeRatio1m5,
+                aboveEma20: isAboveEma,
               });
               if (!guard.allowed) {
                 logPlacebuyFinalGateBlocked(guard.blockReason!, {
@@ -9935,6 +10144,8 @@ export function createLiveDataStrategy(opts: {
                 continue;
               }
 
+              reclaim_precheck_pass_count++;
+
               const signalPayloadForBuy = {
                 strict_exit: true,
                 exit_policy_attached: true,
@@ -9945,8 +10156,28 @@ export function createLiveDataStrategy(opts: {
                 surge_stop_price: stopPrice,
                 surge_take_profit_price: takeProfitPrice,
                 surge_trailing_start_pct: 1.8,
-                surge_trailing_gap_pct: 1.2
+                surge_trailing_gap_pct: 1.2,
+                sourceStrategy: "surge_reclaim_entry",
+                strategyType: "surge_reclaim",
+                entrySignalType: "reclaim"
               };
+
+              reclaim_final_buy_attempt_count++;
+              console.info(
+                JSON.stringify({
+                  tag: "RECLAIM_FINAL_BUY_ATTEMPT",
+                  ts: new Date().toISOString(),
+                  market,
+                  source_path: "watchlist",
+                  market_state: marketState.market_state,
+                  btc_rsi: rsiVal,
+                  reclaim_score: rScore,
+                  score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
+                  strategyType: "surge_reclaim",
+                  entrySignalType: "reclaim",
+                  promoted_reclaim: false,
+                })
+              );
 
               const buyRes = await opts.trade.placeBuy(
                 market,
@@ -9958,6 +10189,28 @@ export function createLiveDataStrategy(opts: {
                 finalPath
               );
 
+              const buyOk = buyRes && (buyRes as any).ok;
+              if (buyOk) {
+                reclaim_actual_buy_count++;
+              }
+
+              console.info(
+                JSON.stringify({
+                  tag: "RECLAIM_BUY_RESULT",
+                  ts: new Date().toISOString(),
+                  market,
+                  source_path: "watchlist",
+                  market_state: marketState.market_state,
+                  btc_rsi: rsiVal,
+                  reclaim_score: rScore,
+                  score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
+                  strategyType: "surge_reclaim",
+                  entrySignalType: "reclaim",
+                  promoted_reclaim: false,
+                  block_reason: buyOk ? null : "place_buy_failed",
+                })
+              );
+
               console.info(
                 JSON.stringify({
                   tag: "LIVE_PLACEBUY_ATTEMPT",
@@ -9965,7 +10218,7 @@ export function createLiveDataStrategy(opts: {
                   market,
                   path: finalPath,
                   order_krw: orderKrw,
-                  status: buyRes && (buyRes as any).ok ? "ok" : "error",
+                  status: buyOk ? "ok" : "error",
                 })
               );
 
@@ -9979,6 +10232,22 @@ export function createLiveDataStrategy(opts: {
 
             } catch (innerErr) {
               console.error(`Reclaim placeBuy failed for ${market}:`, innerErr);
+              console.info(
+                JSON.stringify({
+                  tag: "RECLAIM_BUY_RESULT",
+                  ts: new Date().toISOString(),
+                  market,
+                  source_path: "watchlist",
+                  market_state: marketState.market_state,
+                  btc_rsi: rsiVal,
+                  reclaim_score: rScore,
+                  score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
+                  strategyType: "surge_reclaim",
+                  entrySignalType: "reclaim",
+                  promoted_reclaim: false,
+                  block_reason: String(innerErr).slice(0, 300),
+                })
+              );
             }
           }
         }
@@ -10091,7 +10360,33 @@ export function createLiveDataStrategy(opts: {
         }),
       );
       const acctSnap = accountHoldSnapshot[market];
-      const candidateMetaFromSetup = candidateMetaMap.get(market);
+      
+      let candidateMetaFromSetup = candidateMetaMap.get(market);
+      const isPromotedReclaim = sigPre?.p?.surge_capture_promoted === true && (sigPre?.p as any)?.reclaim_promoted === true;
+      const isSurgeSourceLocal =
+        candidateMetaFromSetup?.engine_bucket === "surge" ||
+        isPromotedReclaim ||
+        (sigPre?.p as any)?.sourceStrategy === "surge_reclaim_entry" ||
+        (sigPre?.p as any)?.entrySignalType === "reclaim";
+
+      const loopStrategyType = isSurgeSourceLocal ? "surge_reclaim" : "momentum";
+      const loopEntrySignalType = isSurgeSourceLocal ? "reclaim" : undefined;
+
+      if (!candidateMetaFromSetup && isSurgeSourceLocal) {
+        candidateMetaFromSetup = {
+          market,
+          engine_bucket: "surge",
+          real_signal_present: true,
+          is_fresh_signal: true,
+          is_watch_candidate: true,
+          stopPrice: (sigPre?.p as any)?.surge_stop_price ?? 0,
+          targetPrice: (sigPre?.p as any)?.surge_take_profit_price ?? 0,
+          tier: "C",
+          riskReward: 1.5,
+          paper_profile_key: "fallback_reclaim"
+        } as any;
+        candidateMetaMap.set(market, candidateMetaFromSetup!);
+      }
       console.info(
         JSON.stringify({
           tag: "DEBUG_LIVE_SYMBOL_EVAL_START",
@@ -10258,7 +10553,6 @@ export function createLiveDataStrategy(opts: {
       }
       // 공통 Buy Safety Guard 검사
       // 공통 Buy Safety Guard 검사
-      const isSurgeSourceLocal = candidateMetaFromSetup?.engine_bucket === "surge";
       const guard = await validateLiveBuyPrecheck({
         market,
         trades: state.trades,
@@ -10266,10 +10560,12 @@ export function createLiveDataStrategy(opts: {
         cooldown_until: state.cooldown_until,
         marketState: opts.marketState,
         signalPayload: sigPre?.p,
-        strategyType: isSurgeSourceLocal ? "surge_reclaim" : "momentum",
-        entrySignalType: isSurgeSourceLocal ? "reclaim" : undefined,
+        strategyType: loopStrategyType,
+        entrySignalType: loopEntrySignalType,
         entryPath: "precheck",
         isAdditionalBuy: false,
+        currentPrice: Number(priceBy.get(market) ?? 0),
+        reclaimScore: isSurgeSourceLocal ? ((sigPre?.p as any)?.surge_capture_score ?? (sigPre?.p as any)?.reclaim_score ?? (sigPre?.p as any)?.scanner_score ?? (sigPre?.p as any)?.signal_score) : undefined,
       });
       if (!guard.allowed) {
         if (guard.blockReason === "global_kill_switch_active") {
@@ -10280,7 +10576,7 @@ export function createLiveDataStrategy(opts: {
         logPlacebuyFinalGateBlocked(guard.blockReason!, {
           market,
           path: "precheck",
-          strategyType: isSurgeSourceLocal ? "surge_reclaim" : "momentum",
+          strategyType: loopStrategyType,
           killSwitchReason: guard.killSwitchReason,
           cooldownRemaining: guard.cooldownRemainingSec,
           dailyLossCount: guard.dailyLossCount,
@@ -10318,6 +10614,9 @@ export function createLiveDataStrategy(opts: {
       } else {
         (state as any).global_kill_switch_active = false;
         (state as any).global_kill_switch_reason = null;
+        if (isSurgeSourceLocal) {
+          reclaim_precheck_pass_count++;
+        }
       }
 
       if ((state.daily.stop_by_market[market] ?? 0) >= 2) {
@@ -10411,151 +10710,178 @@ export function createLiveDataStrategy(opts: {
         );
 
         // --- Immediate Entry Block & Watchlist Registration ---
-        const nowKst = new Date(Date.now() + 9 * 60 * 60 * 1000);
-        const kstHour = nowKst.getUTCHours();
-        const kstMinute = nowKst.getUTCMinutes();
-        const kstTimeVal = kstHour * 60 + kstMinute;
-        const isMorningWindow = kstTimeVal >= 510 && kstTimeVal < 570; // 08:30 ~ 09:30 KST
-
-        let c1: UpbitCandle[] = [];
-        let c5: UpbitCandle[] = [];
-        try {
-          c1 = await fetchMinuteCandlesCached(market, 1, 12);
-          c5 = await fetchMinuteCandlesCached(market, 5, 12);
-        } catch {}
-
-        const closes1 = c1.map(c => Number(c.trade_price));
-        const closes5 = c5.map(c => Number(c.trade_price));
-        const currentPrice = Number(priceBy.get(market) ?? 0);
-
-        const recent1mRet = closes1.length >= 2 ? ((currentPrice - closes1[closes1.length - 2]) / closes1[closes1.length - 2]) * 100 : 0;
-        const recent3mRet = closes1.length >= 4 ? ((currentPrice - closes1[closes1.length - 4]) / closes1[closes1.length - 4]) * 100 : 0;
-        const recent5mRet = closes5.length >= 2 ? ((currentPrice - closes5[closes5.length - 2]) / closes5[closes5.length - 2]) * 100 : 0;
-
-        const lastC1 = c1[c1.length - 1];
-        const lastVol = lastC1 ? Number(lastC1.candle_acc_trade_volume ?? 0) : 0;
-        const prev5Vols = c1.slice(-6, -1).map(c => Number(c.candle_acc_trade_volume ?? 0));
-        const prev5AvgVol = prev5Vols.reduce((a, b) => a + b, 0) / Math.max(1, prev5Vols.length);
-        const volumeRatio1m5 = prev5AvgVol > 0 ? lastVol / prev5AvgVol : 1.0;
-
-        const day_change_pct = changeRateBy.get(market) !== undefined ? changeRateBy.get(market)! * 100 : 0;
-        const volume_24h_krw = sig?.p?.volume_24h_krw || (sig?.p as any)?.acc_trade_price_24h || 100000000;
-
-        const isSurging =
-          day_change_pct >= 5.0 ||
-          recent1mRet >= 1.2 ||
-          recent3mRet >= 2.0 ||
-          volumeRatio1m5 >= 1.5;
-
-        const btcChange = Number((tstatus as any)?.btc_change_24h ?? 0);
-        const isBtcPanic = btcChange <= -0.025;
-        const isRiskOff = marketState.market_state === "risk_off";
-
-        if (isSurging && !isBtcPanic && !isRiskOff) {
-          const currentCount = Object.keys(state.surge_watchlist || {}).length + Object.keys(state.morning_surge_watchlist || {}).length;
-          const existInWatch = (state.surge_watchlist && state.surge_watchlist[market]) || (state.morning_surge_watchlist && state.morning_surge_watchlist[market]);
-
-          if (currentCount < 20 && !existInWatch) {
-            const watchItem: SurgeWatchItem = {
-              market,
-              first_detected_at: new Date().toISOString(),
-              first_detected_price: currentPrice,
-              day_change_pct,
-              volume_24h_krw,
-              local_high_price: currentPrice,
-              local_high_at: new Date().toISOString(),
-              pullback_low_price: null,
-              pullback_low_at: null,
-              max_day_change_pct: day_change_pct,
-              last_seen_price: currentPrice,
-              last_seen_at: new Date().toISOString(),
-              status: "watching",
-              reason: "surge_detected",
-              expire_at: new Date(Date.now() + 30 * 60000).toISOString(),
-              morning_reentry_candidate: isMorningWindow,
-            };
-
-            if (isMorningWindow) {
-              state.morning_surge_watchlist![market] = watchItem;
-              console.info(
-                JSON.stringify({
-                  tag: "MORNING_SURGE_WATCH_REGISTERED",
-                  ts: new Date().toISOString(),
-                  market,
-                  price: currentPrice,
-                  day_change_pct,
-                  recent1mRet,
-                  recent3mRet,
-                  volumeRatio1m5,
-                  volume_24h_krw,
-                  reason: "surge_detected_morning",
-                })
-              );
-            } else {
-              state.surge_watchlist![market] = watchItem;
-              console.info(
-                JSON.stringify({
-                  tag: "SURGE_WATCH_REGISTERED",
-                  ts: new Date().toISOString(),
-                  market,
-                  price: currentPrice,
-                  day_change_pct,
-                  recent1mRet,
-                  recent3mRet,
-                  volumeRatio1m5,
-                  volume_24h_krw,
-                  reason: "surge_detected",
-                })
-              );
-            }
-          }
-        }
-
-        const localHigh = Math.max(currentPrice, (candidateMetaFromSetup as any)?.localHigh ?? 0);
-        const nearHigh = localHigh > 0 && ((localHigh - currentPrice) / localHigh) * 100 <= 0.2;
-        const isLateChase =
-          (day_change_pct >= 10.0 && nearHigh) ||
-          recent3mRet > 3.5 ||
-          recent5mRet > 6.0;
-
-        if (isLateChase) {
+        if (isPromotedReclaim) {
           console.info(
             JSON.stringify({
-              tag: "SURGE_LATE_CHASE_BLOCK",
+              tag: "RECLAIM_PROMOTED_BYPASS_WATCHLIST",
               ts: new Date().toISOString(),
               market,
-              currentPrice,
-              recent3mRet,
-              recent5mRet,
-              reason: "late_chase_conditions_met",
-              blocked_before_placebuy: true,
+              message: "Bypassing watchlist registration for promoted reclaim candidate",
             })
           );
         } else {
-          console.info(
-            JSON.stringify({
-              tag: "SURGE_WATCH_ONLY_NO_ENTRY",
-              ts: new Date().toISOString(),
-              market,
-              price: currentPrice,
-              reason: "immediate_entry_forbidden_under_new_strategy",
-            })
-          );
-        }
+          const nowKst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+          const kstHour = nowKst.getUTCHours();
+          const kstMinute = nowKst.getUTCMinutes();
+          const kstTimeVal = kstHour * 60 + kstMinute;
+          const isMorningWindow = kstTimeVal >= 510 && kstTimeVal < 570; // 08:30 ~ 09:30 KST
 
-        bumpSkip("immediate_entry_forbidden_under_new_strategy");
-        if (evaluationDiagnostics[market]) {
-          const existInWatch = (state.surge_watchlist && state.surge_watchlist[market]) || (state.morning_surge_watchlist && state.morning_surge_watchlist[market]);
-          evaluationDiagnostics[market].watchlist = {
-            entered: Boolean(existInWatch),
-            reason: existInWatch ? "surge_detected" : "watchlist_full_or_other"
-          };
-          evaluationDiagnostics[market].final = {
-            action: "watchlist_only",
-            reason: "immediate_entry_forbidden_under_new_strategy"
-          };
+          let c1: UpbitCandle[] = [];
+          let c5: UpbitCandle[] = [];
+          try {
+            c1 = await fetchMinuteCandlesCached(market, 1, 12);
+            c5 = await fetchMinuteCandlesCached(market, 5, 12);
+          } catch {}
+
+          const closes1 = c1.map(c => Number(c.trade_price));
+          const closes5 = c5.map(c => Number(c.trade_price));
+          const currentPrice = Number(priceBy.get(market) ?? 0);
+
+          const recent1mRet = closes1.length >= 2 ? ((currentPrice - closes1[closes1.length - 2]) / closes1[closes1.length - 2]) * 100 : 0;
+          const recent3mRet = closes1.length >= 4 ? ((currentPrice - closes1[closes1.length - 4]) / closes1[closes1.length - 4]) * 100 : 0;
+          const recent5mRet = closes5.length >= 2 ? ((currentPrice - closes5[closes5.length - 2]) / closes5[closes5.length - 2]) * 100 : 0;
+
+          const lastC1 = c1[c1.length - 1];
+          const lastVol = lastC1 ? Number(lastC1.candle_acc_trade_volume ?? 0) : 0;
+          const prev5Vols = c1.slice(-6, -1).map(c => Number(c.candle_acc_trade_volume ?? 0));
+          const prev5AvgVol = prev5Vols.reduce((a, b) => a + b, 0) / Math.max(1, prev5Vols.length);
+          const volumeRatio1m5 = prev5AvgVol > 0 ? lastVol / prev5AvgVol : 1.0;
+
+          const day_change_pct = changeRateBy.get(market) !== undefined ? changeRateBy.get(market)! * 100 : 0;
+          const volume_24h_krw = sig?.p?.volume_24h_krw || (sig?.p as any)?.acc_trade_price_24h || 100000000;
+
+          const isSurging =
+            day_change_pct >= 5.0 ||
+            recent1mRet >= 1.2 ||
+            recent3mRet >= 2.0 ||
+            volumeRatio1m5 >= 1.5;
+
+          const btcChange = Number((tstatus as any)?.btc_change_24h ?? 0);
+          const isBtcPanic = btcChange <= -0.025;
+          const isRiskOff = marketState.market_state === "risk_off";
+
+          if (isSurging && !isBtcPanic && !isRiskOff) {
+            const currentCount = Object.keys(state.surge_watchlist || {}).length + Object.keys(state.morning_surge_watchlist || {}).length;
+            const existInWatch = (state.surge_watchlist && state.surge_watchlist[market]) || (state.morning_surge_watchlist && state.morning_surge_watchlist[market]);
+
+            if (currentCount < 20 && !existInWatch) {
+              const watchItem: SurgeWatchItem = {
+                market,
+                first_detected_at: new Date().toISOString(),
+                first_detected_price: currentPrice,
+                day_change_pct,
+                volume_24h_krw,
+                local_high_price: currentPrice,
+                local_high_at: new Date().toISOString(),
+                pullback_low_price: null,
+                pullback_low_at: null,
+                max_day_change_pct: day_change_pct,
+                last_seen_price: currentPrice,
+                last_seen_at: new Date().toISOString(),
+                status: "watching",
+                reason: "surge_detected",
+                expire_at: new Date(Date.now() + 30 * 60000).toISOString(),
+                morning_reentry_candidate: isMorningWindow,
+              };
+
+              watchlist_added_count++;
+              const rsiVal = opts.marketState.status()?.btc_rsi ?? null;
+              console.info(JSON.stringify({
+                tag: "RECLAIM_CANDIDATE_CREATED",
+                ts: new Date().toISOString(),
+                market,
+                source_path: "watchlist",
+                market_state: marketState.market_state,
+                btc_rsi: rsiVal,
+                reclaim_score: (sigPre?.p as any)?.surge_capture_score ?? (sigPre?.p as any)?.reclaim_score ?? (sigPre?.p as any)?.scanner_score ?? (sigPre?.p as any)?.signal_score ?? 0,
+                score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
+                strategyType: "surge_reclaim",
+                entrySignalType: "reclaim",
+                promoted_reclaim: false,
+              }));
+
+              if (isMorningWindow) {
+                state.morning_surge_watchlist![market] = watchItem;
+                console.info(
+                  JSON.stringify({
+                    tag: "MORNING_SURGE_WATCH_REGISTERED",
+                    ts: new Date().toISOString(),
+                    market,
+                    price: currentPrice,
+                    day_change_pct,
+                    recent1mRet,
+                    recent3mRet,
+                    volumeRatio1m5,
+                    volume_24h_krw,
+                    reason: "surge_detected_morning",
+                  })
+                );
+              } else {
+                state.surge_watchlist![market] = watchItem;
+                console.info(
+                  JSON.stringify({
+                    tag: "SURGE_WATCH_REGISTERED",
+                    ts: new Date().toISOString(),
+                    market,
+                    price: currentPrice,
+                    day_change_pct,
+                    recent1mRet,
+                    recent3mRet,
+                    volumeRatio1m5,
+                    volume_24h_krw,
+                    reason: "surge_detected",
+                  })
+                );
+              }
+            }
+          }
+
+          const localHigh = Math.max(currentPrice, (candidateMetaFromSetup as any)?.localHigh ?? 0);
+          const nearHigh = localHigh > 0 && ((localHigh - currentPrice) / localHigh) * 100 <= 0.2;
+          const isLateChase =
+            (day_change_pct >= 10.0 && nearHigh) ||
+            recent3mRet > 3.5 ||
+            recent5mRet > 6.0;
+
+          if (isLateChase) {
+            console.info(
+              JSON.stringify({
+                tag: "SURGE_LATE_CHASE_BLOCK",
+                ts: new Date().toISOString(),
+                market,
+                currentPrice,
+                recent3mRet,
+                recent5mRet,
+                reason: "late_chase_conditions_met",
+                blocked_before_placebuy: true,
+              })
+            );
+          } else {
+            console.info(
+              JSON.stringify({
+                tag: "SURGE_WATCH_ONLY_NO_ENTRY",
+                ts: new Date().toISOString(),
+                market,
+                price: currentPrice,
+                reason: "immediate_entry_forbidden_under_new_strategy",
+              })
+            );
+          }
+
+          bumpSkip("immediate_entry_forbidden_under_new_strategy");
+          if (evaluationDiagnostics[market]) {
+            const existInWatch = (state.surge_watchlist && state.surge_watchlist[market]) || (state.morning_surge_watchlist && state.morning_surge_watchlist[market]);
+            evaluationDiagnostics[market].watchlist = {
+              entered: Boolean(existInWatch),
+              reason: existInWatch ? "surge_detected" : "watchlist_full_or_other"
+            };
+            evaluationDiagnostics[market].final = {
+              action: "watchlist_only",
+              reason: "immediate_entry_forbidden_under_new_strategy"
+            };
+          }
+          continue;
         }
-        continue;
       }
       const scannerBridgeScore = isSurgeSource
         ? computeScannerBridgeScore({
@@ -12033,33 +12359,56 @@ export function createLiveDataStrategy(opts: {
           }
 
           surgeV2EvalCount++;
-          const decision = evaluateSurgeEntryPipeline({
-            market,
-            payload: sig.p,
-            candles1,
-            candles5,
-            currentPrice,
-            marketState: {
-              market_state: marketState.market_state,
-              btc_5m_trend: marketState.btc_5m_trend ?? "flat",
-              btc_15m_trend: marketState.btc_15m_trend ?? "flat",
-              btc_change_24h: btcChange,
-            },
-            volumeRatio: vol,
-            bridgePass,
-            staleOk,
-            ageSeconds: sourceMetaResolved.age_seconds,
-            surgeSetupPass: surgeSetupFromCandidate?.ok,
-            surgeSetupScore: surgeSetupFromCandidate?.score,
-            surgeSetupGrade: surgeSetupFromCandidate?.grade,
-            failedSurgeConditions: surgeSetupFromCandidate?.failed_conditions,
-            capturePromoted: isPromoted,
-            captureScore: (sig.p as any).surge_capture_score,
-            captureConfirmCount: (sig.p as any).surge_capture_confirm_count,
-            captureVolumeAccel1m: (sig.p as any).surge_capture_volume_accel_1m,
-            captureNearHighPct: (sig.p as any).surge_capture_near_high_pct,
-            tickLease: myLease
-          });
+          let decision: SurgeEntryDecision;
+          if (isPromotedReclaim) {
+            const isConfirmed = (sig.p as any).capture_grade === "HIGH";
+            decision = {
+              action: "enter",
+              reason: "surge_entry_approved",
+              authoritySource: "surge-v2",
+              entryMode: isConfirmed ? "CONFIRMED_SURGE_ENTRY" : "FAST_SURGE_PROBE",
+              sizeMultiplier: isConfirmed ? 1.0 : 0.5,
+              stopPct: isConfirmed ? -3.4 : -2.5,
+              takeProfitPct: isConfirmed ? 5.0 : 3.5,
+              trailingStartPct: isConfirmed ? 3.0 : 2.0,
+              trailingGapPct: isConfirmed ? 2.0 : 1.5,
+              detail: {
+                symbol: market,
+                pipeline: "surge",
+                source_kind: sig.p.source_kind ?? "scanner",
+                volume_multiple: sig.p.volume_ratio ?? 1.2,
+                reclaim_promoted: true
+              }
+            };
+          } else {
+            decision = evaluateSurgeEntryPipeline({
+              market,
+              payload: sig.p,
+              candles1,
+              candles5,
+              currentPrice,
+              marketState: {
+                market_state: marketState.market_state,
+                btc_5m_trend: marketState.btc_5m_trend ?? "flat",
+                btc_15m_trend: marketState.btc_15m_trend ?? "flat",
+                btc_change_24h: btcChange,
+              },
+              volumeRatio: vol,
+              bridgePass,
+              staleOk,
+              ageSeconds: sourceMetaResolved.age_seconds,
+              surgeSetupPass: surgeSetupFromCandidate?.ok,
+              surgeSetupScore: surgeSetupFromCandidate?.score,
+              surgeSetupGrade: surgeSetupFromCandidate?.grade,
+              failedSurgeConditions: surgeSetupFromCandidate?.failed_conditions,
+              capturePromoted: isPromoted,
+              captureScore: (sig.p as any).surge_capture_score,
+              captureConfirmCount: (sig.p as any).surge_capture_confirm_count,
+              captureVolumeAccel1m: (sig.p as any).surge_capture_volume_accel_1m,
+              captureNearHighPct: (sig.p as any).surge_capture_near_high_pct,
+              tickLease: myLease
+            });
+          }
 
           console.info(
             JSON.stringify({
@@ -12706,12 +13055,18 @@ export function createLiveDataStrategy(opts: {
         }
         continue;
       }
-      const strategyType: StrategyType = marketState.market_state === "risk_on" ? "momentum" : "stable";
+      const strategyType: StrategyType = isSurgeSourceLocal ? "surge_reclaim" as any : (marketState.market_state === "risk_on" ? "momentum" : "stable");
       const signalPayloadForBuy: any = {
         ...sig.p,
         __allow_risk_scaled_entry: true,
         __strong_symbol_override: strongSymbolOverride,
         __risk_off_exception_reason: exception?.reason,
+        ...(isSurgeSourceLocal ? {
+          sourceStrategy: "surge_reclaim_entry",
+          strategyType: "surge_reclaim",
+          entrySignalType: "reclaim",
+          reclaim_promoted: isPromotedReclaim
+        } : {})
       };
 
       const finalMeta = candidateMeta.find((x) => x.market === market) ?? null;
@@ -13046,8 +13401,11 @@ export function createLiveDataStrategy(opts: {
             marketState: opts.marketState,
             signalPayload: sigPre?.p || sig?.p,
             strategyType,
+            entrySignalType: isSurgeSourceLocal ? "reclaim" : undefined,
             entryPath: isSurgeSource ? "surge_normal" : "normal",
             isAdditionalBuy: false,
+            currentPrice: Number(priceBy.get(market) ?? 0),
+            reclaimScore: isSurgeSourceLocal ? ((sig?.p as any)?.surge_capture_score ?? (sig?.p as any)?.reclaim_score ?? (sig?.p as any)?.scanner_score ?? (sig?.p as any)?.signal_score) : undefined,
           });
           if (!guard.allowed) {
             logPlacebuyFinalGateBlocked(guard.blockReason!, {
@@ -13067,20 +13425,86 @@ export function createLiveDataStrategy(opts: {
           if (!leaseOk()) {
             throw new Error("TICK_LEASE_REVOKED");
           }
+
+          const rsiValForLog = opts.marketState.status()?.btc_rsi ?? null;
+          const rScoreForLog = isSurgeSourceLocal ? ((sig?.p as any)?.surge_capture_score ?? (sig?.p as any)?.reclaim_score ?? (sig?.p as any)?.scanner_score ?? (sig?.p as any)?.signal_score ?? 0) : 0;
+          if (isSurgeSourceLocal) {
+            reclaim_final_buy_attempt_count++;
+            console.info(
+              JSON.stringify({
+                tag: "RECLAIM_FINAL_BUY_ATTEMPT",
+                ts: new Date().toISOString(),
+                market,
+                source_path: "capture_queue",
+                market_state: marketState.market_state,
+                btc_rsi: rsiValForLog,
+                reclaim_score: rScoreForLog,
+                score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
+                strategyType: "surge_reclaim",
+                entrySignalType: "reclaim",
+                promoted_reclaim: isPromotedReclaim,
+              })
+            );
+          }
+
           finalBuyAttemptCount++;
-          await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", {
+          const buyRes = await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", {
             ...signalPayloadForBuy,
             __surge_stop_price: isSurgeSource ? surgeStopPrice : undefined,
             __surge_risk_pct: isSurgeSource ? surgeRiskPct : undefined,
             __surge_stop_reason: isSurgeSource ? surgeStopReason : undefined,
           }, isSurgeSource ? "surge_normal" : "normal");
-          placeBuyOk = true;
-          placeBuyReason = "success";
+          
+          const buyOk = buyRes && (buyRes as any).ok;
+          if (isSurgeSourceLocal) {
+            if (buyOk) {
+              reclaim_actual_buy_count++;
+            }
+            console.info(
+              JSON.stringify({
+                tag: "RECLAIM_BUY_RESULT",
+                ts: new Date().toISOString(),
+                market,
+                source_path: "capture_queue",
+                market_state: marketState.market_state,
+                btc_rsi: rsiValForLog,
+                reclaim_score: rScoreForLog,
+                score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
+                strategyType: "surge_reclaim",
+                entrySignalType: "reclaim",
+                promoted_reclaim: isPromotedReclaim,
+                block_reason: buyOk ? null : "place_buy_failed",
+              })
+            );
+          }
+
+          placeBuyOk = !!buyOk;
+          placeBuyReason = buyOk ? "success" : "place_buy_failed";
           if (evaluationDiagnostics[market]) {
-            evaluationDiagnostics[market].buyGate = { checked: true, allowed: true, reason: "none" };
-            evaluationDiagnostics[market].final = { action: "place_buy_attempt", reason: "none" };
+            evaluationDiagnostics[market].buyGate = { checked: true, allowed: placeBuyOk, reason: placeBuyReason };
+            evaluationDiagnostics[market].final = { action: placeBuyOk ? "place_buy_attempt" : "blocked", reason: placeBuyReason };
           }
         } catch (innerErr) {
+          const rsiValForLog = opts.marketState.status()?.btc_rsi ?? null;
+          const rScoreForLog = isSurgeSourceLocal ? ((sig?.p as any)?.surge_capture_score ?? (sig?.p as any)?.reclaim_score ?? (sig?.p as any)?.scanner_score ?? (sig?.p as any)?.signal_score ?? 0) : 0;
+          if (isSurgeSourceLocal) {
+            console.info(
+              JSON.stringify({
+                tag: "RECLAIM_BUY_RESULT",
+                ts: new Date().toISOString(),
+                market,
+                source_path: "capture_queue",
+                market_state: marketState.market_state,
+                btc_rsi: rsiValForLog,
+                reclaim_score: rScoreForLog,
+                score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
+                strategyType: "surge_reclaim",
+                entrySignalType: "reclaim",
+                promoted_reclaim: isPromotedReclaim,
+                block_reason: String(innerErr).slice(0, 300),
+              })
+            );
+          }
           placeBuyOk = false;
           placeBuyReason = innerErr instanceof Error ? innerErr.message.slice(0, 200) : String(innerErr).slice(0, 200);
           if (evaluationDiagnostics[market]) {
@@ -13549,6 +13973,18 @@ export function createLiveDataStrategy(opts: {
         }),
       );
     }
+    console.info(
+      JSON.stringify({
+        tag: "SURGE_RECLAIM_TICK_SUMMARY",
+        ts: new Date().toISOString(),
+        watchlist_added_count,
+        pullback_seen_count,
+        reclaim_detected_count,
+        reclaim_precheck_pass_count,
+        reclaim_final_buy_attempt_count,
+        reclaim_actual_buy_count
+      })
+    );
     lastDiagnostics = {
       universe_count: entryUniverse.length,
       scanned_count: scannedCount,
@@ -13560,6 +13996,12 @@ export function createLiveDataStrategy(opts: {
       skipped_by_reason: skippedByReason,
       market_diagnostics: evaluationDiagnostics,
       updated_at: new Date().toISOString(),
+      reclaim_watchlist_added_count: watchlist_added_count,
+      reclaim_pullback_seen_count: pullback_seen_count,
+      reclaim_detected_count,
+      reclaim_precheck_pass_count,
+      reclaim_final_buy_attempt_count,
+      reclaim_actual_buy_count,
     };
     await racePersist("tick_tail_before_return");
       },
