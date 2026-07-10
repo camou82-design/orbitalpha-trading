@@ -285,6 +285,9 @@ export function assertOrderBuyAllowed(
     strategyType?: string;
     market?: string;
     entrySignalType?: string;
+    reclaimScore?: number;
+    volumeAccel?: number;
+    aboveEma20?: boolean;
   },
 ): OrderBuyGateResult {
   const { market_state, entry_policy } = snap;
@@ -321,22 +324,62 @@ export function assertOrderBuyAllowed(
     if (market_state === "risk_off") {
       return deny("risk_off: 신규 진입 금지", true, false);
     }
-    // neutral_market_surge_blocked: aggressive surge(momentum/surge_breakout/surge_chase)에만 적용
-    if (isAggressiveSurgeStrategy) {
-      if (market_state === "neutral") {
-        return deny("neutral_market_surge_blocked: 중립 장세에서는 surge 진입 차단", true, false);
+
+    if (isReclaimStrategy) {
+      // 1. Reclaim 전용 점수 결정 (우선순위: args.reclaimScore -> signalPayload 내 필드)
+      let rScore = args.reclaimScore ?? 0;
+      if (rScore <= 0 && args.signalPayload) {
+        const p = args.signalPayload as any;
+        rScore = Number(p.surge_capture_score ?? p.reclaim_score ?? p.scanner_score ?? p.entry_score ?? p.signal_score ?? 0);
+      }
+
+      if (rScore <= 0) {
+        return deny("reclaim_score_missing: Reclaim score is missing or invalid", true, false);
+      }
+
+      // 2. Reclaim 전용 BTC RSI 정책 분리
+      if (snap.btc_rsi !== undefined) {
+        if (snap.btc_rsi < 40) {
+          return deny(`btc_rsi_low_reclaim_blocked: Reclaim requires BTC RSI >= 40 (${snap.btc_rsi.toFixed(1)})`, true, false);
+        } else if (snap.btc_rsi < 50) {
+          // 40 <= btc_rsi < 50: 추가 강화 조건 적용
+          const volAccel = args.volumeAccel ?? 0;
+          const aboveEma = args.aboveEma20 ?? false;
+          if (rScore < 65) {
+            return deny(`btc_rsi_low_reclaim_penalty_blocked: RSI < 50 requires reclaim_score >= 65 (actual: ${rScore})`, true, false);
+          }
+          if (volAccel < 1.1) {
+            return deny(`btc_rsi_low_reclaim_penalty_blocked: RSI < 50 requires volume acceleration >= 1.1 (actual: ${volAccel.toFixed(2)})`, true, false);
+          }
+          if (!aboveEma) {
+            return deny("btc_rsi_low_reclaim_penalty_blocked: RSI < 50 requires price > EMA20", true, false);
+          }
+        }
+      }
+
+      // 3. Reclaim 전용 최소 점수 적용
+      const minReclaimScore = market_state === "risk_on" ? 50 : 55;
+      if (rScore < minReclaimScore) {
+        return deny(`reclaim_score_low: Reclaim score ${rScore} < ${minReclaimScore} in ${market_state} market`, true, false);
+      }
+
+    } else {
+      // 일반 Aggressive Surge 정책
+      if (isAggressiveSurgeStrategy) {
+        if (market_state === "neutral") {
+          return deny("neutral_market_surge_blocked: 중립 장세에서는 surge 진입 차단", true, false);
+        }
+        if (snap.btc_rsi !== undefined && snap.btc_rsi < 50) {
+          return deny(`btc_rsi_low_surge_blocked: BTC RSI가 50 미만이라 진입 차단 (${snap.btc_rsi.toFixed(1)})`, true, false);
+        }
+      }
+
+      const g = runEntryScoreGate(market_state, snap.min_entry_score, snap.market_bonus, args.signalPayload);
+      if (!g.ok) {
+        return deny(g.reason, true, false);
       }
     }
-    // BTC RSI < 50 차단: aggressive surge + reclaim 계열 모두에 적용 (기존 안전장치 유지)
-    if (isAggressiveSurgeStrategy || isReclaimStrategy) {
-      if (snap.btc_rsi !== undefined && snap.btc_rsi < 50) {
-        return deny(`btc_rsi_low_surge_blocked: BTC RSI가 50 미만이라 진입 차단 (${snap.btc_rsi.toFixed(1)})`, true, false);
-      }
-    }
-    const g = runEntryScoreGate(market_state, snap.min_entry_score, snap.market_bonus, args.signalPayload);
-    if (!g.ok) {
-      return deny(g.reason, true, false);
-    }
+
     return {
       ok: true,
       market_state,
