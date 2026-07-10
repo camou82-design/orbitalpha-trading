@@ -2849,6 +2849,7 @@ export default function HomePage() {
                     <th style={{ padding: "0.5rem 0.4rem", textAlign: "right" }}>보유 수량</th>
                     <th style={{ padding: "0.5rem 0.4rem", textAlign: "right" }}>평균 매수가</th>
                     <th style={{ padding: "0.5rem 0.4rem", textAlign: "right" }}>현재가</th>
+                    <th style={{ padding: "0.5rem 0.4rem", textAlign: "right" }}>보유금액</th>
                     <th style={{ padding: "0.5rem 0.4rem", textAlign: "right" }}>평가손익 (KRW)</th>
                     <th style={{ padding: "0.5rem 0.4rem", textAlign: "right" }}>수익률 (%)</th>
                   </tr>
@@ -2856,6 +2857,9 @@ export default function HomePage() {
                 <tbody>
                   {visibleBalances.map((item, idx) => {
                     const isKrw = item.currency === "KRW";
+                    const qty = Number(item.qty ?? 0);
+                    const currentPrice = Number(item.current_price ?? 0);
+                    const holdingValueKrw = isKrw ? qty : qty * currentPrice;
                     return (
                       <tr key={idx} style={{ borderBottom: "1px solid #1e293b33", background: idx % 2 === 0 ? "transparent" : "#0d1525" }}>
                         <td style={{ padding: "0.55rem 0.4rem", fontWeight: 800 }}>
@@ -2886,6 +2890,15 @@ export default function HomePage() {
                         <td style={{ padding: "0.55rem 0.4rem", textAlign: "right", fontFamily: "monospace" }}>
                           {isKrw ? "—" : `${Math.round(item.current_price).toLocaleString()}원`}
                         </td>
+                        <td style={{
+                          padding: "0.55rem 0.4rem",
+                          textAlign: "right",
+                          fontFamily: "monospace",
+                          fontWeight: 700,
+                          color: UI.body,
+                        }}>
+                          {Math.round(holdingValueKrw).toLocaleString()}원
+                        </td>
                         <td style={{ 
                           padding: "0.55rem 0.4rem", 
                           textAlign: "right", 
@@ -2910,6 +2923,22 @@ export default function HomePage() {
                   <tr style={{ background: "#0a1220", borderTop: "2px solid #1e293b", fontWeight: 800 }}>
                     <td style={{ padding: "0.6rem 0.4rem", color: UI.title }}>합계 (숨김 잔고 포함)</td>
                     <td colSpan={3} />
+                    <td style={{
+                      padding: "0.6rem 0.4rem",
+                      textAlign: "right",
+                      fontFamily: "monospace",
+                      fontWeight: 700,
+                      color: UI.body,
+                      fontSize: "0.85rem"
+                    }}>
+                      {Math.round(
+                        actualBalances.reduce((acc, item) => {
+                          const q = Number(item.qty ?? 0);
+                          const cp = Number(item.current_price ?? 0);
+                          return acc + (item.currency === "KRW" ? q : q * cp);
+                        }, 0)
+                      ).toLocaleString()}원
+                    </td>
                     <td style={{ 
                       padding: "0.6rem 0.4rem", 
                       textAlign: "right", 
