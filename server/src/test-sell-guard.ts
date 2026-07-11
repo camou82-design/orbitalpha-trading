@@ -2064,6 +2064,137 @@ async function runTests() {
 
   console.log("-> Test 8.16 Passed!");
 
+  // 8.17. Watchlist 캔들 fallback 최대 나이 제한 및 stale 차단 검증 테스트
+  console.log("\n[Test 8.17] Verifying watchlist candle fallback age limit and stale blocking...");
+  
+  const testWatchlistCandleCache = new Map<string, { ts: number; c1: any[]; c5: any[] }>();
+  let mockFetchMinuteCandlesCalls = 0;
+  let mockFetchShouldFail = false;
+  let loggedBlockedReason: string | null = null;
+  let mockPlaceBuyCalls817: any = 0;
+
+  function runWatchlistReclaimTickSim817(market: string, nowMs: number, item: any) {
+    const cached = testWatchlistCandleCache.get(market);
+
+    let c1: any[] = [];
+    let c5: any[] = [];
+    let candleSource = "live_fetch";
+    let candleAgeMs = 0;
+    let candleFallbackUsed = false;
+
+    // 12초 이내 캐시 사용
+    if (cached && nowMs - cached.ts < 12000) {
+      c1 = cached.c1;
+      c5 = cached.c5;
+      candleSource = "cache_fresh";
+      candleAgeMs = nowMs - cached.ts;
+      candleFallbackUsed = false;
+    } else {
+      let fetchErrStr = "fetch error";
+      if (!mockFetchShouldFail) {
+        mockFetchMinuteCandlesCalls++;
+        c1 = Array.from({ length: 20 }, () => ({ trade_price: 995 }));
+        c5 = Array.from({ length: 20 }, () => ({ trade_price: 995 }));
+        testWatchlistCandleCache.set(market, { ts: nowMs, c1, c5 });
+        candleSource = "live_fetch";
+        candleAgeMs = 0;
+        candleFallbackUsed = false;
+      } else {
+        // fetch 실패 시
+        if (cached) {
+          const age = nowMs - cached.ts;
+          if (age > 30000) { // 30초 초과 시 차단
+            loggedBlockedReason = "watchlist_candles_stale";
+            return; // evaluateReclaimConditions 나 pullback 평가 자체를 진행하지 않고 continue
+          }
+          c1 = cached.c1;
+          c5 = cached.c5;
+          candleSource = "cache_fallback";
+          candleAgeMs = age;
+          candleFallbackUsed = true;
+        } else {
+          loggedBlockedReason = "watchlist_candles_missing";
+          return; // evaluateReclaimConditions 나 pullback 평가 자체를 진행하지 않고 continue
+        }
+      }
+    }
+
+    // 캔들 로딩이 된 경우에만 EMA/수익률 조건 평가 및 placeBuy 실행 모사
+    if (c1.length > 0 && item.status === "reclaim_ready") {
+      mockPlaceBuyCalls817++;
+    }
+  }
+
+  const baseItem817 = { status: "reclaim_ready" };
+
+  // 시나리오 1: 10초 캐시 + fetch 실패 -> 허용 범위 내 fallback 사용해 placeBuy 실행 성공
+  testWatchlistCandleCache.clear();
+  mockFetchMinuteCandlesCalls = 0;
+  mockFetchShouldFail = true;
+  loggedBlockedReason = null;
+  mockPlaceBuyCalls817 = 0;
+
+  // 10초 전에 쌓인 캐시 설정
+  testWatchlistCandleCache.set("KRW-OK", {
+    ts: 1000,
+    c1: Array.from({ length: 20 }, () => ({ trade_price: 995 })),
+    c5: Array.from({ length: 20 }, () => ({ trade_price: 995 })),
+  });
+
+  runWatchlistReclaimTickSim817("KRW-OK", 11000, baseItem817); // 나이 10초(10000ms)
+  console.log(`- Scenario 1 (10s cache fallback): placeBuyCalls=${mockPlaceBuyCalls817}, blockedReason=${loggedBlockedReason} (Expected: 1, null)`);
+  if (mockPlaceBuyCalls817 !== 1 || loggedBlockedReason !== null) {
+    throw new Error("Test 8.17 Scenario 1 Failed");
+  }
+
+  // 시나리오 2: 30초 이상 stale 캐시 + fetch 실패 -> placeBuy 차단(0회) 및 stale 로그 생성
+  testWatchlistCandleCache.clear();
+  mockFetchMinuteCandlesCalls = 0;
+  mockFetchShouldFail = true;
+  loggedBlockedReason = null;
+  mockPlaceBuyCalls817 = 0;
+
+  // 31초 전에 쌓인 캐시 설정
+  testWatchlistCandleCache.set("KRW-STALE", {
+    ts: 1000,
+    c1: Array.from({ length: 20 }, () => ({ trade_price: 995 })),
+    c5: Array.from({ length: 20 }, () => ({ trade_price: 995 })),
+  });
+
+  runWatchlistReclaimTickSim817("KRW-STALE", 32000, baseItem817); // 나이 31초(31000ms)
+  console.log(`- Scenario 2 (31s stale cache): placeBuyCalls=${mockPlaceBuyCalls817}, blockedReason=${loggedBlockedReason} (Expected: 0, watchlist_candles_stale)`);
+  if (mockPlaceBuyCalls817 !== 0 || loggedBlockedReason !== "watchlist_candles_stale") {
+    throw new Error("Test 8.17 Scenario 2 Failed");
+  }
+
+  // 시나리오 3: 캐시 없음 + fetch 실패 -> placeBuy 차단(0회) 및 missing 로그 생성
+  testWatchlistCandleCache.clear();
+  mockFetchMinuteCandlesCalls = 0;
+  mockFetchShouldFail = true;
+  loggedBlockedReason = null;
+  mockPlaceBuyCalls817 = 0;
+
+  runWatchlistReclaimTickSim817("KRW-MISSING", 1000, baseItem817);
+  console.log(`- Scenario 3 (No cache + fetch fail): placeBuyCalls=${mockPlaceBuyCalls817}, blockedReason=${loggedBlockedReason} (Expected: 0, watchlist_candles_missing)`);
+  if (mockPlaceBuyCalls817 !== 0 || loggedBlockedReason !== "watchlist_candles_missing") {
+    throw new Error("Test 8.17 Scenario 3 Failed");
+  }
+
+  // 시나리오 4: 새 fetch 성공 -> 최신 캔들로 정상 평가 및 placeBuy 성공
+  testWatchlistCandleCache.clear();
+  mockFetchMinuteCandlesCalls = 0;
+  mockFetchShouldFail = false;
+  loggedBlockedReason = null;
+  mockPlaceBuyCalls817 = 0;
+
+  runWatchlistReclaimTickSim817("KRW-FRESH", 1000, baseItem817);
+  console.log(`- Scenario 4 (New fetch success): placeBuyCalls=${mockPlaceBuyCalls817}, fetchCalls=${mockFetchMinuteCandlesCalls} (Expected: 1, 1)`);
+  if (mockPlaceBuyCalls817 !== 1 || mockFetchMinuteCandlesCalls !== 1) {
+    throw new Error("Test 8.17 Scenario 4 Failed");
+  }
+
+  console.log("-> Test 8.17 Passed!");
+
   console.log("-> Test 8 Passed!");
 
   // Restore fetch

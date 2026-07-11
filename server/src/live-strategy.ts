@@ -10175,19 +10175,60 @@ export function createLiveDataStrategy(opts: {
       const nowMs = Date.now();
       const cached = watchlistCandleCache.get(market);
 
+      let candleSource = "live_fetch";
+      let candleAgeMs = 0;
+      let candleFallbackUsed = false;
+
       if (cached && nowMs - cached.ts < 12000) {
         c1 = cached.c1;
         c5 = cached.c5;
+        candleSource = "cache_fresh";
+        candleAgeMs = nowMs - cached.ts;
+        candleFallbackUsed = false;
       } else {
+        let fetchErrStr = "unknown";
         try {
           c1 = await fetchMinuteCandlesCached(market, 1, 12);
           c5 = await fetchMinuteCandlesCached(market, 5, 12);
           watchlistCandleCache.set(market, { ts: nowMs, c1, c5 });
-        } catch {
+          candleSource = "live_fetch";
+          candleAgeMs = 0;
+          candleFallbackUsed = false;
+        } catch (err) {
+          fetchErrStr = String(err).slice(0, 300);
           if (cached) {
+            const age = nowMs - cached.ts;
+            if (age > 30000) {
+              console.info(
+                JSON.stringify({
+                  tag: "RECLAIM_CANDLE_DATA_BLOCKED",
+                  ts: new Date().toISOString(),
+                  market,
+                  reason: "watchlist_candles_stale",
+                  candle_age_ms: age,
+                  max_allowed_age_ms: 30000,
+                  fetch_error: fetchErrStr,
+                })
+              );
+              continue;
+            }
             c1 = cached.c1;
             c5 = cached.c5;
+            candleSource = "cache_fallback";
+            candleAgeMs = age;
+            candleFallbackUsed = true;
           } else {
+            console.info(
+              JSON.stringify({
+                tag: "RECLAIM_CANDLE_DATA_BLOCKED",
+                ts: new Date().toISOString(),
+                market,
+                reason: "watchlist_candles_missing",
+                candle_age_ms: null,
+                max_allowed_age_ms: 30000,
+                fetch_error: fetchErrStr,
+              })
+            );
             continue;
           }
         }
@@ -10336,6 +10377,9 @@ export function createLiveDataStrategy(opts: {
               high_reclaim: highReclaim,
               volume_accel: volumeRatio1m5,
               reason: "reclaim_triggered",
+              candle_source: candleSource,
+              candle_age_ms: candleAgeMs,
+              candle_fallback_used: candleFallbackUsed,
             })
           );
         }
@@ -10370,6 +10414,9 @@ export function createLiveDataStrategy(opts: {
               nearHigh: evalRes.nearHigh,
               hasEma: evalRes.hasEma,
               isAboveEma: evalRes.isAboveEma,
+              candle_source: candleSource,
+              candle_age_ms: candleAgeMs,
+              candle_fallback_used: candleFallbackUsed,
             })
           );
         }
@@ -10402,6 +10449,9 @@ export function createLiveDataStrategy(opts: {
               nearHigh: evalRes.nearHigh,
               hasEma: evalRes.hasEma,
               isAboveEma: evalRes.isAboveEma,
+              candle_source: candleSource,
+              candle_age_ms: candleAgeMs,
+              candle_fallback_used: candleFallbackUsed,
             })
           );
           continue;
@@ -10524,6 +10574,9 @@ export function createLiveDataStrategy(opts: {
             strategyType: "surge_reclaim",
             entrySignalType: "reclaim",
             promoted_reclaim: false,
+            candle_source: candleSource,
+            candle_age_ms: candleAgeMs,
+            candle_fallback_used: candleFallbackUsed,
           })
         );
 
@@ -10646,6 +10699,9 @@ export function createLiveDataStrategy(opts: {
                 strategyType: "surge_reclaim",
                 entrySignalType: "reclaim",
                 promoted_reclaim: false,
+                candle_source: candleSource,
+                candle_age_ms: candleAgeMs,
+                candle_fallback_used: candleFallbackUsed,
               })
             );
 
