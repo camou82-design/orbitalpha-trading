@@ -327,13 +327,28 @@ export function assertOrderBuyAllowed(
 
     if (isReclaimStrategy) {
       // 1. Reclaim 전용 점수 결정 (우선순위: args.reclaimScore -> signalPayload 내 필드)
-      let rScore = args.reclaimScore ?? 0;
-      if (rScore <= 0 && args.signalPayload) {
+      let rScore: number | undefined = args.reclaimScore;
+      if ((rScore === undefined || rScore === null || Number.isNaN(rScore)) && args.signalPayload) {
         const p = args.signalPayload as any;
-        rScore = Number(p.surge_capture_score ?? p.reclaim_score ?? p.scanner_score ?? p.entry_score ?? p.signal_score ?? 0);
+        const candidateFields = [
+          p.surge_capture_score,
+          p.reclaim_score,
+          p.scanner_score,
+          p.entry_score,
+          p.signal_score
+        ];
+        for (const f of candidateFields) {
+          if (f !== undefined && f !== null && f !== "") {
+            const parsed = Number(f);
+            if (!Number.isNaN(parsed)) {
+              rScore = parsed;
+              break;
+            }
+          }
+        }
       }
 
-      if (rScore <= 0) {
+      if (rScore === undefined || rScore === null || Number.isNaN(rScore)) {
         return deny("reclaim_score_missing: Reclaim score is missing or invalid", true, false);
       }
 

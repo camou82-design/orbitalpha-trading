@@ -429,6 +429,11 @@ type CandidateMeta = {
   real_signal_present: boolean;
   is_fresh_signal?: boolean;
   is_watch_candidate?: boolean;
+  sourceStrategy?: string;
+  strategyType?: string;
+  entrySignalType?: string;
+  isAggressiveSurgeStrategy?: boolean;
+  isReclaimStrategy?: boolean;
 };
 
 type SurgeEntrySetupResult = {
@@ -564,9 +569,13 @@ type SurgeWatchItem = {
   max_day_change_pct: number;
   last_seen_price: number;
   last_seen_at: string;
-  status: "watching" | "pullback_seen" | "reclaim_ready" | "entered" | "expired";
+  status: "watching" | "pullback_seen" | "reclaim_ready" | "entered" | "expired" | "retry_wait";
   reason: string;
   expire_at: string;
+  attempt_count?: number;
+  last_attempt_at?: string;
+  last_block_reason?: string | null;
+  retry_after?: number;
   // metrics for dashboard
   reclaim_ready?: boolean;
   morning_reentry_candidate?: boolean;
@@ -1228,6 +1237,75 @@ function evaluateGlobalKillSwitch(
   }
   return { active: false, reason: null };
 }
+const precheckCandleCache = new Map<string, { ts: number; candles: any[] }>();
+const precheckInFlight = new Map<string, Promise<any[]>>();
+
+async function fetchPrecheckCandlesSafe(market: string, timeoutMs = 5000): Promise<{ candles: any[]; source: string; ageMs: number }> {
+  const now = Date.now();
+  
+  // 0. 메모리 정리: 1분 이상 지난 오래된 캐시 제거
+  for (const [k, v] of precheckCandleCache.entries()) {
+    if (now - v.ts > 60000) {
+      precheckCandleCache.delete(k);
+    }
+  }
+
+  // 1. 캐시 확인 (10초 이내 캐시 유효)
+  const cached = precheckCandleCache.get(market);
+  if (cached && now - cached.ts < 10000) {
+    return { candles: cached.candles, source: "precheck_cache", ageMs: now - cached.ts };
+  }
+
+  // 2. inFlight 중복 호출 방지 및 timeout 제어
+  let promise = precheckInFlight.get(market);
+  if (!promise) {
+    const controller = new AbortController();
+    let timeoutId: NodeJS.Timeout | undefined;
+    let timedOut = false;
+    
+    const fetchPromise = fetchMinuteCandles(market, 1, 22, controller.signal);
+    const timeoutPromise = new Promise<any[]>((_, reject) => {
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        controller.abort(); // HTTP 요청 중단
+        precheckInFlight.delete(market);
+        reject(new Error("fetchMinuteCandles timeout"));
+      }, timeoutMs);
+    });
+
+    promise = Promise.race([
+      fetchPromise.then((res) => {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+        if (!timedOut) {
+          precheckCandleCache.set(market, { ts: Date.now(), candles: res });
+        }
+        precheckInFlight.delete(market);
+        return res;
+      }),
+      timeoutPromise
+    ]).catch((err) => {
+      precheckInFlight.delete(market);
+      throw err;
+    });
+
+    precheckInFlight.set(market, promise);
+  }
+
+  try {
+    const candles = await promise;
+    // 강화 조건 계산 전 캐시 나이(ageMs) 재검증
+    const finalCached = precheckCandleCache.get(market);
+    const ageMs = finalCached ? (Date.now() - finalCached.ts) : 0;
+    if (ageMs >= 10000) {
+      throw new Error("precheck_candles_stale");
+    }
+    return { candles, source: "live_fetch", ageMs };
+  } catch (err) {
+    throw err;
+  }
+}
 
 async function validateLiveBuyPrecheck(params: {
   market: string;
@@ -1244,6 +1322,7 @@ async function validateLiveBuyPrecheck(params: {
   volumeAccel?: number;
   aboveEma20?: boolean;
   currentPrice?: number;
+  candidateMeta?: any;
 }): Promise<{
   allowed: boolean;
   blockReason: string | null;
@@ -1296,10 +1375,58 @@ async function validateLiveBuyPrecheck(params: {
     );
   }
 
-  let rScore = params.reclaimScore ?? 0;
-  if (rScore <= 0 && params.signalPayload) {
+  // 1단계: params.reclaimScore가 명시적으로 제공되었는지 확인
+  let rScore: number | undefined = params.reclaimScore;
+
+  // 2단계: 제공되지 않았거나 null/undefined/NaN인 경우 signalPayload에서 파싱 시도
+  if ((rScore === undefined || rScore === null || Number.isNaN(rScore)) && params.signalPayload) {
     const p = params.signalPayload as any;
-    rScore = Number(p.surge_capture_score ?? p.reclaim_score ?? p.scanner_score ?? p.entry_score ?? p.signal_score ?? 0);
+    const candidateFields = [
+      p.surge_capture_score,
+      p.reclaim_score,
+      p.scanner_score,
+      p.entry_score,
+      p.signal_score
+    ];
+    for (const f of candidateFields) {
+      if (f !== undefined && f !== null && f !== "") {
+        const parsed = Number(f);
+        if (!Number.isNaN(parsed)) {
+          rScore = parsed;
+          break;
+        }
+      }
+    }
+  }
+
+  const isMissing = rScore === undefined || rScore === null || Number.isNaN(rScore);
+
+  if (isReclaimStrategy && isMissing) {
+    return {
+      allowed: false,
+      blockReason: "reclaim_score_missing",
+      killSwitchReason: null,
+      cooldownRemainingSec: 0,
+      dailyLossCount: 0,
+      dailyPnlPct: 0,
+      marketStateStr: marketStateStr,
+      btcRsi: btcRsi
+    };
+  }
+
+  const minReclaimScore = marketStateStr === "risk_on" ? 50 : 55;
+  const finalRScore = rScore ?? 0;
+  if (isReclaimStrategy && !isMissing && finalRScore < minReclaimScore) {
+    return {
+      allowed: false,
+      blockReason: "reclaim_score_low",
+      killSwitchReason: null,
+      cooldownRemainingSec: 0,
+      dailyLossCount: 0,
+      dailyPnlPct: 0,
+      marketStateStr: marketStateStr,
+      btcRsi: btcRsi
+    };
   }
 
   if (isReclaimStrategy) {
@@ -1319,12 +1446,23 @@ async function validateLiveBuyPrecheck(params: {
   let aboveEma20Val = params.aboveEma20;
   let volumeAccelVal = params.volumeAccel;
 
+  let candleSource = "none";
+  let candleAgeMs = 0;
+  let ema20Computed = null as boolean | null;
+  let volumeAccelComputed = null as number | null;
+  let fallbackUsed = false;
+  let fetchError = null as string | null;
+
   if (snap && isReclaimStrategy) {
     const rsiVal = snap.btc_rsi ?? 0;
     if (rsiVal >= 40 && rsiVal < 50) {
       if (aboveEma20Val === undefined || volumeAccelVal === undefined) {
         try {
-          const c1 = await fetchMinuteCandles(params.market, 1, 22);
+          const fetchResult = await fetchPrecheckCandlesSafe(params.market, 5000);
+          const c1 = fetchResult.candles;
+          candleSource = fetchResult.source;
+          candleAgeMs = fetchResult.ageMs;
+
           const curPrice = params.currentPrice ?? 0;
           if (c1.length >= 7) {
             const last = c1[c1.length - 1];
@@ -1333,25 +1471,42 @@ async function validateLiveBuyPrecheck(params: {
             const prevAvg = prev5.reduce((a: number, b: any) => a + Number(b.trade_price ?? 0)*Number(b.candle_acc_trade_volume ?? 0), 0) / Math.max(1, prev5.length);
             if (prevAvg > 0) {
               volumeAccelVal = lastNotional / prevAvg;
+              volumeAccelComputed = volumeAccelVal;
             }
           }
           if (c1.length >= 20) {
             const closes = c1.map((c: any) => Number(c.trade_price));
             const emaVal = emaLast(closes, 20) || curPrice;
             aboveEma20Val = curPrice >= emaVal;
+            ema20Computed = aboveEma20Val;
           }
-        } catch (e) {
+        } catch (e: any) {
+          fetchError = e instanceof Error ? e.message : String(e);
           console.error(`[validateLiveBuyPrecheck] Failed to compute reclaim metrics for ${params.market}`, e);
+          
+          aboveEma20Val = false;
+          volumeAccelVal = 0;
+          fallbackUsed = false;
         }
+      } else {
+        fallbackUsed = true;
+        candleSource = "params_fallback";
       }
     }
   }
 
   const result = await _validateLiveBuyPrecheckInternal({
     ...params,
-    reclaimScore: rScore,
+    reclaimScore: finalRScore,
     volumeAccel: volumeAccelVal,
-    aboveEma20: aboveEma20Val
+    aboveEma20: aboveEma20Val,
+    candidateMeta: params.candidateMeta,
+    candleSource,
+    candleAgeMs,
+    ema20Computed,
+    volumeAccelComputed,
+    fallbackUsed,
+    fetchError
   }, snap);
 
   if (isReclaimStrategy && !result.allowed) {
@@ -1387,6 +1542,13 @@ async function _validateLiveBuyPrecheckInternal(params: {
   reclaimScore?: number;
   volumeAccel?: number;
   aboveEma20?: boolean;
+  candidateMeta?: any;
+  candleSource?: string;
+  candleAgeMs?: number;
+  ema20Computed?: boolean | null;
+  volumeAccelComputed?: number | null;
+  fallbackUsed?: boolean;
+  fetchError?: string | null;
 }, snap: any): Promise<{
   allowed: boolean;
   blockReason: string | null;
@@ -1397,6 +1559,18 @@ async function _validateLiveBuyPrecheckInternal(params: {
   marketStateStr: string;
   btcRsi: number | null;
 }> {
+  const isReclaimStrategy =
+    params.strategyType === "reclaim" ||
+    params.strategyType === "surge_reclaim" ||
+    params.entrySignalType === "reclaim";
+
+  const isPromotedReclaim =
+    params.entryPath === "precheck" ||
+    params.entryPath === "surge_normal" ||
+    Boolean(params.signalPayload?.surge_capture_promoted);
+
+  const rScore = params.reclaimScore ?? 0;
+
   const result = {
     allowed: true,
     blockReason: null as string | null,
@@ -1480,6 +1654,33 @@ async function _validateLiveBuyPrecheckInternal(params: {
   }
 
   if (snap) {
+    if (isReclaimStrategy) {
+      console.info(
+        JSON.stringify({
+          tag: "RECLAIM_PRECHECK_INPUT_PROOF",
+          ts: new Date().toISOString(),
+          market: params.market,
+          reclaimScore: rScore,
+          volumeAccel: params.volumeAccel ?? null,
+          aboveEma20: params.aboveEma20 ?? null,
+          btcRsi: snap.btc_rsi ?? null,
+          marketState: snap.market_state,
+          sourceStrategy: params.signalPayload?.sourceStrategy ?? null,
+          strategyType: params.strategyType,
+          entrySignalType: params.entrySignalType ?? null,
+          signalPayloadPresent: Boolean(params.signalPayload),
+          candidateMetaPresent: Boolean(params.candidateMeta),
+          promotedReclaim: isPromotedReclaim,
+          candle_source: params.candleSource ?? "none",
+          candle_age_ms: params.candleAgeMs ?? 0,
+          ema20_computed_from_fresh_data: params.ema20Computed ?? null,
+          volume_accel_computed_from_fresh_data: params.volumeAccelComputed ?? null,
+          fallback_used: params.fallbackUsed ?? false,
+          fetch_error: params.fetchError ?? null
+        })
+      );
+    }
+
     const r = assertOrderBuyAllowed(snap, {
       kind: params.isAdditionalBuy ? "add_to_position" : "new_entry",
       signalPayload: params.signalPayload,
@@ -1493,8 +1694,19 @@ async function _validateLiveBuyPrecheckInternal(params: {
     if (!r.ok) {
       result.allowed = false;
       result.blockReason = r.blocked_reason || "market_state_filter_blocked";
-      return result;
     }
+  }
+
+  if (isReclaimStrategy && !result.allowed) {
+    console.info(
+      JSON.stringify({
+        tag: "RECLAIM_PRECHECK_BLOCKED",
+        ts: new Date().toISOString(),
+        market: params.market,
+        block_reason: result.blockReason,
+        kill_switch_reason: result.killSwitchReason,
+      })
+    );
   }
 
   return result;
@@ -2721,6 +2933,15 @@ export function createLiveDataStrategy(opts: {
   }) => Promise<void>;
 }) {
   const engineStartedAtMs = Date.now();
+
+  // Reclaim Cumulative Counters
+  let accum_watchlist_added_count = 0;
+  let accum_pullback_seen_count = 0;
+  let accum_reclaim_detected_count = 0;
+  let accum_reclaim_precheck_pass_count = 0;
+  let accum_reclaim_final_buy_attempt_count = 0;
+  let accum_reclaim_actual_buy_count = 0;
+
   const baseDir = path.join(tradingDataRoot(), "strategy", opts.companyId, opts.serviceId);
   const tradesFile = path.join(baseDir, "live_strategy_trades.json");
   const dailyFile = path.join(baseDir, "live_strategy_daily_stats.json");
@@ -9425,6 +9646,18 @@ export function createLiveDataStrategy(opts: {
           is_watch_candidate: isWatchCandidate,
         };
 
+        const isReclaimFromSignal = 
+          (Boolean((effectivePayload as any).surge_capture_promoted) || (effectivePayload as any).capture_state === "PROMOTED") && 
+          ((effectivePayload as any).reclaim_promoted === true || (effectivePayload as any).source_kind === "surge_reclaim");
+
+        if (isReclaimFromSignal) {
+          meta.sourceStrategy = "surge_reclaim_entry";
+          meta.strategyType = "surge_reclaim";
+          meta.entrySignalType = "reclaim";
+          meta.isAggressiveSurgeStrategy = false;
+          meta.isReclaimStrategy = true;
+        }
+
         console.info(JSON.stringify({
           tag: "DEBUG_CANDIDATE_META_SETTLED_PROOF",
           market: m,
@@ -9778,6 +10011,7 @@ export function createLiveDataStrategy(opts: {
           .slice(0, 20),
       }),
     );
+    const tickEnteredMarkets = new Set<string>();
     console.info(
       JSON.stringify({
         tag: "DEBUG_LIVE_STAGE_TRACE",
@@ -9890,6 +10124,35 @@ export function createLiveDataStrategy(opts: {
       }),
     );
 
+    function evaluateReclaimConditions(params: {
+      currentPrice: number;
+      pullbackLowPrice: number | null;
+      recent1mRet: number;
+      recent3mRet: number;
+      localHigh: number;
+      closes1: number[];
+    }) {
+      const isRebounding = params.pullbackLowPrice !== null && params.currentPrice > params.pullbackLowPrice;
+      const returnsOk = params.recent1mRet > 0 && params.recent3mRet >= 0 && params.recent3mRet <= 2.5;
+      const nearHigh = params.currentPrice >= params.localHigh * 0.997 && params.currentPrice <= params.localHigh * 1.003;
+
+      const ema20 = emaLast(params.closes1, 20);
+      const hasEma = typeof ema20 === "number" && Number.isFinite(ema20);
+      const isAboveEma = hasEma && params.currentPrice >= ema20;
+
+      const valid = isRebounding && returnsOk && nearHigh && hasEma && isAboveEma;
+
+      return {
+        valid,
+        isRebounding,
+        returnsOk,
+        nearHigh,
+        hasEma,
+        isAboveEma,
+        ema20,
+      };
+    }
+
     // --- Watchlist State Machine and Reclaim Entry Engine ---
     if (!state.surge_watchlist) state.surge_watchlist = {};
     if (!state.morning_surge_watchlist) state.morning_surge_watchlist = {};
@@ -9900,6 +10163,10 @@ export function createLiveDataStrategy(opts: {
 
     for (const item of allWatchItems) {
       const market = item.market;
+      if (tickEnteredMarkets.has(market)) continue;
+      if (item.status === "retry_wait" && item.retry_after && Date.now() < item.retry_after) {
+        continue;
+      }
       const currentPrice = priceBy.get(market) || 0;
       if (currentPrice <= 0) continue;
 
@@ -9993,10 +10260,35 @@ export function createLiveDataStrategy(opts: {
         const isPullback = pullbackPct >= 0.6 && pullbackPct < 2.5;
 
         if (isPullback && volumeRatio1m5 >= 0.1 && marketState.market_state !== "risk_off") {
+          const fromState = item.status;
           item.status = "pullback_seen";
           item.pullback_low_price = currentPrice;
           item.pullback_low_at = new Date().toISOString();
           pullback_seen_count++;
+
+          const ema20 = emaLast(closes1, 20) || currentPrice;
+          const isAboveEma = currentPrice >= ema20;
+          const highReclaim = currentPrice >= localHigh * 0.9985;
+
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_WATCH_STATE_TRANSITION",
+              ts: new Date().toISOString(),
+              market,
+              from_state: fromState,
+              to_state: "pullback_seen",
+              local_high: localHigh,
+              current_price: currentPrice,
+              pullback_pct: pullbackPct,
+              pullback_low_price: currentPrice,
+              recent_1m_ret: recent1mRet,
+              price_above_ema20: isAboveEma,
+              high_reclaim: highReclaim,
+              volume_accel: volumeRatio1m5,
+              reason: "pullback_confirmed",
+            })
+          );
+
           console.info(
             JSON.stringify({
               tag: "SURGE_PULLBACK_CONFIRMED",
@@ -10011,301 +10303,473 @@ export function createLiveDataStrategy(opts: {
         }
       }
 
-      // 3. 상태 기계: pullback_seen -> reclaim 진입
+      // 3. 상태 기계: pullback_seen -> reclaim_ready 전이
       if (item.status === "pullback_seen") {
-        const isRebounding = item.pullback_low_price !== null && currentPrice > item.pullback_low_price;
-        const returnsOk = recent1mRet > 0 && recent3mRet >= 0 && recent3mRet <= 2.5;
-        const nearHigh = currentPrice >= localHigh * 0.997 && currentPrice <= localHigh * 1.003;
+        const evalRes = evaluateReclaimConditions({
+          currentPrice,
+          pullbackLowPrice: item.pullback_low_price,
+          recent1mRet,
+          recent3mRet,
+          localHigh,
+          closes1,
+        });
+        const highReclaim = currentPrice >= localHigh * 0.9985;
 
-        const ema20 = emaLast(closes1, 20) || currentPrice;
-        const isAboveEma = currentPrice >= ema20;
-
-        if (isRebounding && returnsOk && nearHigh && isAboveEma) {
-          const pullbackLow = item.pullback_low_price || currentPrice;
-          const stopCandidate1 = pullbackLow * 0.997;
-          const stopCandidate2 = currentPrice * 0.985;
-          let stopPrice = Math.max(stopCandidate1, stopCandidate2);
-
-          let lossPct = ((currentPrice - stopPrice) / currentPrice) * 100;
-          if (lossPct < 0.8) {
-            stopPrice = currentPrice * 0.992;
-            lossPct = 0.8;
-          }
-
-          const takeProfitPrice = currentPrice * 1.018;
-          const profitPct = ((takeProfitPrice - currentPrice) / currentPrice) * 100;
-          const riskReward = lossPct > 0 ? profitPct / lossPct : 0;
-
-          item.riskReward = riskReward;
-
-          const valid =
-            stopPrice > 0 &&
-            takeProfitPrice > 0 &&
-            stopPrice < currentPrice &&
-            takeProfitPrice > currentPrice &&
-            riskReward >= 1.3 &&
-            lossPct <= 2.0;
-
-          const finalPath = isMorning ? "morning_surge_reclaim_entry" : "surge_reclaim_entry";
-
-          if (!valid) {
-            console.info(
-              JSON.stringify({
-                tag: isMorning ? "MORNING_SURGE_RECLAIM_ENTRY_BLOCK" : "SURGE_RECLAIM_ENTRY_BLOCK",
-                ts: new Date().toISOString(),
-                market,
-                price: currentPrice,
-                stopPrice,
-                takeProfitPrice,
-                riskReward,
-                reason: "exit_policy_verification_failed",
-              })
-            );
-            continue;
-          }
-
-          if (dailyRiskKillSwitchActive) {
-            console.info(
-              JSON.stringify({
-                tag: isMorning ? "MORNING_SURGE_RECLAIM_ENTRY_BLOCK" : "SURGE_RECLAIM_ENTRY_BLOCK",
-                ts: new Date().toISOString(),
-                market,
-                price: currentPrice,
-                stopPrice,
-                takeProfitPrice,
-                riskReward,
-                reason: "daily_risk_kill_switch_active",
-              })
-            );
-            continue;
-          }
-
-          const nowKst = new Date(Date.now() + 9 * 60 * 60 * 1000);
-          const kstHour = nowKst.getUTCHours();
-          const kstMinute = nowKst.getUTCMinutes();
-          const kstTimeVal = kstHour * 60 + kstMinute;
-          if (kstTimeVal >= 0 && kstTimeVal < 510) {
-            console.info(
-              JSON.stringify({
-                tag: isMorning ? "MORNING_SURGE_RECLAIM_ENTRY_BLOCK" : "SURGE_RECLAIM_ENTRY_BLOCK",
-                ts: new Date().toISOString(),
-                market,
-                reason: "night_block_time_reclaim_denied",
-              })
-            );
-            continue;
-          }
-
-          if (kstTimeVal >= 510 && kstTimeVal < 570 && !isMorning) {
-            console.info(
-              JSON.stringify({
-                tag: "MORNING_SURGE_RECLAIM_ENTRY_BLOCK",
-                ts: new Date().toISOString(),
-                market,
-                reason: "only_morning_surge_watchlist_allowed",
-              })
-            );
-            continue;
-          }
-
-          const sig = latestAllSignals.get(market);
-          const rsiVal = opts.marketState.status()?.btc_rsi ?? null;
-          const rScore = (sig?.p as any)?.surge_capture_score ?? (sig?.p as any)?.reclaim_score ?? (sig?.p as any)?.scanner_score ?? (sig?.p as any)?.signal_score ?? 0;
-
-          reclaim_detected_count++;
+        if (evalRes.valid) {
+          const fromState = item.status;
+          item.status = "reclaim_ready"; // reclaim_ready 상태로 전이!
+          
+          const pullbackPct = ((localHigh - currentPrice) / localHigh) * 100;
           console.info(
             JSON.stringify({
-              tag: "RECLAIM_CANDIDATE_CREATED",
+              tag: "SURGE_WATCH_STATE_TRANSITION",
               ts: new Date().toISOString(),
               market,
-              source_path: "watchlist",
-              market_state: marketState.market_state,
-              btc_rsi: rsiVal,
-              reclaim_score: rScore,
-              score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
-              strategyType: "surge_reclaim",
-              entrySignalType: "reclaim",
-              promoted_reclaim: false,
+              from_state: fromState,
+              to_state: "reclaim_ready",
+              local_high: localHigh,
+              current_price: currentPrice,
+              pullback_pct: pullbackPct,
+              pullback_low_price: item.pullback_low_price || currentPrice,
+              recent_1m_ret: recent1mRet,
+              price_above_ema20: evalRes.isAboveEma,
+              high_reclaim: highReclaim,
+              volume_accel: volumeRatio1m5,
+              reason: "reclaim_triggered",
             })
           );
+        }
+      }
 
+      // 4. retry_wait -> reclaim_ready 복귀 (단, 조건을 재검증함)
+      if (item.status === "retry_wait" && item.retry_after && Date.now() >= item.retry_after) {
+        const evalRes = evaluateReclaimConditions({
+          currentPrice,
+          pullbackLowPrice: item.pullback_low_price,
+          recent1mRet,
+          recent3mRet,
+          localHigh,
+          closes1,
+        });
+
+        if (evalRes.valid) {
+          item.status = "reclaim_ready";
+        } else {
+          item.status = "pullback_seen";
+          item.last_block_reason = "reclaim_conditions_no_longer_valid";
           console.info(
             JSON.stringify({
-              tag: isMorning ? "MORNING_SURGE_RECLAIM_ENTRY_ALLOW" : "SURGE_RECLAIM_ENTRY_ALLOW",
+              tag: "SURGE_WATCH_STATE_TRANSITION",
+              ts: new Date().toISOString(),
+              market,
+              from_state: "retry_wait",
+              to_state: "pullback_seen",
+              reason: "reclaim_conditions_no_longer_valid",
+              isRebounding: evalRes.isRebounding,
+              returnsOk: evalRes.returnsOk,
+              nearHigh: evalRes.nearHigh,
+              hasEma: evalRes.hasEma,
+              isAboveEma: evalRes.isAboveEma,
+            })
+          );
+        }
+      }
+
+      // 5. Reclaim 주문 실행 단계
+      if (item.status === "reclaim_ready") {
+        const evalRes = evaluateReclaimConditions({
+          currentPrice,
+          pullbackLowPrice: item.pullback_low_price,
+          recent1mRet,
+          recent3mRet,
+          localHigh,
+          closes1,
+        });
+
+        if (!evalRes.valid) {
+          item.status = "pullback_seen";
+          item.last_block_reason = "reclaim_conditions_no_longer_valid";
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_WATCH_STATE_TRANSITION",
+              ts: new Date().toISOString(),
+              market,
+              from_state: "reclaim_ready",
+              to_state: "pullback_seen",
+              reason: "reclaim_conditions_no_longer_valid",
+              isRebounding: evalRes.isRebounding,
+              returnsOk: evalRes.returnsOk,
+              nearHigh: evalRes.nearHigh,
+              hasEma: evalRes.hasEma,
+              isAboveEma: evalRes.isAboveEma,
+            })
+          );
+          continue;
+        }
+
+        const pullbackLow = item.pullback_low_price || currentPrice;
+        const stopCandidate1 = pullbackLow * 0.997;
+        const stopCandidate2 = currentPrice * 0.985;
+        let stopPrice = Math.max(stopCandidate1, stopCandidate2);
+
+        let lossPct = ((currentPrice - stopPrice) / currentPrice) * 100;
+        if (lossPct < 0.8) {
+          stopPrice = currentPrice * 0.992;
+          lossPct = 0.8;
+        }
+
+        const takeProfitPrice = currentPrice * 1.018;
+        const profitPct = ((takeProfitPrice - currentPrice) / currentPrice) * 100;
+        const riskReward = lossPct > 0 ? profitPct / lossPct : 0;
+
+        item.riskReward = riskReward;
+
+        const valid =
+          stopPrice > 0 &&
+          takeProfitPrice > 0 &&
+          stopPrice < currentPrice &&
+          takeProfitPrice > currentPrice &&
+          riskReward >= 1.3 &&
+          lossPct <= 2.0;
+
+        const finalPath = isMorning ? "morning_surge_reclaim_entry" : "surge_reclaim_entry";
+
+        if (!valid) {
+          console.info(
+            JSON.stringify({
+              tag: isMorning ? "MORNING_SURGE_RECLAIM_ENTRY_BLOCK" : "SURGE_RECLAIM_ENTRY_BLOCK",
               ts: new Date().toISOString(),
               market,
               price: currentPrice,
               stopPrice,
               takeProfitPrice,
               riskReward,
-              strict_exit: true,
-              exit_policy_attached: true,
+              reason: "exit_policy_verification_failed",
             })
           );
+          continue;
+        }
 
+        if (dailyRiskKillSwitchActive) {
           console.info(
             JSON.stringify({
-              tag: "ENTRY_EXIT_POLICY_ATTACHED_PROOF",
+              tag: isMorning ? "MORNING_SURGE_RECLAIM_ENTRY_BLOCK" : "SURGE_RECLAIM_ENTRY_BLOCK",
+              ts: new Date().toISOString(),
               market,
-              path: finalPath,
-              currentPrice,
+              price: currentPrice,
               stopPrice,
               takeProfitPrice,
-              riskPct: lossPct,
               riskReward,
-              strict_exit: true,
-              exit_policy_attached: true,
-              trailingStartPct: 1.8,
-              trailingGapPct: 1.2,
+              reason: "daily_risk_kill_switch_active",
             })
           );
+          continue;
+        }
 
-          const baseOrderAmount = strategyUsableKrwForAlloc > 0 ? strategyUsableKrwForAlloc * 0.15 : 20000;
-          const orderKrw = Math.floor(baseOrderAmount * 0.5);
+        const nowKst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+        const kstHour = nowKst.getUTCHours();
+        const kstMinute = nowKst.getUTCMinutes();
+        const kstTimeVal = kstHour * 60 + kstMinute;
+        if (kstTimeVal >= 0 && kstTimeVal < 510) {
+          console.info(
+            JSON.stringify({
+              tag: isMorning ? "MORNING_SURGE_RECLAIM_ENTRY_BLOCK" : "SURGE_RECLAIM_ENTRY_BLOCK",
+              ts: new Date().toISOString(),
+              market,
+              reason: "night_block_time_reclaim_denied",
+            })
+          );
+          continue;
+        }
 
-          if (orderKrw >= 5000) {
-            try {
-              const guard = await validateLiveBuyPrecheck({
+        if (kstTimeVal >= 510 && kstTimeVal < 570 && !isMorning) {
+          console.info(
+            JSON.stringify({
+              tag: "MORNING_SURGE_RECLAIM_ENTRY_BLOCK",
+              ts: new Date().toISOString(),
+              market,
+              reason: "only_morning_surge_watchlist_allowed",
+            })
+          );
+          continue;
+        }
+
+        const sig = latestAllSignals.get(market);
+        const rsiVal = opts.marketState.status()?.btc_rsi ?? null;
+        
+        const rawReclaimScore =
+          (sig?.p as any)?.surge_capture_score ??
+          (sig?.p as any)?.reclaim_score ??
+          (sig?.p as any)?.scanner_score ??
+          (sig?.p as any)?.entry_score ??
+          (sig?.p as any)?.signal_score;
+
+        const rScore =
+          typeof rawReclaimScore === "number" &&
+          Number.isFinite(rawReclaimScore)
+            ? rawReclaimScore
+            : undefined;
+
+        reclaim_detected_count++;
+        console.info(
+          JSON.stringify({
+            tag: "RECLAIM_CANDIDATE_CREATED",
+            ts: new Date().toISOString(),
+            market,
+            source_path: "watchlist",
+            market_state: marketState.market_state,
+            btc_rsi: rsiVal,
+            reclaim_score: rScore ?? null,
+            score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
+            strategyType: "surge_reclaim",
+            entrySignalType: "reclaim",
+            promoted_reclaim: false,
+          })
+        );
+
+        console.info(
+          JSON.stringify({
+            tag: isMorning ? "MORNING_SURGE_RECLAIM_ENTRY_ALLOW" : "SURGE_RECLAIM_ENTRY_ALLOW",
+            ts: new Date().toISOString(),
+            market,
+            price: currentPrice,
+            stopPrice,
+            takeProfitPrice,
+            riskReward,
+            strict_exit: true,
+            exit_policy_attached: true,
+          })
+        );
+
+        console.info(
+          JSON.stringify({
+            tag: "ENTRY_EXIT_POLICY_ATTACHED_PROOF",
+            market,
+            path: finalPath,
+            currentPrice,
+            stopPrice,
+            takeProfitPrice,
+            riskPct: lossPct,
+            riskReward,
+            strict_exit: true,
+            exit_policy_attached: true,
+            trailingStartPct: 1.8,
+            trailingGapPct: 1.2,
+          })
+        );
+
+        const baseOrderAmount = strategyUsableKrwForAlloc > 0 ? strategyUsableKrwForAlloc * 0.15 : 20000;
+        const orderKrw = Math.floor(baseOrderAmount * 0.5);
+
+        if (orderKrw >= 5000) {
+          try {
+            const guard = await validateLiveBuyPrecheck({
+              market,
+              trades: state.trades,
+              positions: state.positions,
+              cooldown_until: state.cooldown_until,
+              marketState: opts.marketState,
+              signalPayload: sig?.p,
+              strategyType: "surge_reclaim",
+              entrySignalType: "reclaim",
+              entryPath: finalPath,
+              isAdditionalBuy: false,
+              currentPrice,
+              reclaimScore: rScore,
+              volumeAccel: volumeRatio1m5,
+              aboveEma20: evalRes.isAboveEma,
+              candidateMeta: undefined,
+            });
+            if (!guard.allowed) {
+              logPlacebuyFinalGateBlocked(guard.blockReason!, {
                 market,
-                trades: state.trades,
-                positions: state.positions,
-                cooldown_until: state.cooldown_until,
-                marketState: opts.marketState,
-                signalPayload: sig?.p,
+                path: finalPath,
                 strategyType: "surge_reclaim",
-                entrySignalType: "reclaim",
-                entryPath: finalPath,
-                isAdditionalBuy: false,
-                currentPrice,
-                reclaimScore: rScore,
-                volumeAccel: volumeRatio1m5,
-                aboveEma20: isAboveEma,
+                killSwitchReason: guard.killSwitchReason,
+                cooldownRemaining: guard.cooldownRemainingSec,
+                dailyLossCount: guard.dailyLossCount,
+                dailyPnlPct: guard.dailyPnlPct,
+                marketState: guard.marketStateStr,
+                btcRsi: guard.btcRsi,
               });
-              if (!guard.allowed) {
-                logPlacebuyFinalGateBlocked(guard.blockReason!, {
-                  market,
-                  path: finalPath,
-                  strategyType: "surge_reclaim",
-                  killSwitchReason: guard.killSwitchReason,
-                  cooldownRemaining: guard.cooldownRemainingSec,
-                  dailyLossCount: guard.dailyLossCount,
-                  dailyPnlPct: guard.dailyPnlPct,
-                  marketState: guard.marketStateStr,
-                  btcRsi: guard.btcRsi,
-                });
+
+              const isPermanentBlock = false; // 점수 누락/미달은 일시적 차단으로 간주 (다음 틱에 개선 가능)
+
+              item.attempt_count = (item.attempt_count || 0) + 1;
+              
+              if (isPermanentBlock || item.attempt_count >= 5) {
                 if (isMorning) {
                   delete state.morning_surge_watchlist![market];
                 } else {
                   delete state.surge_watchlist![market];
                 }
-                continue;
+              } else {
+                item.status = "retry_wait";
+                item.last_attempt_at = new Date().toISOString();
+                item.last_block_reason = guard.blockReason;
+                item.retry_after = Date.now() + 5000;
               }
+              continue;
+            }
 
-              reclaim_precheck_pass_count++;
+            reclaim_precheck_pass_count++;
 
-              const signalPayloadForBuy = {
-                strict_exit: true,
-                exit_policy_attached: true,
-                entry_stop_price: stopPrice,
-                entry_target_price: takeProfitPrice,
-                entry_risk_reward: riskReward,
-                surge_entry_mode: finalPath,
-                surge_stop_price: stopPrice,
-                surge_take_profit_price: takeProfitPrice,
-                surge_trailing_start_pct: 1.8,
-                surge_trailing_gap_pct: 1.2,
-                sourceStrategy: "surge_reclaim_entry",
-                strategyType: "surge_reclaim",
-                entrySignalType: "reclaim"
-              };
+            const signalPayloadForBuy = {
+              strict_exit: true,
+              exit_policy_attached: true,
+              entry_stop_price: stopPrice,
+              entry_target_price: takeProfitPrice,
+              entry_risk_reward: riskReward,
+              surge_entry_mode: finalPath,
+              surge_stop_price: stopPrice,
+              surge_take_profit_price: takeProfitPrice,
+              surge_trailing_start_pct: 1.8,
+              surge_trailing_gap_pct: 1.2,
+              sourceStrategy: "surge_reclaim_entry",
+              strategyType: "surge_reclaim",
+              entrySignalType: "reclaim",
+              isAggressiveSurgeStrategy: false,
+              isReclaimStrategy: true
+            };
 
-              reclaim_final_buy_attempt_count++;
-              console.info(
-                JSON.stringify({
-                  tag: "RECLAIM_FINAL_BUY_ATTEMPT",
-                  ts: new Date().toISOString(),
-                  market,
-                  source_path: "watchlist",
-                  market_state: marketState.market_state,
-                  btc_rsi: rsiVal,
-                  reclaim_score: rScore,
-                  score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
-                  strategyType: "surge_reclaim",
-                  entrySignalType: "reclaim",
-                  promoted_reclaim: false,
-                })
-              );
-
-              const buyRes = await opts.trade.placeBuy(
+            reclaim_final_buy_attempt_count++;
+            console.info(
+              JSON.stringify({
+                tag: "RECLAIM_FINAL_BUY_ATTEMPT",
+                ts: new Date().toISOString(),
                 market,
-                true,
-                orderKrw,
-                "surge_reclaim",
-                "strategy",
-                signalPayloadForBuy,
-                finalPath
-              );
+                source_path: "watchlist",
+                market_state: marketState.market_state,
+                btc_rsi: rsiVal,
+                reclaim_score: rScore,
+                score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
+                strategyType: "surge_reclaim",
+                entrySignalType: "reclaim",
+                promoted_reclaim: false,
+              })
+            );
 
-              const buyOk = buyRes && (buyRes as any).ok;
-              if (buyOk) {
-                reclaim_actual_buy_count++;
-              }
+            tickEnteredMarkets.add(market); // 진입 시도 즉시 락 추가 (동일 틱 중복 진입 차단)
+            const buyRes = await opts.trade.placeBuy(
+              market,
+              true,
+              orderKrw,
+              "surge_reclaim",
+              "strategy",
+              signalPayloadForBuy,
+              finalPath
+            );
 
-              console.info(
-                JSON.stringify({
-                  tag: "RECLAIM_BUY_RESULT",
-                  ts: new Date().toISOString(),
-                  market,
-                  source_path: "watchlist",
-                  market_state: marketState.market_state,
-                  btc_rsi: rsiVal,
-                  reclaim_score: rScore,
-                  score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
-                  strategyType: "surge_reclaim",
-                  entrySignalType: "reclaim",
-                  promoted_reclaim: false,
-                  block_reason: buyOk ? null : "place_buy_failed",
-                })
-              );
+            const buyOk = buyRes && (buyRes as any).ok;
+            if (buyOk) {
+              reclaim_actual_buy_count++;
+            }
 
-              console.info(
-                JSON.stringify({
-                  tag: "LIVE_PLACEBUY_ATTEMPT",
-                  ts: new Date().toISOString(),
-                  market,
-                  path: finalPath,
-                  order_krw: orderKrw,
-                  status: buyOk ? "ok" : "error",
-                })
-              );
+            console.info(
+              JSON.stringify({
+                tag: "RECLAIM_BUY_RESULT",
+                ts: new Date().toISOString(),
+                market,
+                source_path: "watchlist",
+                market_state: marketState.market_state,
+                btc_rsi: rsiVal,
+                reclaim_score: rScore,
+                score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
+                strategyType: "surge_reclaim",
+                entrySignalType: "reclaim",
+                promoted_reclaim: false,
+                block_reason: buyOk ? null : "place_buy_failed",
+              })
+            );
 
+            console.info(
+              JSON.stringify({
+                tag: "LIVE_PLACEBUY_ATTEMPT",
+                ts: new Date().toISOString(),
+                market,
+                path: finalPath,
+                order_krw: orderKrw,
+                status: buyOk ? "ok" : "error",
+              })
+            );
+
+            if (buyOk) {
               item.status = "entered";
-
               if (isMorning) {
                 delete state.morning_surge_watchlist![market];
               } else {
                 delete state.surge_watchlist![market];
               }
-
-            } catch (innerErr) {
-              console.error(`Reclaim placeBuy failed for ${market}:`, innerErr);
-              console.info(
-                JSON.stringify({
-                  tag: "RECLAIM_BUY_RESULT",
-                  ts: new Date().toISOString(),
-                  market,
-                  source_path: "watchlist",
-                  market_state: marketState.market_state,
-                  btc_rsi: rsiVal,
-                  reclaim_score: rScore,
-                  score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
-                  strategyType: "surge_reclaim",
-                  entrySignalType: "reclaim",
-                  promoted_reclaim: false,
-                  block_reason: String(innerErr).slice(0, 300),
-                })
-              );
+            } else {
+              item.attempt_count = (item.attempt_count || 0) + 1;
+              if (item.attempt_count >= 5) {
+                if (isMorning) {
+                  delete state.morning_surge_watchlist![market];
+                } else {
+                  delete state.surge_watchlist![market];
+                }
+              } else {
+                item.status = "retry_wait";
+                item.last_attempt_at = new Date().toISOString();
+                item.last_block_reason = "place_buy_failed";
+                item.retry_after = Date.now() + 5000;
+              }
             }
+
+          } catch (innerErr) {
+            console.error(`Reclaim placeBuy failed for ${market}:`, innerErr);
+            console.info(
+              JSON.stringify({
+                tag: "RECLAIM_BUY_RESULT",
+                ts: new Date().toISOString(),
+                market,
+                source_path: "watchlist",
+                market_state: marketState.market_state,
+                btc_rsi: rsiVal,
+                reclaim_score: rScore,
+                score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
+                strategyType: "surge_reclaim",
+                entrySignalType: "reclaim",
+                promoted_reclaim: false,
+                block_reason: String(innerErr).slice(0, 300),
+              })
+            );
+            item.attempt_count = (item.attempt_count || 0) + 1;
+            if (item.attempt_count >= 5) {
+              if (isMorning) {
+                delete state.morning_surge_watchlist![market];
+              } else {
+                delete state.surge_watchlist![market];
+              }
+            } else {
+              item.status = "retry_wait";
+              item.last_attempt_at = new Date().toISOString();
+              item.last_block_reason = String(innerErr).slice(0, 300);
+              item.retry_after = Date.now() + 5000;
+            }
+          }
+        } else {
+          console.info(
+            JSON.stringify({
+              tag: "RECLAIM_PRECHECK_BLOCKED",
+              ts: new Date().toISOString(),
+              market,
+              block_reason: "order_amount_below_minimum",
+              order_krw: orderKrw,
+            })
+          );
+          item.attempt_count = (item.attempt_count || 0) + 1;
+          if (item.attempt_count >= 5) {
+            if (isMorning) {
+              delete state.morning_surge_watchlist![market];
+            } else {
+              delete state.surge_watchlist![market];
+            }
+          } else {
+            item.status = "retry_wait";
+            item.last_attempt_at = new Date().toISOString();
+            item.last_block_reason = "order_amount_below_minimum";
+            item.retry_after = Date.now() + 5000;
           }
         }
       }
@@ -10313,6 +10777,7 @@ export function createLiveDataStrategy(opts: {
 
     for (const marketRaw of entryUniverse) {
       const market = typeof marketRaw === "string" ? marketRaw.trim() : "";
+      if (tickEnteredMarkets.has(market)) continue;
       
       const priceSource = (tickerPriceHydrationForCandidates?.sourceByMarket[market] ?? tickerSourceMap.get(market) ?? "missing") as string;
       const isLivePrice = priceSource === "ticker_batch" || priceSource === "per_symbol_fetch" || priceSource === "live";
@@ -10623,6 +11088,7 @@ export function createLiveDataStrategy(opts: {
         isAdditionalBuy: false,
         currentPrice: Number(priceBy.get(market) ?? 0),
         reclaimScore: isSurgeSourceLocal ? ((sigPre?.p as any)?.surge_capture_score ?? (sigPre?.p as any)?.reclaim_score ?? (sigPre?.p as any)?.scanner_score ?? (sigPre?.p as any)?.signal_score) : undefined,
+        candidateMeta: candidateMetaFromSetup,
       });
       if (!guard.allowed) {
         if (guard.blockReason === "global_kill_switch_active") {
@@ -13463,6 +13929,7 @@ export function createLiveDataStrategy(opts: {
             isAdditionalBuy: false,
             currentPrice: Number(priceBy.get(market) ?? 0),
             reclaimScore: isSurgeSourceLocal ? ((sig?.p as any)?.surge_capture_score ?? (sig?.p as any)?.reclaim_score ?? (sig?.p as any)?.scanner_score ?? (sig?.p as any)?.signal_score) : undefined,
+            candidateMeta: candidateMetaFromSetup,
           });
           if (!guard.allowed) {
             logPlacebuyFinalGateBlocked(guard.blockReason!, {
@@ -13505,6 +13972,7 @@ export function createLiveDataStrategy(opts: {
           }
 
           finalBuyAttemptCount++;
+          tickEnteredMarkets.add(market); // 진입 시도 즉시 락 추가 (중복 진입 방지)
           const buyRes = await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", {
             ...signalPayloadForBuy,
             __surge_stop_price: isSurgeSource ? surgeStopPrice : undefined,
@@ -14030,16 +14498,34 @@ export function createLiveDataStrategy(opts: {
         }),
       );
     }
+    accum_watchlist_added_count += watchlist_added_count;
+    accum_pullback_seen_count += pullback_seen_count;
+    accum_reclaim_detected_count += reclaim_detected_count;
+    accum_reclaim_precheck_pass_count += reclaim_precheck_pass_count;
+    accum_reclaim_final_buy_attempt_count += reclaim_final_buy_attempt_count;
+    accum_reclaim_actual_buy_count += reclaim_actual_buy_count;
+
     console.info(
       JSON.stringify({
         tag: "SURGE_RECLAIM_TICK_SUMMARY",
         ts: new Date().toISOString(),
-        watchlist_added_count,
-        pullback_seen_count,
-        reclaim_detected_count,
-        reclaim_precheck_pass_count,
-        reclaim_final_buy_attempt_count,
-        reclaim_actual_buy_count
+        recent_tick: {
+          watchlist_added_count,
+          pullback_seen_count,
+          reclaim_detected_count,
+          reclaim_precheck_pass_count,
+          reclaim_final_buy_attempt_count,
+          reclaim_actual_buy_count
+        },
+        since_process_start: {
+          watchlist_added_count: accum_watchlist_added_count,
+          pullback_seen_count: accum_pullback_seen_count,
+          reclaim_detected_count: accum_reclaim_detected_count,
+          reclaim_precheck_pass_count: accum_reclaim_precheck_pass_count,
+          reclaim_final_buy_attempt_count: accum_reclaim_final_buy_attempt_count,
+          reclaim_actual_buy_count: accum_reclaim_actual_buy_count
+        },
+        process_started_at: new Date(engineStartedAtMs).toISOString()
       })
     );
     lastDiagnostics = {

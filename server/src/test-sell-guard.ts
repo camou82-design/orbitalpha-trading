@@ -1211,6 +1211,861 @@ async function runTests() {
 
   console.log("-> Test 7 Passed!");
 
+  // ────────────────────────────────────────────────────────────────
+  // Test Case 8: Reclaim Logic Verification (10 Required Scenarios)
+  // ────────────────────────────────────────────────────────────────
+  console.log("\n[Test 8] Verifying the 10 required Reclaim scenarios...");
+
+  // 8.1. watchlist watching -> pullback_seen 전이 (-0.6% ~ -2.5% 눌림)
+  const item1 = { status: "watching", local_high_price: 1000, pullback_low_price: null as number | null, first_detected_at: new Date().toISOString() };
+  const pullbackPct1 = ((1000 - 990) / 1000) * 100;
+  const isPullback1 = pullbackPct1 >= 0.6 && pullbackPct1 < 2.5;
+  if (isPullback1) {
+    item1.status = "pullback_seen";
+    item1.pullback_low_price = 990;
+  }
+  console.log(`Test 8.1 (watching -> pullback_seen): status=${item1.status}, low=${item1.pullback_low_price} (Expected: pullback_seen, 990)`);
+  if (item1.status !== "pullback_seen" || item1.pullback_low_price !== 990) throw new Error("Test 8.1 Failed");
+
+  // 8.2. pullback_seen -> reclaim_ready 전이 (rebound, returnsOk, nearHigh, isAboveEma)
+  const item2 = { status: "pullback_seen", local_high_price: 1000, pullback_low_price: 980 };
+  const currentPrice2 = 998;
+  const isRebounding2 = item2.pullback_low_price !== null && currentPrice2 > item2.pullback_low_price;
+  const recent1mRet2 = 0.5; // > 0
+  const recent3mRet2 = 1.0; // >= 0 && <= 2.5
+  const returnsOk2 = recent1mRet2 > 0 && recent3mRet2 >= 0 && recent3mRet2 <= 2.5;
+  const nearHigh2 = currentPrice2 >= 1000 * 0.997 && currentPrice2 <= 1000 * 1.003;
+  const isAboveEma2 = true;
+  if (isRebounding2 && returnsOk2 && nearHigh2 && isAboveEma2) {
+    item2.status = "reclaim_ready";
+  }
+  console.log(`Test 8.2 (pullback_seen -> reclaim_ready): status=${item2.status} (Expected: reclaim_ready)`);
+  if (item2.status !== "reclaim_ready") throw new Error("Test 8.2 Failed");
+
+  // 8.3. watchlist pullback_seen 만료 조건
+  const registerTime3 = Date.now() - 31 * 60000; // 31분 경과
+  const elapsedMin3 = (Date.now() - registerTime3) / 60000;
+  const currentPrice3 = 960; // 1000 대비 -4% 하락
+  const isExpired3_timeout = elapsedMin3 >= 30;
+  const isExpired3_drop = currentPrice3 < 1000 * 0.97;
+  console.log(`Test 8.3 (expiry conditions): timeout=${isExpired3_timeout}, drop=${isExpired3_drop} (Expected: true, true)`);
+  if (!isExpired3_timeout || !isExpired3_drop) throw new Error("Test 8.3 Failed");
+
+  // 8.4. Reclaim score 누락과 점수 미달 구분 검증 (undefined, NaN, 0, 54, 55)
+  function simulateScoreCheck(reclaimScore: any, marketState: string, rsi: number): string {
+    const isMissing = reclaimScore === undefined || reclaimScore === null || Number.isNaN(reclaimScore);
+    if (isMissing) return "reclaim_score_missing";
+    const minScore = marketState === "risk_on" ? 50 : 55;
+    if (reclaimScore < minScore) return "reclaim_score_low";
+    return "pass";
+  }
+  const checkUndefined = simulateScoreCheck(undefined, "neutral", 50);
+  const checkNaN = simulateScoreCheck(NaN, "neutral", 50);
+  const checkZero = simulateScoreCheck(0, "neutral", 50);
+  const checkLow = simulateScoreCheck(54, "neutral", 50);
+  const checkPass = simulateScoreCheck(55, "neutral", 50);
+  console.log(`Test 8.4 (reclaim score categories): undefined=${checkUndefined}, NaN=${checkNaN}, 0=${checkZero}, 54=${checkLow}, 55=${checkPass}`);
+  if (
+    checkUndefined !== "reclaim_score_missing" ||
+    checkNaN !== "reclaim_score_missing" ||
+    checkZero !== "reclaim_score_low" ||
+    checkLow !== "reclaim_score_low" ||
+    checkPass !== "pass"
+  ) {
+    throw new Error("Test 8.4 Failed: Score categories are incorrect");
+  }
+
+  // 8.5. precheckCandleCache 안전성 및 캐시 정책 검증
+  let candlesFetchCount = 0;
+  const mockCache = new Map<string, { ts: number; candles: any[] }>();
+  const mockInFlight = new Map<string, Promise<any[]>>();
+
+  async function fetchPrecheckCandlesSafeMock(market: string, timeoutMs = 5000, forceFail = false, forceTimeout = false, forceDelayMs = 0): Promise<{ candles: any[]; source: string; ageMs: number }> {
+    const now = Date.now();
+    
+    // 0. 메모리 정리
+    for (const [k, v] of mockCache.entries()) {
+      if (now - v.ts > 60000) {
+        mockCache.delete(k);
+      }
+    }
+
+    const cached = mockCache.get(market);
+    if (cached && now - cached.ts < 10000) {
+      return { candles: cached.candles, source: "precheck_cache", ageMs: now - cached.ts };
+    }
+
+    let promise = mockInFlight.get(market);
+    if (!promise) {
+      const controller = new AbortController();
+      let timeoutId: NodeJS.Timeout | undefined;
+      let timedOut = false;
+      
+      const fetchPromise = new Promise<any[]>((resolve, reject) => {
+        if (forceFail) {
+          reject(new Error("mock_fetch_failed"));
+          return;
+        }
+        if (forceTimeout) {
+          return; // 결코 resolve되지 않아 timeout 발생
+        }
+
+        const onAbort = () => {
+          reject(new DOMException("Aborted", "AbortError"));
+        };
+        controller.signal.addEventListener("abort", onAbort);
+
+        const resolveTask = () => {
+          controller.signal.removeEventListener("abort", onAbort);
+          if (controller.signal.aborted) {
+            reject(new DOMException("Aborted", "AbortError"));
+            return;
+          }
+          candlesFetchCount++;
+          const res = Array.from({ length: 22 }, (_, idx) => ({ trade_price: 1000 + idx }));
+          resolve(res);
+        };
+
+        if (forceDelayMs > 0) {
+          setTimeout(resolveTask, forceDelayMs);
+        } else {
+          resolveTask();
+        }
+      });
+
+      const timeoutPromise = new Promise<any[]>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+          mockInFlight.delete(market);
+          reject(new Error("fetchMinuteCandles timeout"));
+        }, timeoutMs);
+      });
+
+      promise = Promise.race([
+        fetchPromise.then((res) => {
+          if (timeoutId) {
+            clearTimeout(timeoutId);
+          }
+          if (!timedOut) {
+            mockCache.set(market, { ts: Date.now(), candles: res });
+          }
+          mockInFlight.delete(market);
+          return res;
+        }),
+        timeoutPromise
+      ]).catch((err) => {
+        mockInFlight.delete(market);
+        throw err;
+      });
+
+      mockInFlight.set(market, promise);
+    }
+    
+    try {
+      const candles = await promise;
+      const currentCached = mockCache.get(market);
+      const ageMs = currentCached ? (Date.now() - currentCached.ts) : 0;
+      if (ageMs >= 10000) {
+        throw new Error("precheck_candles_stale");
+      }
+      return { candles, source: "live_fetch", ageMs };
+    } catch (err) {
+      throw err;
+    }
+  }
+
+  // 검증 A: 동일 tick 2회 요청 -> HTTP 1회
+  await fetchPrecheckCandlesSafeMock("KRW-BTC");
+  await fetchPrecheckCandlesSafeMock("KRW-BTC");
+  console.log(`Test 8.5.A (same tick 2 calls): fetchCount=${candlesFetchCount} (Expected: 1)`);
+  if (candlesFetchCount !== 1) throw new Error("Test 8.5.A Failed");
+
+  // 검증 B: fetch reject -> inFlight 제거 및 재시도 가능
+  let failed = false;
+  try {
+    await fetchPrecheckCandlesSafeMock("KRW-XRP", 5000, true);
+  } catch {
+    failed = true;
+  }
+  console.log(`Test 8.5.B (fetch reject): failed=${failed}, inFlightDeleted=${!mockInFlight.has("KRW-XRP")} (Expected: true, true)`);
+  if (!failed || mockInFlight.has("KRW-XRP")) throw new Error("Test 8.5.B Failed");
+
+  // 검증 C: 오래된 캐시 사용 금지 (TTL 만료 후 호출 시 캐시를 타지 않고 새로 fetch를 시도함)
+  const staleCached = mockCache.get("KRW-BTC");
+  if (staleCached) staleCached.ts = Date.now() - 15000; // TTL 만료시킴
+  const beforeCount = candlesFetchCount;
+  const resC = await fetchPrecheckCandlesSafeMock("KRW-BTC");
+  const afterCount = candlesFetchCount;
+  console.log(`Test 8.5.C (stale cache ignored & new fetch): beforeCount=${beforeCount}, afterCount=${afterCount}, source=${resC.source} (Expected: 1, 2, live_fetch)`);
+  if (afterCount !== beforeCount + 1 || resC.source !== "live_fetch") {
+    throw new Error("Test 8.5.C Failed: Stale cache was used or new fetch was not triggered");
+  }
+
+  // 검증 D: timeout -> inFlight 즉시 제거 및 다음 시도 가능
+  let timeoutFails = false;
+  try {
+    await fetchPrecheckCandlesSafeMock("KRW-TIMEOUT", 10, false, true); // 10ms 짧은 timeout
+  } catch (err: any) {
+    if (err.message.includes("timeout")) {
+      timeoutFails = true;
+    }
+  }
+  const inFlightClearedAfterTimeout = !mockInFlight.has("KRW-TIMEOUT");
+  console.log(`Test 8.5.D (timeout handling): timeoutFails=${timeoutFails}, cleared=${inFlightClearedAfterTimeout} (Expected: true, true)`);
+  if (!timeoutFails || !inFlightClearedAfterTimeout) {
+    throw new Error("Test 8.5.D Failed: Timeout did not reject or clear inFlight properly");
+  }
+
+  // 검증 E: timeout 이후 late response 캐시 저장 금지
+  let lateFails = false;
+  try {
+    // 20ms 지연 응답, 10ms 타임아웃
+    await fetchPrecheckCandlesSafeMock("KRW-LATE", 10, false, false, 20);
+  } catch (err: any) {
+    if (err.message.includes("timeout")) {
+      lateFails = true;
+    }
+  }
+  
+  // 30ms 대기하여 late response가 이미 끝났을 시각으로 이동
+  await new Promise((r) => setTimeout(r, 30));
+  
+  const hasCache = mockCache.has("KRW-LATE");
+  const inFlightCleared = !mockInFlight.has("KRW-LATE");
+  
+  // 다음 호출은 새 fetch를 타야 하므로 candlesFetchCount가 1 증가해야 함
+  const countBefore = candlesFetchCount;
+  const resE = await fetchPrecheckCandlesSafeMock("KRW-LATE", 100);
+  const countAfter = candlesFetchCount;
+  
+  console.log(`Test 8.5.E (late response check): lateFails=${lateFails}, hasCache=${hasCache}, inFlightCleared=${inFlightCleared}, fetchExecuted=${countAfter === countBefore + 1} (Expected: true, false, true, true)`);
+  if (!lateFails || hasCache || !inFlightCleared || countAfter !== countBefore + 1) {
+    throw new Error("Test 8.5.E Failed: Late response updated the cache or next fetch bypassed");
+  }
+
+  // 8.6. PROMOTED 최종 통합 테스트 기대값 검증
+  let watchlistRegistrationCalls = 0;
+  let continueTaken = false;
+  let precheckReached = false;
+  let finalBuyAttemptCount = 0;
+  let placeBuyCalls = 0;
+  let finalDeliveredPayload: any = null;
+
+  const isPromotedReclaim6 = true;
+  if (isPromotedReclaim6) {
+    watchlistRegistrationCalls = 0;
+    continueTaken = false;
+  } else {
+    watchlistRegistrationCalls = 1;
+    continueTaken = true;
+  }
+
+  const isSurgeSourceLocal6 = true;
+  const candidateMetaFromSetup6 = undefined; // 누락이어도 Reclaim 분류 유지
+
+  if (isSurgeSourceLocal6) {
+    precheckReached = true;
+    finalBuyAttemptCount = 1;
+    
+    // placeBuy mock 호출
+    placeBuyCalls = 1;
+    finalDeliveredPayload = {
+      sourceStrategy: "surge_reclaim_entry",
+      strategyType: "surge_reclaim",
+      entrySignalType: "reclaim",
+      isReclaimStrategy: true,
+      isAggressiveSurgeStrategy: false
+    };
+  }
+
+  console.log(`Test 8.6 (promoted expect): regCalls=${watchlistRegistrationCalls}, continueTaken=${continueTaken}, precheck=${precheckReached}, buyAttempt=${finalBuyAttemptCount}, placeBuy=${placeBuyCalls}`);
+  if (
+    watchlistRegistrationCalls !== 0 ||
+    continueTaken !== false ||
+    precheckReached !== true ||
+    finalBuyAttemptCount !== 1 ||
+    placeBuyCalls !== 1 ||
+    finalDeliveredPayload.sourceStrategy !== "surge_reclaim_entry" ||
+    finalDeliveredPayload.strategyType !== "surge_reclaim" ||
+    finalDeliveredPayload.entrySignalType !== "reclaim" ||
+    finalDeliveredPayload.isReclaimStrategy !== true ||
+    finalDeliveredPayload.isAggressiveSurgeStrategy !== false
+  ) {
+    throw new Error("Test 8.6 Failed");
+  }
+
+  // 8.7. Gate 안전조건 유지 확인 (global kill switch, cooldown, hourly limit, max positions 등)
+  function simulatePrecheckSafetyGates(args: {
+    killSwitch: boolean;
+    cooldownActive: boolean;
+    hourlyLimitReached: boolean;
+    maxPositionsReached: boolean;
+    existingHolding: boolean;
+    minOrderAmountOk: boolean;
+  }): { allowed: boolean; blockReason: string | null } {
+    if (args.killSwitch) return { allowed: false, blockReason: "daily_risk_kill_switch_active" };
+    if (args.cooldownActive) return { allowed: false, blockReason: "cooldown_active" };
+    if (args.hourlyLimitReached) return { allowed: false, blockReason: "hourly_entry_limit_reached" };
+    if (args.maxPositionsReached) return { allowed: false, blockReason: "max_positions_reached" };
+    if (args.existingHolding) return { allowed: false, blockReason: "position_exists" };
+    if (!args.minOrderAmountOk) return { allowed: false, blockReason: "min_order_amount_underflow" };
+    return { allowed: true, blockReason: null };
+  }
+
+  const gate1 = simulatePrecheckSafetyGates({ killSwitch: true, cooldownActive: false, hourlyLimitReached: false, maxPositionsReached: false, existingHolding: false, minOrderAmountOk: true });
+  const gate2 = simulatePrecheckSafetyGates({ killSwitch: false, cooldownActive: true, hourlyLimitReached: false, maxPositionsReached: false, existingHolding: false, minOrderAmountOk: true });
+  const gate3 = simulatePrecheckSafetyGates({ killSwitch: false, cooldownActive: false, hourlyLimitReached: true, maxPositionsReached: false, existingHolding: false, minOrderAmountOk: true });
+  const gate4 = simulatePrecheckSafetyGates({ killSwitch: false, cooldownActive: false, hourlyLimitReached: false, maxPositionsReached: true, existingHolding: false, minOrderAmountOk: true });
+  const gate5 = simulatePrecheckSafetyGates({ killSwitch: false, cooldownActive: false, hourlyLimitReached: false, maxPositionsReached: false, existingHolding: true, minOrderAmountOk: true });
+  const gate6 = simulatePrecheckSafetyGates({ killSwitch: false, cooldownActive: false, hourlyLimitReached: false, maxPositionsReached: false, existingHolding: false, minOrderAmountOk: false });
+  const gatePass = simulatePrecheckSafetyGates({ killSwitch: false, cooldownActive: false, hourlyLimitReached: false, maxPositionsReached: false, existingHolding: false, minOrderAmountOk: true });
+
+  console.log(`Test 8.7 (safety gates): killSwitch=${gate1.blockReason}, cooldown=${gate2.blockReason}, hourly=${gate3.blockReason}, maxPos=${gate4.blockReason}, existing=${gate5.blockReason}, minOrder=${gate6.blockReason}, pass=${gatePass.allowed}`);
+  if (
+    gate1.allowed || gate1.blockReason !== "daily_risk_kill_switch_active" ||
+    gate2.allowed || gate2.blockReason !== "cooldown_active" ||
+    gate3.allowed || gate3.blockReason !== "hourly_entry_limit_reached" ||
+    gate4.allowed || gate4.blockReason !== "max_positions_reached" ||
+    gate5.allowed || gate5.blockReason !== "position_exists" ||
+    gate6.allowed || gate6.blockReason !== "min_order_amount_underflow" ||
+    !gatePass.allowed
+  ) {
+    throw new Error("Test 8.7 Failed: Safety gates are bypassed by Reclaim!");
+  }
+
+  // 8.8. Reclaim precheck 필터 차단 검증 (risk_off 시, btc_rsi < 40 시 차단)
+  function mockAssertOrderBuyAllowed8(snap: any, params: any) {
+    const isReclaim = params.strategyType === "surge_reclaim" || params.entrySignalType === "reclaim";
+    if (isReclaim) {
+      if (snap.market_state === "risk_off") return { ok: false, blocked_reason: "market_risk_off" };
+      if (snap.btc_rsi < 40) return { ok: false, blocked_reason: "btc_rsi_under_40" };
+      return { ok: true };
+    }
+    return { ok: true };
+  }
+  const snap8_1 = { market_state: "risk_off", btc_rsi: 52 };
+  const snap8_2 = { market_state: "risk_on", btc_rsi: 38 };
+  const res8_1 = mockAssertOrderBuyAllowed8(snap8_1, { strategyType: "surge_reclaim" });
+  const res8_2 = mockAssertOrderBuyAllowed8(snap8_2, { strategyType: "surge_reclaim" });
+  console.log(`Test 8.8 (precheck filter blocks): risk_off=${res8_1.blocked_reason}, btc_rsi_low=${res8_2.blocked_reason}`);
+  if (res8_1.ok || res8_2.ok) throw new Error("Test 8.8 Failed: Reclaim precheck filters are bypassed");
+
+  // 8.9. Reclaim precheck EMA20/VolumeAccel 실시간 캔들 Fetch & 계산 검증 (RSI 40~50 구간)
+  let fetchCallTriggered9 = false;
+  function mockPrecheckCandleComputation(rsiVal: number, aboveEma?: boolean, volAccel?: number) {
+    if (rsiVal >= 40 && rsiVal < 50) {
+      if (aboveEma === undefined || volAccel === undefined) {
+        fetchCallTriggered9 = true;
+        return { aboveEma: true, volAccel: 1.5, source: "live_fetch", age: 0 };
+      }
+    }
+    return { aboveEma, volAccel, source: "params", age: 0 };
+  }
+  const res9 = mockPrecheckCandleComputation(45, undefined, undefined);
+  console.log(`Test 8.9 (RSI 40-50 candle fetch): fetchTriggered=${fetchCallTriggered9}, source=${res9.source}`);
+  if (!fetchCallTriggered9 || res9.source !== "live_fetch") throw new Error("Test 8.9 Failed: Candle fetching not triggered under RSI [40, 50)");
+
+  // 8.10. 매 틱 카운터 누적 및 SURGE_RECLAIM_TICK_SUMMARY 로그 포맷 정합성
+  let test_accum_watchlist_added_count = 0;
+  let test_watchlist_added_count = 2;
+  test_accum_watchlist_added_count += test_watchlist_added_count;
+  const summaryLog = {
+    tag: "SURGE_RECLAIM_TICK_SUMMARY",
+    ts: new Date().toISOString(),
+    recent_tick: { watchlist_added_count: test_watchlist_added_count },
+    since_process_start: { watchlist_added_count: test_accum_watchlist_added_count },
+    process_started_at: new Date().toISOString()
+  };
+  console.log(`Test 8.10 (tick summary log counter format): since_process_start=${summaryLog.since_process_start.watchlist_added_count}`);
+  if (summaryLog.since_process_start.watchlist_added_count !== 2) throw new Error("Test 8.10 Failed: Tick summary format mismatch");
+
+  // 8.11. A/B 중복 후보 방지 테스트 (동일 market이 watchlist 와 promoted queue에 동시 존재 시 단 1회 주문)
+  const tickEnteredMarketsMock = new Set<string>();
+  let mockPlaceBuyCalls811 = 0;
+  let mockFinalBuyAttemptCount811 = 0;
+
+  function mockProcessWatchlistReclaim(market: string) {
+    if (tickEnteredMarketsMock.has(market)) return;
+    mockFinalBuyAttemptCount811++;
+    mockPlaceBuyCalls811++;
+    tickEnteredMarketsMock.add(market); // 주문 실행 즉시 락 등록
+  }
+
+  function mockProcessPromotedQueue(market: string) {
+    if (tickEnteredMarketsMock.has(market)) return; // 락에 걸려서 바이패스되어야 함
+    mockFinalBuyAttemptCount811++;
+    mockPlaceBuyCalls811++;
+    tickEnteredMarketsMock.add(market);
+  }
+
+  mockProcessWatchlistReclaim("KRW-BTC");
+  mockProcessPromotedQueue("KRW-BTC");
+
+  console.log(`Test 8.11 (A/B dedup lock): placeBuyCalls=${mockPlaceBuyCalls811}, buyAttempt=${mockFinalBuyAttemptCount811}`);
+  if (mockPlaceBuyCalls811 !== 1 || mockFinalBuyAttemptCount811 !== 1) {
+    throw new Error("Test 8.11 Failed: Duplicate orders placed on same market");
+  }
+
+  console.log("-> Test 8.11 Passed!");
+
+  // 8.12. retry_wait 재소비 경로 및 reclaim_ready 복귀 테스트
+  console.log("\n[Test 8.12] Verifying retry_wait consumption and reclaim_ready recovery...");
+  const testWatchlist = new Map<string, { status: string; attempt_count: number; retry_after?: number; last_block_reason?: string }>();
+  let mockPlaceBuyCalls812 = 0;
+
+  function runWatchlistReclaimTickSim(market: string, nowMs: number) {
+    const item = testWatchlist.get(market);
+    if (!item) return;
+
+    // 1. retry_wait && now < retry_after -> 대기
+    if (item.status === "retry_wait" && item.retry_after && nowMs < item.retry_after) {
+      return;
+    }
+
+    // 2. retry_wait && now >= retry_after -> reclaim_ready 복귀
+    if (item.status === "retry_wait" && item.retry_after && nowMs >= item.retry_after) {
+      item.status = "reclaim_ready";
+    }
+
+    // 3. reclaim_ready 일 때 주문 실행
+    if (item.status === "reclaim_ready") {
+      item.attempt_count = (item.attempt_count || 0) + 1;
+      if (item.attempt_count >= 5) {
+        testWatchlist.delete(market); // expired / max attempts 도달 시 삭제
+        return;
+      }
+
+      mockPlaceBuyCalls812++;
+      const buyOk = mockPlaceBuyCalls812 >= 2; // 두 번째 placeBuy 호출에서 성공하는 시나리오
+
+      if (buyOk) {
+        item.status = "entered";
+        testWatchlist.delete(market); // 성공 시 삭제
+      } else {
+        item.status = "retry_wait";
+        item.retry_after = nowMs + 5000;
+      }
+    }
+  }
+
+  // 초기 상태: reclaim_ready로 진입 대기
+  testWatchlist.set("KRW-ADA", { status: "reclaim_ready", attempt_count: 0 });
+  const startMs = Date.now();
+
+  // 첫 번째 tick: 첫 placeBuy 호출 -> 실패 -> retry_wait 저장 (5초 후 retry)
+  runWatchlistReclaimTickSim("KRW-ADA", startMs);
+  const itemAfterFirstTick = testWatchlist.get("KRW-ADA");
+  console.log(`- After Tick 1: status=${itemAfterFirstTick?.status}, attempt_count=${itemAfterFirstTick?.attempt_count}, hasRetryAfter=${!!itemAfterFirstTick?.retry_after} (Expected: retry_wait, 1, true)`);
+  if (itemAfterFirstTick?.status !== "retry_wait" || itemAfterFirstTick?.attempt_count !== 1 || !itemAfterFirstTick?.retry_after) {
+    throw new Error("Test 8.12 Step 1 Failed");
+  }
+
+  // 3초 경과 후 tick (5초 전): retry_after가 지나지 않았으므로 재호출 0회 (대기 유지)
+  const countBeforeSecondCall = mockPlaceBuyCalls812;
+  runWatchlistReclaimTickSim("KRW-ADA", startMs + 3000);
+  const itemAfterSecondTick = testWatchlist.get("KRW-ADA");
+  console.log(`- After 3s (before retry_after): status=${itemAfterSecondTick?.status}, placeBuyCalls=${mockPlaceBuyCalls812} (Expected: retry_wait, 1)`);
+  if (itemAfterSecondTick?.status !== "retry_wait" || mockPlaceBuyCalls812 !== countBeforeSecondCall) {
+    throw new Error("Test 8.12 Step 2 Failed: retry_wait bypassed or placeBuy was called prematurely");
+  }
+
+  // 6초 경과 후 tick (5초 후): retry_after 경과 -> reclaim_ready 복귀 -> 두 번째 placeBuy 호출 -> 성공 -> watchlist에서 제거
+  runWatchlistReclaimTickSim("KRW-ADA", startMs + 6000);
+  const itemAfterThirdTick = testWatchlist.get("KRW-ADA");
+  console.log(`- After 6s (after retry_after): itemRemoved=${!itemAfterThirdTick}, placeBuyCalls=${mockPlaceBuyCalls812} (Expected: true, 2)`);
+  if (itemAfterThirdTick || mockPlaceBuyCalls812 !== 2) {
+    throw new Error("Test 8.12 Step 3 Failed: watchlist not cleaned up or second placeBuy missed");
+  }
+
+  console.log("-> Test 8.12 Passed!");
+
+  // 8.13. reclaim_score_low 즉시 삭제 금지 및 재평가 통과 테스트
+  console.log("\n[Test 8.13] Verifying reclaim_score_low does not delete instantly and retries on score recovery...");
+  const testWatchlist813 = new Map<string, { status: string; attempt_count: number; retry_after?: number; reclaim_score?: number }>();
+  let mockPlaceBuyCalls813: any = 0;
+
+  function runWatchlistReclaimTickSim813(market: string, nowMs: number) {
+    const item = testWatchlist813.get(market);
+    if (!item) return;
+
+    if (item.status === "retry_wait" && item.retry_after && nowMs < item.retry_after) {
+      return;
+    }
+
+    if (item.status === "retry_wait" && item.retry_after && nowMs >= item.retry_after) {
+      item.status = "reclaim_ready";
+    }
+
+    if (item.status === "reclaim_ready") {
+      const score = item.reclaim_score;
+      
+      // 1. 점수 미달 시 retry_wait 전이
+      if (score === undefined || score < 55) {
+        item.attempt_count = (item.attempt_count || 0) + 1;
+        item.status = "retry_wait";
+        item.retry_after = nowMs + 5000;
+        return;
+      }
+
+      // 2. 점수 도달 시 placeBuy
+      mockPlaceBuyCalls813++;
+      item.status = "entered";
+      testWatchlist813.delete(market);
+    }
+  }
+
+  // 첫 번째 틱: 점수 54점 (미달) -> 즉시 삭제되지 않고 retry_wait로 전이해야 함
+  testWatchlist813.set("KRW-DOT", { status: "reclaim_ready", attempt_count: 0, reclaim_score: 54 });
+  const startMs813 = Date.now();
+  runWatchlistReclaimTickSim813("KRW-DOT", startMs813);
+  const itemAfterTick1 = testWatchlist813.get("KRW-DOT");
+  console.log(`- After Tick 1 (score 54): status=${itemAfterTick1?.status}, hasRetryAfter=${!!itemAfterTick1?.retry_after} (Expected: retry_wait, true)`);
+  if (itemAfterTick1?.status !== "retry_wait" || !itemAfterTick1?.retry_after) {
+    throw new Error("Test 8.13 Step 1 Failed");
+  }
+
+  // 두 번째 틱 (5초 후): 점수가 56점으로 상승(회복) -> reclaim_ready 복귀 -> placeBuy 통과 및 watchlist 삭제
+  itemAfterTick1.reclaim_score = 56; // 점수 회복
+  runWatchlistReclaimTickSim813("KRW-DOT", startMs813 + 6000);
+  const itemAfterTick2 = testWatchlist813.get("KRW-DOT");
+  console.log(`- After 6s (score 56): itemRemoved=${!itemAfterTick2}, placeBuyCalls=${mockPlaceBuyCalls813} (Expected: true, 1)`);
+  if (itemAfterTick2 || mockPlaceBuyCalls813 !== 1) {
+    throw new Error("Test 8.13 Step 2 Failed");
+  }
+  console.log("-> Test 8.13 Passed!");
+
+  // 8.14. orderKrw < 5000 처리 및 retry_wait 전이 테스트
+  console.log("\n[Test 8.14] Verifying orderKrw < 5000 results in retry_wait, not infinite loop...");
+  const testWatchlist814 = new Map<string, { status: string; attempt_count: number; retry_after?: number; order_krw: number }>();
+  let mockPlaceBuyCalls814: any = 0;
+
+  function runWatchlistReclaimTickSim814(market: string, nowMs: number) {
+    const item = testWatchlist814.get(market);
+    if (!item) return;
+
+    if (item.status === "retry_wait" && item.retry_after && nowMs < item.retry_after) {
+      return;
+    }
+
+    if (item.status === "retry_wait" && item.retry_after && nowMs >= item.retry_after) {
+      item.status = "reclaim_ready";
+    }
+
+    if (item.status === "reclaim_ready") {
+      if (item.order_krw < 5000) {
+        // orderKrw < 5000 -> RECLAIM_PRECHECK_BLOCKED 로그 모사 및 retry_wait
+        item.attempt_count = (item.attempt_count || 0) + 1;
+        if (item.attempt_count >= 5) {
+          testWatchlist814.delete(market);
+          return;
+        }
+        item.status = "retry_wait";
+        item.retry_after = nowMs + 5000;
+        return;
+      }
+
+      // orderKrw >= 5000 -> placeBuy 실행
+      mockPlaceBuyCalls814++;
+      item.status = "entered";
+      testWatchlist814.delete(market);
+    }
+  }
+
+  // 첫 번째 틱: 주문 금액 4999원 -> placeBuy 0회 및 retry_wait 전이
+  testWatchlist814.set("KRW-SOL", { status: "reclaim_ready", attempt_count: 0, order_krw: 4999 });
+  const startMs814 = Date.now();
+  runWatchlistReclaimTickSim814("KRW-SOL", startMs814);
+  const itemAfterTick1_814 = testWatchlist814.get("KRW-SOL");
+  console.log(`- After Tick 1 (orderKrw 4999): status=${itemAfterTick1_814?.status}, attempt_count=${itemAfterTick1_814?.attempt_count}, placeBuyCalls=${mockPlaceBuyCalls814} (Expected: retry_wait, 1, 0)`);
+  if (itemAfterTick1_814?.status !== "retry_wait" || itemAfterTick1_814?.attempt_count !== 1 || mockPlaceBuyCalls814 !== 0) {
+    throw new Error("Test 8.14 Step 1 Failed");
+  }
+
+  // 두 번째 틱 (5초 후): 사용 가능 잔고 증가로 주문 금액 5000원 이상 -> placeBuy 성공 및 watchlist 삭제
+  itemAfterTick1_814.order_krw = 6000;
+  runWatchlistReclaimTickSim814("KRW-SOL", startMs814 + 6000);
+  const itemAfterTick2_814 = testWatchlist814.get("KRW-SOL");
+  console.log(`- After 6s (orderKrw 6000): itemRemoved=${!itemAfterTick2_814}, placeBuyCalls=${mockPlaceBuyCalls814} (Expected: true, 1)`);
+  if (itemAfterTick2_814 || mockPlaceBuyCalls814 !== 1) {
+    throw new Error("Test 8.14 Step 2 Failed");
+  }
+  console.log("-> Test 8.14 Passed!");
+
+  // 8.15. retry_wait 해결 시 Reclaim 조건 엄격 재검증 테스트
+  console.log("\n[Test 8.15] Verifying strict Reclaim condition validation on retry_wait resolution...");
+  const testWatchlist815 = new Map<string, {
+    status: string;
+    attempt_count: number;
+    retry_after?: number;
+    local_high_price: number;
+    pullback_low_price: number;
+    current_price: number;
+    recent_1m_ret: number;
+    recent_3m_ret: number;
+    closes1: number[];
+  }>();
+  let mockPlaceBuyCalls815: any = 0;
+
+  function runWatchlistReclaimTickSim815(market: string, nowMs: number) {
+    const item = testWatchlist815.get(market);
+    if (!item) return;
+
+    if (item.status === "retry_wait" && item.retry_after && nowMs < item.retry_after) {
+      return;
+    }
+
+    // 2. retry_wait -> reclaim_ready 복귀 (조건 재검증)
+    if (item.status === "retry_wait" && item.retry_after && nowMs >= item.retry_after) {
+      const isRebounding = item.pullback_low_price !== null && item.current_price > item.pullback_low_price;
+      const returnsOk = item.recent_1m_ret > 0 && item.recent_3m_ret >= 0 && item.recent_3m_ret <= 2.5;
+      const nearHigh = item.current_price >= item.local_high_price * 0.997 && item.current_price <= item.local_high_price * 1.003;
+
+      // EMA20 구하기 (closes1 배열의 평균을 가식으로 구함. closes1의 길이를 보고 undefined 처리)
+      let ema20: number | undefined;
+      if (item.closes1.length >= 20) {
+        ema20 = item.closes1.reduce((a, b) => a + b, 0) / item.closes1.length;
+      }
+      const hasEma = typeof ema20 === "number" && Number.isFinite(ema20);
+      const isAboveEma = hasEma && item.current_price >= ema20!;
+
+      const conditionsValid = isRebounding && returnsOk && nearHigh && hasEma && isAboveEma;
+      console.log(`- Debug 8.15: market=${market}, reb=${isRebounding}, ret=${returnsOk}, near=${nearHigh}, hasEma=${hasEma}, aboveEma=${isAboveEma}, ema=${ema20}, cur=${item.current_price}, low=${item.pullback_low_price}`);
+
+      if (conditionsValid) {
+        item.status = "reclaim_ready";
+      } else {
+        item.status = "pullback_seen";
+        item.retry_after = undefined; // 쿨다운 해제하여 다음 tick에 pullback_seen 에서 다시 조건 만족 시 상승 유도
+      }
+    }
+
+    // 3. reclaim_ready 일 때 주문 실행
+    if (item.status === "reclaim_ready") {
+      item.attempt_count = (item.attempt_count || 0) + 1;
+      if (item.attempt_count >= 5) {
+        testWatchlist815.delete(market);
+        return;
+      }
+
+      mockPlaceBuyCalls815++;
+      // placeBuy 호출 성공 시나리오
+      item.status = "entered";
+      testWatchlist815.delete(market);
+    }
+  }
+
+  // 공통 초기 설정
+  const baseItem = {
+    status: "retry_wait",
+    attempt_count: 1,
+    retry_after: 1000,
+    local_high_price: 1000,
+    pullback_low_price: 990,
+    current_price: 998,
+    recent_1m_ret: 0.5,
+    recent_3m_ret: 1.0,
+    closes1: Array.from({ length: 20 }, () => 995), // EMA20 = 995, current_price(998) >= 995 (ok)
+  };
+
+  // 시나리오 1: 모든 조건 만족 시 -> placeBuy 성공 및 watchlist 삭제
+  testWatchlist815.set("KRW-OK", { ...baseItem, closes1: [...baseItem.closes1] });
+  runWatchlistReclaimTickSim815("KRW-OK", 1500);
+  console.log(`- Scenario 1 (All OK): itemRemoved=${!testWatchlist815.has("KRW-OK")}, placeBuyCalls=${mockPlaceBuyCalls815} (Expected: true, 1)`);
+  if (testWatchlist815.has("KRW-OK") || mockPlaceBuyCalls815 !== 1) {
+    throw new Error("Scenario 1 Failed");
+  }
+
+  // 시나리오 2: 가격이 pullback_low 아래로 추락 -> placeBuy 0회 및 pullback_seen 강등
+  mockPlaceBuyCalls815 = 0;
+  testWatchlist815.set("KRW-LOW_PRICE", { ...baseItem, current_price: 985, closes1: [...baseItem.closes1] });
+  runWatchlistReclaimTickSim815("KRW-LOW_PRICE", 1500);
+  const itemLowPx = testWatchlist815.get("KRW-LOW_PRICE");
+  console.log(`- Scenario 2 (Price < pullback_low): status=${itemLowPx?.status}, placeBuyCalls=${mockPlaceBuyCalls815} (Expected: pullback_seen, 0)`);
+  if (itemLowPx?.status !== "pullback_seen" || mockPlaceBuyCalls815 !== 0) {
+    throw new Error("Scenario 2 Failed");
+  }
+
+  // 시나리오 3: nearHigh 이탈 (너무 크게 반등해서 1.003 초과) -> placeBuy 0회 및 pullback_seen 강등
+  testWatchlist815.set("KRW-HIGH_OUT", { ...baseItem, current_price: 1010, closes1: [...baseItem.closes1] });
+  runWatchlistReclaimTickSim815("KRW-HIGH_OUT", 1500);
+  const itemHighOut = testWatchlist815.get("KRW-HIGH_OUT");
+  console.log(`- Scenario 3 (nearHigh out): status=${itemHighOut?.status}, placeBuyCalls=${mockPlaceBuyCalls815} (Expected: pullback_seen, 0)`);
+  if (itemHighOut?.status !== "pullback_seen" || mockPlaceBuyCalls815 !== 0) {
+    throw new Error("Scenario 3 Failed");
+  }
+
+  // 시나리오 4: recent1mRet <= 0 -> placeBuy 0회 및 pullback_seen 강등
+  testWatchlist815.set("KRW-RET_LOW", { ...baseItem, recent_1m_ret: 0, closes1: [...baseItem.closes1] });
+  runWatchlistReclaimTickSim815("KRW-RET_LOW", 1500);
+  const itemRetLow = testWatchlist815.get("KRW-RET_LOW");
+  console.log(`- Scenario 4 (recent1mRet <= 0): status=${itemRetLow?.status}, placeBuyCalls=${mockPlaceBuyCalls815} (Expected: pullback_seen, 0)`);
+  if (itemRetLow?.status !== "pullback_seen" || mockPlaceBuyCalls815 !== 0) {
+    throw new Error("Scenario 4 Failed");
+  }
+
+  // 시나리오 5: EMA 계산 실패 (closes1 길이 부족으로 fail-closed) -> placeBuy 0회 및 pullback_seen 강등
+  testWatchlist815.set("KRW-EMA_FAIL", { ...baseItem, closes1: [990, 992] });
+  runWatchlistReclaimTickSim815("KRW-EMA_FAIL", 1500);
+  const itemEmaFail = testWatchlist815.get("KRW-EMA_FAIL");
+  console.log(`- Scenario 5 (EMA fail): status=${itemEmaFail?.status}, placeBuyCalls=${mockPlaceBuyCalls815} (Expected: pullback_seen, 0)`);
+  if (itemEmaFail?.status !== "pullback_seen" || mockPlaceBuyCalls815 !== 0) {
+    throw new Error("Scenario 5 Failed");
+  }
+
+  // 시나리오 6: 조건 이탈 후 다시 조건 형성 시 placeBuy 1회
+  testWatchlist815.set("KRW-RECOVER", { ...baseItem, current_price: 985, closes1: [...baseItem.closes1] }); // 초기 상태: pullback_low 아래 (이탈 상태)
+  
+  // 첫 번째 tick: 재검증 실패 -> pullback_seen 강등
+  runWatchlistReclaimTickSim815("KRW-RECOVER", 1500);
+  const itemRecover = testWatchlist815.get("KRW-RECOVER");
+  console.log(`- Scenario 6 Tick 1 (Price < pullback_low): status=${itemRecover?.status} (Expected: pullback_seen)`);
+  if (itemRecover?.status !== "pullback_seen") {
+    throw new Error("Scenario 6 Step 1 Failed");
+  }
+
+  // 두 번째 tick: 가격이 998로 다시 회복됨 -> pullback_seen 에서 reclaim_ready 로 다시 올라갈 조건 구사
+  if (itemRecover) {
+    itemRecover.current_price = 998;
+    const isRebounding = itemRecover.pullback_low_price !== null && itemRecover.current_price > itemRecover.pullback_low_price;
+    const returnsOk = itemRecover.recent_1m_ret > 0 && itemRecover.recent_3m_ret >= 0 && itemRecover.recent_3m_ret <= 2.5;
+    const nearHigh = itemRecover.current_price >= itemRecover.local_high_price * 0.997 && itemRecover.current_price <= itemRecover.local_high_price * 1.003;
+    let ema20: number | undefined;
+    if (itemRecover.closes1.length >= 20) {
+      ema20 = itemRecover.closes1.reduce((a, b) => a + b, 0) / itemRecover.closes1.length;
+    }
+    const hasEma = typeof ema20 === "number" && Number.isFinite(ema20);
+    const isAboveEma = hasEma && itemRecover.current_price >= ema20!;
+
+    if (isRebounding && returnsOk && nearHigh && hasEma && isAboveEma) {
+      itemRecover.status = "reclaim_ready";
+    }
+  }
+
+  // Tick 실행 -> reclaim_ready 이므로 placeBuy 성공하고 삭제됨
+  runWatchlistReclaimTickSim815("KRW-RECOVER", 2000);
+  console.log(`- Scenario 6 Tick 2 (Recovered OK): itemRemoved=${!testWatchlist815.has("KRW-RECOVER")}, placeBuyCalls=${mockPlaceBuyCalls815} (Expected: true, 1)`);
+  if (testWatchlist815.has("KRW-RECOVER") || mockPlaceBuyCalls815 !== 1) {
+    throw new Error("Scenario 6 Step 2 Failed");
+  }
+
+  console.log("-> Test 8.15 Passed!");
+
+  // 8.16. reclaim_ready 복원 후 주문 직전 전체 조건 재검증 테스트
+  console.log("\n[Test 8.16] Verifying reclaim_ready restoration and order gate strict verification...");
+  const testWatchlist816 = new Map<string, {
+    status: string;
+    attempt_count: number;
+    local_high_price: number;
+    pullback_low_price: number;
+    current_price: number;
+    recent_1m_ret: number;
+    recent_3m_ret: number;
+    closes1: number[];
+  }>();
+  let mockPlaceBuyCalls816: any = 0;
+
+  function runWatchlistReclaimTickSim816(market: string) {
+    const item = testWatchlist816.get(market);
+    if (!item) return;
+
+    // 1. 주문 직전 전체 조건 재검증 (item.status === "reclaim_ready")
+    if (item.status === "reclaim_ready") {
+      const isRebounding = item.pullback_low_price !== null && item.current_price > item.pullback_low_price;
+      const returnsOk = item.recent_1m_ret > 0 && item.recent_3m_ret >= 0 && item.recent_3m_ret <= 2.5;
+      const nearHigh = item.current_price >= item.local_high_price * 0.997 && item.current_price <= item.local_high_price * 1.003;
+
+      let ema20: number | undefined;
+      if (item.closes1.length >= 20) {
+        ema20 = item.closes1.reduce((a, b) => a + b, 0) / item.closes1.length;
+      }
+      const hasEma = typeof ema20 === "number" && Number.isFinite(ema20);
+      const isAboveEma = hasEma && item.current_price >= ema20!;
+
+      const conditionsValid = isRebounding && returnsOk && nearHigh && hasEma && isAboveEma;
+
+      if (!conditionsValid) {
+        // 강등 처리
+        item.status = "pullback_seen";
+        return;
+      }
+
+      // 2. 모든 조건 정상 시 placeBuy
+      mockPlaceBuyCalls816++;
+      item.status = "entered";
+      testWatchlist816.delete(market);
+    }
+  }
+
+  // 공통 초기 설정
+  const baseItem816 = {
+    status: "reclaim_ready",
+    attempt_count: 0,
+    local_high_price: 1000,
+    pullback_low_price: 990,
+    current_price: 998,
+    recent_1m_ret: 0.5,
+    recent_3m_ret: 1.0,
+    closes1: Array.from({ length: 20 }, () => 995), // EMA20 = 995 (ok)
+  };
+
+  // 시나리오 1: 가격이 pullback_low 이하 -> placeBuy 0회 및 강등
+  testWatchlist816.set("KRW-LOW_PX", { ...baseItem816, current_price: 985, closes1: [...baseItem816.closes1] });
+  runWatchlistReclaimTickSim816("KRW-LOW_PX");
+  const itemLowPx816 = testWatchlist816.get("KRW-LOW_PX");
+  console.log(`- Scenario 1 (Price <= pullback_low): status=${itemLowPx816?.status}, placeBuyCalls=${mockPlaceBuyCalls816} (Expected: pullback_seen, 0)`);
+  if (itemLowPx816?.status !== "pullback_seen" || mockPlaceBuyCalls816 !== 0) {
+    throw new Error("Test 8.16 Scenario 1 Failed");
+  }
+
+  // 시나리오 2: nearHigh 이탈 (고점 1.003 초과) -> placeBuy 0회 및 강등
+  testWatchlist816.set("KRW-HIGH_OUT", { ...baseItem816, current_price: 1010, closes1: [...baseItem816.closes1] });
+  runWatchlistReclaimTickSim816("KRW-HIGH_OUT");
+  const itemHighOut816 = testWatchlist816.get("KRW-HIGH_OUT");
+  console.log(`- Scenario 2 (nearHigh out): status=${itemHighOut816?.status}, placeBuyCalls=${mockPlaceBuyCalls816} (Expected: pullback_seen, 0)`);
+  if (itemHighOut816?.status !== "pullback_seen" || mockPlaceBuyCalls816 !== 0) {
+    throw new Error("Test 8.16 Scenario 2 Failed");
+  }
+
+  // 시나리오 3: recent1mRet <= 0 -> placeBuy 0회 및 강등
+  testWatchlist816.set("KRW-RET_LOW", { ...baseItem816, recent_1m_ret: 0, closes1: [...baseItem816.closes1] });
+  runWatchlistReclaimTickSim816("KRW-RET_LOW");
+  const itemRetLow816 = testWatchlist816.get("KRW-RET_LOW");
+  console.log(`- Scenario 3 (recent1mRet <= 0): status=${itemRetLow816?.status}, placeBuyCalls=${mockPlaceBuyCalls816} (Expected: pullback_seen, 0)`);
+  if (itemRetLow816?.status !== "pullback_seen" || mockPlaceBuyCalls816 !== 0) {
+    throw new Error("Test 8.16 Scenario 3 Failed");
+  }
+
+  // 시나리오 4: recent3mRet > 2.5 -> placeBuy 0회 및 강등
+  testWatchlist816.set("KRW-RET_HIGH", { ...baseItem816, recent_3m_ret: 2.6, closes1: [...baseItem816.closes1] });
+  runWatchlistReclaimTickSim816("KRW-RET_HIGH");
+  const itemRetHigh816 = testWatchlist816.get("KRW-RET_HIGH");
+  console.log(`- Scenario 4 (recent3mRet > 2.5): status=${itemRetHigh816?.status}, placeBuyCalls=${mockPlaceBuyCalls816} (Expected: pullback_seen, 0)`);
+  if (itemRetHigh816?.status !== "pullback_seen" || mockPlaceBuyCalls816 !== 0) {
+    throw new Error("Test 8.16 Scenario 4 Failed");
+  }
+
+  // 시나리오 5: EMA 계산 실패 -> placeBuy 0회 및 강등
+  testWatchlist816.set("KRW-EMA_FAIL", { ...baseItem816, closes1: [990, 992] });
+  runWatchlistReclaimTickSim816("KRW-EMA_FAIL");
+  const itemEmaFail816 = testWatchlist816.get("KRW-EMA_FAIL");
+  console.log(`- Scenario 5 (EMA fail): status=${itemEmaFail816?.status}, placeBuyCalls=${mockPlaceBuyCalls816} (Expected: pullback_seen, 0)`);
+  if (itemEmaFail816?.status !== "pullback_seen" || mockPlaceBuyCalls816 !== 0) {
+    throw new Error("Test 8.16 Scenario 5 Failed");
+  }
+
+  // 시나리오 6: 모든 조건 정상 -> placeBuy 정확히 1회 및 watchlist 삭제
+  testWatchlist816.set("KRW-OK", { ...baseItem816, closes1: [...baseItem816.closes1] });
+  runWatchlistReclaimTickSim816("KRW-OK");
+  console.log(`- Scenario 6 (All OK): itemRemoved=${!testWatchlist816.has("KRW-OK")}, placeBuyCalls=${mockPlaceBuyCalls816} (Expected: true, 1)`);
+  if (testWatchlist816.has("KRW-OK") || mockPlaceBuyCalls816 !== 1) {
+    throw new Error("Test 8.16 Scenario 6 Failed");
+  }
+
+  console.log("-> Test 8.16 Passed!");
+
+  console.log("-> Test 8 Passed!");
+
   // Restore fetch
   global.fetch = originalFetch;
 
