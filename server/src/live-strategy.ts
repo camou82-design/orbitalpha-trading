@@ -7298,7 +7298,7 @@ export function createLiveDataStrategy(opts: {
         reasonExit === "strict_early_loss_cut" ||
         exitAuthorityClass === "emergency_exit";
 
-      const exitBlockedByGrace = withinGracePeriod && !emergencyExit;
+      const exitBlockedByGrace = withinGracePeriod && !emergencyExit && !isRecoveredPosition;
       const exitAllowed = !exitBlockedByGrace && !blockedByMicroLoss;
 
       const beforeQty = p.qty;

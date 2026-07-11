@@ -825,20 +825,38 @@ async function runTests() {
   }
 
   // 6.9. 통합 테스트 추가 (+3% 돌파 시)
-  const simulateLiveStrategyExitFlow = (p: any, currentPrice: number): {
+  const simulateLiveStrategyExitFlow = (args: {
+    p: any;
+    currentPrice: number;
+    elapsedSinceStartMs?: number;
+    heldMs?: number;
+  }): {
     reasonExit: string;
     ratio: number;
     stopTriggerKind: string | null;
     exitAuthorityClass: string;
+    exitBlockedByGrace: boolean;
+    sellGuardReached: boolean;
     placeSellCalls: number;
   } => {
+    const p = args.p;
+    const currentPrice = args.currentPrice;
+    const elapsedSinceStartMs = args.elapsedSinceStartMs ?? 10 * 60_000 + 1000;
+    const heldMs = args.heldMs ?? 70000;
+
     let reasonExit = "";
     let ratio = 1;
     let stopTriggerKind: string | null = null;
     let exitAuthorityClass = "none";
+    let exitBlockedByGrace = false;
+    let sellGuardReached = false;
     let placeSellCalls = 0;
 
-    // 1. isSurge / surgePolicyApplies 판단 (live-strategy.ts 상향 이동 로직 재현)
+    const entryOriginStr = (p as any).entry_origin as string | undefined;
+    const isRecoveredPosition =
+      entryOriginStr === "auto_trade_recovered" ||
+      entryOriginStr === "auto_trade_recovered_all_holdings";
+
     const isSurge = p.engine_bucket === "surge" || (p as any).entry_mode === "SURGE_V2" || p.reason_enter?.includes("surge");
     const surgePolicyApplies =
       isSurge &&
@@ -894,10 +912,51 @@ async function runTests() {
     }
 
     if (reasonExit !== "") {
-      placeSellCalls = 1;
+      const isSurgeEmergencyStop =
+        reasonExit === "SURGE_STOP_LOSS" ||
+        reasonExit === "SURGE_REVERSAL_CUT" ||
+        reasonExit === "SURGE_EXIT_POLICY_INVALID_FORCE_EXIT" ||
+        reasonExit.startsWith("surge_early_failure_");
+
+      const emergencyExit =
+        isSurgeEmergencyStop ||
+        reasonExit.startsWith("fallback_") ||
+        reasonExit === "original_setup_stop_loss" ||
+        reasonExit === "emergency_stop_loss" ||
+        reasonExit === "weak_market_price_stop" ||
+        reasonExit === "strict_hard_stop_loss" ||
+        reasonExit === "strict_early_loss_cut" ||
+        exitAuthorityClass === "emergency_exit";
+
+      const withinGracePeriod = heldMs < 15000;
+      exitBlockedByGrace = withinGracePeriod && !emergencyExit && !isRecoveredPosition;
+      
+      const exitAllowed = !exitBlockedByGrace;
+
+      if (exitAllowed) {
+        sellGuardReached = true;
+        let sellGuardPassed = true;
+
+        if (elapsedSinceStartMs < 10 * 60_000 && !isRecoveredPosition) {
+          sellGuardPassed = false;
+        }
+
+        const isStopLossExitCheck =
+          exitAuthorityClass === "emergency_exit" ||
+          stopTriggerKind === "price_stop" ||
+          /emergency|hard|strict|stop|loss/i.test(reasonExit);
+
+        if (heldMs < 5 * 60000 && !isStopLossExitCheck && !isRecoveredPosition) {
+          sellGuardPassed = false;
+        }
+
+        if (sellGuardPassed) {
+          placeSellCalls = 1;
+        }
+      }
     }
 
-    return { reasonExit, ratio, stopTriggerKind, exitAuthorityClass, placeSellCalls };
+    return { reasonExit, ratio, stopTriggerKind, exitAuthorityClass, exitBlockedByGrace, sellGuardReached, placeSellCalls };
   };
 
   const pos69 = {
@@ -915,7 +974,7 @@ async function runTests() {
     surge_stop_price: 90000000,
   };
 
-  const res69 = simulateLiveStrategyExitFlow(pos69, pos69.entry_price * 1.03);
+  const res69 = simulateLiveStrategyExitFlow({ p: pos69, currentPrice: pos69.entry_price * 1.03 });
   console.log(`Integration Check (+3.0%): reasonExit=${res69.reasonExit}, ratio=${res69.ratio}, stopTriggerKind=${res69.stopTriggerKind}, exitAuthorityClass=${res69.exitAuthorityClass}, placeSellCalls=${res69.placeSellCalls} (Expected: SURGE_TP1_PARTIAL, 0.25, null, take_profit, 1)`);
   if (
     res69.reasonExit !== "SURGE_TP1_PARTIAL" ||
@@ -928,7 +987,7 @@ async function runTests() {
   }
 
   // 6.10. +2.6% 구간 테스트 (전량매도 가로채기 방지)
-  const res610 = simulateLiveStrategyExitFlow(pos69, pos69.entry_price * 1.026);
+  const res610 = simulateLiveStrategyExitFlow({ p: pos69, currentPrice: pos69.entry_price * 1.026 });
   console.log(`Integration Check (+2.6%): reasonExit="${res610.reasonExit}", ratio=${res610.ratio}, stopTriggerKind=${res610.stopTriggerKind}, exitAuthorityClass=${res610.exitAuthorityClass}, placeSellCalls=${res610.placeSellCalls} (Expected: "", 1, null, none, 0)`);
   if (res610.reasonExit !== "" || res610.placeSellCalls !== 0 || res610.exitAuthorityClass !== "none") {
     throw new Error("Case 6.10 Failed: Recovered surge should hold and original_setup_target_tp must be bypassed with placeSellCalls=0");
@@ -941,7 +1000,7 @@ async function runTests() {
     entry_stop_price: 91000000,
     surge_stop_price: 91500000, // 더 높은 surge_stop_price
   };
-  const res611 = simulateLiveStrategyExitFlow(pos611, 90000000);
+  const res611 = simulateLiveStrategyExitFlow({ p: pos611, currentPrice: 90000000 });
   console.log(`Integration Check (Stop Loss - Both): reasonExit=${res611.reasonExit}, ratio=${res611.ratio}, stopTriggerKind=${res611.stopTriggerKind}, exitAuthorityClass=${res611.exitAuthorityClass}, placeSellCalls=${res611.placeSellCalls} (Expected: SURGE_STOP_LOSS, 1, price_stop, emergency_exit, 1)`);
   if (
     res611.reasonExit !== "SURGE_STOP_LOSS" ||
@@ -956,31 +1015,6 @@ async function runTests() {
   console.log("-> Test 6 Passed!");
 
   console.log("\n[Test 7] Verifying new detailed exit authority & grace period bypass rules...");
-
-  // 최소보유시간 검증 로직 모의
-  const simulateHoldingTimeCheck = (args: {
-    heldMs: number;
-    exitAuthorityClass: string;
-    stopTriggerKind: string | null;
-    reasonExit: string;
-    entry_origin?: string;
-  }): { allowed: boolean; blockReason: string } => {
-    const isRecoveredPosition =
-      args.entry_origin === "auto_trade_recovered" ||
-      args.entry_origin === "auto_trade_recovered_all_holdings";
-
-    const isStopLossExit =
-      args.exitAuthorityClass === "emergency_exit" ||
-      args.stopTriggerKind === "price_stop" ||
-      /emergency|hard|strict|stop|loss/i.test(args.reasonExit);
-
-    // 기본 최소보유시간 5분 (300,000ms)
-    if (args.heldMs < 5 * 60000 && !isStopLossExit && !isRecoveredPosition) {
-      return { allowed: false, blockReason: "holding_time_under_min_limit" };
-    }
-
-    return { allowed: true, blockReason: "" };
-  };
 
   // 7.1. 일반 Surge TP1도 take_profit으로 분류 검증
   const posNormalTp1 = {
@@ -997,7 +1031,7 @@ async function runTests() {
     surge_take_profit_price: 1100,
     surge_trailing_gap_pct: 1.5,
   };
-  const resNormalTp1 = simulateLiveStrategyExitFlow(posNormalTp1, 1015); // +1.5%
+  const resNormalTp1 = simulateLiveStrategyExitFlow({ p: posNormalTp1, currentPrice: 1015 }); // +1.5%
   console.log(`Normal Surge TP1 Check: reasonExit=${resNormalTp1.reasonExit}, exitAuthorityClass=${resNormalTp1.exitAuthorityClass} (Expected: SURGE_TP1_PARTIAL, take_profit)`);
   if (resNormalTp1.reasonExit !== "SURGE_TP1_PARTIAL" || resNormalTp1.exitAuthorityClass !== "take_profit") {
     throw new Error("Test 7.1 Failed: Normal Surge TP1 should be classified as take_profit");
@@ -1009,7 +1043,7 @@ async function runTests() {
     surge_tp1_done: true,
     surge_take_profit_price: 1050, // +5.0%
   };
-  const resNormalTp2 = simulateLiveStrategyExitFlow(posNormalTp2, 1050); // +5.0%
+  const resNormalTp2 = simulateLiveStrategyExitFlow({ p: posNormalTp2, currentPrice: 1050 }); // +5.0%
   console.log(`Normal Surge TP2 Check: reasonExit=${resNormalTp2.reasonExit}, exitAuthorityClass=${resNormalTp2.exitAuthorityClass} (Expected: SURGE_TP2_PARTIAL, take_profit)`);
   if (resNormalTp2.reasonExit !== "SURGE_TP2_PARTIAL" || resNormalTp2.exitAuthorityClass !== "take_profit") {
     throw new Error("Test 7.2 Failed: Normal Surge TP2 should be classified as take_profit");
@@ -1023,7 +1057,7 @@ async function runTests() {
     surge_runner_active: true,
     highest_price_after_entry: 1040, // +4.0% 피크
   };
-  const resRunnerTrailing = simulateLiveStrategyExitFlow(posRunnerTrailing, 1015);
+  const resRunnerTrailing = simulateLiveStrategyExitFlow({ p: posRunnerTrailing, currentPrice: 1015 });
   console.log(`Runner Trailing Check: reasonExit=${resRunnerTrailing.reasonExit}, exitAuthorityClass=${resRunnerTrailing.exitAuthorityClass}, stopTriggerKind=${resRunnerTrailing.stopTriggerKind} (Expected: SURGE_RUNNER_TRAILING_EXIT, profit_protect, time_stop)`);
   if (resRunnerTrailing.reasonExit !== "SURGE_RUNNER_TRAILING_EXIT" || resRunnerTrailing.exitAuthorityClass !== "profit_protect" || resRunnerTrailing.stopTriggerKind !== "time_stop") {
     throw new Error("Test 7.3 Failed: Runner trailing exit should be classified as profit_protect and time_stop");
@@ -1066,7 +1100,7 @@ async function runTests() {
     // exitBlockedByGrace 검증
     const withinGracePeriod = heldMs < 15000;
     const emergencyExit = testEmergencyExitFlag(reasonExit, exitAuthorityClass);
-    const blockedByGrace = withinGracePeriod && !emergencyExit;
+    const blockedByGrace = withinGracePeriod && !emergencyExit && !isRecoveredPosition;
 
     // validateSellGuardBeforePlaceSell 검증 (boot grace)
     let allowedByGuard = true;
@@ -1092,48 +1126,57 @@ async function runTests() {
   }
 
   // 7.6. recovered Surge, 진입 10초, TP1 +3%: 최소 보유시간 우회, 매도 허용
-  const res76 = simulateHoldingTimeCheck({
-    heldMs: 10000,
-    exitAuthorityClass: "take_profit",
-    stopTriggerKind: null,
-    reasonExit: "SURGE_TP1_PARTIAL",
-    entry_origin: "auto_trade_recovered",
+  const res76 = simulateLiveStrategyExitFlow({
+    p: pos69,
+    currentPrice: pos69.entry_price * 1.03,
+    elapsedSinceStartMs: 10000, // 부팅 10초
+    heldMs: 10000, // 진입 10초
   });
-  console.log(`Test 7.6 (recovered Surge, 10s, TP1): allowed=${res76.allowed} (Expected: true)`);
-  if (!res76.allowed) throw new Error("Test 7.6 Failed");
+  console.log(`Test 7.6 (recovered Surge, 10s, TP1): reasonExit=${res76.reasonExit}, exitBlockedByGrace=${res76.exitBlockedByGrace}, sellGuardReached=${res76.sellGuardReached}, placeSellCalls=${res76.placeSellCalls} (Expected: SURGE_TP1_PARTIAL, false, true, 1)`);
+  if (
+    res76.reasonExit !== "SURGE_TP1_PARTIAL" ||
+    res76.exitBlockedByGrace !== false ||
+    res76.sellGuardReached !== true ||
+    res76.placeSellCalls !== 1
+  ) {
+    throw new Error("Test 7.6 Failed");
+  }
 
-  // 7.7. 일반 신규 Surge, 진입 10초, TP1 +3%: holding_time_under_min_limit 차단
-  const res77 = simulateHoldingTimeCheck({
-    heldMs: 10000,
-    exitAuthorityClass: "take_profit",
-    stopTriggerKind: null,
-    reasonExit: "SURGE_TP1_PARTIAL",
-    entry_origin: "auto_trade",
+  // 7.7. 일반 신규 Surge, 진입 10초, TP1 +3%: holding_time_under_min_limit 차단 또는 exitBlockedByGrace 차단
+  const res77 = simulateLiveStrategyExitFlow({
+    p: posNormalTp1,
+    currentPrice: 1030, // +3.0%
+    elapsedSinceStartMs: 10 * 60 * 1000 + 1000,
+    heldMs: 10000, // 진입 10초
   });
-  console.log(`Test 7.7 (new Surge, 10s, TP1): allowed=${res77.allowed}, blockReason=${res77.blockReason} (Expected: false, holding_time_under_min_limit)`);
-  if (res77.allowed || res77.blockReason !== "holding_time_under_min_limit") throw new Error("Test 7.7 Failed");
+  console.log(`Test 7.7 (new Surge, 10s, TP1): exitBlockedByGrace=${res77.exitBlockedByGrace}, placeSellCalls=${res77.placeSellCalls} (Expected: true, 0)`);
+  if (res77.exitBlockedByGrace !== true || res77.placeSellCalls !== 0) {
+    throw new Error("Test 7.7 Failed");
+  }
 
   // 7.8. 일반 신규 Surge, 5분 경과, TP1 +3%: 매도 허용
-  const res78 = simulateHoldingTimeCheck({
+  const res78 = simulateLiveStrategyExitFlow({
+    p: posNormalTp1,
+    currentPrice: 1030,
+    elapsedSinceStartMs: 10 * 60 * 1000 + 1000,
     heldMs: 301000, // 5분 초과
-    exitAuthorityClass: "take_profit",
-    stopTriggerKind: null,
-    reasonExit: "SURGE_TP1_PARTIAL",
-    entry_origin: "auto_trade",
   });
-  console.log(`Test 7.8 (new Surge, 5m+, TP1): allowed=${res78.allowed} (Expected: true)`);
-  if (!res78.allowed) throw new Error("Test 7.8 Failed");
+  console.log(`Test 7.8 (new Surge, 5m+, TP1): placeSellCalls=${res78.placeSellCalls} (Expected: 1)`);
+  if (res78.placeSellCalls !== 1) {
+    throw new Error("Test 7.8 Failed");
+  }
 
   // 7.9. Surge emergency stop, 진입 10초: 즉시 허용
-  const res79 = simulateHoldingTimeCheck({
-    heldMs: 10000,
-    exitAuthorityClass: "emergency_exit",
-    stopTriggerKind: "price_stop",
-    reasonExit: "SURGE_STOP_LOSS",
-    entry_origin: "auto_trade",
+  const res79 = simulateLiveStrategyExitFlow({
+    p: posNormalTp1,
+    currentPrice: 800, // 손절
+    elapsedSinceStartMs: 10 * 60 * 1000 + 1000,
+    heldMs: 10000, // 진입 10초
   });
-  console.log(`Test 7.9 (Surge emergency stop, 10s): allowed=${res79.allowed} (Expected: true)`);
-  if (!res79.allowed) throw new Error("Test 7.9 Failed");
+  console.log(`Test 7.9 (Surge emergency stop, 10s): exitBlockedByGrace=${res79.exitBlockedByGrace}, placeSellCalls=${res79.placeSellCalls} (Expected: false, 1)`);
+  if (res79.exitBlockedByGrace !== false || res79.placeSellCalls !== 1) {
+    throw new Error("Test 7.9 Failed");
+  }
 
   // 7.10. recovered Surge, surge_stop_price 없음, entry_stop_price 유효: entry_stop_price fallback 사용
   const pos710 = {
