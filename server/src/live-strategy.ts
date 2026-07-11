@@ -539,7 +539,7 @@ type ExitAuthorityDecision = {
   reasonExit: string | null;
   ratio: number;
   stopTriggerKind: StopTriggerKind | null;
-  authorityClass: "emergency_exit" | "hard_loss" | "partial_take_profit" | "breakeven_protect" | "runner_trail" | "weak_time_stop" | "micro_loss_guard" | "none";
+  authorityClass: "emergency_exit" | "hard_loss" | "partial_take_profit" | "breakeven_protect" | "runner_trail" | "weak_time_stop" | "micro_loss_guard" | "none" | "take_profit" | "profit_protect" | "time_stop";
   reasonDetail: string;
   runnerTrailActive: boolean;
 };
@@ -5959,8 +5959,8 @@ export function createLiveDataStrategy(opts: {
       // 3. 공통 매도 가드 (전량 및 부분매도 통합 적용)
       const isStopLossExit = params.exitAuthorityClass === "emergency_exit" || params.stopTriggerKind === "price_stop" || /emergency|hard|strict|stop|loss/i.test(params.reasonExit);
       
-      // 3.1) 최소 보유 시간 검증 (기본 5분, stop loss 탈출은 제외)
-      if (params.heldMs < LIVE_MIN_HOLDING_MINUTES * 60000 && !isStopLossExit) {
+      // 3.1) 최소 보유 시간 검증 (기본 5분, stop loss 탈출 및 recovered 포지션은 제외)
+      if (params.heldMs < LIVE_MIN_HOLDING_MINUTES * 60000 && !isStopLossExit && !isRecoveredPosition) {
         return {
           allowed: false,
           blockReason: `holding_time_under_min_limit:held=${Math.floor(params.heldMs / 1000)}s_need=${LIVE_MIN_HOLDING_MINUTES * 60}s`,
@@ -6566,11 +6566,21 @@ export function createLiveDataStrategy(opts: {
         }
       }
 
+      const isSurge = isSurgePosition(p);
+      const surgePolicyApplies =
+        isSurge &&
+        p.strict_exit === true &&
+        (
+          (p as any).entry_mode === "SURGE_V2" ||
+          p.engine_bucket === "surge" ||
+          p.reason_enter?.includes("surge")
+        );
+
       // [ORIGINAL SETUP] Primary Exit Authority Enforcement
-      if (p.entry_stop_price && now <= p.entry_stop_price) {
+      if (!surgePolicyApplies && p.entry_stop_price && now <= p.entry_stop_price) {
         reasonExit = "original_setup_stop_loss";
         stopTriggerKind = "price_stop";
-      } else if (p.entry_target_price && now >= p.entry_target_price) {
+      } else if (!surgePolicyApplies && p.entry_target_price && now >= p.entry_target_price) {
         reasonExit = "original_setup_target_tp";
         stopTriggerKind = "price_stop";
       }
@@ -6606,19 +6616,6 @@ export function createLiveDataStrategy(opts: {
         });
       }
       // holdMin은 루프 상단에서 이미 정의됨
-      const isSurge = isSurgePosition(p);
-      // [수정 1] surgePolicyApplies 조건 완화:
-      // entry_mode===SURGE_V2 OR engine_bucket===surge OR reason_enter includes surge
-      // + strict_exit=true 이면 surge exit engine을 적용한다.
-      // 기존에 entry_origin=auto_trade 를 필수로 요구해 복구/장부보정 포지션이 사각지대에 빠지던 문제 해소.
-      const surgePolicyApplies =
-        isSurge &&
-        p.strict_exit === true &&
-        (
-          (p as any).entry_mode === "SURGE_V2" ||
-          p.engine_bucket === "surge" ||
-          p.reason_enter?.includes("surge")
-        );
 
       if (isSurge && !surgePolicyApplies) {
         console.info(
@@ -6746,6 +6743,14 @@ export function createLiveDataStrategy(opts: {
         }
 
         if (decision.reason === "SURGE_TP1_PARTIAL" || decision.reason === "SURGE_TP2_PARTIAL") {
+          const isRecoveredSurgePolicy =
+            (p as any).surge_entry_mode === "RECOVERED_SURGE_POLICY" ||
+            (
+              ((p as any).entry_origin === "auto_trade_recovered" ||
+               (p as any).entry_origin === "auto_trade_recovered_all_holdings") &&
+              p.engine_bucket === "surge"
+            );
+
           console.info(
             JSON.stringify({
               tag: "SURGE_PARTIAL_TAKE_PROFIT_DECISION_PROOF",
@@ -6757,7 +6762,9 @@ export function createLiveDataStrategy(opts: {
               maxPnlPct: p.max_pnl_pct,
               currentPrice: now,
               entryPrice: p.entry_price,
-              targetPct: decision.reason === "SURGE_TP1_PARTIAL" ? 1.5 : ((p as any).surge_entry_mode === "FAST_SURGE_PROBE" ? 3.5 : 5.0),
+              targetPct: decision.reason === "SURGE_TP1_PARTIAL"
+                ? (isRecoveredSurgePolicy ? 3.0 : 1.5)
+                : ((p as any).surge_entry_mode === "FAST_SURGE_PROBE" ? 3.5 : 5.0),
               sellRatio: decision.ratio,
               remainingQty: p.qty,
               reason: decision.reason,
@@ -6808,8 +6815,29 @@ export function createLiveDataStrategy(opts: {
         if (decision.action === "sell") {
           reasonExit = decision.reason;
           ratio = decision.ratio;
-          stopTriggerKind = "price_stop";
-          exitAuthorityClass = "emergency_exit";
+          if (decision.reason === "SURGE_TP1_PARTIAL" || decision.reason === "SURGE_TP2_PARTIAL") {
+            exitAuthorityClass = "take_profit";
+            stopTriggerKind = null;
+          } else if (decision.reason === "SURGE_RUNNER_TRAILING_EXIT") {
+            exitAuthorityClass = "profit_protect";
+            stopTriggerKind = "time_stop";
+          } else if (decision.reason === "SURGE_BREAKEVEN_PROTECT") {
+            exitAuthorityClass = "breakeven_protect";
+            stopTriggerKind = "breakeven_protect";
+          } else if (
+            decision.reason === "SURGE_STOP_LOSS" ||
+            decision.reason === "SURGE_REVERSAL_CUT" ||
+            decision.reason === "SURGE_EXIT_POLICY_INVALID_FORCE_EXIT"
+          ) {
+            exitAuthorityClass = "emergency_exit";
+            stopTriggerKind = "price_stop";
+          } else if (decision.reason === "SURGE_TIMEOUT_EXIT") {
+            exitAuthorityClass = "time_stop";
+            stopTriggerKind = "time_stop";
+          } else {
+            exitAuthorityClass = "emergency_exit";
+            stopTriggerKind = "price_stop";
+          }
           exitReasonDetail = "surge-v2-exit-engine";
           isSurgeExitDecision = true;
         }
@@ -7223,14 +7251,19 @@ export function createLiveDataStrategy(opts: {
         !!p.rescue_add_cooldown_until &&
         new Date().toISOString() < p.rescue_add_cooldown_until;
 
+      const isSurgeEmergencyStop =
+        reasonExit === "SURGE_STOP_LOSS" ||
+        reasonExit === "SURGE_REVERSAL_CUT" ||
+        reasonExit === "SURGE_EXIT_POLICY_INVALID_FORCE_EXIT" ||
+        reasonExit.startsWith("surge_early_failure_");
+
       const rescueCooldownOverride =
         (p.entry_stop_price && now <= p.entry_stop_price) ||
         ((p as any).surge_stop_price && now <= (p as any).surge_stop_price) ||
         pnlGross <= -2.2 ||
         reasonExit.startsWith("fallback_") ||
         reasonExit === "original_setup_stop_loss" ||
-        reasonExit.startsWith("SURGE_") ||
-        reasonExit.startsWith("surge_") ||
+        isSurgeEmergencyStop ||
         reasonExit.includes("volume_fade") ||
         reasonExit.includes("high_rejected") ||
         reasonExit.includes("retest_fail") ||
@@ -7256,15 +7289,13 @@ export function createLiveDataStrategy(opts: {
       const blockedByMicroLoss = withinEarlyLossGuard && isStopLike && netPnlPctEst > LIVE_MIN_EXIT_LOSS_PCT && reasonExit !== "emergency_stop_loss";
 
       const emergencyExit =
-        reasonExit.startsWith("SURGE_") ||
-        reasonExit.startsWith("surge_") ||
+        isSurgeEmergencyStop ||
         reasonExit.startsWith("fallback_") ||
         reasonExit === "original_setup_stop_loss" ||
         reasonExit === "emergency_stop_loss" ||
         reasonExit === "weak_market_price_stop" ||
         reasonExit === "strict_hard_stop_loss" ||
         reasonExit === "strict_early_loss_cut" ||
-        isSurgeExitDecision ||
         exitAuthorityClass === "emergency_exit";
 
       const exitBlockedByGrace = withinGracePeriod && !emergencyExit;

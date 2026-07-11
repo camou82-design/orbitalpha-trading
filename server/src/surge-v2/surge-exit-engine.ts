@@ -48,7 +48,9 @@ export function evaluateSurgeExit(pos: any, currentPx: number, rise3mPct?: numbe
       pos.engine_bucket === "surge"
     );
 
-  const stopPrice = pos.surge_stop_price;
+  const stopPrice = (pos.surge_stop_price > 0 && Number.isFinite(pos.surge_stop_price))
+    ? pos.surge_stop_price
+    : (pos.entry_stop_price > 0 && Number.isFinite(pos.entry_stop_price) ? pos.entry_stop_price : 0);
   let tp2Price = pos.surge_take_profit_price;
 
   let tp1Target = 1.5;
@@ -79,7 +81,7 @@ export function evaluateSurgeExit(pos: any, currentPx: number, rise3mPct?: numbe
       ts: new Date().toISOString(),
       entryPrice,
       currentPx,
-      stopPrice,
+      stopPrice: stopPrice ?? null,
       tp2Price,
       trailingGapPct,
       reason: "invalid_prices_or_gap_detected"
