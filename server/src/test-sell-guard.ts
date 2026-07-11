@@ -2090,9 +2090,9 @@ async function runTests() {
       candleAgeMs = nowMs - cached.ts;
       candleFallbackUsed = false;
     } else {
+      mockFetchMinuteCandlesCalls++; // 성공/실패와 관계없이 fetch 시도 시 무조건 증가
       let fetchErrStr = "fetch error";
       if (!mockFetchShouldFail) {
-        mockFetchMinuteCandlesCalls++;
         c1 = Array.from({ length: 20 }, () => ({ trade_price: 995 }));
         c5 = Array.from({ length: 20 }, () => ({ trade_price: 995 }));
         testWatchlistCandleCache.set(market, { ts: nowMs, c1, c5 });
@@ -2105,7 +2105,7 @@ async function runTests() {
           const age = nowMs - cached.ts;
           if (age > 30000) { // 30초 초과 시 차단
             loggedBlockedReason = "watchlist_candles_stale";
-            return; // evaluateReclaimConditions 나 pullback 평가 자체를 진행하지 않고 continue
+            return { candleSource: "blocked", candleAgeMs: age, candleFallbackUsed: false };
           }
           c1 = cached.c1;
           c5 = cached.c5;
@@ -2114,7 +2114,7 @@ async function runTests() {
           candleFallbackUsed = true;
         } else {
           loggedBlockedReason = "watchlist_candles_missing";
-          return; // evaluateReclaimConditions 나 pullback 평가 자체를 진행하지 않고 continue
+          return { candleSource: "blocked", candleAgeMs: 0, candleFallbackUsed: false };
         }
       }
     }
@@ -2123,27 +2123,40 @@ async function runTests() {
     if (c1.length > 0 && item.status === "reclaim_ready") {
       mockPlaceBuyCalls817++;
     }
+
+    return {
+      candleSource,
+      candleAgeMs,
+      candleFallbackUsed,
+    };
   }
 
   const baseItem817 = { status: "reclaim_ready" };
 
-  // 시나리오 1: 10초 캐시 + fetch 실패 -> 허용 범위 내 fallback 사용해 placeBuy 실행 성공
+  // 시나리오 1: 20초 캐시 + fetch 실패 -> 허용 범위 내 fallback 사용해 placeBuy 실행 성공
   testWatchlistCandleCache.clear();
   mockFetchMinuteCandlesCalls = 0;
   mockFetchShouldFail = true;
   loggedBlockedReason = null;
   mockPlaceBuyCalls817 = 0;
 
-  // 10초 전에 쌓인 캐시 설정
+  // 20초 전에 쌓인 캐시 설정
   testWatchlistCandleCache.set("KRW-OK", {
     ts: 1000,
     c1: Array.from({ length: 20 }, () => ({ trade_price: 995 })),
     c5: Array.from({ length: 20 }, () => ({ trade_price: 995 })),
   });
 
-  runWatchlistReclaimTickSim817("KRW-OK", 11000, baseItem817); // 나이 10초(10000ms)
-  console.log(`- Scenario 1 (10s cache fallback): placeBuyCalls=${mockPlaceBuyCalls817}, blockedReason=${loggedBlockedReason} (Expected: 1, null)`);
-  if (mockPlaceBuyCalls817 !== 1 || loggedBlockedReason !== null) {
+  const res1 = runWatchlistReclaimTickSim817("KRW-OK", 21000, baseItem817); // 나이 20초(20000ms)
+  console.log(`- Scenario 1 (20s cache fallback): fetchCalls=${mockFetchMinuteCandlesCalls}, placeBuyCalls=${mockPlaceBuyCalls817}, source=${res1.candleSource}, fallbackUsed=${res1.candleFallbackUsed}, ageMs=${res1.candleAgeMs}`);
+  if (
+    mockFetchMinuteCandlesCalls !== 1 ||
+    mockPlaceBuyCalls817 !== 1 ||
+    loggedBlockedReason !== null ||
+    res1.candleSource !== "cache_fallback" ||
+    res1.candleFallbackUsed !== true ||
+    res1.candleAgeMs !== 20000
+  ) {
     throw new Error("Test 8.17 Scenario 1 Failed");
   }
 
@@ -2191,6 +2204,82 @@ async function runTests() {
   console.log(`- Scenario 4 (New fetch success): placeBuyCalls=${mockPlaceBuyCalls817}, fetchCalls=${mockFetchMinuteCandlesCalls} (Expected: 1, 1)`);
   if (mockPlaceBuyCalls817 !== 1 || mockFetchMinuteCandlesCalls !== 1) {
     throw new Error("Test 8.17 Scenario 4 Failed");
+  }
+
+  // 시나리오 5: 12초 경계선 테스트 (11,999ms) -> cache_fresh 분기 및 fetch 0회
+  testWatchlistCandleCache.clear();
+  mockFetchMinuteCandlesCalls = 0;
+  mockFetchShouldFail = true;
+  loggedBlockedReason = null;
+  mockPlaceBuyCalls817 = 0;
+
+  testWatchlistCandleCache.set("KRW-BOUNDARY_12_OK", {
+    ts: 1000,
+    c1: Array.from({ length: 20 }, () => ({ trade_price: 995 })),
+    c5: Array.from({ length: 20 }, () => ({ trade_price: 995 })),
+  });
+
+  const resBoundary1 = runWatchlistReclaimTickSim817("KRW-BOUNDARY_12_OK", 12999, baseItem817); // 11,999ms
+  console.log(`- Scenario 5 (11.999s fresh cache): fetchCalls=${mockFetchMinuteCandlesCalls}, placeBuyCalls=${mockPlaceBuyCalls817}, source=${resBoundary1.candleSource} (Expected: 0, 1, cache_fresh)`);
+  if (mockFetchMinuteCandlesCalls !== 0 || mockPlaceBuyCalls817 !== 1 || resBoundary1.candleSource !== "cache_fresh") {
+    throw new Error("Test 8.17 Scenario 5 Failed");
+  }
+
+  // 시나리오 6: 12초 경계선 테스트 (12,000ms) -> fetch 시도 1회
+  testWatchlistCandleCache.clear();
+  mockFetchMinuteCandlesCalls = 0;
+  mockFetchShouldFail = true;
+  loggedBlockedReason = null;
+  mockPlaceBuyCalls817 = 0;
+
+  testWatchlistCandleCache.set("KRW-BOUNDARY_12_FETCH", {
+    ts: 1000,
+    c1: Array.from({ length: 20 }, () => ({ trade_price: 995 })),
+    c5: Array.from({ length: 20 }, () => ({ trade_price: 995 })),
+  });
+
+  const resBoundary2 = runWatchlistReclaimTickSim817("KRW-BOUNDARY_12_FETCH", 13000, baseItem817); // 12,000ms
+  console.log(`- Scenario 6 (12s fetch attempt): fetchCalls=${mockFetchMinuteCandlesCalls}, placeBuyCalls=${mockPlaceBuyCalls817}, source=${resBoundary2.candleSource} (Expected: 1, 1, cache_fallback)`);
+  if (mockFetchMinuteCandlesCalls !== 1 || mockPlaceBuyCalls817 !== 1 || resBoundary2.candleSource !== "cache_fallback") {
+    throw new Error("Test 8.17 Scenario 6 Failed");
+  }
+
+  // 시나리오 7: 30초 경계선 테스트 (30,000ms) + fetch 실패 -> fallback 허용
+  testWatchlistCandleCache.clear();
+  mockFetchMinuteCandlesCalls = 0;
+  mockFetchShouldFail = true;
+  loggedBlockedReason = null;
+  mockPlaceBuyCalls817 = 0;
+
+  testWatchlistCandleCache.set("KRW-BOUNDARY_30_OK", {
+    ts: 1000,
+    c1: Array.from({ length: 20 }, () => ({ trade_price: 995 })),
+    c5: Array.from({ length: 20 }, () => ({ trade_price: 995 })),
+  });
+
+  const resBoundary3 = runWatchlistReclaimTickSim817("KRW-BOUNDARY_30_OK", 31000, baseItem817); // 30,000ms
+  console.log(`- Scenario 7 (30s fallback allowed): fetchCalls=${mockFetchMinuteCandlesCalls}, placeBuyCalls=${mockPlaceBuyCalls817}, blockedReason=${loggedBlockedReason} (Expected: 1, 1, null)`);
+  if (mockFetchMinuteCandlesCalls !== 1 || mockPlaceBuyCalls817 !== 1 || loggedBlockedReason !== null || resBoundary3.candleSource !== "cache_fallback") {
+    throw new Error("Test 8.17 Scenario 7 Failed");
+  }
+
+  // 시나리오 8: 30초 경계선 테스트 (30,001ms) + fetch 실패 -> stale 차단
+  testWatchlistCandleCache.clear();
+  mockFetchMinuteCandlesCalls = 0;
+  mockFetchShouldFail = true;
+  loggedBlockedReason = null;
+  mockPlaceBuyCalls817 = 0;
+
+  testWatchlistCandleCache.set("KRW-BOUNDARY_30_STALE", {
+    ts: 1000,
+    c1: Array.from({ length: 20 }, () => ({ trade_price: 995 })),
+    c5: Array.from({ length: 20 }, () => ({ trade_price: 995 })),
+  });
+
+  const resBoundary4 = runWatchlistReclaimTickSim817("KRW-BOUNDARY_30_STALE", 31001, baseItem817); // 30,001ms
+  console.log(`- Scenario 8 (30.001s fallback denied): fetchCalls=${mockFetchMinuteCandlesCalls}, placeBuyCalls=${mockPlaceBuyCalls817}, blockedReason=${loggedBlockedReason} (Expected: 1, 0, watchlist_candles_stale)`);
+  if (mockFetchMinuteCandlesCalls !== 1 || mockPlaceBuyCalls817 !== 0 || loggedBlockedReason !== "watchlist_candles_stale" || resBoundary4.candleSource !== "blocked") {
+    throw new Error("Test 8.17 Scenario 8 Failed");
   }
 
   console.log("-> Test 8.17 Passed!");
