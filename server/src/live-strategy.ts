@@ -1171,7 +1171,7 @@ function checkConsecutiveLossCooldown(
   trades: Array<{ market: string; pnl_pct?: number | null; timestamp?: string; action?: string; state?: string }>,
   now = Date.now()
 ): { blocked: boolean; remainingMs: number; lossCount: number } {
-  const marketTrades = trades.filter((t) => t.market === market && t.action === "sell");
+  const marketTrades = trades.filter((t) => t.market === market && t.action === "sell" && ((t as any).filled_qty > 0 || (t as any).order_krw > 0));
   let consecutiveLosses = 0;
   let lastLossTimeMs = 0;
   for (let i = marketTrades.length - 1; i >= 0; i--) {
@@ -1201,7 +1201,7 @@ function checkConsecutiveLossCooldown(
 function evaluateGlobalKillSwitch(
   trades: Array<{ market: string; pnl_pct?: number | null; timestamp?: string; action?: string; note?: string }>
 ): { active: boolean; reason: string | null } {
-  const completed = trades.filter((t) => t.action === "sell");
+  const completed = trades.filter((t) => t.action === "sell" && ((t as any).filled_qty > 0 || (t as any).order_krw > 0));
   if (completed.length === 0) return { active: false, reason: null };
   const recent10 = completed.slice(-10);
   if (recent10.length >= 5) {
@@ -1593,7 +1593,7 @@ async function _validateLiveBuyPrecheckInternal(params: {
   
   const dailyTrades = params.trades.filter((t) => {
     const timeMs = Date.parse(t.timestamp || new Date().toISOString());
-    return timeMs >= today0900Ms && t.action === "sell";
+    return timeMs >= today0900Ms && t.action === "sell" && ((t as any).filled_qty > 0 || (t as any).order_krw > 0);
   });
   
   result.dailyLossCount = dailyTrades.filter((t) => (t.pnl_pct ?? 0) < 0).length;
@@ -6548,6 +6548,14 @@ export function createLiveDataStrategy(opts: {
     // exits — 익절/손절 판단은 업비트 보유 화면과 동일한 평단 대비 가격 변동률(gross) 기준
     for (const market of Object.keys(state.positions)) {
       const p = state.positions[market]!;
+      const isCoreTradePos =
+        p.engine_bucket === "core" ||
+        (p as any).entry_mode === "CORE" ||
+        (p as any).source_kind === "CORE_TRADE" ||
+        (p as any).sourceStrategy === "core" ||
+        p.reason_enter?.includes("CORE_TRADE") ||
+        p.reason_enter?.includes("CORE_TREND") ||
+        (CORE_TRADE_MARKETS.includes(market as any) && (p.strategy_type === "stable" || p.strategy_type === "momentum") && p.engine_bucket !== "surge");
 
       // ── [진단] 포지션별 exit loop 진입 체크 ──────────────────────────────
       const entryOriginStr = (p as any).entry_origin as string | undefined;
@@ -6915,11 +6923,113 @@ export function createLiveDataStrategy(opts: {
         const filters = Array.isArray(payload?.filters) ? (payload!.filters as Array<{ id: string; passed: boolean }>) : [];
         const hasFailed = (re: RegExp) => filters.some((f) => re.test(String(f.id)) && f.passed === false);
 
+        // volume_fade 2회 연속 상태 감지 카운트 업데이트
+        const isVolFadeState = volumeRatioNow > 0 && volumeRatioNow < 0.75;
+        if (isVolFadeState) {
+          (p as any).volume_fade_count = ((p as any).volume_fade_count ?? 0) + 1;
+        } else {
+          (p as any).volume_fade_count = 0;
+        }
+
+        // 1) score_below_threshold (CORE_TRADE의 경우 최소 15분 전 매도 금지)
+        let scoreBelowFloor = scoreNow > 0 && scoreNow < ENTRY_PIPELINE_MID_SCORE_FLOOR;
+        let scoreGuardActive = false;
+        if (scoreBelowFloor && isCoreTradePos && holdMin < 15) {
+          scoreBelowFloor = false;
+          scoreGuardActive = true;
+        }
+
+        // 2) volume_fade_after_spike (CORE_TRADE의 경우 최소 10분 이후 + 2회 연속 확인 시에만 허용)
+        let volumeFadeFail = false;
+        let volFadeGuardActive = false;
+        if (isCoreTradePos) {
+          if (isVolFadeState) {
+            if (holdMin < 10 || ((p as any).volume_fade_count ?? 0) < 2) {
+              volFadeGuardActive = true;
+            } else if (p.max_pnl_pct < 1.2) {
+              volumeFadeFail = true;
+            }
+          }
+        } else {
+          if (isVolFadeState && holdMin >= 3 && p.max_pnl_pct < 1.2) {
+            volumeFadeFail = true;
+          }
+        }
+
+        // 3) high_rejected (CORE_TRADE의 경우 최소 10분 전 매도 금지)
+        let highRejectedFail = hasFailed(/upper_wick|high_reject|high_rejected/i);
+        let highRejectGuardActive = false;
+        if (highRejectedFail && isCoreTradePos && holdMin < 10) {
+          highRejectedFail = false;
+          highRejectGuardActive = true;
+        }
+
+        // 4) retest_fail (CORE_TRADE의 경우 최소 10분 전 매도 금지)
+        let retestFail = hasFailed(/retest|pullback|reclaim/i);
+        let retestGuardActive = false;
+        if (retestFail && isCoreTradePos && holdMin < 10) {
+          retestFail = false;
+          retestGuardActive = true;
+        }
+
         let earlyFailureTrigger: string | null = null;
-        if (scoreNow > 0 && scoreNow < ENTRY_PIPELINE_MID_SCORE_FLOOR) earlyFailureTrigger = "score_below_threshold";
-        else if (volumeRatioNow > 0 && volumeRatioNow < 0.75 && holdMin >= 3 && p.max_pnl_pct < 1.2) earlyFailureTrigger = "volume_fade_after_spike";
-        else if (hasFailed(/upper_wick|high_reject|high_rejected/i)) earlyFailureTrigger = "high_rejected";
-        else if (hasFailed(/retest|pullback|reclaim/i)) earlyFailureTrigger = "retest_fail";
+        let rawTrigger: string | null = null;
+        
+        if (scoreNow > 0 && scoreNow < ENTRY_PIPELINE_MID_SCORE_FLOOR) rawTrigger = "score_below_threshold";
+        else if (isVolFadeState && p.max_pnl_pct < 1.2) rawTrigger = "volume_fade_after_spike";
+        else if (hasFailed(/upper_wick|high_reject|high_rejected/i)) rawTrigger = "high_rejected";
+        else if (hasFailed(/retest|pullback|reclaim/i)) rawTrigger = "retest_fail";
+
+        if (scoreBelowFloor) earlyFailureTrigger = "score_below_threshold";
+        else if (volumeFadeFail) earlyFailureTrigger = "volume_fade_after_spike";
+        else if (highRejectedFail) earlyFailureTrigger = "high_rejected";
+        else if (retestFail) earlyFailureTrigger = "retest_fail";
+
+        // CORE_TRADE 손익 가드 적용: 최소 보유시간(10분) 전 pnlGross > -0.8% 이면 청산 금지
+        let isPnlGuardTriggered = false;
+        if (earlyFailureTrigger && isCoreTradePos && holdMin < 10 && pnlGross > -0.8) {
+          isPnlGuardTriggered = true;
+          earlyFailureTrigger = null;
+        }
+
+        // 로그 기록 (가드가 적용되었거나, 가드 해제 후 청산되었을 시)
+        if (isCoreTradePos && (scoreGuardActive || volFadeGuardActive || highRejectGuardActive || retestGuardActive || isPnlGuardTriggered || earlyFailureTrigger)) {
+          if (earlyFailureTrigger) {
+            console.info(
+              JSON.stringify({
+                tag: "CORE_TRADE_EARLY_EXIT_ALLOWED_AFTER_GUARD",
+                ts: new Date().toISOString(),
+                market,
+                holdMin,
+                pnlGross,
+                maxPnl: p.max_pnl_pct,
+                originalExitReason: rawTrigger,
+                finalDecision: `surge_early_failure_${earlyFailureTrigger}`,
+              })
+            );
+          } else {
+            console.info(
+              JSON.stringify({
+                tag: "CORE_TRADE_EARLY_EXIT_GUARD_APPLIED",
+                ts: new Date().toISOString(),
+                market,
+                holdMin,
+                pnlGross,
+                maxPnl: p.max_pnl_pct,
+                originalExitReason: rawTrigger,
+                finalDecision: "blocked_by_guard",
+                guard_details: {
+                  scoreGuardActive,
+                  volFadeGuardActive,
+                  highRejectGuardActive,
+                  retestGuardActive,
+                  isPnlGuardTriggered,
+                  volume_fade_count: (p as any).volume_fade_count ?? 0,
+                }
+              })
+            );
+          }
+        }
 
         if (earlyFailureTrigger) {
           console.info(
@@ -7265,8 +7375,37 @@ export function createLiveDataStrategy(opts: {
               reasonExit = `stable_catastrophic_exit_${recv.catastrophic_exit_pct}`;
               stopTriggerKind = "price_stop";
             } else if (holdMin >= weakHoldMin && p.max_pnl_pct < 0.35 && pnlGross < 0) {
-              reasonExit = "weak_market_time_stop";
-              stopTriggerKind = "time_stop";
+              if (isCoreTradePos && holdMin < 15 && pnlGross > -1.0) {
+                console.info(
+                  JSON.stringify({
+                    tag: "CORE_TRADE_TIME_STOP_GUARD_APPLIED",
+                    ts: new Date().toISOString(),
+                    market,
+                    holdMin,
+                    pnlGross,
+                    maxPnl: p.max_pnl_pct,
+                    originalExitReason: "weak_market_time_stop",
+                    finalDecision: "blocked_by_guard",
+                  })
+                );
+              } else {
+                if (isCoreTradePos) {
+                  console.info(
+                    JSON.stringify({
+                      tag: "CORE_TRADE_EARLY_EXIT_ALLOWED_AFTER_GUARD",
+                      ts: new Date().toISOString(),
+                      market,
+                      holdMin,
+                      pnlGross,
+                      maxPnl: p.max_pnl_pct,
+                      originalExitReason: "weak_market_time_stop",
+                      finalDecision: "weak_market_time_stop",
+                    })
+                  );
+                }
+                reasonExit = "weak_market_time_stop";
+                stopTriggerKind = "time_stop";
+              }
             }
           }
         } else if (!reasonExit) {
@@ -7453,8 +7592,37 @@ export function createLiveDataStrategy(opts: {
                 }
               } catch {}
               if (!reasonExit && holdMin >= m.time_stop_min_minutes && holdMin <= m.time_stop_max_minutes && p.max_pnl_pct < 0.8 && pnlGross <= -0.1) {
-                reasonExit = "momentum_time_stop";
-                stopTriggerKind = "time_stop";
+                if (isCoreTradePos && holdMin < 15 && pnlGross > -1.0) {
+                  console.info(
+                    JSON.stringify({
+                      tag: "CORE_TRADE_TIME_STOP_GUARD_APPLIED",
+                      ts: new Date().toISOString(),
+                      market,
+                      holdMin,
+                      pnlGross,
+                      maxPnl: p.max_pnl_pct,
+                      originalExitReason: "momentum_time_stop",
+                      finalDecision: "blocked_by_guard",
+                    })
+                  );
+                } else {
+                  if (isCoreTradePos) {
+                    console.info(
+                      JSON.stringify({
+                        tag: "CORE_TRADE_EARLY_EXIT_ALLOWED_AFTER_GUARD",
+                        ts: new Date().toISOString(),
+                        market,
+                        holdMin,
+                        pnlGross,
+                        maxPnl: p.max_pnl_pct,
+                        originalExitReason: "momentum_time_stop",
+                        finalDecision: "momentum_time_stop",
+                      })
+                    );
+                  }
+                  reasonExit = "momentum_time_stop";
+                  stopTriggerKind = "time_stop";
+                }
               }
             }
           }
