@@ -10947,7 +10947,9 @@ export function createLiveDataStrategy(opts: {
         (sigPre?.p as any)?.sourceStrategy === "surge_reclaim_entry" ||
         (sigPre?.p as any)?.entrySignalType === "reclaim";
 
-      const loopStrategyType = isSurgeSourceLocal ? "surge_reclaim" : "momentum";
+      const loopStrategyType = isSurgeSourceLocal
+        ? "surge_reclaim"
+        : (sourceMeta?.source_kind === "CORE_TRADE" ? "stable" : "momentum");
       const loopEntrySignalType = isSurgeSourceLocal ? "reclaim" : undefined;
 
       if (!candidateMetaFromSetup && isSurgeSourceLocal) {
