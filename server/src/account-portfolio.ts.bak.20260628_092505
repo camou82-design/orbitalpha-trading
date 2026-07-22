@@ -33,8 +33,6 @@ export type AccountPortfolioSnapshot = {
   estimated_fees_krw: number;
   net_pnl_krw: number;
   net_return_pct: number;
-  cost_basis_unknown_krw: number;
-  passive_holding_value_krw: number;
   as_of: string;
 };
 
@@ -66,63 +64,36 @@ export function computeAccountValuationFromPrices(balances: BalanceRow[], tradeP
   }
 
   let total_evaluated = krwTotal;
-  let known_buy_cost = krwTotal;
-  let known_evaluated = krwTotal;
+  let buy_cost = krwTotal;
   let estimated_fees = 0;
-  let cost_basis_unknown_krw = 0;
-  let passive_holding_value_krw = 0;
 
   for (const b of balances) {
     if (b.currency === "KRW") continue;
     const qty = b.balance + b.locked;
     if (qty <= 0) continue;
     const market = marketCodeForCurrency(b.currency);
-    const price = tradePriceByMarket[market];
-    
-    // 가격이 없거나 0 이하이면 이 종목의 자산평가 및 평단 매수 금액을 제외한다
-    if (price === undefined || price === null || Number.isNaN(price) || price <= 0) {
-      continue;
-    }
-    
+    const price = tradePriceByMarket[market] ?? 0;
     const evalAmt = qty * price;
     const avg = Number(b.avg_buy_price ?? 0);
-
-    // 업비트 앱 연동 총자산(total_evaluated_krw)에는 소액 비관리 잔고를 포함한 전 코인 평가금액 합산
+    const cost = qty * avg;
     total_evaluated += evalAmt;
-
-    // 관리 대상 종목(MANAGED_MARKETS)이 아닌 코인의 평가금액 합산
-    const isManaged = MANAGED_MARKETS.includes(market as any);
-    if (!isManaged) {
-      passive_holding_value_krw += evalAmt;
-    }
-
-    // 평단가가 0이거나 미산정(avg <= 0)인 자산인 경우
-    if (!Number.isFinite(avg) || avg <= 0) {
-      cost_basis_unknown_krw += evalAmt;
-      // 손익 계산 대상 및 수익률 분모에서 별도 제외 (net_pnl 기여 0원, 수익률 분모 왜곡 방지)
-    } else {
-      const cost = qty * avg;
-      known_buy_cost += cost;
-      known_evaluated += evalAmt;
-      if (evalAmt > 0 && cost > 0) {
-        estimated_fees += UPBIT_FEE_RATE * (evalAmt + cost);
-      }
+    buy_cost += cost;
+    if (evalAmt > 0 && cost > 0) {
+      estimated_fees += UPBIT_FEE_RATE * (evalAmt + cost);
     }
   }
 
-  const net_pnl_krw = known_evaluated - known_buy_cost - estimated_fees;
-  const net_return_pct = known_buy_cost > 0 ? (net_pnl_krw / known_buy_cost) * 100 : 0;
+  const net_pnl_krw = total_evaluated - buy_cost - estimated_fees;
+  const net_return_pct = buy_cost > 0 ? (net_pnl_krw / buy_cost) * 100 : 0;
 
   const portfolio: AccountPortfolioSnapshot = {
     total_evaluated_krw: total_evaluated,
     krw_available_krw: krwAvail,
     krw_total_krw: krwTotal,
-    buy_cost_krw: known_buy_cost,
+    buy_cost_krw: buy_cost,
     estimated_fees_krw: estimated_fees,
     net_pnl_krw,
     net_return_pct,
-    cost_basis_unknown_krw,
-    passive_holding_value_krw,
     as_of,
   };
 
@@ -144,8 +115,6 @@ export function sanitizeAccountPortfolioSnapshot(p: AccountPortfolioSnapshot): A
     estimated_fees_krw: num(p.estimated_fees_krw),
     net_pnl_krw: num(p.net_pnl_krw),
     net_return_pct: num(p.net_return_pct),
-    cost_basis_unknown_krw: num(p.cost_basis_unknown_krw),
-    passive_holding_value_krw: num(p.passive_holding_value_krw),
     as_of: typeof p.as_of === "string" && p.as_of.length > 0 ? p.as_of : new Date().toISOString(),
   };
 }
@@ -167,11 +136,16 @@ export function marketsForAccountValuation(balances: BalanceRow[]): string[] {
  * 티커가 있으면 항상 티커 우선.
  */
 export function buildEffectiveValuationPriceMap(balances: BalanceRow[], tickerMap: Record<string, number>): Record<string, number> {
-  const out: Record<string, number> = {};
-  for (const [k, v] of Object.entries(tickerMap)) {
-    if (typeof v === "number" && Number.isFinite(v) && v > 0) {
-      out[k] = v;
-    }
+  const out: Record<string, number> = { ...tickerMap };
+  for (const b of balances) {
+    if (b.currency === "KRW") continue;
+    const qty = b.balance + b.locked;
+    if (qty <= 0) continue;
+    const m = marketCodeForCurrency(b.currency);
+    const tp = out[m];
+    if (typeof tp === "number" && Number.isFinite(tp) && tp > 0) continue;
+    const avg = Number(b.avg_buy_price ?? 0);
+    if (Number.isFinite(avg) && avg > 0) out[m] = avg;
   }
   return out;
 }
@@ -202,9 +176,9 @@ function parseTickerRow(t: { market?: unknown; trade_price?: unknown }): { marke
 }
 
 /** 공개 티커 조회 실패 시 throw — 호출부에서 마지막 정상 가격맵으로 폴백한다. */
-export async function fetchTickerPriceMap(markets: string[], isPriority = true): Promise<Record<string, number>> {
+export async function fetchTickerPriceMap(markets: string[]): Promise<Record<string, number>> {
   if (markets.length === 0) return {};
-  const tickerRows = await fetchTickers(markets, { isPriority });
+  const tickerRows = await fetchTickers(markets);
   const tradePriceByMarket: Record<string, number> = {};
   for (const t of tickerRows) {
     const parsed = parseTickerRow(t as { market?: unknown; trade_price?: unknown });
@@ -226,14 +200,14 @@ function heldMarketsNeedingPrice(balances: BalanceRow[], priceMap: Record<string
   return miss;
 }
 
-const TICKER_CHUNK = 10; // Chunk 크기를 10 이하로 조정
+const TICKER_CHUNK = 18;
 
-async function fetchTickerPriceMapChunked(markets: string[], isPriority = true): Promise<Record<string, number>> {
+async function fetchTickerPriceMapChunked(markets: string[]): Promise<Record<string, number>> {
   const out: Record<string, number> = {};
   for (let i = 0; i < markets.length; i += TICKER_CHUNK) {
     const chunk = markets.slice(i, i + TICKER_CHUNK);
     try {
-      const part = await fetchTickerPriceMap(chunk, isPriority);
+      const part = await fetchTickerPriceMap(chunk);
       Object.assign(out, part);
     } catch {
       /* 청크 단위 실패는 무시 — 단건 보충에서 이어짐 */
@@ -266,7 +240,7 @@ export async function resolveTickerPricesForBalances(
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const fresh = markets.length <= TICKER_CHUNK ? await fetchTickerPriceMap(markets, true) : await fetchTickerPriceMapChunked(markets, true);
+      const fresh = markets.length <= TICKER_CHUNK ? await fetchTickerPriceMap(markets) : await fetchTickerPriceMapChunked(markets);
       absorb(fresh);
       break;
     } catch {
@@ -276,7 +250,7 @@ export async function resolveTickerPricesForBalances(
 
   for (const m of heldMarketsNeedingPrice(balances, merged)) {
     try {
-      const one = await fetchTickerPriceMap([m], true);
+      const one = await fetchTickerPriceMap([m]);
       absorb(one);
     } catch {
       /* 다음 종목 */

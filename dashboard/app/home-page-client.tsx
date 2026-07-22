@@ -1386,6 +1386,12 @@ export default function HomePage() {
     accountAvailableKrw,
     accountPnlKrw,
     accountPnlPct,
+    todayRealizedPnlKrw,
+    todayRealizedPnlPct,
+    cumulativeRealizedPnlKrw,
+    unrealizedPnlKrw,
+    passiveHoldingValueKrw,
+    costBasisUnknownKrw,
     strategyOpenPositions,
     strategyMaxPositions,
     strategyRemainingSlots,
@@ -2451,6 +2457,7 @@ export default function HomePage() {
   };
 
   const [graphTab, setGraphTab] = useState<"1D" | "1W" | "1M" | "ALL">("1D");
+  const [chartAssetMode, setChartAssetMode] = useState<"ALL" | "STRATEGY" | "BOTH">("BOTH");
 
   // Keep dashboard shell visible while trade/account sync runs in background.
 
@@ -2733,9 +2740,9 @@ export default function HomePage() {
         <section
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
-            gap: "0.85rem",
-            marginBottom: "1rem",
+            gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))",
+            gap: "0.8rem",
+            marginBottom: "1rem"
           }}
         >
           <div style={{ background: UI.cardBg, border: `1px solid ${UI.border}`, borderRadius: 12, padding: "0.9rem 1rem", boxShadow: "0 4px 20px rgba(0,0,0,0.25)" }}>
@@ -2754,17 +2761,17 @@ export default function HomePage() {
               {liveCapitalApi.ready ? Math.round(liveCapitalApi.availableKrw).toLocaleString() : "—"}
             </div>
             <div style={{ fontSize: "0.68rem", color: UI.mutedSoft, marginTop: 4 }}>
-              대시보드 가용액 기준
+              대시보드 가용액 기준 {passiveHoldingValueKrw > 0 ? `(비관리 코인: ${Math.round(passiveHoldingValueKrw).toLocaleString()}원)` : ""}
             </div>
           </div>
 
           <div style={{ background: UI.cardBg, border: `1px solid ${UI.border}`, borderRadius: 12, padding: "0.9rem 1rem", boxShadow: "0 4px 20px rgba(0,0,0,0.25)" }}>
-            <div style={{ fontSize: "0.74rem", color: UI.muted, marginBottom: 5, fontWeight: 700 }}>오늘 손익</div>
-            <div style={{ fontSize: "1.65rem", fontWeight: 900, color: accountPnlKrw >= 0 ? UI.pass : UI.watch, lineHeight: 1.1 }}>
-              {accountPnlKrw >= 0 ? "+" : ""}{Math.round(accountPnlKrw).toLocaleString()}
+            <div style={{ fontSize: "0.74rem", color: UI.muted, marginBottom: 5, fontWeight: 700 }}>오늘 손익 (당일 실현)</div>
+            <div style={{ fontSize: "1.65rem", fontWeight: 900, color: todayRealizedPnlKrw >= 0 ? UI.pass : UI.watch, lineHeight: 1.1 }}>
+              {todayRealizedPnlKrw >= 0 ? "+" : ""}{Math.round(todayRealizedPnlKrw).toLocaleString()}
             </div>
-            <div style={{ fontSize: "0.68rem", color: accountPnlKrw >= 0 ? UI.pass : UI.watch, marginTop: 4, fontWeight: 700 }}>
-              {accountPnlPct >= 0 ? "+" : ""}{accountPnlPct.toFixed(2)}% (실현손익)
+            <div style={{ fontSize: "0.68rem", color: todayRealizedPnlKrw >= 0 ? UI.pass : UI.watch, marginTop: 4, fontWeight: 700 }}>
+              {todayRealizedPnlPct >= 0 ? "+" : ""}{todayRealizedPnlPct.toFixed(2)}% (KST 00:00 이후 매도 청산)
             </div>
           </div>
 
@@ -2774,7 +2781,7 @@ export default function HomePage() {
               {assetSummary.kpi === "ready" ? `${netRetVal >= 0 ? "+" : ""}${netRetVal.toFixed(2)}%` : "—"}
             </div>
             <div style={{ fontSize: "0.68rem", color: netPnlVal >= 0 ? UI.pass : UI.watch, marginTop: 4, fontWeight: 700 }}>
-              평가손익: {assetSummary.kpi === "ready" ? `${netPnlVal >= 0 ? "+" : ""}${Math.round(netPnlVal).toLocaleString()}` : "—"} KRW
+              평가손익: {assetSummary.kpi === "ready" ? `${netPnlVal >= 0 ? "+" : ""}${Math.round(netPnlVal).toLocaleString()}` : "—"} KRW {unrealizedPnlKrw !== 0 ? `(미실현: ${Math.round(unrealizedPnlKrw).toLocaleString()}원)` : ""}
             </div>
           </div>
         </section>
@@ -2791,32 +2798,61 @@ export default function HomePage() {
           }}
         >
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.7rem", flexWrap: "wrap", gap: 8 }}>
-            <div style={{ fontSize: "0.9rem", color: UI.title, fontWeight: 900 }}>포트폴리오 가치 추이 (KRW)</div>
-            <div style={{ display: "flex", gap: "0.3rem" }}>
-              {(["1D", "1W", "1M", "ALL"] as const).map((tab) => (
-                <button
-                  key={tab}
-                  type="button"
-                  onClick={() => setGraphTab(tab)}
-                  style={{
-                    background: graphTab === tab ? "#3b82f6" : UI.cardSoftBg,
-                    border: `1px solid ${graphTab === tab ? "#60a5fa" : UI.borderSoft}`,
-                    borderRadius: 6,
-                    color: UI.title,
-                    fontSize: "0.68rem",
-                    fontWeight: 700,
-                    padding: "0.22rem 0.55rem",
-                    cursor: "pointer"
-                  }}
-                >
-                  {tab}
-                </button>
-              ))}
+            <div style={{ fontSize: "0.9rem", color: UI.title, fontWeight: 900, display: "flex", alignItems: "center", gap: 10 }}>
+              <span>포트폴리오 가치 추이 (KRW)</span>
+              <span style={{ fontSize: "0.7rem", fontWeight: 500, color: UI.mutedSoft }}>
+                <span style={{ color: "#3b82f6" }}>● 전체자산</span> &nbsp;
+                <span style={{ color: "#10b981" }}>● 전략자산</span>
+              </span>
+            </div>
+            <div style={{ display: "flex", gap: "0.6rem", flexWrap: "wrap" }}>
+              <div style={{ display: "flex", gap: "0.25rem", background: UI.cardSoftBg, padding: "2px 4px", borderRadius: 6, border: `1px solid ${UI.borderSoft}` }}>
+                {(["BOTH", "ALL", "STRATEGY"] as const).map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => setChartAssetMode(mode)}
+                    style={{
+                      background: chartAssetMode === mode ? "#10b981" : "transparent",
+                      border: "none",
+                      borderRadius: 4,
+                      color: chartAssetMode === mode ? "#ffffff" : UI.title,
+                      fontSize: "0.66rem",
+                      fontWeight: 700,
+                      padding: "0.2rem 0.5rem",
+                      cursor: "pointer"
+                    }}
+                  >
+                    {mode === "BOTH" ? "전체+전략" : mode === "ALL" ? "전체자산" : "전략자산"}
+                  </button>
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: "0.25rem", background: UI.cardSoftBg, padding: "2px 4px", borderRadius: 6, border: `1px solid ${UI.borderSoft}` }}>
+                {(["1D", "1W", "1M", "ALL"] as const).map((tab) => (
+                  <button
+                    key={tab}
+                    type="button"
+                    onClick={() => setGraphTab(tab)}
+                    style={{
+                      background: graphTab === tab ? "#3b82f6" : "transparent",
+                      border: "none",
+                      borderRadius: 4,
+                      color: graphTab === tab ? "#ffffff" : UI.title,
+                      fontSize: "0.66rem",
+                      fontWeight: 700,
+                      padding: "0.2rem 0.5rem",
+                      cursor: "pointer"
+                    }}
+                  >
+                    {tab}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
           
           <div style={{ background: "#090d16", border: "1px solid #1e293b", borderRadius: 8, padding: "0.8rem 0.4rem" }}>
-            <SvgPortfolioChart history={filteredHistory} />
+            <SvgPortfolioChart history={filteredHistory} mode={chartAssetMode} />
           </div>
         </section>
 
@@ -3542,7 +3578,7 @@ export default function HomePage() {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const SvgPortfolioChart = ({ history }: { history: any[] }) => {
+const SvgPortfolioChart = ({ history, mode = "BOTH" }: { history: any[]; mode?: "ALL" | "STRATEGY" | "BOTH" }) => {
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
   
   if (history.length === 0) {
@@ -3553,32 +3589,54 @@ const SvgPortfolioChart = ({ history }: { history: any[] }) => {
     );
   }
 
-  const padding = { top: 20, right: 30, bottom: 30, left: 60 };
+  const padding = { top: 20, right: 30, bottom: 30, left: 65 };
   const width = 800;
   const height = 260;
 
-  const vals = history.map(h => Number(h.total_asset_equity_krw ?? 0));
-  const minVal = Math.min(...vals) * 0.999;
-  const maxVal = Math.max(...vals) * 1.001;
-  const range = maxVal - minVal || 1;
-
-  const points = history.map((h, i) => {
-    const x = padding.left + (i * (width - padding.left - padding.right)) / Math.max(1, history.length - 1);
-    const y = height - padding.bottom - ((Number(h.total_asset_equity_krw ?? 0) - minVal) / range) * (height - padding.top - padding.bottom);
-    return { x, y, val: Number(h.total_asset_equity_krw ?? 0), ts: h.ts, item: h };
+  const totalVals = history.map((h) => Number(h.total_asset_equity_krw ?? h.total_asset_krw ?? 0));
+  const spotVals = history.map((h) => {
+    const v = Number(h.spot_trading_equity_krw ?? h.spot_trading_equity ?? 0);
+    return v > 0 ? v : Number(h.total_asset_equity_krw ?? 0);
   });
 
-  const pathD = points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x} ${p.y}`).join(" ");
-  const areaD = `${pathD} L ${points[points.length - 1].x} ${height - padding.bottom} L ${points[0].x} ${height - padding.bottom} Z`;
+  const allValsToCompare: number[] = [];
+  if (mode === "ALL" || mode === "BOTH") allValsToCompare.push(...totalVals);
+  if (mode === "STRATEGY" || mode === "BOTH") allValsToCompare.push(...spotVals);
+  if (allValsToCompare.length === 0) allValsToCompare.push(...totalVals);
 
-  const firstVal = vals[0] || 0;
+  const minVal = Math.min(...allValsToCompare) * 0.998;
+  const maxVal = Math.max(...allValsToCompare) * 1.002;
+  const range = maxVal - minVal || 1;
+
+  const totalPoints = history.map((h, i) => {
+    const val = Number(h.total_asset_equity_krw ?? h.total_asset_krw ?? 0);
+    const x = padding.left + (i * (width - padding.left - padding.right)) / Math.max(1, history.length - 1);
+    const y = height - padding.bottom - ((val - minVal) / range) * (height - padding.top - padding.bottom);
+    return { x, y, val, ts: h.ts, item: h };
+  });
+
+  const spotPoints = history.map((h, i) => {
+    const rawV = Number(h.spot_trading_equity_krw ?? h.spot_trading_equity ?? 0);
+    const val = rawV > 0 ? rawV : Number(h.total_asset_equity_krw ?? 0);
+    const x = padding.left + (i * (width - padding.left - padding.right)) / Math.max(1, history.length - 1);
+    const y = height - padding.bottom - ((val - minVal) / range) * (height - padding.top - padding.bottom);
+    return { x, y, val, ts: h.ts, item: h };
+  });
+
+  const totalPathD = totalPoints.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x} ${p.y}`).join(" ");
+  const totalAreaD = `${totalPathD} L ${totalPoints[totalPoints.length - 1].x} ${height - padding.bottom} L ${totalPoints[0].x} ${height - padding.bottom} Z`;
+
+  const spotPathD = spotPoints.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x} ${p.y}`).join(" ");
+
+  const showTotal = mode === "ALL" || mode === "BOTH";
+  const showSpot = mode === "STRATEGY" || mode === "BOTH";
 
   return (
     <div style={{ position: "relative", width: "100%" }}>
       <svg viewBox={`0 0 ${width} ${height}`} width="100%" height={height} style={{ overflow: "visible" }}>
         <defs>
           <linearGradient id="chartGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#3b82f6" stopOpacity="0.3" />
+            <stop offset="0%" stopColor="#3b82f6" stopOpacity="0.25" />
             <stop offset="100%" stopColor="#3b82f6" stopOpacity="0.0" />
           </linearGradient>
         </defs>
@@ -3611,44 +3669,31 @@ const SvgPortfolioChart = ({ history }: { history: any[] }) => {
           );
         })}
 
-        <path d={areaD} fill="url(#chartGrad)" />
+        {showTotal && <path d={totalAreaD} fill="url(#chartGrad)" />}
 
-        {points.map((p, idx) => {
-          if (p.val < firstVal && idx > 0) {
-            const prevP = points[idx - 1];
-            return (
-              <line
-                key={`loss-seg-${idx}`}
-                x1={prevP.x}
-                y1={prevP.y}
-                x2={p.x}
-                y2={p.y}
-                stroke="#ef4444"
-                strokeWidth={2.5}
-              />
-            );
-          }
-          return null;
-        })}
+        {/* 전체자산 라인 (파란색) */}
+        {showTotal && <path d={totalPathD} fill="none" stroke="#3b82f6" strokeWidth={2.2} />}
 
-        <path d={pathD} fill="none" stroke="#3b82f6" strokeWidth={2} />
+        {/* 전략자산 라인 (초록색) */}
+        {showSpot && <path d={spotPathD} fill="none" stroke="#10b981" strokeWidth={2} strokeDasharray={mode === "BOTH" ? "5 3" : undefined} />}
 
-        {hoveredIdx !== null && points[hoveredIdx] && (
+        {hoveredIdx !== null && totalPoints[hoveredIdx] && (
           <g>
             <line
-              x1={points[hoveredIdx].x}
+              x1={totalPoints[hoveredIdx].x}
               y1={padding.top}
-              x2={points[hoveredIdx].x}
+              x2={totalPoints[hoveredIdx].x}
               y2={height - padding.bottom}
               stroke="#60a5fa"
               strokeWidth={1.5}
               strokeDasharray="2 2"
             />
-            <circle cx={points[hoveredIdx].x} cy={points[hoveredIdx].y} r={5} fill="#60a5fa" stroke="#0f172a" strokeWidth={2} />
+            {showTotal && <circle cx={totalPoints[hoveredIdx].x} cy={totalPoints[hoveredIdx].y} r={4.5} fill="#3b82f6" stroke="#0f172a" strokeWidth={2} />}
+            {showSpot && <circle cx={spotPoints[hoveredIdx].x} cy={spotPoints[hoveredIdx].y} r={4.5} fill="#10b981" stroke="#0f172a" strokeWidth={2} />}
           </g>
         )}
 
-        {points.map((p, idx) => {
+        {totalPoints.map((p, idx) => {
           const segmentWidth = (width - padding.left - padding.right) / Math.max(1, history.length - 1);
           return (
             <rect
@@ -3666,12 +3711,12 @@ const SvgPortfolioChart = ({ history }: { history: any[] }) => {
         })}
       </svg>
 
-      {hoveredIdx !== null && points[hoveredIdx] && (
+      {hoveredIdx !== null && totalPoints[hoveredIdx] && (
         <div
           style={{
             position: "absolute",
-            left: `${(points[hoveredIdx].x / width) * 100}%`,
-            top: `${(points[hoveredIdx].y / height) * 100 - 60}%`,
+            left: `${(totalPoints[hoveredIdx].x / width) * 100}%`,
+            top: `${(Math.min(totalPoints[hoveredIdx].y, spotPoints[hoveredIdx].y) / height) * 100 - 65}%`,
             transform: "translateX(-50%)",
             background: "#0f172a",
             border: "1px solid #3b82f6",
@@ -3685,13 +3730,17 @@ const SvgPortfolioChart = ({ history }: { history: any[] }) => {
             whiteSpace: "nowrap"
           }}
         >
-          <div style={{ fontWeight: 800 }}>{Math.round(points[hoveredIdx].val).toLocaleString()} KRW</div>
-          <div style={{ fontSize: "0.62rem", color: UI.mutedSoft }}>
-            {new Date(points[hoveredIdx].ts).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}
+          <div style={{ fontSize: "0.62rem", color: UI.mutedSoft, marginBottom: 3 }}>
+            {new Date(totalPoints[hoveredIdx].ts).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}
           </div>
-          {points[hoveredIdx].item.unrealized_pnl_krw !== 0 && (
-            <div style={{ fontSize: "0.64rem", color: points[hoveredIdx].item.unrealized_pnl_krw >= 0 ? UI.pass : UI.watch }}>
-              평가손익: {Math.round(points[hoveredIdx].item.unrealized_pnl_krw).toLocaleString()} KRW
+          {showTotal && (
+            <div style={{ fontWeight: 800, color: "#60a5fa" }}>
+              전체자산: {Math.round(totalPoints[hoveredIdx].val).toLocaleString()} KRW
+            </div>
+          )}
+          {showSpot && (
+            <div style={{ fontWeight: 800, color: "#34d399" }}>
+              전략자산: {Math.round(spotPoints[hoveredIdx].val).toLocaleString()} KRW
             </div>
           )}
         </div>

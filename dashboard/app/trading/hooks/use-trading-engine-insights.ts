@@ -5,12 +5,21 @@ type TradeLike = {
   account_portfolio?: unknown;
   total_krw?: number;
   krw_available?: number;
+  today_realized_pnl_krw?: number;
+  cumulative_realized_pnl_krw?: number;
+  unrealized_pnl_krw?: number;
+  account_net_pnl_krw?: number;
+  passive_holding_value_krw?: number;
+  cost_basis_unknown_krw?: number;
 };
 
 type StrategyLike = {
   max_positions?: number | null;
   strategy_available_krw?: number | null;
   open_positions?: Record<string, { remaining_qty?: unknown }> | null;
+  today_realized_pnl_krw?: number;
+  cumulative_realized_pnl_krw?: number;
+  unrealized_pnl_krw?: number;
 };
 
 export function useTradingEngineInsights<TScannerItem extends { market: string }>(params: {
@@ -23,6 +32,8 @@ export function useTradingEngineInsights<TScannerItem extends { market: string }
     krw_available_krw: number;
     net_pnl_krw: number;
     net_return_pct: number;
+    passive_holding_value_krw?: number;
+    cost_basis_unknown_krw?: number;
   } | null;
 }) {
   const { trade, strategy, scanner, accountHoldings, accountPortfolioForKpi } = params;
@@ -66,8 +77,15 @@ export function useTradingEngineInsights<TScannerItem extends { market: string }
   const ap = useMemo(() => accountPortfolioForKpi(trade?.account_portfolio ?? null), [trade, accountPortfolioForKpi]);
   const accountTotalEquity = Number(ap?.krw_total_krw ?? trade?.total_krw ?? trade?.krw_available ?? 0);
   const accountAvailableKrw = Number(ap?.krw_available_krw ?? trade?.krw_available ?? 0);
-  const accountPnlKrw = Number(ap?.net_pnl_krw ?? 0);
+  const accountPnlKrw = Number(ap?.net_pnl_krw ?? trade?.account_net_pnl_krw ?? 0);
   const accountPnlPct = Number(ap?.net_return_pct ?? 0);
+
+  const todayRealizedPnlKrw = Number(trade?.today_realized_pnl_krw ?? strategy?.today_realized_pnl_krw ?? 0);
+  const cumulativeRealizedPnlKrw = Number(trade?.cumulative_realized_pnl_krw ?? strategy?.cumulative_realized_pnl_krw ?? 0);
+  const unrealizedPnlKrw = Number(trade?.unrealized_pnl_krw ?? strategy?.unrealized_pnl_krw ?? 0);
+  const todayRealizedPnlPct = accountTotalEquity > 0 ? (todayRealizedPnlKrw / accountTotalEquity) * 100 : 0;
+  const passiveHoldingValueKrw = Number(trade?.passive_holding_value_krw ?? ap?.passive_holding_value_krw ?? 0);
+  const costBasisUnknownKrw = Number(trade?.cost_basis_unknown_krw ?? ap?.cost_basis_unknown_krw ?? 0);
 
   const strategyOpenPositions = useMemo(() => {
     const used = Number(accountHoldings?.used_slots ?? NaN);
@@ -154,6 +172,12 @@ export function useTradingEngineInsights<TScannerItem extends { market: string }
     accountAvailableKrw,
     accountPnlKrw,
     accountPnlPct,
+    todayRealizedPnlKrw,
+    todayRealizedPnlPct,
+    cumulativeRealizedPnlKrw,
+    unrealizedPnlKrw,
+    passiveHoldingValueKrw,
+    costBasisUnknownKrw,
     strategyOpenPositions,
     strategyMaxPositions,
     strategyRemainingSlots,

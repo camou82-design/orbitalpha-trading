@@ -401,8 +401,18 @@ async function main() {
     readLogs: (limit: number) => readRecentLogs(env.companyId, env.serviceId, limit),
     onEvent: (row) => opLog.event(row),
   });
+  let strategyRef: ReturnType<typeof createLiveDataStrategy> | null = null;
   const trade = createTradeControl(env, {
     onEvent: (row) => opLog.event(row),
+    getStrategyMetrics: () => {
+      if (!strategyRef) return {};
+      const st = strategyRef.status() as any;
+      return {
+        today_realized_pnl_krw: st.today_realized_pnl_krw,
+        cumulative_realized_pnl_krw: st.cumulative_realized_pnl_krw,
+        unrealized_pnl_krw: st.unrealized_pnl_krw,
+      };
+    },
     assertBuyGate: async (ctx) => {
       let snap;
       try {
@@ -444,6 +454,7 @@ async function main() {
     marketState: marketFilter,
     onEvent: (row) => opLog.event(row),
   });
+  strategyRef = strategy;
   await strategy.init();
   app.log.info({ tag: "DEBUG_LIVE_LOOP_STARTED", stage: "strategy_init_done" }, "DEBUG_LIVE_LOOP_STARTED");
   const pumpScanner = createPumpScanner(() => {
@@ -1299,14 +1310,24 @@ async function main() {
     };
   });
   app.get("/api/v1/strategy/status", async () => {
-    const s = strategy.status();
-    const t = await trade.status();
+    const s = strategy.status() as Record<string, unknown>;
+    const t = await trade.status() as Record<string, unknown>;
     const krwAvailable = Number(t.krw_available ?? 0);
     const invested = Number(s.strategy_invested_krw ?? 0);
     const strategyAvailable = Math.max(0, Math.floor(krwAvailable - invested));
+    const ap = t.account_portfolio as Record<string, unknown> | null | undefined;
     return {
       ...s,
       strategy_available_krw: strategyAvailable,
+      strategy_pnl_krw: Number(s.strategy_pnl_krw ?? s.cumulative_realized_pnl_krw ?? 0),
+      strategy_asset_pnl: Number(s.strategy_asset_pnl ?? s.strategy_pnl_krw ?? 0),
+      strategy_asset_pnl_krw: Number(s.strategy_asset_pnl_krw ?? s.strategy_pnl_krw ?? s.cumulative_realized_pnl_krw ?? 0),
+      today_realized_pnl_krw: Number(s.today_realized_pnl_krw ?? 0),
+      cumulative_realized_pnl_krw: Number(s.cumulative_realized_pnl_krw ?? s.strategy_pnl_krw ?? 0),
+      unrealized_pnl_krw: Number(s.unrealized_pnl_krw ?? 0),
+      account_net_pnl_krw: Number(t.account_net_pnl_krw ?? ap?.net_pnl_krw ?? 0),
+      passive_holding_value_krw: Number(t.passive_holding_value_krw ?? ap?.passive_holding_value_krw ?? 0),
+      cost_basis_unknown_krw: Number(t.cost_basis_unknown_krw ?? ap?.cost_basis_unknown_krw ?? 0),
     };
   });
   app.get("/api/v1/scanner/status", async () => {
