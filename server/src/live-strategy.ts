@@ -75,6 +75,165 @@ function mean(values: number[]): number {
 }
 
 
+export type PlaceBuyResultClass =
+  | "policy_blocked"
+  | "precheck_blocked"
+  | "exchange_order_failed"
+  | "exchange_order_unknown"
+  | "exchange_order_accepted";
+
+export function classifyPlaceBuyResult(reasonOrError: unknown): {
+  resultClass: PlaceBuyResultClass;
+  reasonStr: string;
+  exchangeErrorName: string | null;
+  exchangeErrorMessage: string | null;
+  exchangeHttpStatus: number | null;
+} {
+  let reasonStr = "";
+  let exchangeErrorName: string | null = null;
+  let exchangeErrorMessage: string | null = null;
+  let exchangeHttpStatus: number | null = null;
+
+  if (reasonOrError instanceof Error) {
+    reasonStr = reasonOrError.message;
+  } else if (typeof reasonOrError === "string") {
+    reasonStr = reasonOrError;
+  } else if (reasonOrError && typeof reasonOrError === "object") {
+    reasonStr = String((reasonOrError as any).reason || (reasonOrError as any).detail || (reasonOrError as any).message || JSON.stringify(reasonOrError));
+    exchangeErrorName = (reasonOrError as any).error_name || (reasonOrError as any).name || null;
+    exchangeErrorMessage = (reasonOrError as any).error_message || (reasonOrError as any).message || null;
+    if (typeof (reasonOrError as any).http_status === "number") {
+      exchangeHttpStatus = (reasonOrError as any).http_status;
+    }
+  } else {
+    reasonStr = String(reasonOrError);
+  }
+
+  // Upbit Private API HTTP 에러 패턴 파싱
+  const upbitMatch = reasonStr.match(/Upbit private\s+([^\s]+)\s*->\s*(\d+):\s*(.*)/s);
+  if (upbitMatch) {
+    exchangeHttpStatus = Number(upbitMatch[2]);
+    const bodyText = upbitMatch[3];
+    try {
+      const parsedBody = JSON.parse(bodyText);
+      if (parsedBody?.error) {
+        exchangeErrorName = parsedBody.error.name ?? null;
+        exchangeErrorMessage = parsedBody.error.message ?? null;
+      }
+    } catch {
+      exchangeErrorMessage = bodyText.slice(0, 200);
+    }
+  }
+
+  // Explicit Allowlist
+  const POLICY_ALLOWLIST = new Set([
+    "night_low_liquidity_window",
+    "daily_risk_kill_switch_active",
+    "risk_off",
+    "surge_market_crash_guard",
+    "btc_filter_blocked",
+    "btc_rsi_blocked",
+    "entry_score_insufficient",
+    "score_below_threshold",
+    "market_state_blocked",
+    "global_market_state_block",
+  ]);
+
+  const PRECHECK_ALLOWLIST = new Set([
+    "cooldown_active",
+    "reentry_cooldown",
+    "max_positions_reached",
+    "max_concurrent_strategy_positions",
+    "additional_entry_limit_reached",
+    "insufficient_strategy_budget",
+    "not_enough_krw",
+    "below_min_order_krw",
+    "tick_lease_revoked",
+    "tick_lease_revoked_pre_exchange",
+    "tick_lease_revoked_post_fill",
+    "exit_policy_missing",
+    "EXIT_POLICY_MISSING",
+    "TICK_LEASE_REVOKED",
+    "duplicate_order_blocked",
+    "auto_trade_disabled",
+    "safety_guard_stopped",
+    "order_entry_gate",
+  ]);
+
+  const EXCHANGE_FAIL_ALLOWLIST = new Set([
+    "insufficient_funds_bid",
+    "under_min_total_bid",
+    "invalid_query_payload",
+    "jwt_verification_failed",
+    "invalid_access_key",
+    "out_of_scope",
+    "upbit_api_error",
+    "place_buy_failed",
+  ]);
+
+  const isNetworkTimeoutOrDisconnect =
+    /timeout|ETIMEDOUT|ECONNRESET|socket hang up|fetch failed|network error/i.test(reasonStr);
+
+  if (POLICY_ALLOWLIST.has(reasonStr) || Array.from(POLICY_ALLOWLIST).some((p) => reasonStr.includes(p))) {
+    return {
+      resultClass: "policy_blocked",
+      reasonStr,
+      exchangeErrorName,
+      exchangeErrorMessage,
+      exchangeHttpStatus,
+    };
+  }
+
+  if (
+    PRECHECK_ALLOWLIST.has(reasonStr) ||
+    reasonStr.startsWith("precheck_safety_guard_blocked:") ||
+    reasonStr.startsWith("order_entry_gate:") ||
+    Array.from(PRECHECK_ALLOWLIST).some((p) => reasonStr.includes(p))
+  ) {
+    return {
+      resultClass: "precheck_blocked",
+      reasonStr,
+      exchangeErrorName,
+      exchangeErrorMessage,
+      exchangeHttpStatus,
+    };
+  }
+
+  if (
+    upbitMatch ||
+    exchangeErrorName ||
+    (exchangeHttpStatus && exchangeHttpStatus >= 400) ||
+    EXCHANGE_FAIL_ALLOWLIST.has(reasonStr) ||
+    Array.from(EXCHANGE_FAIL_ALLOWLIST).some((f) => reasonStr.includes(f))
+  ) {
+    return {
+      resultClass: "exchange_order_failed",
+      reasonStr,
+      exchangeErrorName: exchangeErrorName || (EXCHANGE_FAIL_ALLOWLIST.has(reasonStr) ? reasonStr : "upbit_api_error"),
+      exchangeErrorMessage: exchangeErrorMessage || reasonStr.slice(0, 200),
+      exchangeHttpStatus: exchangeHttpStatus || 400,
+    };
+  }
+
+  if (isNetworkTimeoutOrDisconnect) {
+    return {
+      resultClass: "exchange_order_unknown",
+      reasonStr,
+      exchangeErrorName: "network_unknown",
+      exchangeErrorMessage: reasonStr.slice(0, 200),
+      exchangeHttpStatus: null,
+    };
+  }
+
+  return {
+    resultClass: "precheck_blocked",
+    reasonStr,
+    exchangeErrorName,
+    exchangeErrorMessage,
+    exchangeHttpStatus,
+  };
+}
+
 type UpbitBalance = {
   currency: string;
   balance: string | number;
@@ -139,6 +298,7 @@ type TradeApi = {
     bucket?: "strategy" | "legacy",
     signalPayload?: unknown,
     path?: string,
+    logicalOrderId?: string,
   ) => Promise<{ ok?: boolean; reason?: string } | Record<string, unknown>>;
   placeSell: (market: string, confirm: boolean, ratio?: number) => Promise<{ ok?: boolean; reason?: string } | Record<string, unknown>>;
   placeLegacyDcaBuy?: (market: string, confirm: boolean, amountKrw?: number, signalPayload?: unknown) => Promise<{ ok?: boolean; reason?: string } | Record<string, unknown>>;
@@ -146,6 +306,7 @@ type TradeApi = {
   setAutoTradeEnabled?: (enabled: boolean) => Promise<void>;
   syncManagedPosition?: (market: string, qty: number, avg: number, strategyType: StrategyType, stopLossPct?: number, stopLossPrice?: number) => Promise<boolean>;
   setDailyRiskKillSwitch?: (active: boolean) => void;
+  fetchOrderByIdentifier?: (identifier: string) => Promise<any>;
 };
 
 type MarketStateApi = {
@@ -3045,8 +3206,23 @@ export function createLiveDataStrategy(opts: {
       state.morning_surge_watchlist = d.morning_surge_watchlist ?? state.morning_surge_watchlist ?? {};
       state.daily_risk_kill_switch_triggered = d.daily_risk_kill_switch_triggered ?? state.daily_risk_kill_switch_triggered ?? false;
     } catch {}
-    state.safety_guard.state = "정상";
-    state.safety_guard.reason = null;
+
+    // [REQUIREMENT 3, 11] 서버 재시작 시 영속화된 safety_guard 상태 및 order_fail_count_today 일관성 유지
+    // 당일(todayKst()) 상태이면 덮어쓰지 않고 로드된 state/reason/order_fail_count_today를 유지함.
+    // 자동 마이그레이션은 제거되었으며, 수동 해제 API (/api/v1/trade/reset-safety-guard) 또는 자정 리셋으로만 해제됨.
+    const isToday = state.daily.date === todayKst();
+    if (!isToday) {
+      // 날짜가 바뀐 경우 자정 리셋 규정에 따름
+      state.daily = { date: todayKst(), entry_count: 0, loss_pct: 0, stop_by_market: {} };
+      state.safety_guard.order_fail_count_today = 0;
+      state.safety_guard.consecutive_losses = 0;
+      state.daily_risk_kill_switch_triggered = false;
+      if (state.safety_guard.state === "자동정지") {
+        state.safety_guard.state = "주의";
+        state.safety_guard.reason = "daily_reset";
+      }
+      await persist();
+    }
   };
 
   const emitStageChange = (args: {
@@ -14090,338 +14266,232 @@ export function createLiveDataStrategy(opts: {
           })
         );
       }
-      try {
-        let placeBuyOk = false;
-        let placeBuyReason = "unknown";
-        try {
-          const targetStopPrice = isSurgeSource ? surgeStopPrice : (metaForGuard?.stopPrice ?? metaForGuard?.setup?.stopPrice ?? 0);
-          const targetTakeProfitPrice = isSurgeSource ? surgeTakeProfitPrice : (metaForGuard?.targetPrice ?? metaForGuard?.setup?.targetPrice ?? 0);
-          const targetRiskReward = metaForGuard?.riskReward ?? metaForGuard?.setup?.riskReward ?? 0;
-          
-          if (!(
-            currentPrice > 0 &&
-            targetStopPrice > 0 &&
-            targetTakeProfitPrice > 0 &&
-            targetStopPrice < currentPrice &&
-            targetTakeProfitPrice > currentPrice &&
-            targetRiskReward > 0
-          )) {
-            console.info(JSON.stringify({
-              tag: "ENTRY_EXIT_POLICY_MISSING_BLOCK",
-              market,
-              path: isSurgeSource ? "surge_normal" : "normal",
-              currentPrice,
-              stopPrice: targetStopPrice,
-              takeProfitPrice: targetTakeProfitPrice,
-              riskReward: targetRiskReward,
-              reason: "Invalid exit policy values before normal placeBuy",
-              blocked_before_placebuy: true
-            }));
-            placeBuyReason = "EXIT_POLICY_MISSING";
-            throw new Error("EXIT_POLICY_MISSING");
-          }
+      let buyOutcomeClass: PlaceBuyResultClass = "precheck_blocked";
+      let buyOutcomeReason = "unknown";
+      let buyExchangeErrorName: string | null = null;
+      let buyExchangeErrorMessage: string | null = null;
+      let buyExchangeHttpStatus: number | null = null;
+      const orderFailCountBefore = state.safety_guard.order_fail_count_today;
 
+      // [REQUIREMENT 1, 2, 3] 논리 주문별 고유 64자 이하 identifier 생성 (동일 논리 주문 재시도 시 고정)
+      const cleanMarket = market.replace(/[^a-zA-Z0-9]/g, "");
+      const randHex = Math.random().toString(36).substring(2, 8);
+      const logicalOrderId = `orbitalpha-${Date.now()}-${cleanMarket}-${randHex}`;
+      let buyOrderUuid: string | null = null;
+      let buyExchangeIdentifier: string | null = logicalOrderId;
+
+      try {
+        const targetStopPrice = isSurgeSource ? surgeStopPrice : (metaForGuard?.stopPrice ?? metaForGuard?.setup?.stopPrice ?? 0);
+        const targetTakeProfitPrice = isSurgeSource ? surgeTakeProfitPrice : (metaForGuard?.targetPrice ?? metaForGuard?.setup?.targetPrice ?? 0);
+        const targetRiskReward = metaForGuard?.riskReward ?? metaForGuard?.setup?.riskReward ?? 0;
+
+        if (!(
+          currentPrice > 0 &&
+          targetStopPrice > 0 &&
+          targetTakeProfitPrice > 0 &&
+          targetStopPrice < currentPrice &&
+          targetTakeProfitPrice > currentPrice &&
+          targetRiskReward > 0
+        )) {
           console.info(JSON.stringify({
-            tag: "ENTRY_EXIT_POLICY_ATTACHED_PROOF",
+            tag: "ENTRY_EXIT_POLICY_MISSING_BLOCK",
             market,
             path: isSurgeSource ? "surge_normal" : "normal",
             currentPrice,
             stopPrice: targetStopPrice,
             takeProfitPrice: targetTakeProfitPrice,
-            riskPct: isSurgeSource ? surgeRiskPct : 0,
             riskReward: targetRiskReward,
-            strict_exit: true,
-            exit_policy_attached: true,
-            trailingStartPct: isSurgeSource ? (surgeDecisionMetrics?.trailingGapPct ?? 2.0) : 2.0,
-            trailingGapPct: isSurgeSource ? (surgeDecisionMetrics?.trailingGapPct ?? 1.5) : 1.5,
+            reason: "Invalid exit policy values before normal placeBuy",
+            blocked_before_placebuy: true
           }));
+          throw new Error("EXIT_POLICY_MISSING");
+        }
 
-          signalPayloadForBuy.strict_exit = true;
-          signalPayloadForBuy.exit_policy_attached = true;
-          signalPayloadForBuy.entry_stop_price = targetStopPrice;
-          signalPayloadForBuy.entry_target_price = targetTakeProfitPrice;
-          signalPayloadForBuy.entry_risk_reward = targetRiskReward;
+        console.info(JSON.stringify({
+          tag: "ENTRY_EXIT_POLICY_ATTACHED_PROOF",
+          market,
+          path: isSurgeSource ? "surge_normal" : "normal",
+          currentPrice,
+          stopPrice: targetStopPrice,
+          takeProfitPrice: targetTakeProfitPrice,
+          riskPct: isSurgeSource ? surgeRiskPct : 0,
+          riskReward: targetRiskReward,
+          strict_exit: true,
+          exit_policy_attached: true,
+          trailingStartPct: isSurgeSource ? (surgeDecisionMetrics?.trailingGapPct ?? 2.0) : 2.0,
+          trailingGapPct: isSurgeSource ? (surgeDecisionMetrics?.trailingGapPct ?? 1.5) : 1.5,
+        }));
 
-          const guard = await validateLiveBuyPrecheck({
+        signalPayloadForBuy.strict_exit = true;
+        signalPayloadForBuy.exit_policy_attached = true;
+        signalPayloadForBuy.entry_stop_price = targetStopPrice;
+        signalPayloadForBuy.entry_target_price = targetTakeProfitPrice;
+        signalPayloadForBuy.entry_risk_reward = targetRiskReward;
+
+        const guard = await validateLiveBuyPrecheck({
+          market,
+          trades: state.trades,
+          positions: state.positions,
+          cooldown_until: state.cooldown_until,
+          marketState: opts.marketState,
+          signalPayload: sigPre?.p || sig?.p,
+          strategyType,
+          entrySignalType: isSurgeSourceLocal ? "reclaim" : undefined,
+          entryPath: isSurgeSource ? "surge_normal" : "normal",
+          isAdditionalBuy: false,
+          currentPrice: Number(priceBy.get(market) ?? 0),
+          reclaimScore: isSurgeSourceLocal ? ((sig?.p as any)?.surge_capture_score ?? (sig?.p as any)?.reclaim_score ?? (sig?.p as any)?.scanner_score ?? (sig?.p as any)?.signal_score) : undefined,
+          candidateMeta: candidateMetaFromSetup,
+        });
+        if (!guard.allowed) {
+          logPlacebuyFinalGateBlocked(guard.blockReason!, {
             market,
-            trades: state.trades,
-            positions: state.positions,
-            cooldown_until: state.cooldown_until,
-            marketState: opts.marketState,
-            signalPayload: sigPre?.p || sig?.p,
+            path: isSurgeSource ? "surge_normal" : "normal",
             strategyType,
-            entrySignalType: isSurgeSourceLocal ? "reclaim" : undefined,
-            entryPath: isSurgeSource ? "surge_normal" : "normal",
-            isAdditionalBuy: false,
-            currentPrice: Number(priceBy.get(market) ?? 0),
-            reclaimScore: isSurgeSourceLocal ? ((sig?.p as any)?.surge_capture_score ?? (sig?.p as any)?.reclaim_score ?? (sig?.p as any)?.scanner_score ?? (sig?.p as any)?.signal_score) : undefined,
-            candidateMeta: candidateMetaFromSetup,
+            killSwitchReason: guard.killSwitchReason,
+            cooldownRemaining: guard.cooldownRemainingSec,
+            dailyLossCount: guard.dailyLossCount,
+            dailyPnlPct: guard.dailyPnlPct,
+            marketState: guard.marketStateStr,
+            btcRsi: guard.btcRsi,
           });
-          if (!guard.allowed) {
-            logPlacebuyFinalGateBlocked(guard.blockReason!, {
-              market,
-              path: isSurgeSource ? "surge_normal" : "normal",
-              strategyType,
-              killSwitchReason: guard.killSwitchReason,
-              cooldownRemaining: guard.cooldownRemainingSec,
-              dailyLossCount: guard.dailyLossCount,
-              dailyPnlPct: guard.dailyPnlPct,
-              marketState: guard.marketStateStr,
-              btcRsi: guard.btcRsi,
-            });
-            throw new Error(`precheck_safety_guard_blocked:${guard.blockReason}`);
-          }
-
-          if (!leaseOk()) {
-            throw new Error("TICK_LEASE_REVOKED");
-          }
-
-          const rsiValForLog = opts.marketState.status()?.btc_rsi ?? null;
-          const rScoreForLog = isSurgeSourceLocal ? ((sig?.p as any)?.surge_capture_score ?? (sig?.p as any)?.reclaim_score ?? (sig?.p as any)?.scanner_score ?? (sig?.p as any)?.signal_score ?? 0) : 0;
-          if (isSurgeSourceLocal) {
-            reclaim_final_buy_attempt_count++;
-            console.info(
-              JSON.stringify({
-                tag: "RECLAIM_FINAL_BUY_ATTEMPT",
-                ts: new Date().toISOString(),
-                market,
-                source_path: "capture_queue",
-                market_state: marketState.market_state,
-                btc_rsi: rsiValForLog,
-                reclaim_score: rScoreForLog,
-                score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
-                strategyType: "surge_reclaim",
-                entrySignalType: "reclaim",
-                promoted_reclaim: isPromotedReclaim,
-              })
-            );
-          }
-
-          finalBuyAttemptCount++;
-          tickEnteredMarkets.add(market); // 진입 시도 즉시 락 추가 (중복 진입 방지)
-          const buyRes = await opts.trade.placeBuy(market, true, orderKrw, strategyType, "strategy", {
-            ...signalPayloadForBuy,
-            __surge_stop_price: isSurgeSource ? surgeStopPrice : undefined,
-            __surge_risk_pct: isSurgeSource ? surgeRiskPct : undefined,
-            __surge_stop_reason: isSurgeSource ? surgeStopReason : undefined,
-          }, isSurgeSource ? "surge_normal" : "normal");
-          
-          const buyOk = buyRes && (buyRes as any).ok;
-          if (isSurgeSourceLocal) {
-            if (buyOk) {
-              reclaim_actual_buy_count++;
-            }
-            console.info(
-              JSON.stringify({
-                tag: "RECLAIM_BUY_RESULT",
-                ts: new Date().toISOString(),
-                market,
-                source_path: "capture_queue",
-                market_state: marketState.market_state,
-                btc_rsi: rsiValForLog,
-                reclaim_score: rScoreForLog,
-                score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
-                strategyType: "surge_reclaim",
-                entrySignalType: "reclaim",
-                promoted_reclaim: isPromotedReclaim,
-                block_reason: buyOk ? null : "place_buy_failed",
-              })
-            );
-          }
-
-          placeBuyOk = !!buyOk;
-          placeBuyReason = buyOk ? "success" : "place_buy_failed";
-          if (evaluationDiagnostics[market]) {
-            evaluationDiagnostics[market].buyGate = { checked: true, allowed: placeBuyOk, reason: placeBuyReason };
-            evaluationDiagnostics[market].final = { action: placeBuyOk ? "place_buy_attempt" : "blocked", reason: placeBuyReason };
-          }
-        } catch (innerErr) {
-          const rsiValForLog = opts.marketState.status()?.btc_rsi ?? null;
-          const rScoreForLog = isSurgeSourceLocal ? ((sig?.p as any)?.surge_capture_score ?? (sig?.p as any)?.reclaim_score ?? (sig?.p as any)?.scanner_score ?? (sig?.p as any)?.signal_score ?? 0) : 0;
-          if (isSurgeSourceLocal) {
-            console.info(
-              JSON.stringify({
-                tag: "RECLAIM_BUY_RESULT",
-                ts: new Date().toISOString(),
-                market,
-                source_path: "capture_queue",
-                market_state: marketState.market_state,
-                btc_rsi: rsiValForLog,
-                reclaim_score: rScoreForLog,
-                score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
-                strategyType: "surge_reclaim",
-                entrySignalType: "reclaim",
-                promoted_reclaim: isPromotedReclaim,
-                block_reason: String(innerErr).slice(0, 300),
-              })
-            );
-          }
-          placeBuyOk = false;
-          placeBuyReason = innerErr instanceof Error ? innerErr.message.slice(0, 200) : String(innerErr).slice(0, 200);
-          if (evaluationDiagnostics[market]) {
-            evaluationDiagnostics[market].buyGate = { checked: true, allowed: false, reason: placeBuyReason };
-            evaluationDiagnostics[market].final = { action: "blocked", reason: placeBuyReason };
-          }
-          throw innerErr;
-        } finally {
-          const proofTag = isSurgeSource ? "SURGE_V2_LIVE_ENTRY_EXECUTION_PROOF" : "CORE_LIVE_ENTRY_EXECUTION_PROOF";
-          console.info(
-            JSON.stringify({
-              tag: proofTag,
-              ts: new Date().toISOString(),
-              market,
-              decision_action: "enter",
-              decision_reason: sourceKindForJudgment,
-              order_krw: orderKrw,
-              size_multiplier: isSurgeSource ? surgeMarketSizeMultiplier : lateEntrySizingMultiplier,
-              relaxed_probe: !isSurgeSource && metaForGuard?.is_relaxed_probe,
-              softened_reasons: !isSurgeSource ? metaForGuard?.softened_reasons : [],
-              authority_source: isSurgeSource ? "surge-v2" : "core",
-              execution_layer: "live-strategy",
-              place_buy_called: true,
-              place_buy_ok: placeBuyOk,
-              place_buy_reason: placeBuyReason,
-            }),
-          );
+          throw new Error(`precheck_safety_guard_blocked:${guard.blockReason}`);
         }
 
         if (!leaseOk()) {
-          console.info(
-            JSON.stringify({
-              tag: "LIVE_PLACEBUY_RESULT",
-              ts: new Date().toISOString(),
-              market,
-              ok: false,
-              path: isSurgeSource ? "surge_normal" : "normal",
-              order_krw: orderKrw,
-              strategy_type: strategyType,
-              error: "tick_lease_revoked_after_exchange_call",
-              tick_lease: myLease,
-              valid_lease: liveTickValidLease,
-            }),
-          );
-          bumpSkip("tick_lease_revoked_post_fill");
-          emitFinalBlocked("tick_lease_revoked_post_fill", { order_krw: orderKrw });
-          continue;
+          throw new Error("TICK_LEASE_REVOKED");
         }
 
-        const finalMeta = candidateMeta.find(x => x.market === market);
-        if (isCoreMarket) {
-          const stF = Number(finalMeta?.stopPrice ?? 0);
-          const enP = Number(priceBy.get(market) ?? 0);
-          const expStopF = enP > 0 && stF > 0 && orderKrw > 0 ? (orderKrw / enP) * stF : 0;
-          emitCoreEntryFinalDecisionProof({
-            market,
-            decision: "allow",
-            authority_source: "core_placebuy",
-            engine_bucket: "core",
-            decision_action: "ENTER",
-            decision_mode: finalMeta?.is_relaxed_probe ? "relaxed_probe" : "normal",
-            reject_reason: null,
-            requiredCapital: Math.floor(orderKrw),
-            final_core_allowed: true,
-            block_reason: null,
-            softened_reasons: finalMeta?.softened_reasons,
-            score: finalMeta?.score,
-            signal_type: sig.p.signal_type,
-            setup_ok: Boolean(finalMeta?.setup?.ok),
-            base_gate_ok: finalMeta?.gate_ok,
-            base_gate_return_reason: finalMeta?.gate_reason,
-            original_setup_ok: finalMeta?.setup?.ok,
-            late_entry_guard_triggered: lateEntryGuardTriggered,
-            late_entry_guard_reason: lateEntryGuardReason,
-            order_krw: orderKrw,
-            available_krw: liveOrderAvailableKrw,
-            multiplier: finalMeta?.relaxed_multiplier,
-            entry_price: enP,
-            stopPrice: stF,
-            expectedStopSellValue: expStopF,
-            minSafeEntryKrw: LIVE_MIN_SAFE_ENTRY_KRW,
-          });
-        }
-        console.info(
-          JSON.stringify({
-            tag: "LIVE_PLACEBUY_RESULT",
-            ts: new Date().toISOString(),
-            market,
-            ok: true,
-            path: isSurgeSource ? "surge_normal" : "normal",
-            order_krw: orderKrw,
-            strategy_type: strategyType,
-            tick_lease: myLease,
-          }),
-        );
-        if (liveTradingOn) {
-          if (isCoreMarket) coreRemainingInTick = Math.max(0, coreRemainingInTick - orderKrw);
-          else surgeRemainingInTick = Math.max(0, surgeRemainingInTick - orderKrw);
-          
-          console.info(JSON.stringify({
-            tag: "LIVE_MANAGED_POSITION_REGISTERED_PROOF",
-            ts: new Date().toISOString(),
-            market,
-            engine_bucket: isCoreMarket ? "core" : "surge",
-            order_krw: orderKrw,
-            strategy_type: strategyType,
-            ts_opened: new Date().toISOString()
-          }));
-          // Ensure immediate persistence of managed state change
-          await racePersist("after_managed_position_registered_pre_meta");
-        }
-        await appendLog({
-          company_id: companyIdSchema.parse(opts.companyId),
-          service_id: serviceIdSchema.parse(opts.serviceId),
-          ts: new Date().toISOString(),
-          kind: "system",
-          message: "entry_opened",
-          payload: {
-            symbol: market,
-            order_krw: orderKrw,
-            strategy_type: strategyType,
-            entry_pipeline: entryPipelineDetail,
-            entry_profile_key,
-            profile_decision: profileInfo.decision,
-            profile_reason: profileInfo.reason,
-          },
-        });
-        emitEval("entry_opened", { symbol: market, order_krw: orderKrw });
-        selectedCount += 1;
-      } catch (e) {
-        if (e instanceof Error && e.message === "TICK_LEASE_REVOKED") {
+        const rsiValForLog = opts.marketState.status()?.btc_rsi ?? null;
+        const rScoreForLog = isSurgeSourceLocal ? ((sig?.p as any)?.surge_capture_score ?? (sig?.p as any)?.reclaim_score ?? (sig?.p as any)?.scanner_score ?? (sig?.p as any)?.signal_score ?? 0) : 0;
+        if (isSurgeSourceLocal) {
+          reclaim_final_buy_attempt_count++;
           console.info(
             JSON.stringify({
-              tag: "LIVE_PLACEBUY_RESULT",
+              tag: "RECLAIM_FINAL_BUY_ATTEMPT",
               ts: new Date().toISOString(),
               market,
-              ok: false,
-              path: isSurgeSource ? "surge_normal" : "normal",
-              order_krw: orderKrw,
-              strategy_type: strategyType,
-              error: "tick_lease_revoked_pre_exchange",
-              tick_lease: myLease,
-              valid_lease: liveTickValidLease,
-            }),
+              source_path: "capture_queue",
+              market_state: marketState.market_state,
+              btc_rsi: rsiValForLog,
+              reclaim_score: rScoreForLog,
+              score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
+              strategyType: "surge_reclaim",
+              entrySignalType: "reclaim",
+              promoted_reclaim: isPromotedReclaim,
+            })
           );
-          bumpSkip("tick_lease_revoked");
-          emitFinalBlocked("tick_lease_revoked", { order_krw: orderKrw });
-          continue;
         }
-        console.info(
-          JSON.stringify({
-            tag: "LIVE_PLACEBUY_RESULT",
-            ts: new Date().toISOString(),
+
+        finalBuyAttemptCount++;
+        tickEnteredMarkets.add(market); // 진입 시도 즉시 락 추가 (중복 진입 방지)
+
+        let buyRes: any;
+
+        try {
+          buyRes = await opts.trade.placeBuy(
             market,
-            ok: false,
-            path: isSurgeSource ? "surge_normal" : "normal",
-            order_krw: orderKrw,
-            strategy_type: strategyType,
-            error: e instanceof Error ? e.message.slice(0, 240) : String(e).slice(0, 240),
-          }),
+            true,
+            orderKrw,
+            strategyType,
+            "strategy",
+            {
+              ...signalPayloadForBuy,
+              __surge_stop_price: isSurgeSource ? surgeStopPrice : undefined,
+              __surge_risk_pct: isSurgeSource ? surgeRiskPct : undefined,
+              __surge_stop_reason: isSurgeSource ? surgeStopReason : undefined,
+            },
+            isSurgeSource ? "surge_normal" : "normal",
+            logicalOrderId,
+          );
+          buyOrderUuid = (buyRes as any)?.order_uuid ?? null;
+          if ((buyRes as any)?.identifier) {
+            buyExchangeIdentifier = (buyRes as any).identifier;
+          }
+        } catch (rawCallErr) {
+          const classified = classifyPlaceBuyResult(rawCallErr);
+          if (classified.resultClass === "exchange_order_unknown") {
+            console.info(
+              JSON.stringify({
+                tag: "EXCHANGE_ORDER_UNKNOWN_VERIFYING",
+                ts: new Date().toISOString(),
+                market,
+                logical_order_id: logicalOrderId,
+                reason: classified.reasonStr,
+                note: "verifying order state by exact identifier lookup over grace window",
+              }),
+            );
+
+            let confirmedFill = false;
+
+            // [REQUIREMENT 3] GET /v1/order?identifier={logicalOrderId} 백오프 재조회 (최대 3회, 1초 간격)
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              await new Promise((r) => setTimeout(r, 1000));
+              try {
+                const ord = await opts.trade.fetchOrderByIdentifier?.(logicalOrderId);
+                if (ord && ord.uuid) {
+                  confirmedFill = true;
+                  buyOrderUuid = ord.uuid;
+                  buyExchangeIdentifier = ord.identifier || logicalOrderId;
+                  buyRes = {
+                    status: "ok",
+                    order_uuid: ord.uuid,
+                    identifier: buyExchangeIdentifier,
+                    detail: "resolved_from_identifier_lookup",
+                  };
+                  break;
+                }
+              } catch (idErr) {
+                const idErrStr = idErr instanceof Error ? idErr.message : String(idErr);
+                console.warn(
+                  JSON.stringify({
+                    tag: "IDENTIFIER_LOOKUP_ATTEMPT_WARNING",
+                    attempt,
+                    logical_order_id: logicalOrderId,
+                    error: idErrStr,
+                  }),
+                );
+              }
+            }
+
+            if (!confirmedFill) {
+              // 접수 여부 확정 불가 시 exchange_order_unknown 상태 유지 및 자동 재주문 금지
+              throw rawCallErr;
+            }
+          } else {
+            throw rawCallErr;
+          }
+        }
+
+        const buyOk = Boolean(
+          buyRes &&
+          ((buyRes as any).status === "ok" || (buyRes as any).ok === true) &&
+          ((buyRes as any).order_uuid || (buyRes as any).ok === true),
         );
-        state.safety_guard.order_fail_count_today += 1;
+        if (!buyOk) {
+          const detailMsg = (buyRes as any)?.detail || (buyRes as any)?.reason || "place_buy_returned_not_ok";
+          throw new Error(detailMsg);
+        }
+
+        buyOutcomeClass = "exchange_order_accepted";
+        buyOutcomeReason = "success";
+        if (isSurgeSourceLocal) reclaim_actual_buy_count++;
+
+      } catch (placeErr) {
+        const classified = classifyPlaceBuyResult(placeErr);
+        buyOutcomeClass = classified.resultClass;
+        buyOutcomeReason = classified.reasonStr;
+        buyExchangeErrorName = classified.exchangeErrorName;
+        buyExchangeErrorMessage = classified.exchangeErrorMessage;
+        buyExchangeHttpStatus = classified.exchangeHttpStatus;
+
+        if (buyOutcomeClass === "exchange_order_failed") {
+          state.safety_guard.order_fail_count_today += 1;
+        }
+
         if (state.safety_guard.order_fail_count_today >= 3) {
           state.safety_guard.state = "자동정지";
           state.safety_guard.reason = "order_failures";
-          await opts.trade.setAutoTradeEnabled?.(false);
           await opts.onEvent?.({
             timestamp: new Date().toISOString(),
             event_type: "safety_guard_stopped",
@@ -14436,12 +14506,44 @@ export function createLiveDataStrategy(opts: {
             current_price: null,
             pnl_net: null,
             pnl_net_pct: null,
-            note: e instanceof Error ? e.message : "buy_failed",
+            note: buyOutcomeReason,
           });
         }
-        await racePersist("after_place_buy_failure_guard");
-        bumpSkip("order_failed");
-        emitFinalBlocked("order_failed", { order_krw: orderKrw });
+      } finally {
+        const orderFailCountAfter = state.safety_guard.order_fail_count_today;
+
+        console.info(
+          JSON.stringify({
+            tag: "LIVE_PLACEBUY_RESULT",
+            ts: new Date().toISOString(),
+            market,
+            ok: buyOutcomeClass === "exchange_order_accepted",
+            result_class: buyOutcomeClass,
+            reason: buyOutcomeReason,
+            exchange_error_name: buyExchangeErrorName,
+            exchange_error_message: buyExchangeErrorMessage,
+            exchange_http_status: buyExchangeHttpStatus,
+            order_fail_count_before: orderFailCountBefore,
+            order_fail_count_after: orderFailCountAfter,
+            logical_order_id: logicalOrderId,
+            exchange_identifier: buyExchangeIdentifier,
+            order_uuid: buyOrderUuid,
+            path: isSurgeSource ? "surge_normal" : "normal",
+            order_krw: orderKrw,
+            strategy_type: strategyType,
+            tick_lease: myLease,
+          }),
+        );
+      }
+
+      if (buyOutcomeClass !== "exchange_order_accepted") {
+        if (evaluationDiagnostics[market]) {
+          evaluationDiagnostics[market].buyGate = { checked: true, allowed: false, reason: buyOutcomeReason };
+          evaluationDiagnostics[market].final = { action: "blocked", reason: buyOutcomeReason };
+        }
+        await racePersist("after_place_buy_blocked_or_failed");
+        bumpSkip(buyOutcomeClass === "policy_blocked" ? "policy_blocked" : "order_failed");
+        emitFinalBlocked(buyOutcomeReason, { order_krw: orderKrw });
         continue;
       }
       const price = priceBy.get(market) ?? 0;
@@ -14820,10 +14922,19 @@ export function createLiveDataStrategy(opts: {
     }
   };
 
+  const resetSafetyGuardState = async () => {
+    state.safety_guard.state = "정상";
+    state.safety_guard.reason = null;
+    state.safety_guard.order_fail_count_today = 0;
+    (state.safety_guard as any).migration_20260722_applied = true;
+    await persist();
+  };
+
   return {
     init: restore,
     tick: runTick,
     status: summarize,
+    resetSafetyGuardState,
     files: { tradesFile, dailyFile },
   };
 }

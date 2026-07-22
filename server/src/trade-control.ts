@@ -14,7 +14,7 @@ import {
   tickerAgeMap,
 } from "./upbit-public.js";
 import { appendLog } from "./log-store.js";
-import { fetchAccounts, placeMarketBuy, placeMarketSell, fetchOrderDetails, type UpbitAccount } from "./upbit-private.js";
+import { fetchAccounts, placeMarketBuy, placeMarketSell, fetchOrderDetails, fetchOrderByIdentifier, type UpbitAccount } from "./upbit-private.js";
 import { companyIdSchema, serviceIdSchema } from "@orbitalpha/shared";
 import type { StrategyType } from "./strategy-risk-config.js";
 import { ORDER_LIMITS } from "@orbitalpha/shared";
@@ -51,6 +51,7 @@ type TradeOrderSnapshot = {
   status: "ok" | "error";
   detail: string;
   order_uuid?: string;
+  identifier?: string;
 };
 
 type TradeState = {
@@ -706,6 +707,7 @@ export function createTradeControl(
     bucket: PositionBucket = "strategy",
     signalPayload?: unknown,
     path?: string,
+    logicalOrderId?: string,
   ) => {
     if (state.dailyRiskKillSwitchActive) {
       console.info(
@@ -810,6 +812,7 @@ export function createTradeControl(
         secretKey: env.upbitSecretKey!,
         market,
         krwAmount: amountKrw,
+        identifier: logicalOrderId,
       });
       const snap: TradeOrderSnapshot = {
         ts: new Date().toISOString(),
@@ -819,6 +822,7 @@ export function createTradeControl(
         status: "ok",
         detail: rsp.state,
         order_uuid: rsp.uuid,
+        identifier: rsp.identifier || logicalOrderId,
       };
       markOrderResult(snap);
       let executed = Number(rsp.executed_volume ?? "0");
@@ -1538,6 +1542,10 @@ export function createTradeControl(
       
       persistAutoTradeState();
       return true;
+    },
+    fetchOrderByIdentifier: async (identifier: string) => {
+      if (!env.upbitAccessKey || !env.upbitSecretKey) throw new Error("Upbit API keys missing");
+      return await fetchOrderByIdentifier(env.upbitAccessKey, env.upbitSecretKey, identifier);
     },
   };
 }

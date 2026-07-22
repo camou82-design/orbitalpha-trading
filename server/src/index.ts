@@ -1559,6 +1559,57 @@ async function main() {
     };
   });
 
+  app.post("/api/v1/trade/reset-safety-guard", async (req, reply) => {
+    const s = getSession(req.headers.cookie);
+    if (!s) {
+      reply.code(401);
+      return { ok: false, error: "Unauthorized" };
+    }
+
+    await strategy.resetSafetyGuardState();
+
+    const st = await trade.status();
+    const ss = strategy.status() as any;
+
+    await opLog.event({
+      timestamp: new Date().toISOString(),
+      event_type: "RESET_SAFETY_GUARD_AUDIT",
+      market: null,
+      strategy_type: null,
+      market_state: null,
+      side: null,
+      reason: "operator_reset",
+      balance_krw: Number(st.krw_available ?? 0),
+      position_qty: null,
+      avg_buy_price: null,
+      current_price: null,
+      pnl_net: null,
+      pnl_net_pct: null,
+      note: `Reset by user ${s.user_id}`,
+    });
+
+    console.info(
+      JSON.stringify({
+        tag: "RESET_SAFETY_GUARD_AUDIT",
+        ts: new Date().toISOString(),
+        user_id: s.user_id,
+        safety_guard_state: ss.safety_guard_state,
+        safety_guard_reason: ss.safety_guard_reason,
+        order_fail_count_today: ss.order_fail_count_today,
+      }),
+    );
+
+    return {
+      ok: true,
+      authenticated: true,
+      user_id: s.user_id,
+      safety_guard_state: ss.safety_guard_state,
+      safety_guard_reason: ss.safety_guard_reason,
+      order_fail_count_today: ss.order_fail_count_today,
+      auto_trade_enabled: st.auto_trade_enabled,
+    };
+  });
+
   app.post("/api/v1/trade/check", async (_req, reply) => {
     try {
       const c = await trade.connectionCheck();

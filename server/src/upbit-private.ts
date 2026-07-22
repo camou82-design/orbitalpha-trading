@@ -15,14 +15,26 @@ function makeJwt(secretKey: string, payload: Record<string, unknown>): string {
   return `${unsigned}.${sig}`;
 }
 
-function buildAuthHeader(accessKey: string, secretKey: string, query?: URLSearchParams): string {
+function buildAuthHeader(accessKey: string, secretKey: string, queryOrParams?: URLSearchParams | Record<string, unknown>): string {
   const payload: Record<string, unknown> = {
     access_key: accessKey,
     nonce: crypto.randomUUID(),
   };
-  if (query && [...query.keys()].length > 0) {
-    const raw = query.toString();
-    payload.query_hash = crypto.createHash("sha512").update(raw).digest("hex");
+  let queryString = "";
+  if (queryOrParams instanceof URLSearchParams) {
+    queryString = queryOrParams.toString();
+  } else if (queryOrParams && typeof queryOrParams === "object") {
+    const searchParams = new URLSearchParams();
+    for (const [k, v] of Object.entries(queryOrParams)) {
+      if (v !== undefined && v !== null) {
+        searchParams.set(k, String(v));
+      }
+    }
+    queryString = searchParams.toString();
+  }
+
+  if (queryString) {
+    payload.query_hash = crypto.createHash("sha512").update(queryString).digest("hex");
     payload.query_hash_alg = "SHA512";
   }
   const jwt = makeJwt(secretKey, payload);
@@ -35,19 +47,33 @@ async function upbitFetch<T>(args: {
   accessKey: string;
   secretKey: string;
   query?: URLSearchParams;
+  jsonBody?: Record<string, unknown>;
   body?: URLSearchParams;
 }): Promise<T> {
-  const query = args.query ?? args.body;
-  const auth = buildAuthHeader(args.accessKey, args.secretKey, query);
+  const queryOrParams = args.query ?? args.jsonBody ?? args.body;
+  const auth = buildAuthHeader(args.accessKey, args.secretKey, queryOrParams);
   const url = `${UPBIT}${args.path}${args.query ? `?${args.query.toString()}` : ""}`;
+
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    Authorization: auth,
+  };
+  let bodyStr: string | undefined = undefined;
+
+  if (args.method === "POST") {
+    if (args.jsonBody) {
+      headers["Content-Type"] = "application/json; charset=utf-8";
+      bodyStr = JSON.stringify(args.jsonBody);
+    } else if (args.body) {
+      headers["Content-Type"] = "application/x-www-form-urlencoded";
+      bodyStr = args.body.toString();
+    }
+  }
+
   const r = await fetch(url, {
     method: args.method,
-    headers: {
-      Accept: "application/json",
-      Authorization: auth,
-      ...(args.method === "POST" ? { "Content-Type": "application/x-www-form-urlencoded" } : {}),
-    },
-    body: args.method === "POST" ? args.body?.toString() : undefined,
+    headers,
+    body: bodyStr,
   });
   const text = await r.text();
   if (!r.ok) {
@@ -67,6 +93,7 @@ export type UpbitAccount = {
 
 export type UpbitOrderResponse = {
   uuid: string;
+  identifier?: string;
   side: "bid" | "ask";
   ord_type: string;
   price: string | null;
@@ -81,6 +108,8 @@ export type UpbitOrderResponse = {
   locked: string;
   executed_volume: string;
   trades_count: number;
+  trades?: any[];
+  executed_funds?: string;
 };
 
 export function fetchAccounts(accessKey: string, secretKey: string): Promise<UpbitAccount[]> {
@@ -97,18 +126,23 @@ export function placeMarketBuy(args: {
   secretKey: string;
   market: string;
   krwAmount: number;
+  identifier?: string;
 }): Promise<UpbitOrderResponse> {
-  const body = new URLSearchParams();
-  body.set("market", args.market);
-  body.set("side", "bid");
-  body.set("ord_type", "price");
-  body.set("price", String(Math.floor(args.krwAmount)));
+  const jsonBody: Record<string, unknown> = {
+    market: args.market,
+    side: "bid",
+    ord_type: "price",
+    price: String(Math.floor(args.krwAmount)),
+  };
+  if (args.identifier) {
+    jsonBody.identifier = args.identifier;
+  }
   return upbitFetch<UpbitOrderResponse>({
     method: "POST",
     path: "/v1/orders",
     accessKey: args.accessKey,
     secretKey: args.secretKey,
-    body,
+    jsonBody,
   });
 }
 
@@ -117,18 +151,23 @@ export function placeMarketSell(args: {
   secretKey: string;
   market: string;
   volume: number;
+  identifier?: string;
 }): Promise<UpbitOrderResponse> {
-  const body = new URLSearchParams();
-  body.set("market", args.market);
-  body.set("side", "ask");
-  body.set("ord_type", "market");
-  body.set("volume", String(args.volume));
+  const jsonBody: Record<string, unknown> = {
+    market: args.market,
+    side: "ask",
+    ord_type: "market",
+    volume: String(args.volume),
+  };
+  if (args.identifier) {
+    jsonBody.identifier = args.identifier;
+  }
   return upbitFetch<UpbitOrderResponse>({
     method: "POST",
     path: "/v1/orders",
     accessKey: args.accessKey,
     secretKey: args.secretKey,
-    body,
+    jsonBody,
   });
 }
 
@@ -136,10 +175,26 @@ export function fetchOrderDetails(
   accessKey: string,
   secretKey: string,
   uuid: string,
-): Promise<any> {
+): Promise<UpbitOrderResponse> {
   const query = new URLSearchParams();
   query.set("uuid", uuid);
-  return upbitFetch<any>({
+  return upbitFetch<UpbitOrderResponse>({
+    method: "GET",
+    path: "/v1/order",
+    accessKey,
+    secretKey,
+    query,
+  });
+}
+
+export function fetchOrderByIdentifier(
+  accessKey: string,
+  secretKey: string,
+  identifier: string,
+): Promise<UpbitOrderResponse> {
+  const query = new URLSearchParams();
+  query.set("identifier", identifier);
+  return upbitFetch<UpbitOrderResponse>({
     method: "GET",
     path: "/v1/order",
     accessKey,
