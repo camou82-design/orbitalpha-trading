@@ -6751,6 +6751,11 @@ export function createLiveDataStrategy(opts: {
         p.reason_enter?.includes("CORE_TREND") ||
         (CORE_TRADE_MARKETS.includes(market as any) && (p.strategy_type === "stable" || p.strategy_type === "momentum") && p.engine_bucket !== "surge");
 
+      const isStableCandidatePos =
+        p.strategy_type === "stable" ||
+        (p.reason_enter && (p.reason_enter.includes("거래량·박스·눌림 충족") || p.reason_enter.includes("relaxed pass"))) ||
+        (!!p.position_id && (Number(p.order_krw ?? 0) >= 5000));
+
       // ── [진단] 포지션별 exit loop 진입 체크 ──────────────────────────────
       const entryOriginStr = (p as any).entry_origin as string | undefined;
       const isRecoveredPosition =
@@ -7580,6 +7585,21 @@ export function createLiveDataStrategy(opts: {
                     maxPnl: p.max_pnl_pct,
                     originalExitReason: "weak_market_time_stop",
                     finalDecision: "blocked_by_guard",
+                  })
+                );
+              } else if (isStableCandidatePos && holdMin < 30 && pnlGross > -0.35) {
+                console.info(
+                  JSON.stringify({
+                    tag: "STABLE_TIME_STOP_NEAR_BREAKEVEN_GUARD_APPLIED",
+                    ts: new Date().toISOString(),
+                    market,
+                    holdMin,
+                    pnlGross,
+                    maxPnl: p.max_pnl_pct,
+                    originalExitReason: "weak_market_time_stop",
+                    strategy_type: p.strategy_type,
+                    reason_enter: p.reason_enter,
+                    position_id: p.position_id,
                   })
                 );
               } else {
