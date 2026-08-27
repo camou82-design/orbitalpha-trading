@@ -614,51 +614,260 @@ const tickerCircuitOpenUntilByMarket = new Map<string, number>();
 const tickerFailureLastLogAtMs = new Map<string, number>();
 
 // 동시성 제어를 위한 우선순위 락 큐
-interface TickerRequestTask {
-  resolve: () => void;
-  priority: boolean;
+export interface TickerLockOptions {
+  priority?: boolean;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  caller?: string;
 }
+
+interface TickerRequestTask {
+  id: number;
+  priority: boolean;
+  caller: string;
+  createdAt: number;
+  resolve: (release: () => void) => void;
+  reject: (err: Error) => void;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  timerId?: NodeJS.Timeout;
+  abortHandler?: () => void;
+  aborted: boolean;
+}
+
 const tickerQueue: TickerRequestTask[] = [];
 let tickerActiveRequests = 0;
+let tickerTaskIdSeq = 0;
 const UPBIT_TICKER_MAX_CONCURRENCY = Number(process.env.UPBIT_TICKER_MAX_CONCURRENCY ?? 1);
 
-function acquireTickerLock(priority = false): Promise<() => void> {
-  return new Promise((resolve) => {
+function createIdempotentRelease(caller: string, acquiredAt: number): () => void {
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    tickerActiveRequests = Math.max(0, tickerActiveRequests - 1);
+    if (tickerDebugEnabled()) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_TICKER_LOCK_RELEASE",
+          ts: new Date().toISOString(),
+          caller,
+          held_ms: Date.now() - acquiredAt,
+          active_requests: tickerActiveRequests,
+          queue_len: tickerQueue.length,
+        }),
+      );
+    }
+    processNextTickerRequest();
+  };
+}
+
+export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<() => void> {
+  const options: TickerLockOptions = typeof opts === "boolean" ? { priority: opts } : (opts ?? {});
+  const priority = options.priority === true;
+  const signal = options.signal;
+  const timeoutMs = options.timeoutMs;
+  const caller = options.caller ?? "unknown";
+  const now0 = Date.now();
+
+  // 1. 이미 취소된 signal인 경우 즉시 거부 (큐 진입 안 함)
+  if (signal?.aborted) {
+    if (tickerDebugEnabled()) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_TICKER_LOCK_ABORT",
+          ts: new Date().toISOString(),
+          caller,
+          reason: "already_aborted",
+          active_requests: tickerActiveRequests,
+          queue_len: tickerQueue.length,
+        }),
+      );
+    }
+    return Promise.reject(new DOMException("Aborted", "AbortError"));
+  }
+
+  // 2. 동시성 슬롯이 남아있으면 즉시 획득
+  if (tickerActiveRequests < UPBIT_TICKER_MAX_CONCURRENCY) {
+    tickerActiveRequests++;
+    if (tickerDebugEnabled()) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_TICKER_LOCK_ACQUIRE",
+          ts: new Date().toISOString(),
+          caller,
+          status: "immediate",
+          wait_ms: 0,
+          active_requests: tickerActiveRequests,
+          queue_len: tickerQueue.length,
+        }),
+      );
+    }
+    return Promise.resolve(createIdempotentRelease(caller, now0));
+  }
+
+  // 3. 대기 큐 진입
+  return new Promise((resolve, reject) => {
+    const taskId = ++tickerTaskIdSeq;
     const task: TickerRequestTask = {
-      resolve: () => {},
+      id: taskId,
       priority,
+      caller,
+      createdAt: now0,
+      resolve,
+      reject,
+      signal,
+      timeoutMs,
+      aborted: false,
     };
-    task.resolve = () => {
-      resolve(() => {
-        tickerActiveRequests--;
-        processNextTickerRequest();
-      });
+
+    const cleanup = () => {
+      if (task.timerId) {
+        clearTimeout(task.timerId);
+        task.timerId = undefined;
+      }
+      if (task.signal && task.abortHandler) {
+        task.signal.removeEventListener("abort", task.abortHandler);
+        task.abortHandler = undefined;
+      }
     };
-    
-    if (tickerActiveRequests < UPBIT_TICKER_MAX_CONCURRENCY) {
-      tickerActiveRequests++;
-      task.resolve();
-    } else {
-      if (priority) {
-        const firstNonPriorityIndex = tickerQueue.findIndex((t) => !t.priority);
-        if (firstNonPriorityIndex !== -1) {
-          tickerQueue.splice(firstNonPriorityIndex, 0, task);
-        } else {
-          tickerQueue.push(task);
+
+    const removeTaskFromQueue = () => {
+      const idx = tickerQueue.findIndex((t) => t.id === taskId);
+      if (idx !== -1) {
+        tickerQueue.splice(idx, 1);
+      }
+    };
+
+    if (signal) {
+      task.abortHandler = () => {
+        if (task.aborted) return;
+        task.aborted = true;
+        cleanup();
+        removeTaskFromQueue();
+        if (tickerDebugEnabled()) {
+          console.info(
+            JSON.stringify({
+              tag: "DEBUG_TICKER_LOCK_ABORT",
+              ts: new Date().toISOString(),
+              caller,
+              task_id: taskId,
+              wait_ms: Date.now() - now0,
+              active_requests: tickerActiveRequests,
+              queue_len: tickerQueue.length,
+            }),
+          );
         }
+        reject(new DOMException("Aborted", "AbortError"));
+      };
+      signal.addEventListener("abort", task.abortHandler, { once: true });
+    }
+
+    if (timeoutMs !== undefined && timeoutMs !== null && Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      task.timerId = setTimeout(() => {
+        if (task.aborted) return;
+        task.aborted = true;
+        cleanup();
+        removeTaskFromQueue();
+        if (tickerDebugEnabled()) {
+          console.info(
+            JSON.stringify({
+              tag: "DEBUG_TICKER_LOCK_TIMEOUT",
+              ts: new Date().toISOString(),
+              caller,
+              task_id: taskId,
+              wait_ms: Date.now() - now0,
+              timeout_ms: timeoutMs,
+              active_requests: tickerActiveRequests,
+              queue_len: tickerQueue.length,
+            }),
+          );
+        }
+        reject(new Error(`Ticker lock acquisition timed out after ${timeoutMs}ms (caller=${caller})`));
+      }, timeoutMs);
+    } else if (timeoutMs !== undefined && timeoutMs !== null && timeoutMs <= 0) {
+      task.aborted = true;
+      cleanup();
+      reject(new Error(`Ticker lock acquisition timed out immediately (caller=${caller})`));
+      return;
+    }
+
+    if (priority) {
+      const firstNonPriorityIndex = tickerQueue.findIndex((t) => !t.priority);
+      if (firstNonPriorityIndex !== -1) {
+        tickerQueue.splice(firstNonPriorityIndex, 0, task);
       } else {
         tickerQueue.push(task);
       }
+    } else {
+      tickerQueue.push(task);
+    }
+
+    if (tickerDebugEnabled()) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_TICKER_LOCK_WAIT",
+          ts: new Date().toISOString(),
+          caller,
+          task_id: taskId,
+          priority,
+          active_requests: tickerActiveRequests,
+          queue_len: tickerQueue.length,
+        }),
+      );
     }
   });
 }
 
 function processNextTickerRequest() {
-  if (tickerQueue.length > 0 && tickerActiveRequests < UPBIT_TICKER_MAX_CONCURRENCY) {
-    tickerActiveRequests++;
+  while (tickerQueue.length > 0 && tickerActiveRequests < UPBIT_TICKER_MAX_CONCURRENCY) {
     const next = tickerQueue.shift();
-    if (next) next.resolve();
+    if (!next) break;
+    if (next.aborted) continue;
+
+    if (next.timerId) {
+      clearTimeout(next.timerId);
+      next.timerId = undefined;
+    }
+    if (next.signal && next.abortHandler) {
+      next.signal.removeEventListener("abort", next.abortHandler);
+      next.abortHandler = undefined;
+    }
+
+    tickerActiveRequests++;
+    const now = Date.now();
+    const waitMs = now - next.createdAt;
+    if (tickerDebugEnabled()) {
+      console.info(
+        JSON.stringify({
+          tag: "DEBUG_TICKER_LOCK_ACQUIRE",
+          ts: new Date().toISOString(),
+          caller: next.caller,
+          task_id: next.id,
+          status: "queued",
+          wait_ms: waitMs,
+          active_requests: tickerActiveRequests,
+          queue_len: tickerQueue.length,
+        }),
+      );
+    }
+    const release = createIdempotentRelease(next.caller, now);
+    next.resolve(release);
+    break;
   }
+}
+
+export function getTickerLockStats() {
+  return {
+    activeRequests: tickerActiveRequests,
+    queueLength: tickerQueue.length,
+    maxConcurrency: UPBIT_TICKER_MAX_CONCURRENCY,
+  };
+}
+
+export function resetTickerLockStateForTest() {
+  tickerActiveRequests = 0;
+  tickerQueue.length = 0;
 }
 
 function tickerDebugEnabled(): boolean {
@@ -890,10 +1099,27 @@ export async function fetchTickers(markets: string[], opts?: FetchTickersOptions
     const totalTimeoutMs = opts?.totalTimeoutMs ?? null;
     const batchTimeoutMs = opts?.batchTimeoutMs ?? null;
 
-    // 동시성 제어 락 획득 (isPriority 에 따라 우선순위 적용)
-    const releaseLock = await acquireTickerLock(isPriority);
+    // 전체 남은 예산 계산 (락 대기 시간도 total budget에 포함)
+    const elapsedSoFar = Date.now() - now0;
+    const remainingBudgetMs = totalTimeoutMs !== null ? Math.max(0, totalTimeoutMs - elapsedSoFar) : undefined;
     
+    // 락 획득 타임아웃: 남은 전체 예산이 있으면 그것을 상한으로, 없으면 batchTimeoutMs의 2배 또는 기본 10초
+    const lockTimeoutMs = remainingBudgetMs !== undefined
+      ? remainingBudgetMs
+      : (batchTimeoutMs ? Math.max(2000, batchTimeoutMs * 2) : 10_000);
+
+    let releaseLock: (() => void) | null = null;
     try {
+      if (remainingBudgetMs !== undefined && remainingBudgetMs <= 0) {
+        throw new Error(`fetchTickers budget expired before acquiring lock (caller=${opts?.debugCaller})`);
+      }
+      releaseLock = await acquireTickerLock({
+        priority: isPriority,
+        signal: tickSignal,
+        timeoutMs: lockTimeoutMs,
+        caller: opts?.debugCaller ?? "fetchTickers",
+      });
+
       for (let i = 0; i < batches.length; i += parallelTickerBatches) {
         if (tickSignal?.aborted) throw new DOMException("Aborted", "AbortError");
         if (totalTimeoutMs !== null && Date.now() - now0 > totalTimeoutMs) {
@@ -924,8 +1150,16 @@ export async function fetchTickers(markets: string[], opts?: FetchTickersOptions
           await sleepAbortable(Math.max(0, batchDelayMs), tickSignal);
         }
       }
+    } catch (fetchErr) {
+      if (dbgOn) {
+        console.warn(
+          `[upbit-ticker] fetchTickers REST fetch aborted or failed (caller=${opts?.debugCaller}): ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`,
+        );
+      }
     } finally {
-      releaseLock(); // 락 해제
+      if (releaseLock) {
+        releaseLock(); // 락 해제 (idempotent)
+      }
     }
   }
 

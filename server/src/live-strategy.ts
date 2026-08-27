@@ -1030,9 +1030,10 @@ function isLiveTickPhaseTimeout(err: unknown): err is LiveTickPhaseTimeoutError 
 
 async function liveTickRacePhase<T>(
   ctx: { phase: string; tick_lease: number; timeout_ms: number },
-  fn: () => Promise<T>,
+  fn: (signal?: AbortSignal) => Promise<T>,
 ): Promise<T> {
   const t0 = Date.now();
+  const phaseCtrl = new AbortController();
   console.info(
     JSON.stringify({
       tag: "LIVE_TICK_PHASE_ENTER",
@@ -1044,10 +1045,13 @@ async function liveTickRacePhase<T>(
   );
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutP = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new LiveTickPhaseTimeoutError(ctx.phase, ctx.timeout_ms)), ctx.timeout_ms);
+    timer = setTimeout(() => {
+      phaseCtrl.abort();
+      reject(new LiveTickPhaseTimeoutError(ctx.phase, ctx.timeout_ms));
+    }, ctx.timeout_ms);
   });
   try {
-    const result = await Promise.race([fn(), timeoutP]);
+    const result = await Promise.race([fn(phaseCtrl.signal), timeoutP]);
     console.info(
       JSON.stringify({
         tag: "LIVE_TICK_PHASE_EXIT",
@@ -1060,6 +1064,7 @@ async function liveTickRacePhase<T>(
     );
     return result;
   } catch (e) {
+    phaseCtrl.abort();
     console.info(
       JSON.stringify({
         tag: "LIVE_TICK_PHASE_EXIT",
@@ -3411,7 +3416,7 @@ export function createLiveDataStrategy(opts: {
       return false;
     };
     const PHASE_MS = LIVE_TICK_PHASE_MS;
-    const racePhase = <T>(phase: string, timeout_ms: number, fn: () => Promise<T>) =>
+    const racePhase = <T>(phase: string, timeout_ms: number, fn: (signal?: AbortSignal) => Promise<T>) =>
       liveTickRacePhase({ phase, tick_lease: myLease, timeout_ms }, fn);
     let lastGoodTradeStatus: TradeStatus | null = null;
     let lastGoodTradeStatusAtMs = 0;
@@ -5205,10 +5210,13 @@ export function createLiveDataStrategy(opts: {
     );
     let tickerRows: any[] = [];
     try {
-      tickerRows = await racePhase("fetch_tickers", PHASE_MS.fetch_tickers, () =>
+      tickerRows = await racePhase("fetch_tickers", PHASE_MS.fetch_tickers, (phaseSignal) =>
         fetchTickers(tickerRequestedSymbols, {
           debugCaller: "live-strategy",
-          signal: tickSignal,
+          signal: phaseSignal || tickSignal,
+          isPriority: true,
+          totalTimeoutMs: Math.max(2000, PHASE_MS.fetch_tickers - 500),
+          batchTimeoutMs: Math.max(1500, Math.min(4000, Math.floor(PHASE_MS.fetch_tickers / 3))),
         }),
       );
       for (const r of tickerRows) {
