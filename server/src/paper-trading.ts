@@ -460,6 +460,166 @@ export function evaluateGlobalKillSwitch(
   };
 }
 
+export function evaluateHourlyEntryLimit(
+  history: Array<{ market: string; ts?: string | null; state?: string; order_krw?: number | null; buy_total_krw?: number | null; qty?: number | null; position_id?: string | null; id?: string | null; [key: string]: any }>,
+  positions: Record<string, any>,
+  nowMs = Date.now(),
+  hourlyLimit = 2,
+): {
+  active: boolean;
+  reason: string | null;
+  totalUnique1hEntries: number;
+  meta: {
+    history_buy_1h_count: number;
+    open_position_1h_count: number;
+    deduped_overlap_count: number;
+    recovered_open_only_count: number;
+    total_unique_1h_entries: number;
+    hourly_entry_limit: number;
+    active: boolean;
+    reason: string | null;
+    invalid_timestamp_count: number;
+  };
+} {
+  const MAX_CLOCK_SKEW_MS = 60_000;
+  const maxValidFutureMs = nowMs + MAX_CLOCK_SKEW_MS;
+  const windowStartMs = nowMs - 3600 * 1000;
+
+  let invalidTimestampCount = 0;
+
+  const validBuyTrades: Array<{
+    id?: string;
+    market: string;
+    tradeTimeMs: number;
+    orderKrw: number;
+    qty: number;
+  }> = [];
+
+  for (const t of history || []) {
+    if (t.state === "SKIPPED") continue;
+    const raw = t.ts;
+    if (!raw || typeof raw !== "string" || raw.trim() === "") {
+      invalidTimestampCount++;
+      continue;
+    }
+    const parsed = Date.parse(raw);
+    if (!Number.isFinite(parsed) || parsed <= 0 || parsed > maxValidFutureMs) {
+      invalidTimestampCount++;
+      continue;
+    }
+    if (parsed >= windowStartMs && parsed <= maxValidFutureMs) {
+      validBuyTrades.push({
+        id: (t.position_id || t.id) ?? undefined,
+        market: t.market,
+        tradeTimeMs: parsed,
+        orderKrw: Number(t.order_krw ?? t.buy_total_krw ?? 0),
+        qty: Number(t.qty ?? 0),
+      });
+    }
+  }
+
+  const validOpenPositions: Array<{
+    id?: string;
+    market: string;
+    entryTimeMs: number;
+    orderKrw: number;
+    qty: number;
+    rawPos: any;
+  }> = [];
+
+  for (const p of Object.values(positions || {})) {
+    if (!p) continue;
+    const raw = p.entry_ts || p.ts;
+    if (!raw || typeof raw !== "string" || raw.trim() === "") {
+      invalidTimestampCount++;
+      continue;
+    }
+    const parsed = Date.parse(raw);
+    if (!Number.isFinite(parsed) || parsed <= 0 || parsed > maxValidFutureMs) {
+      invalidTimestampCount++;
+      continue;
+    }
+    if (parsed >= windowStartMs && parsed <= maxValidFutureMs) {
+      validOpenPositions.push({
+        id: (p.position_id || p.id) ?? undefined,
+        market: p.market,
+        entryTimeMs: parsed,
+        orderKrw: Number(p.order_krw ?? p.buy_total_krw ?? 0),
+        qty: Number(p.qty ?? 0),
+        rawPos: p,
+      });
+    }
+  }
+
+  let dedupedOverlapCount = 0;
+  let recoveredOpenOnlyCount = 0;
+  const matchedBuyIndices = new Set<number>();
+
+  for (const pos of validOpenPositions) {
+    let bestMatchIdx = -1;
+    let minTimeDiff = Infinity;
+
+    for (let i = 0; i < validBuyTrades.length; i++) {
+      if (matchedBuyIndices.has(i)) continue;
+      const buy = validBuyTrades[i];
+      if (buy.market !== pos.market) continue;
+
+      if (buy.id && pos.id && buy.id === pos.id) {
+        bestMatchIdx = i;
+        break;
+      }
+
+      const timeDiffMs = Math.abs(buy.tradeTimeMs - pos.entryTimeMs);
+      const isTightTime = timeDiffMs <= 5000;
+
+      const isKrwMatch =
+        (buy.orderKrw > 0 && pos.orderKrw > 0 && Math.abs(buy.orderKrw - pos.orderKrw) <= 10) ||
+        (buy.orderKrw === 0 || pos.orderKrw === 0);
+
+      const isQtyMatch =
+        (buy.qty > 0 && pos.qty > 0 && Math.abs(buy.qty - pos.qty) <= 0.0001) ||
+        (buy.qty === 0 || pos.qty === 0);
+
+      if (isTightTime && isKrwMatch && isQtyMatch) {
+        if (timeDiffMs < minTimeDiff) {
+          minTimeDiff = timeDiffMs;
+          bestMatchIdx = i;
+        }
+      }
+    }
+
+    if (bestMatchIdx !== -1) {
+      matchedBuyIndices.add(bestMatchIdx);
+      dedupedOverlapCount++;
+    } else {
+      recoveredOpenOnlyCount++;
+    }
+  }
+
+  const totalUnique1hEntries = validBuyTrades.length + recoveredOpenOnlyCount;
+  const active = totalUnique1hEntries >= hourlyLimit;
+  const reason = active
+    ? `Hourly entry limit reached (${totalUnique1hEntries}/${hourlyLimit} in last 1h)`
+    : null;
+
+  return {
+    active,
+    reason,
+    totalUnique1hEntries,
+    meta: {
+      history_buy_1h_count: validBuyTrades.length,
+      open_position_1h_count: validOpenPositions.length,
+      deduped_overlap_count: dedupedOverlapCount,
+      recovered_open_only_count: recoveredOpenOnlyCount,
+      total_unique_1h_entries: totalUnique1hEntries,
+      hourly_entry_limit: hourlyLimit,
+      active,
+      reason,
+      invalid_timestamp_count: invalidTimestampCount,
+    },
+  };
+}
+
 function toNum(v: unknown, d = 0): number {
   const n = Number(v);
   return Number.isFinite(n) ? n : d;
@@ -1940,15 +2100,8 @@ export function createPaperTradingEngine(opts: {
       }
 
       // 3.1) 시간당 진입 제한 (최근 1시간 이내 진입 최대 2회)
-      const oneHourAgo = Date.now() - 3600 * 1000;
-      const recent1hEntries = state.history.filter((t) => {
-        return t.state !== "SKIPPED" && Date.parse(t.ts || new Date().toISOString()) >= oneHourAgo;
-      }).length;
-      const active1hEntries = Object.values(state.positions).filter((p) => {
-        return Date.now() - Date.parse(p.entry_ts) < 3600 * 1000;
-      }).length;
-      const total1hEntries = recent1hEntries + active1hEntries;
-      if (total1hEntries >= 2) {
+      const hourlyEval = evaluateHourlyEntryLimit(state.history, state.positions);
+      if (hourlyEval.active) {
         emitPaper("DEBUG_PAPER_BLOCK_REASON", { market, reason: "hourly_entry_limit_reached", stage: "hourly_limit" });
         continue;
       }
