@@ -1789,7 +1789,13 @@ async function validateLiveBuyPrecheck(params: {
     }
   }
 
-  const isPromotedReclaim = params.entryPath === "precheck" || params.entryPath === "surge_normal" || Boolean(params.signalPayload?.surge_capture_promoted);
+  const isActualPromotedReclaim = Boolean(
+    params.signalPayload?.surge_capture_promoted === true ||
+    params.signalPayload?.reclaim_promoted === true ||
+    params.entrySignalType === "reclaim" ||
+    params.strategyType === "surge_reclaim" ||
+    (params.signalPayload as any)?.sourceStrategy === "surge_reclaim_entry"
+  );
 
   if (isReclaimStrategy) {
     console.info(
@@ -1797,12 +1803,12 @@ async function validateLiveBuyPrecheck(params: {
         tag: "RECLAIM_PRECHECK_ENTER",
         ts: new Date().toISOString(),
         market: params.market,
-        source_path: isPromotedReclaim ? "capture_queue" : "watchlist",
+        source_path: isActualPromotedReclaim ? "capture_queue" : "watchlist",
         market_state: marketStateStr,
         btc_rsi: btcRsi,
         strategyType: params.strategyType,
         entrySignalType: params.entrySignalType,
-        promoted_reclaim: isPromotedReclaim,
+        promoted_reclaim: isActualPromotedReclaim,
       }),
     );
   }
@@ -11589,19 +11595,24 @@ export function createLiveDataStrategy(opts: {
       const acctSnap = accountHoldSnapshot[market];
       
       let candidateMetaFromSetup = candidateMetaMap.get(market);
-      const isPromotedReclaim = sigPre?.p?.surge_capture_promoted === true && (sigPre?.p as any)?.reclaim_promoted === true;
+      const isActualPromotedReclaim = Boolean(
+        (sigPre?.p?.surge_capture_promoted === true && (sigPre?.p as any)?.reclaim_promoted === true) ||
+        (sigPre?.p as any)?.sourceStrategy === "surge_reclaim_entry" ||
+        (sigPre?.p as any)?.entrySignalType === "reclaim"
+      );
+      const isPromotedReclaim = isActualPromotedReclaim;
       const isSurgeSourceLocal =
         candidateMetaFromSetup?.engine_bucket === "surge" ||
-        isPromotedReclaim ||
-        (sigPre?.p as any)?.sourceStrategy === "surge_reclaim_entry" ||
-        (sigPre?.p as any)?.entrySignalType === "reclaim";
+        isActualPromotedReclaim ||
+        (sourceMeta as any)?.source_kind === "surge_scanner_worker" ||
+        (sourceMeta as any)?.source_kind === "scanner_tradable_candidate";
 
-      const loopStrategyType = isSurgeSourceLocal
+      const loopStrategyType = isActualPromotedReclaim
         ? "surge_reclaim"
         : (sourceMeta?.source_kind === "CORE_TRADE" ? "stable" : "momentum");
-      const loopEntrySignalType = isSurgeSourceLocal ? "reclaim" : undefined;
+      const loopEntrySignalType = isActualPromotedReclaim ? "reclaim" : undefined;
 
-      if (!candidateMetaFromSetup && isSurgeSourceLocal) {
+      if (!candidateMetaFromSetup && isActualPromotedReclaim) {
         candidateMetaFromSetup = {
           market,
           engine_bucket: "surge",
@@ -11794,9 +11805,28 @@ export function createLiveDataStrategy(opts: {
         entryPath: "precheck",
         isAdditionalBuy: false,
         currentPrice: Number(priceBy.get(market) ?? 0),
-        reclaimScore: isSurgeSourceLocal ? ((sigPre?.p as any)?.surge_capture_score ?? (sigPre?.p as any)?.reclaim_score ?? (sigPre?.p as any)?.scanner_score ?? (sigPre?.p as any)?.signal_score) : undefined,
+        reclaimScore: isActualPromotedReclaim ? ((sigPre?.p as any)?.surge_capture_score ?? (sigPre?.p as any)?.reclaim_score) : undefined,
         candidateMeta: candidateMetaFromSetup,
       });
+
+      console.info(
+        JSON.stringify({
+          tag: "SURGE_AUTHORITY_EVAL_PROOF",
+          ts: new Date().toISOString(),
+          market,
+          engine_bucket: candidateMetaFromSetup?.engine_bucket ?? "none",
+          strategy_type: loopStrategyType,
+          entry_signal_type: loopEntrySignalType ?? "none",
+          actual_promoted_reclaim: isActualPromotedReclaim,
+          promotion_authority_source: isActualPromotedReclaim ? (sigPre?.p?.surge_capture_promoted ? "capture_queue_promoted" : (sigPre?.p as any)?.sourceStrategy ?? "reclaim_signal") : "none",
+          entry_path: "precheck",
+          setup_ok: !candidateMetaEvalDropReason,
+          setup_reason: candidateMetaFromSetup?.setupReason ?? "none",
+          reclaim_score: isActualPromotedReclaim ? ((sigPre?.p as any)?.surge_capture_score ?? (sigPre?.p as any)?.reclaim_score ?? 0) : null,
+          reclaim_required_score: isActualPromotedReclaim ? (guard.marketStateStr === "risk_on" ? 50 : 55) : null,
+          final_block_reason: guard.allowed ? null : guard.blockReason,
+        }),
+      );
       if (!guard.allowed) {
         if (guard.blockReason === "global_kill_switch_active") {
           (state as any).global_kill_switch_active = true;
@@ -14633,6 +14663,12 @@ export function createLiveDataStrategy(opts: {
         signalPayloadForBuy.entry_target_price = targetTakeProfitPrice;
         signalPayloadForBuy.entry_risk_reward = targetRiskReward;
 
+        const isActualPromotedReclaimForBuy = Boolean(
+          (sig?.p as any)?.surge_capture_promoted === true ||
+          (sig?.p as any)?.reclaim_promoted === true ||
+          strategyType === "surge_reclaim"
+        );
+
         const guard = await validateLiveBuyPrecheck({
           market,
           trades: state.trades,
@@ -14641,11 +14677,11 @@ export function createLiveDataStrategy(opts: {
           marketState: opts.marketState,
           signalPayload: sigPre?.p || sig?.p,
           strategyType,
-          entrySignalType: isSurgeSourceLocal ? "reclaim" : undefined,
+          entrySignalType: isActualPromotedReclaimForBuy ? "reclaim" : undefined,
           entryPath: isSurgeSource ? "surge_normal" : "normal",
           isAdditionalBuy: false,
           currentPrice: Number(priceBy.get(market) ?? 0),
-          reclaimScore: isSurgeSourceLocal ? ((sig?.p as any)?.surge_capture_score ?? (sig?.p as any)?.reclaim_score ?? (sig?.p as any)?.scanner_score ?? (sig?.p as any)?.signal_score) : undefined,
+          reclaimScore: isActualPromotedReclaimForBuy ? ((sig?.p as any)?.surge_capture_score ?? (sig?.p as any)?.reclaim_score) : undefined,
           candidateMeta: candidateMetaFromSetup,
         });
         if (!guard.allowed) {
@@ -14668,8 +14704,8 @@ export function createLiveDataStrategy(opts: {
         }
 
         const rsiValForLog = opts.marketState.status()?.btc_rsi ?? null;
-        const rScoreForLog = isSurgeSourceLocal ? ((sig?.p as any)?.surge_capture_score ?? (sig?.p as any)?.reclaim_score ?? (sig?.p as any)?.scanner_score ?? (sig?.p as any)?.signal_score ?? 0) : 0;
-        if (isSurgeSourceLocal) {
+        const rScoreForLog = isActualPromotedReclaimForBuy ? ((sig?.p as any)?.surge_capture_score ?? (sig?.p as any)?.reclaim_score ?? 0) : 0;
+        if (isActualPromotedReclaimForBuy) {
           reclaim_final_buy_attempt_count++;
           console.info(
             JSON.stringify({
@@ -14683,7 +14719,7 @@ export function createLiveDataStrategy(opts: {
               score_threshold: marketState.market_state === "risk_on" ? 50 : 55,
               strategyType: "surge_reclaim",
               entrySignalType: "reclaim",
-              promoted_reclaim: isPromotedReclaim,
+              promoted_reclaim: isActualPromotedReclaimForBuy,
             })
           );
         }
