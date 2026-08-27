@@ -288,6 +288,7 @@ export function assertOrderBuyAllowed(
     reclaimScore?: number;
     volumeAccel?: number;
     aboveEma20?: boolean;
+    candidateMeta?: any;
   },
 ): OrderBuyGateResult {
   const { market_state, entry_policy } = snap;
@@ -320,9 +321,23 @@ export function assertOrderBuyAllowed(
     strategyType === "surge_reclaim" ||
     entrySignalType === "reclaim";
 
+  // genuine setup PASS evidence: 오직 production의 canonical engine_bucket === "surge" && setup.ok === true 만 인정
+  const isSurgeSetupPassed = Boolean(
+    isAggressiveSurgeStrategy &&
+    !isReclaimStrategy &&
+    args.candidateMeta?.engine_bucket === "surge" &&
+    args.candidateMeta?.setup?.ok === true
+  );
+
   if (args.kind === "new_entry") {
     if (market_state === "risk_off") {
-      return deny("risk_off: 신규 진입 금지", true, false);
+      // [SURGE MARKET-STATE EXECUTION ALIGNMENT]
+      // genuine setup.ok를 통과한 일반 Surge momentum에 한해 risk_off 일괄 차단을 해제하고,
+      // 뒤쪽의 기존 BTC RSI 50 및 Entry Score 품질 검증을 거치도록 통과시킴.
+      // 저품질 Surge, Reclaim, Core/Stable, 일반 전략은 기존대로 즉시 차단.
+      if (!isSurgeSetupPassed) {
+        return deny("risk_off: 신규 진입 금지", true, false);
+      }
     }
 
     if (isReclaimStrategy) {
@@ -381,17 +396,20 @@ export function assertOrderBuyAllowed(
     } else {
       // 일반 Aggressive Surge 정책
       if (isAggressiveSurgeStrategy) {
-        if (market_state === "neutral") {
+        if (market_state === "neutral" && !isSurgeSetupPassed) {
+          // genuine setup_ok를 통과하지 못한 Surge는 neutral에서 진입 차단
           return deny("neutral_market_surge_blocked: 중립 장세에서는 surge 진입 차단", true, false);
         }
+        // [불변] BTC RSI < 50 기존 기준 100% 유지
         if (snap.btc_rsi !== undefined && snap.btc_rsi < 50) {
           return deny(`btc_rsi_low_surge_blocked: BTC RSI가 50 미만이라 진입 차단 (${snap.btc_rsi.toFixed(1)})`, true, false);
         }
       }
 
-      const g = runEntryScoreGate(market_state, snap.min_entry_score, snap.market_bonus, args.signalPayload);
-      if (!g.ok) {
-        return deny(g.reason, true, false);
+      // [품질 판정] Entry Score 품질 검증: 기존 min_entry_score 및 market_bonus 기준 100% 적용
+      const score = signalStrengthScore(args.signalPayload) + snap.market_bonus;
+      if (score < snap.min_entry_score) {
+        return deny(`entry score ${score} < ${snap.min_entry_score}`, true, false);
       }
     }
 
