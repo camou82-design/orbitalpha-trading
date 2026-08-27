@@ -1364,44 +1364,138 @@ function checkConsecutiveLossCooldown(
   return { blocked: false, remainingMs: 0, lossCount: consecutiveLosses };
 }
 
-function evaluateGlobalKillSwitch(
-  trades: Array<{ market: string; pnl_pct?: number | null; timestamp?: string; action?: string; note?: string }>
-): { active: boolean; reason: string | null } {
+export function evaluateGlobalKillSwitch(
+  trades: Array<{ market: string; pnl_pct?: number | null; timestamp?: string; action?: string; note?: string }>,
+  nowMs = Date.now(),
+): { active: boolean; reason: string | null; meta?: Record<string, unknown> } {
   const completed = trades.filter((t) => t.action === "sell" && ((t as any).filled_qty > 0 || (t as any).order_krw > 0));
   if (completed.length === 0) return { active: false, reason: null };
-  const recent10 = completed.slice(-10);
-  if (recent10.length >= 5) {
-    const wins = recent10.filter((t) => (t.pnl_pct ?? 0) > 0).length;
-    const winRate = wins / recent10.length;
-    if (winRate < 0.20) {
-      return { active: true, reason: `Win rate under 20% in recent ${recent10.length} trades (${(winRate * 100).toFixed(1)}%)` };
+
+  const MAX_CLOCK_SKEW_MS = 60_000; // 1분 이내의 미세 clock skew 허용
+  const maxValidFutureMs = nowMs + MAX_CLOCK_SKEW_MS;
+
+  let validTimestampCount = 0;
+  let invalidTimestampCount = 0;
+
+  const validCompleted: Array<{
+    market: string;
+    pnl_pct: number;
+    tradeTimeMs: number;
+    note?: string;
+  }> = [];
+
+  for (const t of completed) {
+    const raw = t.timestamp;
+    if (!raw || typeof raw !== "string" || raw.trim() === "") {
+      invalidTimestampCount++;
+      continue;
     }
-  }
-  if (recent10.length >= 3) {
-    const totalPnlPct = recent10.reduce((acc, t) => acc + (t.pnl_pct ?? 0), 0);
-    if (totalPnlPct <= -5.0) {
-      return { active: true, reason: `Cumulative PnL under -5% in recent ${recent10.length} trades (${totalPnlPct.toFixed(2)}%)` };
+    const parsed = Date.parse(raw);
+    if (!Number.isFinite(parsed) || parsed <= 0 || parsed > maxValidFutureMs) {
+      invalidTimestampCount++;
+      continue;
     }
+    validTimestampCount++;
+    validCompleted.push({
+      market: t.market,
+      pnl_pct: Number(t.pnl_pct ?? 0),
+      tradeTimeMs: parsed,
+      note: t.note,
+    });
   }
-  const oneDayAgo = Date.now() - 24 * 3600 * 1000;
-  const recent24h = completed.filter((t) => {
-    return Date.parse(t.timestamp || new Date().toISOString()) >= oneDayAgo;
-  });
-  const losses24h = recent24h.filter((t) => (t.pnl_pct ?? 0) < 0).length;
-  if (losses24h >= 5) {
-    return { active: true, reason: `5 or more loss trades in the last 24 hours (${losses24h} losses)` };
+
+  const RECENT_WINDOW_HOURS = 48;
+  const recentWindowMs = RECENT_WINDOW_HOURS * 3600 * 1000;
+  const windowStartMs = nowMs - recentWindowMs;
+  const oneDayAgoMs = nowMs - 24 * 3600 * 1000;
+
+  // windowStartMs <= tradeTimeMs <= maxValidFutureMs (최근 48시간 유효 표본)
+  const recentWindowTrades = validCompleted.filter(
+    (t) => t.tradeTimeMs >= windowStartMs && t.tradeTimeMs <= maxValidFutureMs,
+  );
+
+  // oneDayAgoMs <= tradeTimeMs <= maxValidFutureMs (최근 24시간 유효 표본)
+  const recent24hTrades = validCompleted.filter(
+    (t) => t.tradeTimeMs >= oneDayAgoMs && t.tradeTimeMs <= maxValidFutureMs,
+  );
+
+  // 가장 최신 완료 거래의 경과 시간 (hours)
+  const latestTradeTimeMs = validCompleted.reduce((max, t) => Math.max(max, t.tradeTimeMs), 0);
+  const latestTradeAgeHours = latestTradeTimeMs > 0 ? (nowMs - latestTradeTimeMs) / (3600 * 1000) : null;
+
+  const totalPnlPct = recentWindowTrades.reduce((acc, t) => acc + t.pnl_pct, 0);
+  const wins = recentWindowTrades.filter((t) => t.pnl_pct > 0).length;
+  const winRate = recentWindowTrades.length > 0 ? wins / recentWindowTrades.length : null;
+  const losses24h = recent24hTrades.filter((t) => t.pnl_pct < 0).length;
+
+  let active = false;
+  let reason: string | null = null;
+
+  // 1. 승률 가드: 최근 48시간 내 5건 이상 거래가 있고 승률 < 20%일 때 발동
+  if (recentWindowTrades.length >= 5 && winRate !== null && winRate < 0.20) {
+    active = true;
+    reason = `Win rate under 20% in recent 48h (${recentWindowTrades.length} trades, ${(winRate * 100).toFixed(1)}%)`;
   }
-  if (recent10.length >= 5) {
-    const surgeStopLosses = recent10.filter((t) => {
+  // 2. 누적 심각한 손실 가드: 최근 48시간 내 3건 이상 거래가 있고 누적 PnL <= -5.0%일 때 발동
+  else if (recentWindowTrades.length >= 3 && totalPnlPct <= -5.0) {
+    active = true;
+    reason = `Cumulative PnL under -5% in recent 48h (${recentWindowTrades.length} trades, ${totalPnlPct.toFixed(2)}%)`;
+  }
+  // 3. 24시간 손실 횟수 가드: 최근 24시간 내 손실 5건 이상 시 발동
+  else if (losses24h >= 5) {
+    active = true;
+    reason = `5 or more loss trades in the last 24 hours (${losses24h} losses)`;
+  }
+  // 4. surge_stop_loss 집중 가드: 최근 48시간 내 5건 이상 거래 중 surge_stop_loss 비율 >= 50% & 누적 PnL 음수
+  else if (recentWindowTrades.length >= 5) {
+    const surgeStopLosses = recentWindowTrades.filter((t) => {
       const note = (t.note || "").toLowerCase();
       return note.includes("surge_stop_loss");
     }).length;
-    const totalPnl = recent10.reduce((acc, t) => acc + (t.pnl_pct ?? 0), 0);
-    if (surgeStopLosses / recent10.length >= 0.5 && totalPnl < 0) {
-      return { active: true, reason: `surge_stop_loss ratio >= 50% (${(surgeStopLosses / recent10.length * 100).toFixed(1)}%) and negative cumulative PnL (${totalPnl.toFixed(2)}%)` };
+    if (surgeStopLosses / recentWindowTrades.length >= 0.5 && totalPnlPct < 0) {
+      active = true;
+      reason = `surge_stop_loss ratio >= 50% in recent 48h (${((surgeStopLosses / recentWindowTrades.length) * 100).toFixed(1)}%) and negative cumulative PnL (${totalPnlPct.toFixed(2)}%)`;
     }
   }
-  return { active: false, reason: null };
+
+  // 관측성 증거 로그
+  console.info(
+    JSON.stringify({
+      tag: "GLOBAL_KILL_SWITCH_EVAL_PROOF",
+      ts: new Date(nowMs).toISOString(),
+      total_completed: completed.length,
+      valid_timestamp_count: validTimestampCount,
+      invalid_timestamp_count: invalidTimestampCount,
+      recent_window_hours: RECENT_WINDOW_HOURS,
+      recent_window_count: recentWindowTrades.length,
+      recent_24h_count: recent24hTrades.length,
+      wins,
+      win_rate: winRate !== null ? Number(winRate.toFixed(4)) : null,
+      total_pnl_pct: Number(totalPnlPct.toFixed(4)),
+      losses_24h: losses24h,
+      latest_trade_age_hours: latestTradeAgeHours !== null ? Number(latestTradeAgeHours.toFixed(2)) : null,
+      active,
+      reason,
+    }),
+  );
+
+  return {
+    active,
+    reason,
+    meta: {
+      total_completed: completed.length,
+      valid_timestamp_count: validTimestampCount,
+      invalid_timestamp_count: invalidTimestampCount,
+      recent_window_hours: RECENT_WINDOW_HOURS,
+      recent_window_count: recentWindowTrades.length,
+      recent_24h_count: recent24hTrades.length,
+      wins,
+      win_rate: winRate,
+      total_pnl_pct: totalPnlPct,
+      losses_24h: losses24h,
+      latest_trade_age_hours: latestTradeAgeHours,
+    },
+  };
 }
 const precheckCandleCache = new Map<string, { ts: number; candles: any[] }>();
 const precheckInFlight = new Map<string, Promise<any[]>>();

@@ -360,44 +360,104 @@ function checkConsecutiveLossCooldown(
   return { blocked: false, remainingMs: 0, lossCount: consecutiveLosses };
 }
 
-function evaluateGlobalKillSwitch(
-  history: Array<{ market: string; pnl_pct?: number | null; ts?: string; state?: string; note?: string }>
-): { active: boolean; reason: string | null } {
+export function evaluateGlobalKillSwitch(
+  history: Array<{ market: string; pnl_pct?: number | null; ts?: string; state?: string; note?: string }>,
+  nowMs = Date.now(),
+): { active: boolean; reason: string | null; meta?: Record<string, unknown> } {
   const completed = history.filter((t) => t.state === "CLOSED_LOSS" || t.state === "CLOSED_WIN" || t.state === "CLOSED_TIMEOUT" || t.pnl_pct !== undefined);
   if (completed.length === 0) return { active: false, reason: null };
-  const recent10 = completed.slice(-10);
-  if (recent10.length >= 5) {
-    const wins = recent10.filter((t) => (t.pnl_pct ?? 0) > 0).length;
-    const winRate = wins / recent10.length;
-    if (winRate < 0.20) {
-      return { active: true, reason: `Win rate under 20% in recent ${recent10.length} trades (${(winRate*100).toFixed(1)}%)` };
+
+  const MAX_CLOCK_SKEW_MS = 60_000;
+  const maxValidFutureMs = nowMs + MAX_CLOCK_SKEW_MS;
+
+  let validTimestampCount = 0;
+  let invalidTimestampCount = 0;
+
+  const validCompleted: Array<{
+    market: string;
+    pnl_pct: number;
+    tradeTimeMs: number;
+    state?: string;
+    note?: string;
+  }> = [];
+
+  for (const t of completed) {
+    const raw = t.ts;
+    if (!raw || typeof raw !== "string" || raw.trim() === "") {
+      invalidTimestampCount++;
+      continue;
     }
-  }
-  if (recent10.length >= 3) {
-    const totalPnlPct = recent10.reduce((acc, t) => acc + (t.pnl_pct ?? 0), 0);
-    if (totalPnlPct <= -5.0) {
-      return { active: true, reason: `Cumulative PnL under -5% in recent ${recent10.length} trades (${totalPnlPct.toFixed(2)}%)` };
+    const parsed = Date.parse(raw);
+    if (!Number.isFinite(parsed) || parsed <= 0 || parsed > maxValidFutureMs) {
+      invalidTimestampCount++;
+      continue;
     }
+    validTimestampCount++;
+    validCompleted.push({
+      market: t.market,
+      pnl_pct: Number(t.pnl_pct ?? 0),
+      tradeTimeMs: parsed,
+      state: t.state,
+      note: t.note,
+    });
   }
-  const oneDayAgo = Date.now() - 24 * 3600 * 1000;
-  const recent24h = completed.filter((t) => {
-    return Date.parse(t.ts || new Date().toISOString()) >= oneDayAgo;
-  });
-  const losses24h = recent24h.filter((t) => (t.pnl_pct ?? 0) < 0 || t.state === "CLOSED_LOSS").length;
-  if (losses24h >= 5) {
-    return { active: true, reason: `5 or more loss trades in the last 24 hours (${losses24h} losses)` };
-  }
-  if (recent10.length >= 5) {
-    const surgeStopLosses = recent10.filter((t) => {
+
+  const RECENT_WINDOW_HOURS = 48;
+  const recentWindowMs = RECENT_WINDOW_HOURS * 3600 * 1000;
+  const windowStartMs = nowMs - recentWindowMs;
+  const oneDayAgoMs = nowMs - 24 * 3600 * 1000;
+
+  const recentWindowTrades = validCompleted.filter(
+    (t) => t.tradeTimeMs >= windowStartMs && t.tradeTimeMs <= maxValidFutureMs,
+  );
+  const recent24hTrades = validCompleted.filter(
+    (t) => t.tradeTimeMs >= oneDayAgoMs && t.tradeTimeMs <= maxValidFutureMs,
+  );
+
+  const totalPnlPct = recentWindowTrades.reduce((acc, t) => acc + t.pnl_pct, 0);
+  const wins = recentWindowTrades.filter((t) => t.pnl_pct > 0 || t.state === "CLOSED_WIN").length;
+  const winRate = recentWindowTrades.length > 0 ? wins / recentWindowTrades.length : null;
+  const losses24h = recent24hTrades.filter((t) => t.pnl_pct < 0 || t.state === "CLOSED_LOSS").length;
+
+  let active = false;
+  let reason: string | null = null;
+
+  if (recentWindowTrades.length >= 5 && winRate !== null && winRate < 0.20) {
+    active = true;
+    reason = `Win rate under 20% in recent 48h (${recentWindowTrades.length} trades, ${(winRate * 100).toFixed(1)}%)`;
+  } else if (recentWindowTrades.length >= 3 && totalPnlPct <= -5.0) {
+    active = true;
+    reason = `Cumulative PnL under -5% in recent 48h (${recentWindowTrades.length} trades, ${totalPnlPct.toFixed(2)}%)`;
+  } else if (losses24h >= 5) {
+    active = true;
+    reason = `5 or more loss trades in the last 24 hours (${losses24h} losses)`;
+  } else if (recentWindowTrades.length >= 5) {
+    const surgeStopLosses = recentWindowTrades.filter((t) => {
       const note = (t.note || "").toLowerCase();
       return note.includes("surge_stop_loss");
     }).length;
-    const totalPnl = recent10.reduce((acc, t) => acc + (t.pnl_pct ?? 0), 0);
-    if (surgeStopLosses / recent10.length >= 0.5 && totalPnl < 0) {
-      return { active: true, reason: `surge_stop_loss ratio >= 50% (${(surgeStopLosses/recent10.length*100).toFixed(1)}%) and negative cumulative PnL (${totalPnl.toFixed(2)}%)` };
+    if (surgeStopLosses / recentWindowTrades.length >= 0.5 && totalPnlPct < 0) {
+      active = true;
+      reason = `surge_stop_loss ratio >= 50% in recent 48h (${((surgeStopLosses / recentWindowTrades.length) * 100).toFixed(1)}%) and negative cumulative PnL (${totalPnlPct.toFixed(2)}%)`;
     }
   }
-  return { active: false, reason: null };
+
+  return {
+    active,
+    reason,
+    meta: {
+      total_completed: completed.length,
+      valid_timestamp_count: validTimestampCount,
+      invalid_timestamp_count: invalidTimestampCount,
+      recent_window_hours: RECENT_WINDOW_HOURS,
+      recent_window_count: recentWindowTrades.length,
+      recent_24h_count: recent24hTrades.length,
+      wins,
+      win_rate: winRate,
+      total_pnl_pct: totalPnlPct,
+      losses_24h: losses24h,
+    },
+  };
 }
 
 function toNum(v: unknown, d = 0): number {
