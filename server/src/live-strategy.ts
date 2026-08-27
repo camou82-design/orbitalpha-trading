@@ -3028,6 +3028,42 @@ function evaluateCoreTrendEntrySetup(
   };
 }
 
+export function isScannerEarlyContractApproved(payload: any, isFresh: boolean = true): {
+  approved: boolean;
+  reason: string;
+} {
+  if (!payload) return { approved: false, reason: "payload_missing" };
+  if (!isFresh) return { approved: false, reason: "not_fresh" };
+
+  const sourceKind = String(payload.source_kind ?? "");
+  const isScannerSource =
+    sourceKind === "scanner_tradable_candidate" ||
+    sourceKind === "scanner_filter_fresh" ||
+    sourceKind === "scanner_then_filter_pass" ||
+    payload.scanner_tradable_candidate === true;
+
+  if (!isScannerSource) return { approved: false, reason: "not_scanner_source" };
+  if (payload.filter_pass !== true) return { approved: false, reason: "filter_pass_false" };
+  if (sourceKind === "scanner_bridge_score_fail" || payload.filter_fail_reason === "scanner_bridge_score_fail") {
+    return { approved: false, reason: "bridge_score_fail" };
+  }
+
+  const volRatio = Number(payload.volume_ratio ?? payload.volume_multiple ?? 0);
+  const rise3m = Number(payload.rise_3m_pct ?? payload.momentum_3m_pct ?? payload.price_change_3m_pct ?? 0);
+
+  const volApproved = volRatio >= 1.2;
+  const momentumApproved = rise3m >= 0.25;
+
+  if (!volApproved || !momentumApproved) {
+    return {
+      approved: false,
+      reason: !volApproved ? `scanner_vol_below_1.2:${volRatio}` : `scanner_rise_below_0.25:${rise3m}`,
+    };
+  }
+
+  return { approved: true, reason: "scanner_early_contract_approved" };
+}
+
 /**
  * [SURGE SETUP EVALUATOR] - Shadow/Evaluation only.
  * 급등주 전용 평가기. 눌림목/정배열 기반인 Original Spot Setup과 달리 
@@ -3048,14 +3084,25 @@ function evaluateSurgeEntrySetup(
   const closes = completed.map(c => Number(c.trade_price));
   const highs = completed.map(c => Number(c.high_price));
   const lows = completed.map(c => Number(c.low_price));
+
+  // [SURGE ENTRY CONTRACT SEPARATION]
+  // Case 1: Scanner Early Contract 승인 후보 (1.2배 / 0.25% scanner contract 존중)
+  // Case 2: 독립 일반 Surge 평가 (1.4배 / 0.7% independent setup 유지)
+  const isFresh = payload?.is_fresh_signal !== false && payload?.age_seconds !== null && (payload?.age_seconds ?? 0) <= 240;
+  const earlyContract = isScannerEarlyContractApproved(payload, isFresh);
+
+  const setupVolRequired = earlyContract.approved ? 1.2 : 1.4;
+  const setupMomentumRequired = earlyContract.approved ? 0.25 : 0.7;
+  const volAuthority = earlyContract.approved ? "scanner_early_contract" : "independent_surge_setup";
+  const momentumAuthority = earlyContract.approved ? "scanner_early_contract" : "independent_surge_setup";
   
   // 1. Volume Expansion (payload's volume_ratio)
-  const volRatio = Number(payload.volume_ratio ?? 0);
-  const volOk = volRatio >= 1.4;
+  const volRatio = Number(payload.volume_ratio ?? payload.volume_multiple ?? 0);
+  const volOk = volRatio >= setupVolRequired;
 
   // 2. Short-term Momentum (rise in last 3m)
   const momentum = Number(payload.rise_3m_pct ?? payload.momentum_3m_pct ?? payload.price_change_3m_pct ?? 0);
-  const momentumOk = momentum >= 0.7;
+  const momentumOk = momentum >= setupMomentumRequired;
 
   // 3. Price above short EMA (EMA 20) or recent high reclaim
   const e20 = emaLast(closes, 20);
@@ -3111,6 +3158,31 @@ function evaluateSurgeEntrySetup(
       probeAllowed = true;
     }
   }
+
+  // [SURGE ENTRY CONTRACT PROOF LOGGING]
+  console.info(
+    JSON.stringify({
+      tag: "SURGE_ENTRY_CONTRACT_PROOF",
+      ts: new Date().toISOString(),
+      market,
+      source_kind: payload?.source_kind ?? "none",
+      scanner_authority: earlyContract.approved,
+      scanner_filter_pass: Boolean(payload?.filter_pass),
+      scanner_bridge_pass: payload?.filter_pass === true && payload?.source_kind !== "scanner_bridge_score_fail",
+      volume_multiple: volRatio,
+      rise_3m_pct: momentum,
+      setup_volume_required: setupVolRequired,
+      setup_momentum_required: setupMomentumRequired,
+      volume_authority: volAuthority,
+      momentum_authority: momentumAuthority,
+      price_structure_ok: priceAboveEma20 || highReclaim,
+      wick_ok: wickOk,
+      rr_ok: rrOk,
+      setup_ok: pass || probeAllowed,
+      failed_conditions: failed,
+      final_reason: pass ? "setup_conditions_met" : (probeAllowed ? "surge_probe_downgrade_allowed" : (failed.join(",") || "setup_conditions_not_met")),
+    }),
+  );
 
   // Indicators for logging
   const ema50 = emaLast(closes, 50) ?? 0;
@@ -4795,11 +4867,32 @@ export function createLiveDataStrategy(opts: {
         const capturedAt = typeof raw?.captured_at === "string" ? raw.captured_at : null;
         const updatedAt = typeof raw?.updated_at === "string" ? raw.updated_at : null;
         const signalTs = typeof raw?.signal_ts === "string" ? raw.signal_ts : null;
-        // [SURGE-REPAIR] 개별 row timestamp가 없거나 stale이면 feed 전체 최신 ts를 fallback으로 사용.
+
+        // [FRESHNESS-DEFECT-FIX] 개별 row 자체의 고유 timestamp만 엄격히 사용 (feed 전체 timestamp로 세탁 금지)
         const rawSourceTs = scannerSignalTimestamp(raw);
-        const feedFallbackTs = scannerFeedNewestTs;
-        const sourceTs = resolveFreshestIsoTs([rawSourceTs, feedFallbackTs]);
+        const sourceTs = rawSourceTs; // Do NOT mix with feedFallbackTs
         const ageSeconds = sourceTs ? Math.max(0, Math.floor((Date.now() - Date.parse(sourceTs)) / 1000)) : null;
+        const isStale = ageSeconds === null || ageSeconds > LIVE_ENTRY_SIGNAL_STALE_SECONDS;
+        const isMissingTimestamp = sourceTs === null;
+        const timestampSource = updatedAt ? "updated_at" : (signalTs ? "signal_ts" : (capturedAt ? "captured_at" : (rawSourceTs ? "signal_key" : "none")));
+        const rejuvenationPrevented = Boolean(scannerFeedNewestTs && rawSourceTs && Date.parse(scannerFeedNewestTs) > Date.parse(rawSourceTs));
+
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_SCANNER_FRESHNESS_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            raw_source_ts: rawSourceTs,
+            resolved_source_ts: sourceTs,
+            feed_newest_ts: scannerFeedNewestTs,
+            timestamp_source: timestampSource,
+            age_seconds: ageSeconds,
+            stale: isStale,
+            missing_timestamp: isMissingTimestamp,
+            rejuvenation_prevented: rejuvenationPrevented,
+          }),
+        );
+
         return {
           market,
           score: Number(raw?.score ?? 0),
