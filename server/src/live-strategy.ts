@@ -9545,9 +9545,24 @@ export function createLiveDataStrategy(opts: {
       });
     };
 
-    const surgeOpenCount =
-      Object.values(state.positions).filter((p) => p.engine_bucket === "surge").length +
-      Object.values(state.early_positions).filter((p) => p.engine_bucket === "surge").length;
+    const acceptedSurgeMarketsThisTick = new Set<string>();
+    const getEffectiveSurgeOpenCount = (): number => {
+      const canonicalCount =
+        Object.values(state.positions).filter((p) => p.engine_bucket === "surge").length +
+        Object.values(state.early_positions).filter((p) => p.engine_bucket === "surge").length;
+      let pendingAcceptedNotInStateCount = 0;
+      for (const mk of acceptedSurgeMarketsThisTick) {
+        const inPos = state.positions[mk]?.engine_bucket === "surge";
+        const inEarly = state.early_positions[mk]?.engine_bucket === "surge";
+        if (!inPos && !inEarly) {
+          pendingAcceptedNotInStateCount++;
+        }
+      }
+      return canonicalCount + pendingAcceptedNotInStateCount;
+    };
+    const surgeOpenCount = getEffectiveSurgeOpenCount();
+    let sameTickAcceptedSurgeKrw = 0;
+    const tickStartRemainingSurgeCapKrw = Math.max(0, surgeCapAmount - Math.max(0, surgeUsedCapitalKrw));
     const paperStatsMap = await racePhase("paper_surge_pattern_stats_load", PHASE_MS.paper_stats, () =>
       loadPaperSurgePatternStats(opts.companyId, opts.serviceId),
     );
@@ -10657,16 +10672,58 @@ export function createLiveDataStrategy(opts: {
         const remainingInTick = isCoreMarket ? coreRemainingInTick : surgeRemainingInTick;
         const bucketName = isCoreMarket ? "core" : "surge";
 
-        const bucketMinOrderRatio = isCoreMarket ? 0.05 : SURGE_MIN_ORDER_RATIO;
-        const bucketNormalOrderRatio = isCoreMarket ? 0.15 : SURGE_NORMAL_ORDER_RATIO;
-        const bucketHighConfOrderRatio = isCoreMarket ? 0.25 : SURGE_HIGH_CONFIDENCE_ORDER_RATIO;
+        let bucketMinOrderKrw = 0;
+        let bucketNormalOrderKrw = 0;
+        let bucketHighConfidenceOrderKrw = 0;
+
+        if (isCoreMarket) {
+          const bucketMinOrderRatio = 0.05;
+          const bucketNormalOrderRatio = 0.15;
+          const bucketHighConfOrderRatio = 0.25;
+          bucketMinOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(capLimit * bucketMinOrderRatio));
+          bucketNormalOrderKrw = Math.floor(capLimit * bucketNormalOrderRatio);
+          bucketHighConfidenceOrderKrw = Math.floor(capLimit * bucketHighConfOrderRatio);
+        } else {
+          // [SURGE SLOT-AWARE SIZING]
+          // canonical getEffectiveSurgeOpenCount 및 sameTickAcceptedSurgeKrw 반영 기준 동적 배분
+          const currentSurgeInvestedKrw = Math.max(0, surgeUsedCapitalKrw) + sameTickAcceptedSurgeKrw;
+          const remainingSurgeCapital = Math.max(0, surgeCapAmount - currentSurgeInvestedKrw);
+          const openSurgePositionsCount = getEffectiveSurgeOpenCount();
+          const remainingSurgeSlots = Math.max(0, SURGE_MAX_OPEN_POSITIONS - openSurgePositionsCount);
+
+          let slotBaseOrderKrw = 0;
+          if (remainingSurgeSlots > 0 && remainingSurgeCapital >= UPBIT_MIN_ORDER_KRW) {
+            slotBaseOrderKrw = Math.floor(remainingSurgeCapital / remainingSurgeSlots);
+          }
+
+          bucketNormalOrderKrw = slotBaseOrderKrw;
+          bucketMinOrderKrw = slotBaseOrderKrw > 0
+            ? Math.max(UPBIT_MIN_ORDER_KRW, Math.min(slotBaseOrderKrw, LIVE_MIN_ENTRY_KRW))
+            : 0;
+          bucketHighConfidenceOrderKrw = Math.min(capLimit, Math.floor(slotBaseOrderKrw * 1.15));
+
+          const currentMarketScale = marketState.market_state === "risk_on" ? 1 : marketState.market_state === "neutral" ? 0.72 : 0.45;
+
+          console.info(JSON.stringify({
+            tag: "SURGE_SLOT_AWARE_SIZING_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            surge_cap_krw: surgeCapAmount,
+            current_surge_invested_krw: currentSurgeInvestedKrw,
+            remaining_surge_capital_krw: remainingSurgeCapital,
+            open_surge_positions: openSurgePositionsCount,
+            remaining_slots: remainingSurgeSlots,
+            slot_base_order_krw: slotBaseOrderKrw,
+            pre_scale_slot_budget_krw: slotBaseOrderKrw,
+            remaining_cap_before_order_krw: remainingSurgeCapital,
+            market_state_scale: currentMarketScale,
+            hard_cap_applied: Math.min(LIVE_MAX_ENTRY_KRW, ORDER_LIMITS.MAX_STRATEGY_INVESTED_KRW_PER_MARKET),
+            available_krw: remainingInTick,
+          }));
+        }
 
         const baseBudgetKrw = perPositionBudgetBySymbol.get(market) ?? 0;
-        const bucketMinOrderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(capLimit * bucketMinOrderRatio));
-        const bucketNormalOrderKrw = Math.floor(capLimit * bucketNormalOrderRatio);
-        const bucketHighConfidenceOrderKrw = Math.floor(capLimit * bucketHighConfOrderRatio);
-
-        let finalOrderKrw = Math.floor(baseBudgetKrw * finalMultiplier);
+        let finalOrderKrw = Math.floor((isCoreMarket ? baseBudgetKrw : bucketNormalOrderKrw) * finalMultiplier);
         const highConfidenceSurgeSetup = paperConfidence === "high" && (stats?.win_rate ?? 0) >= 0.55;
         if (highConfidenceSurgeSetup) {
           finalOrderKrw = Math.max(finalOrderKrw, bucketHighConfidenceOrderKrw);
@@ -13125,7 +13182,11 @@ export function createLiveDataStrategy(opts: {
               );
               if (liveTradingOn) {
                 if (isCoreMarket) coreRemainingInTick = Math.max(0, coreRemainingInTick - earlyOrderKrw);
-                else surgeRemainingInTick = Math.max(0, surgeRemainingInTick - earlyOrderKrw);
+                else {
+                  surgeRemainingInTick = Math.max(0, surgeRemainingInTick - earlyOrderKrw);
+                  sameTickAcceptedSurgeKrw += earlyOrderKrw;
+                  acceptedSurgeMarketsThisTick.add(market);
+                }
               }
               bumpSkip("early_entry_filled");
               continue; // do not run normal entry in same tick for same symbol
@@ -14368,10 +14429,11 @@ export function createLiveDataStrategy(opts: {
           }),
         );
       }
-      if (surgeOpenCount >= SURGE_MAX_OPEN_POSITIONS && !stPos) {
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "surge_max_positions_reached", surgeOpenCount, SURGE_MAX_OPEN_POSITIONS });
+      const currentSurgeOpenCountAtGate = getEffectiveSurgeOpenCount();
+      if (isSurgeSource && currentSurgeOpenCountAtGate >= SURGE_MAX_OPEN_POSITIONS && !stPos) {
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "surge_max_positions_reached", surgeOpenCount: currentSurgeOpenCountAtGate, SURGE_MAX_OPEN_POSITIONS });
         bumpSkip("surge_max_positions_reached");
-        emitFinalBlocked("surge_max_positions_reached", { surge_open_positions: surgeOpenCount, surge_max_open_positions: SURGE_MAX_OPEN_POSITIONS });
+        emitFinalBlocked("surge_max_positions_reached", { surge_open_positions: currentSurgeOpenCountAtGate, surge_max_open_positions: SURGE_MAX_OPEN_POSITIONS });
         continue;
       }
       if (orderKrw < 5000) {
@@ -14693,6 +14755,23 @@ export function createLiveDataStrategy(opts: {
             } : {})
           })
         );
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_ORDER_PRE_EXECUTION_SIZING_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            final_order_krw: orderKrw,
+            market_state_scale: surgeMarketSizeMultiplier,
+            experience_multiplier: metaForGuard?.paper_pattern_multiplier ?? 1.0,
+            per_market_remaining_krw: remainingPerMarket,
+            tick_start_remaining_cap_krw: tickStartRemainingSurgeCapKrw,
+            same_tick_accepted_krw: sameTickAcceptedSurgeKrw,
+            remaining_in_tick_before_order: remainingInTick,
+            projected_remaining_in_tick_after_accept: Math.max(0, remainingInTick - orderKrw),
+            surge_cap_krw: capLimit,
+            projected_total_after_order: Math.floor(usedCap + sameTickAcceptedSurgeKrw + orderKrw),
+          })
+        );
       }
       let buyOutcomeClass: PlaceBuyResultClass = "precheck_blocked";
       let buyOutcomeReason = "unknown";
@@ -14980,6 +15059,30 @@ export function createLiveDataStrategy(opts: {
         emitFinalBlocked(buyOutcomeReason, { order_krw: orderKrw });
         continue;
       }
+
+      // [SAME-TICK CAPITAL RESERVATION]
+      // 실제 exchange_order_accepted 확정 직후 잔여 tick 자본 차감하여 다음 후보의 preorder gate에 즉시 반영
+      if (liveTradingOn) {
+        if (isCoreMarket) {
+          coreRemainingInTick = Math.max(0, coreRemainingInTick - orderKrw);
+        } else {
+          surgeRemainingInTick = Math.max(0, surgeRemainingInTick - orderKrw);
+          sameTickAcceptedSurgeKrw += orderKrw;
+          acceptedSurgeMarketsThisTick.add(market);
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_ORDER_ACCEPTED_CAPITAL_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              accepted_order_krw: orderKrw,
+              remaining_in_tick_after_accept: surgeRemainingInTick,
+              same_tick_accepted_krw: sameTickAcceptedSurgeKrw,
+              surge_open_positions_after_accept: getEffectiveSurgeOpenCount(),
+            })
+          );
+        }
+      }
+
       const price = priceBy.get(market) ?? 0;
 
       // [FIX] placeBuy 직후 캐시 강제 무효화 후 fresh status 조회 — 최대 3회 retry
