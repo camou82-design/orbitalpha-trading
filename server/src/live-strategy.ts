@@ -54,6 +54,17 @@ import {
   type SurgeEntryDecision,
 } from "./surge-v2/index.js";
 import { computeLiveCapitalPolicyV4 } from "./live-capital-policy-v4.js";
+import {
+  buildCoreRescueEvalProof,
+  computeAdverseProgress,
+  computeCoreRescueAddonSizing,
+  CORE_RESCUE_MAX_ADDON_COUNT,
+  CORE_RESCUE_MAX_ADVERSE_PROGRESS,
+  CORE_RESCUE_MIN_ADVERSE_PROGRESS,
+  evaluateCoreRescueHardRisk,
+  evaluateCoreRescueMicroReclaim,
+  isCoreRescueEngineBucket,
+} from "./core-rescue-addon.js";
 
 function num(x: unknown): number {
   return typeof x === "number" ? x : Number(x);
@@ -421,6 +432,13 @@ type StrategyPosition = {
   rescue_add_avg_after_est?: number;
   rescue_add_stop_rebased?: boolean;
   rescue_add_cooldown_until?: string | null;
+  /** Core-only Rescue Add-on (1×); Surge must not use these fields. */
+  coreRescueAddonUsed?: boolean;
+  coreRescueAddonCount?: number;
+  coreRescueInitialOrderKrw?: number;
+  coreRescuePreSoftOrderKrw?: number;
+  coreRescueOriginalStopPrice?: number;
+  coreRescueTriggeredAt?: string | null;
 };
 
 type EarlyEntryPosition = {
@@ -6817,6 +6835,372 @@ export function createLiveDataStrategy(opts: {
       };
     }
 
+    async function evaluateCoreRescueAddon(
+      p: StrategyPosition,
+      now: number,
+      pnlGross: number,
+      holdMin: number,
+      state: PersistedState,
+      marketState: Awaited<ReturnType<MarketStateApi["evaluate"]>>,
+      latestAllSignals: Map<string, any>,
+      market: string,
+      opts: any,
+    ): Promise<{ executed: boolean }> {
+      const nowIso = new Date().toISOString();
+      const logEval = (payload: Record<string, unknown>) => {
+        console.info(JSON.stringify(payload));
+      };
+
+      const block = (blockReason: string, extra?: Record<string, unknown>) => {
+        const originalStopPrice = p.coreRescueOriginalStopPrice ?? p.entry_stop_price ?? 0;
+        const initialOrderKrw = p.coreRescueInitialOrderKrw ?? p.filled_entry_krw ?? p.order_krw ?? 0;
+        const preSoftOrderKrw =
+          p.coreRescuePreSoftOrderKrw ??
+          Math.max(LIVE_MIN_ENTRY_KRW, Math.min(LIVE_MAX_ENTRY_KRW, p.target_budget_krw ?? LIVE_MAX_ENTRY_KRW));
+        const posSnap = tstatus.strategy_positions?.[market];
+        const currentExposureKrw = Math.max(0, Number(posSnap?.invested_krw_total ?? p.qty * p.entry_price));
+        logEval(
+          buildCoreRescueEvalProof({
+            market,
+            entryPrice: p.entry_price,
+            currentPrice: now,
+            originalStopPrice,
+            adverseProgress: computeAdverseProgress({
+              entryPrice: p.entry_price,
+              currentPrice: now,
+              originalStopPrice,
+            }),
+            hardRisk: { hardRiskActive: false, hardRiskReason: null },
+            reclaim: { reclaimConfirmed: false, reclaimAuthority: null },
+            sizing: {
+              addonCandidateKrw: 0,
+              projectedTotalExposureKrw: currentExposureKrw,
+              projectedLossAtStopKrw: 0,
+              preSoftPlannedLossAtStopKrw: 0,
+              addonAllowed: false,
+              blockReason,
+            },
+            initialOrderKrw,
+            currentExposureKrw,
+            preSoftOrderKrw,
+            addonAllowed: false,
+            blockReason,
+            ...(extra ?? {}),
+          }),
+        );
+        return { executed: false };
+      };
+
+      if (!isCoreRescueEngineBucket(p.engine_bucket)) {
+        return { executed: false };
+      }
+      if (p.engine_bucket === "surge" || (p as any).entry_mode === "SURGE_V2") {
+        return { executed: false };
+      }
+
+      const entryOriginStr = (p as any).entry_origin as string | undefined;
+      if (
+        entryOriginStr === "auto_trade_recovered" ||
+        entryOriginStr === "auto_trade_recovered_all_holdings"
+      ) {
+        return block("recovered_position_dca_forbidden");
+      }
+
+      if (p.coreRescueAddonUsed === true || (p.coreRescueAddonCount ?? 0) >= CORE_RESCUE_MAX_ADDON_COUNT) {
+        return block("core_rescue_addon_already_used");
+      }
+
+      const { hour: kstHour, minute: kstMin } = getKstTime(new Date());
+      const kstMinutes = kstHour * 60 + kstMin;
+      if (kstMinutes >= 0 && kstMinutes < 510) {
+        return block("night_low_liquidity_window");
+      }
+
+      const originalStopPrice = p.coreRescueOriginalStopPrice ?? p.entry_stop_price ?? 0;
+      if (!(originalStopPrice > 0 && p.entry_price > originalStopPrice)) {
+        return block("original_stop_invalid");
+      }
+
+      if (now <= originalStopPrice) {
+        return block("hard_stop_breached");
+      }
+
+      const adverseProgress = computeAdverseProgress({
+        entryPrice: p.entry_price,
+        currentPrice: now,
+        originalStopPrice,
+      });
+      if (adverseProgress === null || adverseProgress < CORE_RESCUE_MIN_ADVERSE_PROGRESS) {
+        return block("not_in_rescue_zone_yet", { adverse_progress: adverseProgress });
+      }
+      if (adverseProgress >= CORE_RESCUE_MAX_ADVERSE_PROGRESS) {
+        return block("rescue_zone_too_deep", { adverse_progress: adverseProgress });
+      }
+
+      const sig = latestAllSignals.get(market);
+      const recent1mRet = sig?.p?.rise_1m_pct ?? sig?.p?.recent_1m_return_pct ?? null;
+      const recent3mRet = sig?.p?.rise_3m_pct ?? sig?.p?.momentum_3m_pct ?? sig?.p?.recent_3m_return_pct ?? null;
+      const volumeRatio = sig?.p?.volume_ratio ?? null;
+      const filters = Array.isArray(sig?.p?.filters)
+        ? (sig!.p!.filters as Array<{ id?: string; passed?: boolean }>)
+        : [];
+
+      const hardRisk = evaluateCoreRescueHardRisk({
+        currentPrice: now,
+        originalStopPrice,
+        pnlGrossPct: pnlGross,
+        marketState: marketState.market_state,
+        btcFilterState: (state.regime?.btc_filter_state as string | undefined) ?? null,
+        dailyRiskKillSwitchActive,
+        recent1mRet: recent1mRet !== null ? Number(recent1mRet) : null,
+        recent3mRet: recent3mRet !== null ? Number(recent3mRet) : null,
+        signalFilters: filters,
+        stopBreached: now <= originalStopPrice,
+      });
+      if (hardRisk.hardRiskActive) {
+        return block(hardRisk.hardRiskReason ?? "hard_risk_active", {
+          hard_risk_active: true,
+          hard_risk_reason: hardRisk.hardRiskReason,
+        });
+      }
+
+      const pullbackLowPrice =
+        p.min_pnl_pct !== undefined && p.min_pnl_pct < 0
+          ? p.entry_price * (1 + p.min_pnl_pct / 100)
+          : null;
+      const reclaim = evaluateCoreRescueMicroReclaim({
+        currentPrice: now,
+        entryPrice: p.entry_price,
+        originalStopPrice,
+        recent1mRet: recent1mRet !== null ? Number(recent1mRet) : null,
+        recent3mRet: recent3mRet !== null ? Number(recent3mRet) : null,
+        volumeRatio: volumeRatio !== null ? Number(volumeRatio) : null,
+        signalFilters: filters,
+        pullbackLowPrice,
+      });
+      if (!reclaim.reclaimConfirmed) {
+        return block("reclaim_not_confirmed", {
+          reclaim_confirmed: false,
+          reclaim_authority: null,
+        });
+      }
+
+      const initialOrderKrw = p.coreRescueInitialOrderKrw ?? p.filled_entry_krw ?? p.order_krw ?? 0;
+      const preSoftOrderKrw =
+        p.coreRescuePreSoftOrderKrw ??
+        Math.max(LIVE_MIN_ENTRY_KRW, Math.min(LIVE_MAX_ENTRY_KRW, p.target_budget_krw ?? LIVE_MAX_ENTRY_KRW));
+      const posSnap = tstatus.strategy_positions?.[market];
+      const currentExposureKrw = Math.max(0, Number(posSnap?.invested_krw_total ?? p.qty * p.entry_price));
+
+      const managedSurgeMarkets = new Set<string>();
+      for (const [mk, pos] of Object.entries(state.positions)) {
+        if (pos?.engine_bucket === "surge") managedSurgeMarkets.add(mk);
+      }
+      const capTick = computeLiveCapitalPolicyV4({
+        balances: Array.isArray(tstatus.balances) ? tstatus.balances : [],
+        markPriceOrAvgByMarket: (mk, avgFb) => {
+          const px = Number(priceBy.get(mk) ?? 0);
+          return px > 0 ? px : Number.isFinite(avgFb) && avgFb > 0 ? avgFb : 0;
+        },
+        accountPortfolioTotalEvaluatedKrw: (tstatus as any)?.account_portfolio?.total_evaluated_krw ?? null,
+        totalKrwFallback: (tstatus as any).total_krw ?? 0,
+        reservedKrw: Math.max(0, Number((tstatus as any).reserved_krw ?? 0)),
+        inFlightMarket: (tstatus as any).in_flight_buy_market ?? null,
+        inFlight:
+          Boolean((tstatus as any).in_flight) &&
+          typeof (tstatus as any).in_flight_buy_market === "string" &&
+          (tstatus as any).in_flight_buy_market.length > 0,
+        managedSurgeMarkets,
+      });
+      const availableKrw = Math.max(
+        0,
+        Number(tstatus.strategy_available_krw ?? tstatus.live_order_available_krw ?? tstatus.krw_available ?? 0),
+      );
+      const perMarketRemainingKrw = Math.max(
+        0,
+        ORDER_LIMITS.MAX_STRATEGY_INVESTED_KRW_PER_MARKET - currentExposureKrw,
+      );
+
+      const sizing = computeCoreRescueAddonSizing({
+        initialOrderKrw,
+        preSoftOrderKrw,
+        currentExposureKrw,
+        originalStopPrice,
+        entryPrice: p.entry_price,
+        currentPrice: now,
+        coreRemainingKrw: capTick.coreRemainingKrw,
+        availableKrw,
+        perMarketRemainingKrw,
+        addonAlreadyUsed: Boolean(p.coreRescueAddonUsed),
+      });
+
+      const addonAllowed = sizing.addonAllowed;
+      const blockReason = sizing.blockReason;
+      logEval(
+        buildCoreRescueEvalProof({
+          market,
+          entryPrice: p.entry_price,
+          currentPrice: now,
+          originalStopPrice,
+          adverseProgress,
+          hardRisk,
+          reclaim,
+          sizing,
+          initialOrderKrw,
+          currentExposureKrw,
+          preSoftOrderKrw,
+          addonAllowed,
+          blockReason,
+        }),
+      );
+
+      if (!addonAllowed || sizing.addonCandidateKrw < UPBIT_MIN_ORDER_KRW) {
+        return { executed: false };
+      }
+
+      try {
+        const guard = await validateLiveBuyPrecheck({
+          market,
+          trades: state.trades,
+          positions: state.positions,
+          cooldown_until: state.cooldown_until,
+          marketState: opts.marketState,
+          signalPayload: undefined,
+          strategyType: p.strategy_type || "stable",
+          entryPath: "rescue_add",
+          isAdditionalBuy: true,
+        });
+        if (!guard.allowed) {
+          return block(guard.blockReason ?? "precheck_blocked");
+        }
+
+        console.info(
+          JSON.stringify({
+            tag: "CORE_RESCUE_ADDON_PREORDER_PROOF",
+            ts: nowIso,
+            market,
+            addon_krw: sizing.addonCandidateKrw,
+            original_stop_price: originalStopPrice,
+            projected_total_exposure_krw: sizing.projectedTotalExposureKrw,
+            projected_loss_at_stop_krw: Math.floor(sizing.projectedLossAtStopKrw),
+            pre_soft_planned_loss_at_stop_krw: Math.floor(sizing.preSoftPlannedLossAtStopKrw),
+            reclaim_authority: reclaim.reclaimAuthority,
+            engine_bucket: p.engine_bucket,
+          }),
+        );
+
+        const buyRes = await opts.trade.placeBuy(
+          market,
+          true,
+          sizing.addonCandidateKrw,
+          p.strategy_type,
+          "strategy",
+          {
+            __rescue_add: true,
+            __core_rescue_addon: true,
+            __rescue_add_reason: "core_rescue_addon_micro_reclaim",
+            strict_exit: true,
+            exit_policy_attached: true,
+            entry_stop_price: originalStopPrice,
+            entry_target_price: p.entry_target_price,
+            entry_risk_reward: p.entry_risk_reward,
+            engine_bucket: "core",
+          },
+          "rescue_add",
+        );
+
+        const classified = classifyPlaceBuyResult(buyRes);
+        if (classified.resultClass === "exchange_order_failed" || classified.resultClass === "precheck_blocked" || classified.resultClass === "policy_blocked") {
+          console.info(
+            JSON.stringify({
+              tag: "CORE_RESCUE_ADDON_EVAL_PROOF",
+              ts: nowIso,
+              market,
+              addon_allowed: false,
+              block_reason: `place_buy_${classified.resultClass}`,
+              addon_candidate_krw: sizing.addonCandidateKrw,
+            }),
+          );
+          return { executed: false };
+        }
+
+        const postStatus = await raceTradeStatus("core_rescue_addon_post_buy");
+        const posInfo = postStatus?.strategy_positions?.[market];
+        const postExposure = Math.max(0, Number(posInfo?.invested_krw_total ?? 0));
+        const fillConfirmed =
+          classified.resultClass === "exchange_order_accepted" ||
+          (postExposure > currentExposureKrw + UPBIT_MIN_ORDER_KRW - 1);
+
+        if (!fillConfirmed) {
+          console.info(
+            JSON.stringify({
+              tag: "CORE_RESCUE_ADDON_EVAL_PROOF",
+              ts: nowIso,
+              market,
+              addon_allowed: false,
+              block_reason: "exchange_fill_not_confirmed",
+              addon_candidate_krw: sizing.addonCandidateKrw,
+              result_class: classified.resultClass,
+            }),
+          );
+          return { executed: false };
+        }
+
+        let newAvg = p.entry_price;
+        let newQty = p.qty;
+        if (posInfo && posInfo.qty > 0) {
+          newQty = posInfo.qty;
+          newAvg = (posInfo.invested_krw_total ?? 0) / posInfo.qty;
+        } else {
+          const addedQty = sizing.addonCandidateKrw / now;
+          newQty = p.qty + addedQty;
+          newAvg = (currentExposureKrw + sizing.addonCandidateKrw) / newQty;
+        }
+
+        p.entry_price = newAvg;
+        p.qty = newQty;
+        p.coreRescueAddonUsed = true;
+        p.coreRescueAddonCount = 1;
+        p.coreRescueTriggeredAt = nowIso;
+        p.coreRescueOriginalStopPrice = originalStopPrice;
+        p.entry_stop_price = originalStopPrice;
+        p.stop_loss_price = originalStopPrice;
+        p.rescue_add_cooldown_until = new Date(Date.now() + 60_000).toISOString();
+        p.max_pnl_pct = Math.max(p.max_pnl_pct, grossPnlPct(newAvg, now));
+
+        console.info(
+          JSON.stringify({
+            tag: "CORE_RESCUE_ADDON_ACCEPTED_PROOF",
+            ts: nowIso,
+            market,
+            addon_krw: sizing.addonCandidateKrw,
+            initial_order_krw: initialOrderKrw,
+            total_exposure_krw: currentExposureKrw + sizing.addonCandidateKrw,
+            avg_entry_price: newAvg,
+            original_stop_price: originalStopPrice,
+            stop_preserved: p.entry_stop_price === originalStopPrice,
+            engine_bucket: p.engine_bucket,
+            core_rescue_addon_used: true,
+            core_rescue_addon_count: 1,
+          }),
+        );
+
+        await persist();
+        return { executed: true };
+      } catch (e: unknown) {
+        console.info(
+          JSON.stringify({
+            tag: "CORE_RESCUE_ADDON_EVAL_PROOF",
+            ts: nowIso,
+            market,
+            addon_allowed: false,
+            block_reason: `place_buy_throw:${e instanceof Error ? e.message : String(e)}`,
+          }),
+        );
+        return { executed: false };
+      }
+    }
+
     async function evaluateRescueAdd(
       p: StrategyPosition,
       now: number,
@@ -7303,7 +7687,24 @@ export function createLiveDataStrategy(opts: {
       }));
 
       const holdMin = minutesSince(p.entry_ts);
-      // ── [RESCUE ADD] Pre-Stop Average Down Evaluation ──────────────────
+      // ── [CORE RESCUE ADD-ON] 1× micro-reclaim add (core bucket only) ──
+      if (p.engine_bucket === "core") {
+        const coreRescueResult = await evaluateCoreRescueAddon(
+          p,
+          now,
+          pnlGross,
+          holdMin,
+          state,
+          marketState,
+          latestAllSignals,
+          market,
+          opts,
+        );
+        if (coreRescueResult.executed) {
+          continue;
+        }
+      }
+      // ── [SURGE RESCUE ADD] Pre-Stop Average Down Evaluation ──────────────
       const rescueAddAllowed = await evaluateRescueAdd(p, now, pnlGross, holdMin, state, marketState, latestAllSignals, market, opts);
       if (rescueAddAllowed.executed) {
         continue;
@@ -15221,6 +15622,13 @@ export function createLiveDataStrategy(opts: {
         entry_profile_decision: profileInfo.decision,
         target_budget_krw: baseBudget,
         filled_entry_krw: orderKrw,
+        coreRescueInitialOrderKrw: !isSurgeSource ? orderKrw : undefined,
+        coreRescuePreSoftOrderKrw: !isSurgeSource
+          ? Math.max(LIVE_MIN_ENTRY_KRW, Math.min(LIVE_MAX_ENTRY_KRW, baseBudget))
+          : undefined,
+        coreRescueOriginalStopPrice: !isSurgeSource ? Number(marketMeta?.stopPrice ?? 0) : undefined,
+        coreRescueAddonUsed: !isSurgeSource ? false : undefined,
+        coreRescueAddonCount: !isSurgeSource ? 0 : undefined,
         original_setup_mode: marketMeta?.setupMode,
         original_setup_reason: marketMeta?.setupReason,
         entry_stop_price: marketMeta?.stopPrice,
