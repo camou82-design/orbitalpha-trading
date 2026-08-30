@@ -1278,6 +1278,12 @@ export function createTradeControl(
         ]),
       );
     const mpForCap = mark_prices && typeof mark_prices === "object" ? mark_prices : {};
+    const managedSurgeMarkets = new Set<string>();
+    for (const [mk, pos] of Object.entries(state.strategyPositions)) {
+      if (pos && !ALLOWED_MARKETS.has(mk)) {
+        managedSurgeMarkets.add(mk);
+      }
+    }
     const capitalV4 = computeLiveCapitalPolicyV4({
       balances: conn.balances ?? [],
       markPriceOrAvgByMarket: (mk, avgFb) => {
@@ -1289,6 +1295,7 @@ export function createTradeControl(
       reservedKrw: funds.reserved_krw,
       inFlightMarket: state.inFlightBuyMarket,
       inFlight: state.inFlight && state.inFlightBuyMarket != null,
+      managedSurgeMarkets,
     });
     let missing_count = 0;
     const missing_markets: string[] = [];
@@ -1443,6 +1450,7 @@ export function createTradeControl(
       surge_used_capital_krw: capitalV4.surgeUsedCapitalKrw,
       core_holdings_evaluation_krw: capitalV4.coreHoldingsEvaluationKrw,
       surge_holdings_evaluation_krw: capitalV4.surgeHoldingsEvaluationKrw,
+      passive_holdings_evaluation_krw: capitalV4.passiveHoldingsEvaluationKrw,
       core_pending_buy_reserved_krw: capitalV4.corePendingBuyReservedKrw,
       surge_pending_buy_reserved_krw: capitalV4.surgePendingBuyReservedKrw,
       core_remaining_krw: capitalV4.coreRemainingKrw,

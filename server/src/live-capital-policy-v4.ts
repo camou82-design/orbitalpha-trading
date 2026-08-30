@@ -27,10 +27,11 @@ export type LiveCapitalPolicyV4Result = {
   surgeCapAmount: number;
   /** CORE 6 보유 평가 + CORE 예약 매수금 (cap 적용 분자) */
   coreUsedCapitalKrw: number;
-  /** SURGE(및 그 외 코인) 보유 평가 + SURGE 예약 매수금 */
+  /** SURGE 실제 관리 보유 평가 + SURGE 예약 매수금 */
   surgeUsedCapitalKrw: number;
   coreHoldingsEvaluationKrw: number;
   surgeHoldingsEvaluationKrw: number;
+  passiveHoldingsEvaluationKrw: number;
   corePendingBuyReservedKrw: number;
   surgePendingBuyReservedKrw: number;
   coreRemainingKrw: number;
@@ -46,11 +47,17 @@ export function computeLiveCapitalPolicyV4(params: {
   reservedKrw: number | undefined | null;
   inFlightMarket: string | null | undefined;
   inFlight: boolean;
+  managedSurgeMarkets?: ReadonlySet<string> | readonly string[];
+  surgePendingReservedKrw?: number;
 }): LiveCapitalPolicyV4Result {
   const coreMarketSet = new Set<string>(LIVE_CORE_TRADE_MARKETS_POLICY as unknown as string[]);
+  const managedSurgeSet = params.managedSurgeMarkets
+    ? new Set<string>(params.managedSurgeMarkets)
+    : null;
 
   let coreHoldingsEval = 0;
   let surgeHoldingsEval = 0;
+  let passiveHoldingsEval = 0;
   let usdtValueKrw = 0;
 
   for (const b of params.balances) {
@@ -65,8 +72,10 @@ export function computeLiveCapitalPolicyV4(params: {
       usdtValueKrw += val;
     } else if (coreMarketSet.has(mk)) {
       coreHoldingsEval += val;
-    } else {
+    } else if (managedSurgeSet ? managedSurgeSet.has(mk) : false) {
       surgeHoldingsEval += val;
+    } else {
+      passiveHoldingsEval += val;
     }
   }
 
@@ -74,7 +83,10 @@ export function computeLiveCapitalPolicyV4(params: {
   const inflightMk = typeof params.inFlightMarket === "string" ? params.inFlightMarket.trim() : "";
   const coreInflightPending =
     Boolean(params.inFlight) && inflightMk.length > 0 && coreMarketSet.has(inflightMk) ? reservedRaw : 0;
-  const surgeInflightPending = Math.max(0, reservedRaw - coreInflightPending);
+  const surgeInflightPending =
+    Boolean(params.inFlight) && inflightMk.length > 0 && !coreMarketSet.has(inflightMk)
+      ? reservedRaw
+      : Math.max(0, Number(params.surgePendingReservedKrw ?? 0));
 
   const coreUsedCapitalKrwRaw = coreHoldingsEval + coreInflightPending;
   const surgeUsedCapitalKrwRaw = surgeHoldingsEval + surgeInflightPending;
@@ -82,7 +94,7 @@ export function computeLiveCapitalPolicyV4(params: {
   const portfolioEval = Number(params.accountPortfolioTotalEvaluatedKrw ?? NaN);
   const fallbackEquityKrw =
     Math.max(0, Number(params.totalKrwFallback ?? 0)) +
-    Math.max(0, coreHoldingsEval + surgeHoldingsEval - reservedRaw);
+    Math.max(0, coreHoldingsEval + surgeHoldingsEval + passiveHoldingsEval - reservedRaw);
   const totalAssetEquityKrw = Math.floor(
     Number.isFinite(portfolioEval) && portfolioEval > 0 ? portfolioEval : fallbackEquityKrw,
   );
@@ -92,7 +104,7 @@ export function computeLiveCapitalPolicyV4(params: {
   const spotTradingEquityKrw = Math.max(0, totalAssetEquityKrw - excludedUsdtValueKrw);
 
   const coreCapAmount = Math.floor(spotTradingEquityKrw * 0.5);
-  const surgeCapAmount = Math.floor(spotTradingEquityKrw * 0.5);
+  const surgeCapAmount = Math.floor(spotTradingEquityKrw * 0.30);
 
   const coreUsedCapitalAll = Math.floor(coreUsedCapitalKrwRaw);
   const surgeUsedCapitalAll = Math.floor(surgeUsedCapitalKrwRaw);
@@ -108,6 +120,7 @@ export function computeLiveCapitalPolicyV4(params: {
     surgeUsedCapitalKrw: surgeUsedCapitalAll,
     coreHoldingsEvaluationKrw: Math.floor(coreHoldingsEval),
     surgeHoldingsEvaluationKrw: Math.floor(surgeHoldingsEval),
+    passiveHoldingsEvaluationKrw: Math.floor(passiveHoldingsEval),
     corePendingBuyReservedKrw: Math.floor(coreInflightPending),
     surgePendingBuyReservedKrw: Math.floor(surgeInflightPending),
     coreRemainingKrw: Math.max(0, coreCapAmount - coreUsedCapitalAll),
