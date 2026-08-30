@@ -103,7 +103,7 @@ export function computeLiveCapitalPolicyV4(params: {
   const okxTransferReserveKrw = excludedUsdtValueKrw;
   const spotTradingEquityKrw = Math.max(0, totalAssetEquityKrw - excludedUsdtValueKrw);
 
-  const coreCapAmount = Math.floor(spotTradingEquityKrw * 0.5);
+  const coreCapAmount = Math.floor(spotTradingEquityKrw * 0.70);
   const surgeCapAmount = Math.floor(spotTradingEquityKrw * 0.30);
 
   const coreUsedCapitalAll = Math.floor(coreUsedCapitalKrwRaw);

@@ -291,9 +291,9 @@ console.log("\n--- Fixture K: market state scale applied exactly once (0.72 for 
 }
 
 // ----------------------------------------------------
-// Fixture L: Core sizing/capital 회귀 없음
+// Fixture L: Core sizing and 70% cap preserved
 // ----------------------------------------------------
-console.log("\n--- Fixture L: Core sizing and 50% cap preserved without regression ---");
+console.log("\n--- Fixture L: Core sizing and 70% cap verified ---");
 {
   const cap = computeLiveCapitalPolicyV4({
     balances: [
@@ -309,11 +309,115 @@ console.log("\n--- Fixture L: Core sizing and 50% cap preserved without regressi
     managedSurgeMarkets: new Set<string>(),
   });
 
-  assert.strictEqual(cap.coreCapAmount, 750_000, "Core cap must remain 50% = 750,000");
+  assert.strictEqual(cap.coreCapAmount, 1_050_000, "Core cap must be 70% = 1,050,000");
   assert.strictEqual(cap.coreHoldingsEvaluationKrw, 300_000, "Core holdings must be 300,000");
   assert.strictEqual(cap.coreUsedCapitalKrw, 300_000);
-  assert.strictEqual(cap.coreRemainingKrw, 450_000);
+  assert.strictEqual(cap.coreRemainingKrw, 750_000);
   console.log(`[PASS] Fixture L: coreCap=${cap.coreCapAmount}, coreUsed=${cap.coreUsedCapitalKrw}, coreRemaining=${cap.coreRemainingKrw}`);
+}
+
+// ----------------------------------------------------
+// Fixture Q: spotTradingEquityKrw = 1,547,745 exact 70/30 alignment
+// ----------------------------------------------------
+console.log("\n--- Fixture Q: spotTradingEquityKrw = 1,547,745 exact 70/30 math verification ---");
+{
+  const equity = 1_547_745;
+  const cap = computeLiveCapitalPolicyV4({
+    balances: [{ currency: "KRW", balance: equity, locked: 0 }],
+    markPriceOrAvgByMarket: () => 0,
+    accountPortfolioTotalEvaluatedKrw: equity,
+    totalKrwFallback: equity,
+    reservedKrw: 0,
+    inFlightMarket: null,
+    inFlight: false,
+    managedSurgeMarkets: new Set<string>(),
+  });
+
+  assert.strictEqual(cap.spotTradingEquityKrw, 1_547_745);
+  assert.strictEqual(cap.coreCapAmount, 1_083_421, "Core 70% = floor(1,547,745 * 0.70) = 1,083,421");
+  assert.strictEqual(cap.surgeCapAmount, 464_323, "Surge 30% = floor(1,547,745 * 0.30) = 464,323");
+  const totalAllocated = cap.coreCapAmount + cap.surgeCapAmount;
+  assert.strictEqual(totalAllocated, 1_547_744, "Total allocated = 1,547,744");
+  const residual = equity - totalAllocated;
+  assert.strictEqual(residual, 1, "Rounding residual = 1 KRW");
+  assert.ok(totalAllocated <= equity, "Total allocated must be <= equity");
+  console.log(`[PASS] Fixture Q: Core 70%=${cap.coreCapAmount}, Surge 30%=${cap.surgeCapAmount}, Total=${totalAllocated}, Residual=${residual}`);
+}
+
+// ----------------------------------------------------
+// Fixture R: Core position > 50% but <= 70% is ALLOWED (No 50% block)
+// ----------------------------------------------------
+console.log("\n--- Fixture R: Core at 60% exposure (900k / 1.5M) -> allowed with remaining 150k ---");
+{
+  const cap = computeLiveCapitalPolicyV4({
+    balances: [
+      { currency: "KRW", balance: 600_000, locked: 0 },
+      { currency: "BTC", balance: 0.009, avg_buy_price: 100_000_000 }, // 900,000 KRW Core exposure (60%)
+    ],
+    markPriceOrAvgByMarket: (mk) => (mk === "KRW-BTC" ? 100_000_000 : 0),
+    accountPortfolioTotalEvaluatedKrw: 1_500_000,
+    totalKrwFallback: 1_500_000,
+    reservedKrw: 0,
+    inFlightMarket: null,
+    inFlight: false,
+    managedSurgeMarkets: new Set<string>(),
+  });
+
+  assert.strictEqual(cap.coreCapAmount, 1_050_000);
+  assert.strictEqual(cap.coreUsedCapitalKrw, 900_000);
+  assert.strictEqual(cap.coreRemainingKrw, 150_000);
+  assert.ok(cap.coreRemainingKrw >= 5000, "Core remaining must be >= 5000 (allowed to trade above old 50% cap)");
+  console.log(`[PASS] Fixture R: Core used 900k (60%) > old 50% cap -> coreRemaining=${cap.coreRemainingKrw} (EXECUTION ALLOWED)`);
+}
+
+// ----------------------------------------------------
+// Fixture S: Core position > 70% is BLOCKED
+// ----------------------------------------------------
+console.log("\n--- Fixture S: Core at 75% exposure (1.125M / 1.5M) -> remaining 0, blocked ---");
+{
+  const cap = computeLiveCapitalPolicyV4({
+    balances: [
+      { currency: "KRW", balance: 375_000, locked: 0 },
+      { currency: "BTC", balance: 0.01125, avg_buy_price: 100_000_000 }, // 1,125,000 KRW Core exposure (75%)
+    ],
+    markPriceOrAvgByMarket: (mk) => (mk === "KRW-BTC" ? 100_000_000 : 0),
+    accountPortfolioTotalEvaluatedKrw: 1_500_000,
+    totalKrwFallback: 1_500_000,
+    reservedKrw: 0,
+    inFlightMarket: null,
+    inFlight: false,
+    managedSurgeMarkets: new Set<string>(),
+  });
+
+  assert.strictEqual(cap.coreCapAmount, 1_050_000);
+  assert.strictEqual(cap.coreUsedCapitalKrw, 1_125_000);
+  assert.strictEqual(cap.coreRemainingKrw, 0, "Core remaining must be 0 when exceeding 70%");
+  console.log(`[PASS] Fixture S: Core used 1.125M (75%) > 70% cap -> coreRemaining=${cap.coreRemainingKrw} (EXECUTION BLOCKED)`);
+}
+
+// ----------------------------------------------------
+// Fixture T: Surge position > 30% is BLOCKED
+// ----------------------------------------------------
+console.log("\n--- Fixture T: Surge at 35% exposure (525k / 1.5M) -> remaining 0, blocked ---");
+{
+  const cap = computeLiveCapitalPolicyV4({
+    balances: [
+      { currency: "KRW", balance: 975_000, locked: 0 },
+      { currency: "ZK", balance: 5250, avg_buy_price: 100 }, // 525,000 KRW Surge exposure (35%)
+    ],
+    markPriceOrAvgByMarket: (mk) => (mk === "KRW-ZK" ? 100 : 0),
+    accountPortfolioTotalEvaluatedKrw: 1_500_000,
+    totalKrwFallback: 1_500_000,
+    reservedKrw: 0,
+    inFlightMarket: null,
+    inFlight: false,
+    managedSurgeMarkets: new Set<string>(["KRW-ZK"]),
+  });
+
+  assert.strictEqual(cap.surgeCapAmount, 450_000);
+  assert.strictEqual(cap.surgeUsedCapitalKrw, 525_000);
+  assert.strictEqual(cap.surgeRemainingKrw, 0, "Surge remaining must be 0 when exceeding 30%");
+  console.log(`[PASS] Fixture T: Surge used 525k (35%) > 30% cap -> surgeRemaining=${cap.surgeRemainingKrw} (EXECUTION BLOCKED)`);
 }
 
 // ----------------------------------------------------

@@ -9406,7 +9406,7 @@ export function createLiveDataStrategy(opts: {
 
     // Account-wide equity & cap policy (SURGE_V2 / spot live entry).
     // - Total equity = KRW cash(total) + all coin evaluated value (mark price; fallback avg if missing).
-    // - Cap ratio is fixed at 50%.
+    // - Core cap ratio is fixed at 70%, Surge cap ratio is fixed at 30%.
     // - "Used" includes: evaluated value of in-scope holdings (managed + passive holdings shown/managed by the engine) + pending/reserved buy KRW.
     const reservedKrw = Math.max(0, Number((tstatus as any).reserved_krw ?? 0));
     let holdingsCoreEvalLog = 0;
