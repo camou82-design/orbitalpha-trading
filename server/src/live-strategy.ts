@@ -241,12 +241,27 @@ type UpbitBalance = {
   avg_buy_price: string | number;
 };
 
+const MORNING_SURGE_WINDOW_START_MIN = 510; // 08:30 KST
+const MORNING_SURGE_WINDOW_END_MIN = 570; // 09:30 KST
+
 function getKstTime(date: Date = new Date()) {
   const kstMs = date.getTime() + (9 * 60 * 60 * 1000);
   const kstDate = new Date(kstMs);
   const hour = kstDate.getUTCHours();
   const minute = kstDate.getUTCMinutes();
-  return { hour, minute };
+  return { hour, minute, dayOfWeek: kstDate.getUTCDay(), timeVal: hour * 60 + minute };
+}
+
+/** Mon–Fri 08:30–09:30 KST only; weekend same clock time returns false. */
+export function isMorningSurgeWindowKst(date: Date = new Date()): boolean {
+  const { dayOfWeek, timeVal } = getKstTime(date);
+  const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
+  return isWeekday && timeVal >= MORNING_SURGE_WINDOW_START_MIN && timeVal < MORNING_SURGE_WINDOW_END_MIN;
+}
+
+/** Reclaim gate: block non-morning watch items during weekday morning surge window only. */
+export function isNonMorningSurgeReclaimBlockedInMorningWindow(isMorning: boolean, date: Date = new Date()): boolean {
+  return isMorningSurgeWindowKst(date) && !isMorning;
 }
 
 type TradeStatus = {
@@ -11345,11 +11360,9 @@ export function createLiveDataStrategy(opts: {
           continue;
         }
 
-        const nowKst = new Date(Date.now() + 9 * 60 * 60 * 1000);
-        const kstHour = nowKst.getUTCHours();
-        const kstMinute = nowKst.getUTCMinutes();
-        const kstTimeVal = kstHour * 60 + kstMinute;
-        if (kstTimeVal >= 0 && kstTimeVal < 510) {
+        const now = new Date();
+        const { timeVal: kstTimeVal } = getKstTime(now);
+        if (kstTimeVal >= 0 && kstTimeVal < MORNING_SURGE_WINDOW_START_MIN) {
           console.info(
             JSON.stringify({
               tag: isMorning ? "MORNING_SURGE_RECLAIM_ENTRY_BLOCK" : "SURGE_RECLAIM_ENTRY_BLOCK",
@@ -11361,7 +11374,7 @@ export function createLiveDataStrategy(opts: {
           continue;
         }
 
-        if (kstTimeVal >= 510 && kstTimeVal < 570 && !isMorning) {
+        if (isNonMorningSurgeReclaimBlockedInMorningWindow(Boolean(isMorning), now)) {
           console.info(
             JSON.stringify({
               tag: "MORNING_SURGE_RECLAIM_ENTRY_BLOCK",
@@ -12154,11 +12167,7 @@ export function createLiveDataStrategy(opts: {
             })
           );
         } else {
-          const nowKst = new Date(Date.now() + 9 * 60 * 60 * 1000);
-          const kstHour = nowKst.getUTCHours();
-          const kstMinute = nowKst.getUTCMinutes();
-          const kstTimeVal = kstHour * 60 + kstMinute;
-          const isMorningWindow = kstTimeVal >= 510 && kstTimeVal < 570; // 08:30 ~ 09:30 KST
+          const isMorningWindow = isMorningSurgeWindowKst(new Date());
 
           let c1: UpbitCandle[] = [];
           let c5: UpbitCandle[] = [];
