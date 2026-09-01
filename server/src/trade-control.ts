@@ -1161,7 +1161,7 @@ export function createTradeControl(
             Math.min(2500, Number(process.env.ORBITALPHA_TRADE_STATUS_MARKET_DATA_TIMEOUT_MS ?? 1200)),
           );
           const timed = await Promise.race([
-            resolveTickerPricesForBalances(balanceRows, state.lastGoodMarkPrices),
+            resolveTickerPricesForBalances(balanceRows, state.lastGoodMarkPrices, { isPriority: false }),
             new Promise<never>((_, rej) =>
               setTimeout(() => rej(new Error("MARKET_DATA_TIMEOUT")), marketDataTimeoutMs),
             ),

@@ -605,7 +605,7 @@ export const lastGoodTickerCache = new Map<string, UpbitTicker>();
 export const tickerSourceMap = new Map<string, "live" | "last_good_cache" | "candle_fallback" | "missing" | "fresh_cache" | "cache">();
 export const tickerAgeMap = new Map<string, number>();
 
-const tickerCache = new Map<string, TickerCacheEntry>();
+export const tickerCache = new Map<string, TickerCacheEntry>();
 const tickerCooldownUntilMs = new Map<string, number>();
 let tickerGlobalCooldownUntilMs = 0; // 429 10초 차단용 전역 쿨다운
 const ticker429LastLogAtMs = new Map<string, number>();

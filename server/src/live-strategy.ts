@@ -946,9 +946,11 @@ async function hydrateLiveTickerPriceMaps(
   }
 
   const missingForRefetch = uniq.filter((m) => !(Number(priceBy.get(m) ?? 0) > 0));
+  const validMissingPart = await partitionKrwMarketsByUpbitValidity(missingForRefetch);
+  const validMissing = validMissingPart.accepted;
   const refetchOrdered = [
-    ...missingForRefetch.filter((m) => coreSet.has(m)),
-    ...missingForRefetch.filter((m) => !coreSet.has(m)),
+    ...validMissing.filter((m) => coreSet.has(m)),
+    ...validMissing.filter((m) => !coreSet.has(m)),
   ];
   const perSymTotal = Math.max(2000, Number(process.env.LIVE_TICKER_PER_SYMBOL_TOTAL_TIMEOUT_MS ?? 4000));
   const perSymBatch = Math.max(1500, Number(process.env.LIVE_TICKER_PER_SYMBOL_BATCH_TIMEOUT_MS ?? 3500));
@@ -1036,7 +1038,7 @@ const LIVE_TICK_PHASE_MS = {
   read_logs: Number(process.env.LIVE_TICK_PHASE_MS_READ_LOGS ?? 25_000),
   market_state: Number(process.env.LIVE_TICK_PHASE_MS_MARKET_STATE ?? 15_000),
   partition_validity: Number(process.env.LIVE_TICK_PHASE_MS_PARTITION ?? 35_000),
-  fetch_tickers: Number(process.env.LIVE_TICK_PHASE_MS_FETCH_TICKERS ?? 12_000),
+  fetch_tickers: Number(process.env.LIVE_TICK_PHASE_MS_FETCH_TICKERS ?? 4_000),
   fetch_minute_candles: Number(process.env.LIVE_TICK_PHASE_MS_FETCH_CANDLES ?? 30_000),
   paper_stats: Number(process.env.LIVE_TICK_PHASE_MS_PAPER_STATS ?? 20_000),
   candidate_meta_parallel: Number(process.env.LIVE_TICK_PHASE_MS_CANDIDATE_META ?? 180_000),
@@ -5550,11 +5552,11 @@ export function createLiveDataStrategy(opts: {
     );
     // 보유 포지션 평가/표시 보강 + BTC 기준가 보강(레짐/스케일 계산용)
     const heldExtraSymbols = Array.from(new Set(["KRW-BTC", ...Array.from(heldSymbolSet)])).filter((m) => m.startsWith("KRW-"));
-    // CORE_TRADE 6종은 이후 entry_universe에 강제 병합되므로 배치 티커 요청에 반드시 포함(누락 시 candidate_meta entry_price=0 방지).
-    const captureQueueMarkets = surgeCaptureQueue.filter(q => q.status === "WATCHING").map(q => q.market);
-    const tickerRequestedSymbols = Array.from(
-      new Set([...baseInputSymbols, ...heldExtraSymbols, ...captureQueueMarkets, ...(CORE_TRADE_MARKETS as readonly string[])]),
+    const rawTickerRequestedSymbols = Array.from(
+      new Set([...baseInputSymbols, ...heldExtraSymbols, ...(CORE_TRADE_MARKETS as readonly string[])]),
     );
+    const validTickerPartition = await partitionKrwMarketsByUpbitValidity(rawTickerRequestedSymbols);
+    const tickerRequestedSymbols = validTickerPartition.accepted;
     console.info(
       JSON.stringify({
         tag: "DEBUG_TICKER_REQUEST_SOURCE",

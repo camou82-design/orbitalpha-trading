@@ -1,4 +1,9 @@
-import { fetchTickers } from "./upbit-public.js";
+import {
+  fetchTickers,
+  tickerCache,
+  lastGoodTickerCache,
+  partitionKrwMarketsByUpbitValidity,
+} from "./upbit-public.js";
 
 const UPBIT_FEE_RATE = 0.0005;
 
@@ -243,17 +248,36 @@ async function fetchTickerPriceMapChunked(markets: string[], isPriority = true):
 }
 
 /**
- * seed(직전 성공 맵) + 배치 티커(재시도) + 보유 종목 단건 조회로 가격맵을 최대한 채운다.
- * account_portfolio·하단 카드가 같은 맵을 쓰도록 한 번에 반환한다.
- * `rest_fresh_markets`: 이번 호출에서 REST 응답으로 유효 가격을 받은 마켓(캐시만으로 채운 경우 제외).
+ * seed(직전 성공 맵) + 엔진 최신 캐시(tickerCache/lastGoodTickerCache) + 배치 티커(재시도)로 가격맵을 채운다.
+ * 대시보드/계좌 조회가 Live Execution의 Ticker Lock을 침범/경합하지 않도록 캐시를 우선 활용하고 비우선순위(isPriority: false)를 사용한다.
+ * `rest_fresh_markets`: 이번 호출 또는 최신 캐시로 유효 가격을 확보한 마켓 집합.
  */
 export async function resolveTickerPricesForBalances(
   balances: BalanceRow[],
   seed: Record<string, number> | null,
+  opts?: { isPriority?: boolean },
 ): Promise<{ merged: Record<string, number>; rest_fresh_markets: Set<string> }> {
+  const isPriority = opts?.isPriority ?? false;
   const restFresh = new Set<string>();
   let merged: Record<string, number> = { ...(seed ?? {}) };
-  const markets = marketsForAccountValuation(balances);
+
+  const allValuationMarkets = marketsForAccountValuation(balances);
+  const { accepted: markets } = await partitionKrwMarketsByUpbitValidity(allValuationMarkets);
+
+  // 1. Live Engine이 이미 갱신 중인 tickerCache / lastGoodTickerCache에서 우선 흡수 (0ms, 락 경합 없음)
+  for (const m of markets) {
+    const c = tickerCache.get(m);
+    if (c && c.value && Number(c.value.trade_price) > 0) {
+      merged[m] = Number(c.value.trade_price);
+      restFresh.add(m);
+    } else {
+      const lg = lastGoodTickerCache.get(m);
+      if (lg && Number(lg.trade_price) > 0) {
+        merged[m] = Number(lg.trade_price);
+        restFresh.add(m);
+      }
+    }
+  }
 
   const absorb = (part: Record<string, number>) => {
     for (const [k, v] of Object.entries(part)) {
@@ -264,19 +288,27 @@ export async function resolveTickerPricesForBalances(
     }
   };
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fresh = markets.length <= TICKER_CHUNK ? await fetchTickerPriceMap(markets, true) : await fetchTickerPriceMapChunked(markets, true);
-      absorb(fresh);
-      break;
-    } catch {
-      if (attempt < 1) await new Promise((r) => setTimeout(r, 350));
+  // 2. 캐시로도 아직 가격이 없는 유효 마켓이 남아있을 때만 REST 조회 (isPriority: false로 Live Engine 보호)
+  const needingPrice = markets.filter((m) => !(Number(merged[m] ?? 0) > 0));
+  if (needingPrice.length > 0) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const fresh = needingPrice.length <= TICKER_CHUNK
+          ? await fetchTickerPriceMap(needingPrice, isPriority)
+          : await fetchTickerPriceMapChunked(needingPrice, isPriority);
+        absorb(fresh);
+        break;
+      } catch {
+        if (attempt < 1) await new Promise((r) => setTimeout(r, 200));
+      }
     }
   }
 
-  for (const m of heldMarketsNeedingPrice(balances, merged)) {
+  // 3. 보유 마켓 중 여전히 가격이 없는 종목 단건 보충 (유효 마켓 대상만)
+  const heldNeeding = heldMarketsNeedingPrice(balances, merged).filter((m) => markets.includes(m));
+  for (const m of heldNeeding) {
     try {
-      const one = await fetchTickerPriceMap([m], true);
+      const one = await fetchTickerPriceMap([m], isPriority);
       absorb(one);
     } catch {
       /* 다음 종목 */

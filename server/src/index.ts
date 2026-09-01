@@ -1134,17 +1134,33 @@ async function main() {
     const balances = Array.isArray(tradeStatus?.balances) ? tradeStatus.balances : [];
 
     const DUST_NOTIONAL_KRW = 1000;
+    const markPrices = ((tradeStatus as any)?.mark_prices ?? {}) as Record<string, number>;
     const held = balances
       .map((b: any) => {
         const currency = String(b?.currency ?? "").toUpperCase();
         if (!currency || currency === "KRW") return null;
         const qty = Number(b?.balance ?? 0) + Number(b?.locked ?? 0);
+        if (!(qty > 0)) return null;
+        const market = `KRW-${currency}`;
         const avg = Number(b?.avg_buy_price ?? 0);
-        const notional = qty * avg;
-        if (!(qty > 0) || !(notional >= DUST_NOTIONAL_KRW)) return null;
-        return { market: `KRW-${currency}`, currency, qty, avg_buy_price: avg, notional_cost_krw: notional };
+        const mark = Number(markPrices[market] ?? 0);
+        const notionalCost = qty * avg;
+        const evalKrw = mark > 0 ? qty * mark : (avg > 0 ? notionalCost : 0);
+        const hasPrice = mark > 0 || avg > 0;
+        // 가격(현재가/평단)이 있을 때 1,000원 미만은 dust로 제외. 단, mark/avg 모두 없는 unpriced passive asset(SOLO, XCORE 등)은 숨기지 않고 유지.
+        if (hasPrice && evalKrw < DUST_NOTIONAL_KRW) return null;
+        return {
+          market,
+          currency,
+          qty,
+          avg_buy_price: avg,
+          notional_cost_krw: notionalCost,
+          current_price: mark > 0 ? mark : null,
+          eval_krw: evalKrw > 0 ? evalKrw : null,
+          price_status: mark > 0 ? ("live" as const) : ("unpriced" as const),
+        };
       })
-      .filter((x: any): x is { market: string; currency: string; qty: number; avg_buy_price: number; notional_cost_krw: number } => Boolean(x));
+      .filter((x: any): x is { market: string; currency: string; qty: number; avg_buy_price: number; notional_cost_krw: number; current_price: number | null; eval_krw: number | null; price_status: "live" | "unpriced" } => Boolean(x));
 
     const openPositions = (strategyStatus?.open_positions ?? {}) as Record<string, any>;
     const earlyPositions = (strategyStatus?.early_positions ?? {}) as Record<string, any>;
