@@ -2278,6 +2278,7 @@ async function _validateLiveBuyPrecheckInternal(params: {
       reclaimScore: params.reclaimScore,
       volumeAccel: params.volumeAccel,
       aboveEma20: params.aboveEma20,
+      candidateMeta: params.candidateMeta,
     });
     if (!r.ok) {
       result.allowed = false;
