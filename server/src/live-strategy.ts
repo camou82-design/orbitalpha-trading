@@ -61,9 +61,11 @@ import {
   CORE_RESCUE_MAX_ADDON_COUNT,
   CORE_RESCUE_MAX_ADVERSE_PROGRESS,
   CORE_RESCUE_MIN_ADVERSE_PROGRESS,
+  CORE_RESCUE_POST_GRACE_SECONDS,
   evaluateCoreRescueHardRisk,
   evaluateCoreRescueMicroReclaim,
   isCoreRescueEngineBucket,
+  isCoreRescuePostRescueGraceActive,
 } from "./core-rescue-addon.js";
 
 function num(x: unknown): number {
@@ -439,6 +441,7 @@ type StrategyPosition = {
   coreRescuePreSoftOrderKrw?: number;
   coreRescueOriginalStopPrice?: number;
   coreRescueTriggeredAt?: string | null;
+  coreRescuePostRescueGraceUntil?: string | null;
 };
 
 type EarlyEntryPosition = {
@@ -3628,7 +3631,7 @@ function evaluateEntryProfileDecision(stats?: LiveEntryProfileStats): { decision
   return decideEntryProfile(stats);
 }
 
-function evaluateExitAuthority(params: {
+export function evaluateExitAuthority(params: {
   p: StrategyPosition;
   pnlGross: number;
   heldMs: number;
@@ -3660,7 +3663,9 @@ function evaluateExitAuthority(params: {
     return { reasonExit: "trailing_runner_exit", ratio: 1, stopTriggerKind: "time_stop", authorityClass: "runner_trail", reasonDetail: `dd>=${trailWidth}`, runnerTrailActive: true };
   }
   if (params.marketTier === "weak" && holdMin >= LIVE_STABLE_WEAK_REBOUND_TIME_STOP_MINUTES && p.max_pnl_pct < 0.6 && params.pnlGross < 0 && params.weakReboundPoor) {
-    return { reasonExit: "weak_market_time_stop", ratio: 1, stopTriggerKind: "time_stop", authorityClass: "weak_time_stop", reasonDetail: "weak market low rebound", runnerTrailActive: false };
+    if (!isCoreRescuePostRescueGraceActive(p)) {
+      return { reasonExit: "weak_market_time_stop", ratio: 1, stopTriggerKind: "time_stop", authorityClass: "weak_time_stop", reasonDetail: "weak market low rebound", runnerTrailActive: false };
+    }
   }
   return { reasonExit: null, ratio: 1, stopTriggerKind: null, authorityClass: "none", reasonDetail: "no_exit", runnerTrailActive: p.partial_tp_done };
 }
@@ -7320,47 +7325,73 @@ export function createLiveDataStrategy(opts: {
           }),
         );
 
-        const buyRes = await opts.trade.placeBuy(
-          market,
-          true,
-          sizing.addonCandidateKrw,
-          p.strategy_type,
-          "strategy",
-          {
-            __rescue_add: true,
-            __core_rescue_addon: true,
-            __rescue_add_reason: "core_rescue_addon_micro_reclaim",
-            strict_exit: true,
-            exit_policy_attached: true,
-            entry_stop_price: originalStopPrice,
-            entry_target_price: p.entry_target_price,
-            entry_risk_reward: p.entry_risk_reward,
-            engine_bucket: "core",
-          },
-          "rescue_add",
-        );
+        let buyRes: any = null;
+        try {
+          buyRes = await opts.trade.placeBuy(
+            market,
+            true,
+            sizing.addonCandidateKrw,
+            p.strategy_type,
+            "strategy",
+            {
+              __rescue_add: true,
+              __core_rescue_addon: true,
+              __rescue_add_reason: "core_rescue_addon_micro_reclaim",
+              strict_exit: true,
+              exit_policy_attached: true,
+              entry_stop_price: originalStopPrice,
+              entry_target_price: p.entry_target_price,
+              entry_risk_reward: p.entry_risk_reward,
+              engine_bucket: "core",
+            },
+            "rescue_add",
+          );
+        } catch (e: unknown) {
+          buyRes = e;
+        }
 
         const classified = classifyPlaceBuyResult(buyRes);
-        if (classified.resultClass === "exchange_order_failed" || classified.resultClass === "precheck_blocked" || classified.resultClass === "policy_blocked") {
-          console.info(
-            JSON.stringify({
-              tag: "CORE_RESCUE_ADDON_EVAL_PROOF",
-              ts: nowIso,
-              market,
-              addon_allowed: false,
-              block_reason: `place_buy_${classified.resultClass}`,
-              addon_candidate_krw: sizing.addonCandidateKrw,
-            }),
-          );
-          return { executed: false };
-        }
+        const orderUuid =
+          buyRes && typeof buyRes === "object"
+            ? (buyRes.uuid || buyRes.order_uuid || (buyRes.order && (buyRes.order.uuid || buyRes.order.order_uuid)) || null)
+            : null;
 
         const postStatus = await raceTradeStatus("core_rescue_addon_post_buy");
         const posInfo = postStatus?.strategy_positions?.[market];
         const postExposure = Math.max(0, Number(posInfo?.invested_krw_total ?? 0));
-        const fillConfirmed =
-          classified.resultClass === "exchange_order_accepted" ||
-          (postExposure > currentExposureKrw + UPBIT_MIN_ORDER_KRW - 1);
+        const postQty = Math.max(0, Number(posInfo?.qty ?? 0));
+
+        // Prioritize actual account/exchange position truth over returned resultClass.
+        const positionIncreased = Boolean(
+          posInfo &&
+          posInfo.qty > 0 &&
+          (postExposure > currentExposureKrw + 1000 || postQty > (p.qty ?? 0) + 1e-8)
+        );
+
+        const fillConfirmed = positionIncreased || (
+          !posInfo && classified.resultClass === "exchange_order_accepted"
+        );
+
+        if (
+          (fillConfirmed && classified.resultClass !== "exchange_order_accepted") ||
+          (!fillConfirmed && classified.resultClass === "exchange_order_accepted")
+        ) {
+          console.info(
+            JSON.stringify({
+              tag: "CORE_RESCUE_FILL_RESULT_MISMATCH_PROOF",
+              ts: nowIso,
+              market,
+              exposure_before: currentExposureKrw,
+              exposure_after: postExposure,
+              qty_before: p.qty,
+              qty_after: postQty,
+              result_class: classified.resultClass,
+              reason_str: classified.reasonStr,
+              order_uuid: orderUuid ? String(orderUuid) : null,
+              fill_confirmed: fillConfirmed,
+            }),
+          );
+        }
 
         if (!fillConfirmed) {
           console.info(
@@ -7369,33 +7400,44 @@ export function createLiveDataStrategy(opts: {
               ts: nowIso,
               market,
               addon_allowed: false,
-              block_reason: "exchange_fill_not_confirmed",
+              block_reason: `place_buy_${classified.resultClass}`,
               addon_candidate_krw: sizing.addonCandidateKrw,
               result_class: classified.resultClass,
+              exposure_before: currentExposureKrw,
+              exposure_after: postExposure,
             }),
           );
           return { executed: false };
         }
 
+        const avgBefore = p.entry_price;
+        const exposureBefore = currentExposureKrw;
         let newAvg = p.entry_price;
         let newQty = p.qty;
+        let exposureAfter = currentExposureKrw + sizing.addonCandidateKrw;
+
         if (posInfo && posInfo.qty > 0) {
           newQty = posInfo.qty;
-          newAvg = (posInfo.invested_krw_total ?? 0) / posInfo.qty;
+          exposureAfter = Number(posInfo.invested_krw_total ?? 0);
+          newAvg = exposureAfter > 0 ? exposureAfter / newQty : p.entry_price;
         } else {
           const addedQty = sizing.addonCandidateKrw / now;
           newQty = p.qty + addedQty;
           newAvg = (currentExposureKrw + sizing.addonCandidateKrw) / newQty;
+          exposureAfter = currentExposureKrw + sizing.addonCandidateKrw;
         }
+
+        const postRescueGraceUntil = new Date(Date.now() + CORE_RESCUE_POST_GRACE_SECONDS * 1000).toISOString();
 
         p.entry_price = newAvg;
         p.qty = newQty;
         p.coreRescueAddonUsed = true;
         p.coreRescueAddonCount = 1;
         p.coreRescueTriggeredAt = nowIso;
+        p.coreRescuePostRescueGraceUntil = postRescueGraceUntil;
         p.coreRescueOriginalStopPrice = originalStopPrice;
-        p.entry_stop_price = originalStopPrice;
-        p.stop_loss_price = originalStopPrice;
+        p.entry_stop_price = Math.max(p.entry_stop_price ?? 0, originalStopPrice);
+        p.stop_loss_price = Math.max(p.stop_loss_price ?? 0, originalStopPrice);
         p.rescue_add_cooldown_until = new Date(Date.now() + 60_000).toISOString();
         p.max_pnl_pct = Math.max(p.max_pnl_pct, grossPnlPct(newAvg, now));
 
@@ -7406,10 +7448,15 @@ export function createLiveDataStrategy(opts: {
             market,
             addon_krw: sizing.addonCandidateKrw,
             initial_order_krw: initialOrderKrw,
-            total_exposure_krw: currentExposureKrw + sizing.addonCandidateKrw,
+            avg_before: avgBefore,
+            avg_after: newAvg,
+            exposure_before: exposureBefore,
+            exposure_after: exposureAfter,
+            total_exposure_krw: exposureAfter,
             avg_entry_price: newAvg,
             original_stop_price: originalStopPrice,
-            stop_preserved: p.entry_stop_price === originalStopPrice,
+            post_rescue_grace_until: postRescueGraceUntil,
+            stop_preserved: (p.entry_stop_price ?? 0) >= originalStopPrice,
             engine_bucket: p.engine_bucket,
             core_rescue_addon_used: true,
             core_rescue_addon_count: 1,
@@ -8587,7 +8634,21 @@ export function createLiveDataStrategy(opts: {
               reasonExit = `stable_catastrophic_exit_${recv.catastrophic_exit_pct}`;
               stopTriggerKind = "price_stop";
             } else if (holdMin >= weakHoldMin && p.max_pnl_pct < 0.35 && pnlGross < 0) {
-              if (isCoreTradePos && holdMin < 15 && pnlGross > -1.0) {
+              if (isCoreRescuePostRescueGraceActive(p)) {
+                console.info(
+                  JSON.stringify({
+                    tag: "CORE_RESCUE_POST_GRACE_TIME_STOP_BLOCKED_PROOF",
+                    ts: new Date().toISOString(),
+                    market,
+                    holdMin,
+                    pnlGross,
+                    maxPnl: p.max_pnl_pct,
+                    originalExitReason: "weak_market_time_stop",
+                    finalDecision: "blocked_by_core_rescue_grace",
+                    post_rescue_grace_until: p.coreRescuePostRescueGraceUntil,
+                  })
+                );
+              } else if (isCoreTradePos && holdMin < 15 && pnlGross > -1.0) {
                 console.info(
                   JSON.stringify({
                     tag: "CORE_TRADE_TIME_STOP_GUARD_APPLIED",
@@ -8819,7 +8880,21 @@ export function createLiveDataStrategy(opts: {
                 }
               } catch {}
               if (!reasonExit && holdMin >= m.time_stop_min_minutes && holdMin <= m.time_stop_max_minutes && p.max_pnl_pct < 0.8 && pnlGross <= -0.1) {
-                if (isCoreTradePos && holdMin < 15 && pnlGross > -1.0) {
+                if (isCoreRescuePostRescueGraceActive(p)) {
+                  console.info(
+                    JSON.stringify({
+                      tag: "CORE_RESCUE_POST_GRACE_TIME_STOP_BLOCKED_PROOF",
+                      ts: new Date().toISOString(),
+                      market,
+                      holdMin,
+                      pnlGross,
+                      maxPnl: p.max_pnl_pct,
+                      originalExitReason: "momentum_time_stop",
+                      finalDecision: "blocked_by_core_rescue_grace",
+                      post_rescue_grace_until: p.coreRescuePostRescueGraceUntil,
+                    })
+                  );
+                } else if (isCoreTradePos && holdMin < 15 && pnlGross > -1.0) {
                   console.info(
                     JSON.stringify({
                       tag: "CORE_TRADE_TIME_STOP_GUARD_APPLIED",

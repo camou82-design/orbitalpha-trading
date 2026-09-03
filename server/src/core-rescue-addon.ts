@@ -5,10 +5,33 @@
 import { ORDER_LIMITS } from "@orbitalpha/shared";
 
 export const CORE_RESCUE_MAX_ADDON_COUNT = 1;
+export const CORE_RESCUE_POST_GRACE_SECONDS = 180;
 
 /** Fraction of entry→stop distance traveled toward stop (soft adverse band). */
 export const CORE_RESCUE_MIN_ADVERSE_PROGRESS = 0.25;
 export const CORE_RESCUE_MAX_ADVERSE_PROGRESS = 0.98;
+
+export function isCoreRescuePostRescueGraceActive(
+  params: {
+    coreRescuePostRescueGraceUntil?: string | null;
+    coreRescueTriggeredAt?: string | null;
+  },
+  nowMs: number = Date.now(),
+): boolean {
+  if (params.coreRescuePostRescueGraceUntil) {
+    const graceUntilMs = new Date(params.coreRescuePostRescueGraceUntil).getTime();
+    if (!Number.isNaN(graceUntilMs)) {
+      return nowMs < graceUntilMs;
+    }
+  }
+  if (params.coreRescueTriggeredAt) {
+    const trigMs = new Date(params.coreRescueTriggeredAt).getTime();
+    if (!Number.isNaN(trigMs)) {
+      return nowMs < trigMs + CORE_RESCUE_POST_GRACE_SECONDS * 1000;
+    }
+  }
+  return false;
+}
 
 export type CoreRescueHardRiskInput = {
   currentPrice: number;
