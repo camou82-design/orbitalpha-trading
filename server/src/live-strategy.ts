@@ -3375,6 +3375,106 @@ function evaluateSurgeEntrySetup(
   };
 }
 
+export type MorningSoftPrewatchShadowResult = {
+  ok: boolean;
+  market: string;
+  volume_ratio_1m: number;
+  rise_1m_pct: number;
+  rise_3m_pct: number;
+  scanner_score: number;
+  filter_pass: boolean;
+  breakout: boolean;
+  upper_wick: number;
+  price_structure: string;
+  future_5m_max_return: number | null;
+  future_10m_max_return: number | null;
+  failed_reasons: string[];
+};
+
+export function evaluateMorningSoftPrewatchShadow(params: {
+  market: string;
+  candles1: UpbitCandle[];
+  currentPx: number;
+  payload: any;
+  isMorningWindow: boolean;
+}): MorningSoftPrewatchShadowResult {
+  const isMorning = params.isMorningWindow;
+  if (!isMorning || params.candles1.length < 15) {
+    return {
+      ok: false,
+      market: params.market,
+      volume_ratio_1m: 0,
+      rise_1m_pct: 0,
+      rise_3m_pct: 0,
+      scanner_score: 0,
+      filter_pass: false,
+      breakout: false,
+      upper_wick: 1.0,
+      price_structure: "invalid_candles",
+      future_5m_max_return: null,
+      future_10m_max_return: null,
+      failed_reasons: [isMorning ? "insufficient_candles" : "not_morning_window"],
+    };
+  }
+
+  const completed = params.candles1.slice(0, -1);
+  const lastBar = completed[completed.length - 1]!;
+  const closes = completed.map((c) => Number(c.trade_price));
+
+  const volRatio1m = Number(params.payload?.volume_ratio ?? params.payload?.volume_multiple ?? 0);
+  const rise1m = closes.length >= 2 ? ((params.currentPx - closes[closes.length - 1]) / closes[closes.length - 1]) * 100 : 0;
+  const rise3m = Number(
+    params.payload?.rise_3m_pct ??
+      params.payload?.momentum_3m_pct ??
+      (closes.length >= 4 ? ((params.currentPx - closes[closes.length - 3]) / closes[closes.length - 3]) * 100 : 0)
+  );
+  const scannerScore = Number(params.payload?.scanner_score ?? params.payload?.score ?? 0);
+  const filterPass = Boolean(params.payload?.filter_pass);
+  const breakout = Boolean(params.payload?.breakout || params.payload?.box_breakout);
+
+  const lastHigh = Number(lastBar.high_price);
+  const lastLow = Number(lastBar.low_price);
+  const lastClose = Number(lastBar.trade_price);
+  const range = Math.max(1e-9, lastHigh - lastLow);
+  const upperWick = (lastHigh - lastClose) / range;
+
+  const e20 = emaLast(closes, 20);
+  const priceAboveEma20 = e20 !== null && params.currentPx > e20;
+  const priceStructure = priceAboveEma20 ? "above_ema20" : "below_ema20";
+
+  const failed: string[] = [];
+
+  // Criteria:
+  // 1. volume_ratio >= 1.15
+  if (volRatio1m < 1.15) failed.push("low_volume_1.15");
+
+  // 2. (rise_3m_pct >= 0.25 OR fresh_1m_impulse/breakout confirmed)
+  const impulseOrBreakout = rise3m >= 0.25 || rise1m >= 0.8 || breakout;
+  if (!impulseOrBreakout) failed.push("no_momentum_or_impulse");
+
+  // 3. Structural risk condition: upper wick < 0.45, not extreme overextension (> 4.5% above EMA20)
+  if (upperWick >= 0.45) failed.push("upper_wick_rejection");
+  if (e20 !== null && params.currentPx > e20 * 1.045) failed.push("overextended");
+
+  const ok = failed.length === 0;
+
+  return {
+    ok,
+    market: params.market,
+    volume_ratio_1m: volRatio1m,
+    rise_1m_pct: rise1m,
+    rise_3m_pct: rise3m,
+    scanner_score: scannerScore,
+    filter_pass: filterPass,
+    breakout,
+    upper_wick: upperWick,
+    price_structure: priceStructure,
+    future_5m_max_return: null,
+    future_10m_max_return: null,
+    failed_reasons: failed,
+  };
+}
+
 function minutesSince(ts: string) {
   return Math.max(0, (Date.now() - Date.parse(ts)) / 60_000);
 }
@@ -10741,6 +10841,37 @@ export function createLiveDataStrategy(opts: {
                 failed_conditions: surgeShadowSetup.failed_conditions,
               };
             }
+          }
+        }
+
+        if (isMorningSurgeWindowKst(new Date())) {
+          const softShadowRes = evaluateMorningSoftPrewatchShadow({
+            market: m,
+            candles1,
+            currentPx,
+            payload: effectivePayload,
+            isMorningWindow: true,
+          });
+          if (softShadowRes.ok) {
+            console.info(
+              JSON.stringify({
+                tag: "MORNING_SURGE_SOFT_PREWATCH_SHADOW_PROOF",
+                ts: new Date().toISOString(),
+                market: m,
+                shadow_pass: true,
+                volume_ratio_1m: softShadowRes.volume_ratio_1m,
+                rise_1m_pct: softShadowRes.rise_1m_pct,
+                rise_3m_pct: softShadowRes.rise_3m_pct,
+                scanner_score: softShadowRes.scanner_score,
+                filter_pass: softShadowRes.filter_pass,
+                breakout: softShadowRes.breakout,
+                upper_wick: softShadowRes.upper_wick,
+                price_structure: softShadowRes.price_structure,
+                future_5m_max_return: softShadowRes.future_5m_max_return,
+                future_10m_max_return: softShadowRes.future_10m_max_return,
+                reason: "morning_soft_prewatch_eligible_shadow_only",
+              }),
+            );
           }
         }
 
