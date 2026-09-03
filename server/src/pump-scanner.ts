@@ -1083,7 +1083,7 @@ export function createPumpScanner(
     intervalMs: SCANNER_INTERVAL_MS,
     tick,
     signalFeed: () =>
-      state.allResults
+      state.rows
         .map((r) => ({
           market: r.market,
           score: r.score,

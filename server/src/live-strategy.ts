@@ -1006,6 +1006,128 @@ const SURGE_MIN_ORDER_RATIO = 0.08;
 const SURGE_NORMAL_ORDER_RATIO = 0.15;
 const SURGE_HIGH_CONFIDENCE_ORDER_RATIO = 0.30;
 
+export const SURGE_PULLBACK_MIN_PCT = 0.5;
+export const SURGE_PULLBACK_MAX_PCT = 3.0;
+export const SURGE_PULLBACK_DEEP_EXPIRY_PCT = 4.2;
+
+export function detectSurgePullback(params: {
+  localHigh: number;
+  currentPrice: number;
+  lastSeenPrice?: number | null;
+  recentCandleLows?: number[];
+  minPct?: number;
+  maxPct?: number;
+  deepExpiryPct?: number;
+}): {
+  isPullback: boolean;
+  evidenceSource: "current_tick" | "candle_low" | "tick_range" | null;
+  pullbackLow: number | null;
+  pullbackPct: number;
+} {
+  const minPct = params.minPct ?? SURGE_PULLBACK_MIN_PCT;
+  const maxPct = params.maxPct ?? SURGE_PULLBACK_MAX_PCT;
+  const deepExpiryPct = params.deepExpiryPct ?? SURGE_PULLBACK_DEEP_EXPIRY_PCT;
+  const localHigh = params.localHigh;
+
+  if (!(localHigh > 0) || !(params.currentPrice > 0)) {
+    return { isPullback: false, evidenceSource: null, pullbackLow: null, pullbackPct: 0 };
+  }
+
+  const currentTickPct = ((localHigh - params.currentPrice) / localHigh) * 100;
+  const minCandleLow = Array.isArray(params.recentCandleLows) && params.recentCandleLows.length > 0
+    ? Math.min(...params.recentCandleLows.filter(n => Number.isFinite(n) && n > 0))
+    : params.currentPrice;
+  const candleLowPct = ((localHigh - minCandleLow) / localHigh) * 100;
+
+  const lastSeen = Number.isFinite(params.lastSeenPrice) && (params.lastSeenPrice ?? 0) > 0
+    ? params.lastSeenPrice!
+    : params.currentPrice;
+  const minRangePrice = Math.min(lastSeen, params.currentPrice);
+  const tickRangePct = ((localHigh - minRangePrice) / localHigh) * 100;
+
+  if (currentTickPct >= minPct && currentTickPct <= maxPct) {
+    return {
+      isPullback: true,
+      evidenceSource: "current_tick",
+      pullbackLow: params.currentPrice,
+      pullbackPct: currentTickPct,
+    };
+  }
+
+  if (candleLowPct >= minPct && candleLowPct <= maxPct) {
+    return {
+      isPullback: true,
+      evidenceSource: "candle_low",
+      pullbackLow: minCandleLow,
+      pullbackPct: candleLowPct,
+    };
+  }
+
+  if (tickRangePct >= minPct && tickRangePct <= maxPct) {
+    return {
+      isPullback: true,
+      evidenceSource: "tick_range",
+      pullbackLow: minRangePrice,
+      pullbackPct: tickRangePct,
+    };
+  }
+
+  // Traversed across band even if low ended slightly deeper (within deep boundary)
+  if (candleLowPct > maxPct && candleLowPct <= deepExpiryPct) {
+    return {
+      isPullback: true,
+      evidenceSource: "candle_low",
+      pullbackLow: minCandleLow,
+      pullbackPct: candleLowPct,
+    };
+  }
+
+  if (tickRangePct > maxPct && tickRangePct <= deepExpiryPct) {
+    return {
+      isPullback: true,
+      evidenceSource: "tick_range",
+      pullbackLow: minRangePrice,
+      pullbackPct: tickRangePct,
+    };
+  }
+
+  return {
+    isPullback: false,
+    evidenceSource: null,
+    pullbackLow: null,
+    pullbackPct: currentTickPct,
+  };
+}
+
+export function evaluateReclaimConditions(params: {
+  currentPrice: number;
+  pullbackLowPrice: number | null;
+  recent1mRet: number;
+  recent3mRet: number;
+  localHigh: number;
+  closes1: number[];
+}) {
+  const isRebounding = params.pullbackLowPrice !== null && params.currentPrice > params.pullbackLowPrice;
+  const returnsOk = params.recent1mRet > 0 && params.recent3mRet >= 0 && params.recent3mRet <= 2.5;
+  const nearHigh = params.currentPrice >= params.localHigh * 0.997 && params.currentPrice <= params.localHigh * 1.003;
+
+  const ema20 = emaLast(params.closes1, 20);
+  const hasEma = typeof ema20 === "number" && Number.isFinite(ema20);
+  const isAboveEma = hasEma && params.currentPrice >= ema20;
+
+  const valid = isRebounding && returnsOk && nearHigh && hasEma && isAboveEma;
+
+  return {
+    valid,
+    isRebounding,
+    returnsOk,
+    nearHigh,
+    hasEma,
+    isAboveEma,
+    ema20,
+  };
+}
+
 const LIVE_MIN_SAFE_ENTRY_KRW = 12000;
 const LIVE_MIN_STOP_SELL_VALUE_KRW = 5500;
 const DUST_THRESHOLD_KRW = 5000;
@@ -5170,7 +5292,13 @@ export function createLiveDataStrategy(opts: {
         }),
       );
     }
-    const freshScannerCandidates = scannerCandidatesExcludingHeld.filter((x) => x.ageSeconds !== null && x.ageSeconds <= staleThresholdSeconds);
+    const freshScannerCandidates = scannerCandidatesExcludingHeld.filter(
+      (x) =>
+        x.ageSeconds !== null &&
+        x.ageSeconds <= staleThresholdSeconds &&
+        Boolean(latestAllSignals.get(x.market)?.p?.filter_pass) &&
+        latestAllSignals.get(x.market)?.p?.source_kind !== "scanner_bridge_score_fail",
+    );
     const staleScannerCandidates = scannerCandidatesExcludingHeld.filter((x) => x.ageSeconds === null || x.ageSeconds > staleThresholdSeconds);
     // [LIVE_SURGE_SOURCE_REPAIR_PROOF] scanner source 상태 및 repair 결과 진단 로그
     const newestScannerAgeSeconds = scannerCandidatesExcludingHeld.length > 0
@@ -11435,7 +11563,7 @@ export function createLiveDataStrategy(opts: {
       } else {
         let fetchErrStr = "unknown";
         try {
-          c1 = await fetchMinuteCandlesCached(market, 1, 12);
+          c1 = await fetchMinuteCandlesCached(market, 1, 30);
           c5 = await fetchMinuteCandlesCached(market, 5, 12);
           watchlistCandleCache.set(market, { ts: nowMs, c1, c5 });
           candleSource = "live_fetch";
@@ -11503,6 +11631,7 @@ export function createLiveDataStrategy(opts: {
       }
       const distanceFromLocalHighPct = ((localHigh - currentPrice) / localHigh) * 100;
 
+      const previousSeenPrice = item.last_seen_price;
       item.last_seen_price = currentPrice;
       item.last_seen_at = new Date().toISOString();
       item.day_change_pct = changeRateBy.get(market) !== undefined ? changeRateBy.get(market)! * 100 : item.day_change_pct;
@@ -11513,44 +11642,26 @@ export function createLiveDataStrategy(opts: {
       item.distanceFromLocalHighPct = distanceFromLocalHighPct;
 
       const isMorning = item.morning_reentry_candidate;
-
-      // 1. 만료 조건 체크
       const registerTime = new Date(item.first_detected_at).getTime();
       const elapsedMin = (nowMs - registerTime) / 60000;
-      const isExpired =
-        elapsedMin >= 30 ||
-        currentPrice < localHigh * 0.97 ||
-        volumeRatio1m5 < 0.1 ||
-        marketState.market_state === "risk_off";
 
-      if (isExpired) {
-        console.info(
-          JSON.stringify({
-            tag: "SURGE_WATCH_EXPIRED",
-            ts: new Date().toISOString(),
-            market,
-            reason: elapsedMin >= 30 ? "timeout_30m" : currentPrice < localHigh * 0.97 ? "pullback_too_deep" : "market_degraded",
-            last_price: currentPrice,
-            local_high: localHigh,
-          })
-        );
-        if (isMorning) {
-          delete state.morning_surge_watchlist![market];
-        } else {
-          delete state.surge_watchlist![market];
-        }
-        continue;
-      }
-
-      // 2. 상태 기계: watching -> pullback_seen
+      // 1. 상태 기계: watching -> pullback_seen (pullback 판정을 만료 판정 전에 먼저 수행)
       if (item.status === "watching") {
-        const pullbackPct = ((localHigh - currentPrice) / localHigh) * 100;
-        const isPullback = pullbackPct >= 0.6 && pullbackPct < 2.5;
+        const recentCandleLows = c1.slice(-3).map((c) => Number(c.low_price ?? 0)).filter((n) => n > 0);
+        const pb = detectSurgePullback({
+          localHigh,
+          currentPrice,
+          lastSeenPrice: previousSeenPrice,
+          recentCandleLows,
+          minPct: SURGE_PULLBACK_MIN_PCT,
+          maxPct: SURGE_PULLBACK_MAX_PCT,
+          deepExpiryPct: SURGE_PULLBACK_DEEP_EXPIRY_PCT,
+        });
 
-        if (isPullback && volumeRatio1m5 >= 0.1 && marketState.market_state !== "risk_off") {
+        if (pb.isPullback && volumeRatio1m5 >= 0.1 && marketState.market_state !== "risk_off") {
           const fromState = item.status;
           item.status = "pullback_seen";
-          item.pullback_low_price = currentPrice;
+          item.pullback_low_price = pb.pullbackLow ?? currentPrice;
           item.pullback_low_at = new Date().toISOString();
           pullback_seen_count++;
 
@@ -11567,8 +11678,9 @@ export function createLiveDataStrategy(opts: {
               to_state: "pullback_seen",
               local_high: localHigh,
               current_price: currentPrice,
-              pullback_pct: pullbackPct,
-              pullback_low_price: currentPrice,
+              pullback_pct: pb.pullbackPct,
+              pullback_evidence_source: pb.evidenceSource,
+              pullback_low_price: item.pullback_low_price,
               recent_1m_ret: recent1mRet,
               price_above_ema20: isAboveEma,
               high_reclaim: highReclaim,
@@ -11583,12 +11695,42 @@ export function createLiveDataStrategy(opts: {
               ts: new Date().toISOString(),
               market,
               local_high_price: localHigh,
-              pullback_low_price: currentPrice,
-              pullback_pct: pullbackPct,
+              pullback_low_price: item.pullback_low_price,
+              pullback_pct: pb.pullbackPct,
+              pullback_evidence_source: pb.evidenceSource,
               elapsed_seconds: Math.floor((nowMs - registerTime) / 1000),
             })
           );
         }
+      }
+
+      // 2. 만료 조건 체크
+      const isHardCrash = currentPrice < localHigh * (1 - SURGE_PULLBACK_DEEP_EXPIRY_PCT / 100);
+      const isExpired =
+        elapsedMin >= 30 ||
+        isHardCrash ||
+        (volumeRatio1m5 < 0.1 && elapsedMin >= 5) ||
+        marketState.market_state === "risk_off";
+
+      if (isExpired) {
+        console.info(
+          JSON.stringify({
+            tag: "SURGE_WATCH_EXPIRED",
+            ts: new Date().toISOString(),
+            market,
+            reason: elapsedMin >= 30 ? "timeout_30m" : isHardCrash ? "pullback_too_deep" : "market_degraded",
+            last_price: currentPrice,
+            local_high: localHigh,
+            pullback_deep_boundary_pct: SURGE_PULLBACK_DEEP_EXPIRY_PCT,
+            status_at_expiry: item.status,
+          })
+        );
+        if (isMorning) {
+          delete state.morning_surge_watchlist![market];
+        } else {
+          delete state.surge_watchlist![market];
+        }
+        continue;
       }
 
       // 3. 상태 기계: pullback_seen -> reclaim_ready 전이
@@ -12575,7 +12717,7 @@ export function createLiveDataStrategy(opts: {
           let c1: UpbitCandle[] = [];
           let c5: UpbitCandle[] = [];
           try {
-            c1 = await fetchMinuteCandlesCached(market, 1, 12);
+            c1 = await fetchMinuteCandlesCached(market, 1, 30);
             c5 = await fetchMinuteCandlesCached(market, 5, 12);
           } catch {}
 
