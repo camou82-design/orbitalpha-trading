@@ -636,6 +636,7 @@ type CandidateMeta = {
   btc_phase?: string;
   asset_phase?: string;
   is_major_impulse?: boolean;
+  is_recovery_probe?: boolean;
 };
 
 type SurgeEntrySetupResult = {
@@ -1563,7 +1564,7 @@ export function evaluateGlobalKillSwitch(
     validTimestampCount++;
     validCompleted.push({
       market: t.market,
-      pnl_pct: Number(t.pnl_pct ?? 0),
+      pnl_pct: (t.pnl_pct !== undefined && t.pnl_pct !== null && Number.isFinite(Number(t.pnl_pct))) ? Number(t.pnl_pct) : NaN,
       tradeTimeMs: parsed,
       note: t.note,
     });
@@ -1602,7 +1603,7 @@ export function evaluateGlobalKillSwitch(
     reason = `Win rate under 20% in recent 48h (${recentWindowTrades.length} trades, ${(winRate * 100).toFixed(1)}%)`;
   }
   // 2. 누적 심각한 손실 가드: 최근 48시간 내 3건 이상 거래가 있고 누적 PnL <= -5.0%일 때 발동
-  else if (recentWindowTrades.length >= 3 && totalPnlPct <= -5.0) {
+  else if (recentWindowTrades.length >= 3 && Number.isFinite(totalPnlPct) && totalPnlPct <= -5.0) {
     active = true;
     reason = `Cumulative PnL under -5% in recent 48h (${recentWindowTrades.length} trades, ${totalPnlPct.toFixed(2)}%)`;
   }
@@ -1617,7 +1618,7 @@ export function evaluateGlobalKillSwitch(
       const note = (t.note || "").toLowerCase();
       return note.includes("surge_stop_loss");
     }).length;
-    if (surgeStopLosses / recentWindowTrades.length >= 0.5 && totalPnlPct < 0) {
+    if (surgeStopLosses / recentWindowTrades.length >= 0.5 && Number.isFinite(totalPnlPct) && totalPnlPct < 0) {
       active = true;
       reason = `surge_stop_loss ratio >= 50% in recent 48h (${((surgeStopLosses / recentWindowTrades.length) * 100).toFixed(1)}%) and negative cumulative PnL (${totalPnlPct.toFixed(2)}%)`;
     }
@@ -1636,7 +1637,7 @@ export function evaluateGlobalKillSwitch(
       recent_24h_count: recent24hTrades.length,
       wins,
       win_rate: winRate !== null ? Number(winRate.toFixed(4)) : null,
-      total_pnl_pct: Number(totalPnlPct.toFixed(4)),
+      total_pnl_pct: Number.isFinite(totalPnlPct) ? Number(totalPnlPct.toFixed(4)) : totalPnlPct,
       losses_24h: losses24h,
       latest_trade_age_hours: latestTradeAgeHours !== null ? Number(latestTradeAgeHours.toFixed(2)) : null,
       active,
@@ -1904,7 +1905,7 @@ async function fetchPrecheckCandlesSafe(market: string, timeoutMs = 5000): Promi
   }
 }
 
-async function validateLiveBuyPrecheck(params: {
+export async function validateLiveBuyPrecheck(params: {
   market: string;
   trades: Array<{ market: string; pnl_pct?: number | null; timestamp?: string; action?: string; note?: string }>,
   positions: Record<string, any>;
@@ -2210,10 +2211,116 @@ async function _validateLiveBuyPrecheckInternal(params: {
   if (!params.isAdditionalBuy) {
     const killSwitch = evaluateGlobalKillSwitch(params.trades);
     if (killSwitch.active) {
-      result.allowed = false;
-      result.blockReason = "global_kill_switch_active";
-      result.killSwitchReason = killSwitch.reason;
-      return result;
+      const isMajorMarket = params.market === "KRW-BTC" || params.market === "KRW-ETH";
+      const cMeta = params.candidateMeta;
+      const isMajorImpulse =
+        isMajorMarket &&
+        cMeta?.engine_bucket === "major_impulse" &&
+        cMeta?.is_major_impulse === true &&
+        cMeta?.setup?.ok === true;
+
+      const score = Number(cMeta?.score ?? cMeta?.setup?.score ?? 0);
+      const btcPhase = String(cMeta?.btc_phase ?? "").toLowerCase();
+      const assetPhase = String(cMeta?.asset_phase ?? btcPhase).toLowerCase();
+      const isPanic = cMeta?.is_panic === true || btcPhase === "panic";
+
+      // 1. Hard Risk Check (예외 불가 100% 차단)
+      const structuredCumulativePnl = killSwitch.meta?.total_pnl_pct;
+      const isCumulativePnlAuthorityValid = typeof structuredCumulativePnl === "number" && Number.isFinite(structuredCumulativePnl);
+      const isHardCumulativePnl = !isCumulativePnlAuthorityValid || structuredCumulativePnl <= -5.0;
+      const isDailyLossLimit = result.dailyLossCount >= 5;
+      const isDailyPnlLimit = result.dailyPnlPct <= -3.0;
+      const rawMultiplier = cMeta?.relaxed_multiplier;
+      const isScaleValid = typeof rawMultiplier === "number" && Number.isFinite(rawMultiplier) && rawMultiplier > 0;
+      const isHardRiskBlocked = isPanic || isHardCumulativePnl || isDailyLossLimit || isDailyPnlLimit || !isScaleValid;
+
+      // 2. Recovery Probe Position Limit (동시 최대 1개)
+      const currentOpenPositions = Object.keys(params.positions || {}).filter((m) => (params.positions[m]?.qty ?? 0) > 0);
+      const openMajorPositionsCount = currentOpenPositions.filter((m) => m === "KRW-BTC" || m === "KRW-ETH").length;
+      const isPositionLimitReached = openMajorPositionsCount >= 1;
+
+      // 3. Phase Safety Check
+      const isPhaseSafe = (btcPhase === "impulse" || btcPhase === "continuation") &&
+                          assetPhase !== "exhaustion" &&
+                          assetPhase !== "retrace";
+
+      console.info(
+        JSON.stringify({
+          tag: "GLOBAL_KILL_SWITCH_MAJOR_IMPULSE_EXCEPTION_EVAL",
+          ts: new Date().toISOString(),
+          market: params.market,
+          score,
+          engine_bucket: cMeta?.engine_bucket ?? "none",
+          btc_phase: btcPhase,
+          asset_phase: assetPhase,
+          panic: isPanic,
+          original_kill_reason: killSwitch.reason,
+          is_major_impulse: isMajorImpulse,
+          is_hard_risk_blocked: isHardRiskBlocked,
+          is_position_limit_reached: isPositionLimitReached,
+          is_phase_safe: isPhaseSafe,
+        }),
+      );
+
+      if (isMajorImpulse && score >= 90 && isPhaseSafe && !isHardRiskBlocked && !isPositionLimitReached) {
+        // [MAJOR_IMPULSE RECOVERY PROBE ALLOWED]
+        if (cMeta && typeof rawMultiplier === "number") {
+          cMeta.is_recovery_probe = true;
+          cMeta.relaxed_multiplier = Math.min(rawMultiplier, 0.15);
+        }
+        const finalSizeScale = Math.min(Number(rawMultiplier), 0.15);
+
+        console.info(
+          JSON.stringify({
+            tag: "GLOBAL_KILL_SWITCH_MAJOR_IMPULSE_EXCEPTION_ALLOWED",
+            ts: new Date().toISOString(),
+            market: params.market,
+            score,
+            engine_bucket: cMeta?.engine_bucket ?? "major_impulse",
+            btc_phase: btcPhase,
+            asset_phase: assetPhase,
+            panic: isPanic,
+            original_kill_reason: killSwitch.reason,
+            final_size_scale: finalSizeScale,
+            decision: "RECOVERY_PROBE_ALLOWED",
+          }),
+        );
+        result.allowed = true;
+        result.blockReason = null;
+        result.killSwitchReason = killSwitch.reason;
+      } else {
+        let blockDetail = "not_eligible";
+        if (!isMajorImpulse) blockDetail = "not_major_impulse";
+        else if (score < 90) blockDetail = `score_low:${score}<90`;
+        else if (!isPhaseSafe) blockDetail = `phase_unsafe:btc=${btcPhase},asset=${assetPhase}`;
+        else if (!isCumulativePnlAuthorityValid) blockDetail = "hard_risk_cumulative_pnl_authority_missing";
+        else if (structuredCumulativePnl <= -5.0) blockDetail = "hard_risk_cumulative_pnl_breached";
+        else if (!isScaleValid) blockDetail = `scale_invalid:${rawMultiplier}`;
+        else if (isHardRiskBlocked) blockDetail = "hard_risk_blocked";
+        else if (isPositionLimitReached) blockDetail = "recovery_probe_position_limit_reached";
+
+        console.info(
+          JSON.stringify({
+            tag: "GLOBAL_KILL_SWITCH_MAJOR_IMPULSE_EXCEPTION_BLOCKED",
+            ts: new Date().toISOString(),
+            market: params.market,
+            score,
+            engine_bucket: cMeta?.engine_bucket ?? "none",
+            btc_phase: btcPhase,
+            asset_phase: assetPhase,
+            panic: isPanic,
+            original_kill_reason: killSwitch.reason,
+            block_detail: blockDetail,
+            final_size_scale: 0,
+            decision: "BLOCKED",
+          }),
+        );
+
+        result.allowed = false;
+        result.blockReason = "global_kill_switch_active";
+        result.killSwitchReason = killSwitch.reason;
+        return result;
+      }
     }
 
     const lossCd = checkConsecutiveLossCooldown(params.market, params.trades);

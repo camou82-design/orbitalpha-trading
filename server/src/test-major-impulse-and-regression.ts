@@ -1,7 +1,7 @@
 import assert from "node:assert";
 import { assertOrderBuyAllowed, type MarketStateSnapshot } from "./market-state-filter.js";
 import { runEntryScoreGate } from "@orbitalpha/shared";
-import { evaluateMajorImpulseSetup, detectBtcMarketPhase } from "./live-strategy.js";
+import { evaluateMajorImpulseSetup, detectBtcMarketPhase, validateLiveBuyPrecheck, evaluateGlobalKillSwitch } from "./live-strategy.js";
 import { computeLiveCapitalPolicyV4 } from "./live-capital-policy-v4.js";
 
 async function runAllTests() {
@@ -130,7 +130,6 @@ async function runAllTests() {
     },
     {
       time: "2026-09-03T23:26:30 KST",
-      // 23:26 봉이 30초 진행 중인 라이브 틱 (23:25 완료봉 + 23:26 partial candle)
       availableCandles: [
         ...raw1mHistory.slice(0, 23),
         {
@@ -192,13 +191,6 @@ async function runAllTests() {
   console.log("SECTION 2. STAIRCASE FALSE-POSITIVE NEGATIVE CONTROL");
   console.log("==================================================================");
 
-  // Generate 1,200 minutes (20 hours) of realistic multi-regime BTC market data:
-  // - 600 min flat/noise (0.0% ~ +0.03%, normal noise)
-  // - 200 min gentle drift (+0.04% per min, low volume)
-  // - 100 min mild pullback (-0.05% per min)
-  // - 100 min sudden retrace/exhaustion (-0.30%, upper wick 55%)
-  // - 100 min genuine staircase impulses
-  // - 100 min genuine single impulses
   const simCandles: any[] = [];
   let px = 80_000_000;
   for (let i = 0; i < 1200; i++) {
@@ -207,29 +199,24 @@ async function runAllTests() {
     let highAdd = 15_000;
     let lowSub = 15_000;
 
-    // Gentle drift without volume (noise)
     if (i >= 600 && i < 800) {
       ret = 0.04;
       vol = 4.5;
     }
-    // Retrace / Pullback
     if (i >= 800 && i < 900) {
       ret = -0.06;
       vol = 6.0;
     }
-    // Exhaustion with long upper wick
     if (i >= 900 && i < 1000) {
       ret = -0.10;
-      highAdd = 120_000; // heavy upper wick
+      highAdd = 120_000;
       vol = 15.0;
     }
-    // Genuine Staircase Impulses at i=1020..1024, i=1050..1054
     if ((i >= 1020 && i <= 1024) || (i >= 1050 && i <= 1054)) {
       ret = 0.15;
       vol = 12.0;
-      highAdd = 10_000; // tiny wick
+      highAdd = 10_000;
     }
-    // Genuine Single Impulses at i=1120, i=1150
     if (i === 1120 || i === 1150) {
       ret = 0.35;
       vol = 22.0;
@@ -342,8 +329,8 @@ async function runAllTests() {
         setupReason: "CORE_TREND_CONTINUATION",
         setup: { ok: true, reason: "CORE_TREND_CONTINUATION" },
         score: 90,
-        btc_phase: "continuation", // BTC is normal
-        asset_phase: "exhaustion",  // ETH itself is exhaustion!
+        btc_phase: "continuation",
+        asset_phase: "exhaustion",
       },
     });
     assert.strictEqual(resA.ok, false, "ETH own exhaustion must block new entry even if BTC is normal");
@@ -363,8 +350,8 @@ async function runAllTests() {
         setupReason: "CORE_TREND_CONTINUATION",
         setup: { ok: true, reason: "CORE_TREND_CONTINUATION" },
         score: 90,
-        btc_phase: "exhaustion", // BTC is exhaustion!
-        asset_phase: "continuation", // ETH is normal
+        btc_phase: "exhaustion",
+        asset_phase: "continuation",
       },
     });
     assert.strictEqual(resB.ok, false, "BTC exhaustion must block ETH late chase");
@@ -420,7 +407,7 @@ async function runAllTests() {
         setupReason: "MAJOR_IMPULSE_V1",
         setup: { ok: true, reason: "MAJOR_IMPULSE_V1" },
         score: 95,
-        is_panic: true, // Panic active
+        is_panic: true,
       },
     });
     assert.strictEqual(resD.ok, false, "Panic state must hard-block ETH");
@@ -435,26 +422,22 @@ async function runAllTests() {
   console.log("SECTION 4. FULL INTEGRATION REPLAY (END-TO-END PIPELINE)");
   console.log("==================================================================");
   {
-    // Step 1: Candle feed arrives for BTC (Incident 1 staircase at 23:26:00 KST)
     const candlesForTick = raw1mHistory.slice(0, 23);
     const curPrice = 80_312_000;
 
-    // Step 2: Major Market Phase detection
     const btcPhase = detectBtcMarketPhase(candlesForTick as any, curPrice, "up", "up", "neutral");
     assert.ok(btcPhase.phase === "impulse" || btcPhase.phase === "continuation", `Phase must be safe (impulse or continuation), got ${btcPhase.phase}`);
 
-    // Step 3: Major Impulse evaluation
     const majorImpulse = evaluateMajorImpulseSetup("KRW-BTC", candlesForTick as any, curPrice, btcPhase);
     assert.strictEqual(majorImpulse.ok, true);
     assert.strictEqual(majorImpulse.mode, "STAIRCASE_IMPULSE");
 
-    // Step 4: CandidateMeta construction
     const candidateMeta = {
       market: "KRW-BTC",
       score: majorImpulse.score,
       setupReason: "MAJOR_IMPULSE_V1",
       setup: { ok: true, reason: "MAJOR_IMPULSE_V1" },
-      engine_bucket: "major_impulse",
+      engine_bucket: "major_impulse" as const,
       relaxed_multiplier: majorImpulse.probeMultiplier,
       is_major_impulse: true,
       btc_phase: btcPhase.phase,
@@ -462,7 +445,6 @@ async function runAllTests() {
       is_panic: btcPhase.isPanic,
     };
 
-    // Step 5: Assert Order Buy Allowed (Market State Filter + Phase Common Guard)
     const gateRes = assertOrderBuyAllowed(snapNeutral, {
       kind: "new_entry",
       market: "KRW-BTC",
@@ -473,7 +455,6 @@ async function runAllTests() {
     assert.strictEqual(gateRes.ok, true);
     assert.strictEqual(gateRes.size_scale, 0.72 * 0.25); // 0.18
 
-    // Step 6: Live Capital Policy Sizing
     const capPolicy = computeLiveCapitalPolicyV4({
       balances: [
         { currency: "KRW", balance: 1_000_000, locked: 0 },
@@ -486,13 +467,11 @@ async function runAllTests() {
       inFlight: false,
     });
 
-    // Core Cap: 700k, Base Slot: 233,333 KRW
     const baseSlot = capPolicy.coreRemainingKrw / 3;
     const finalOrderKrw = Math.floor(baseSlot * gateRes.size_scale);
     assert.strictEqual(finalOrderKrw, Math.floor((700_000 / 3) * 0.18)); // ~42,000 KRW
     console.log(`  - Capital Sizing: CoreCap=${capPolicy.coreCapAmount}, Sizing=${finalOrderKrw} KRW (Probe Scale: ${gateRes.size_scale})`);
 
-    // Step 7: Duplicate Position Guard
     const heldPositions = new Set<string>(["KRW-BTC"]);
     const isDuplicate = heldPositions.has("KRW-BTC");
     assert.strictEqual(isDuplicate, true, "Held position strictly prevents duplicate order");
@@ -502,7 +481,7 @@ async function runAllTests() {
   }
 
   // =========================================================================
-  // SECTION 5. REGRESSION INVARIANTS & SAFETY CHECKS (Existing Tests)
+  // SECTION 5. REGRESSION INVARIANTS (CORE / SURGE / RECLAIM / RESCUE)
   // =========================================================================
   console.log("\n==================================================================");
   console.log("SECTION 5. REGRESSION INVARIANTS (CORE / SURGE / RECLAIM / RESCUE)");
@@ -576,8 +555,774 @@ async function runAllTests() {
     assert.strictEqual(reclaimRes.ok, true, "Reclaim with score 65 in neutral must pass");
   }
 
+  // =========================================================================
+  // SECTION 6. GLOBAL KILL SWITCH MAJOR IMPULSE RECOVERY PROBE & NEGATIVE TESTS
+  // =========================================================================
   console.log("\n==================================================================");
-  console.log("ALL INTEGRATION, NO-LOOKAHEAD, MATRIX & REGRESSION TESTS PASSED!");
+  console.log("SECTION 6. GLOBAL KILL SWITCH MAJOR IMPULSE RECOVERY PROBE & NEGATIVE TESTS");
+  console.log("==================================================================");
+
+  const mockKillSwitchTrades = [
+    // 48h window trades: 4 losses yesterday, 1 win & 1 loss today
+    // -> 48h Win rate 16.7% < 20% triggers Kill Switch, but daily loss count = 1 (< 5) and daily PnL = -0.2% (> -3.0%)
+    { market: "KRW-SOL", pnl_pct: -1.2, timestamp: new Date(Date.now() - 30 * 3600_000).toISOString(), action: "sell", filled_qty: 1 },
+    { market: "KRW-AVAX", pnl_pct: -0.8, timestamp: new Date(Date.now() - 32 * 3600_000).toISOString(), action: "sell", filled_qty: 1 },
+    { market: "KRW-DOGE", pnl_pct: -1.5, timestamp: new Date(Date.now() - 34 * 3600_000).toISOString(), action: "sell", filled_qty: 1 },
+    { market: "KRW-XRP", pnl_pct: -0.9, timestamp: new Date(Date.now() - 36 * 3600_000).toISOString(), action: "sell", filled_qty: 1 },
+    { market: "KRW-DOT", pnl_pct: -0.7, timestamp: new Date(Date.now() - 2 * 3600_000).toISOString(), action: "sell", filled_qty: 1 },
+    { market: "KRW-ADA", pnl_pct: 0.5, timestamp: new Date(Date.now() - 4 * 3600_000).toISOString(), action: "sell", filled_qty: 1 },
+  ];
+
+  const ksCheck = evaluateGlobalKillSwitch(mockKillSwitchTrades);
+  assert.strictEqual(ksCheck.active, true, "Mock trades must activate global kill switch");
+  console.log(`[Kill Switch Active State Verified] reason="${ksCheck.reason}"`);
+
+  // Test 6.1: 2026-09-03 staircase incident replay + Kill Switch active -> Recovery Probe PASS
+  {
+    const res6_1 = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: mockKillSwitchTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        btc_phase: "impulse",
+        asset_phase: "impulse",
+        is_panic: false,
+        relaxed_multiplier: 0.25,
+      },
+    });
+
+    assert.strictEqual(res6_1.allowed, true, "Valid Major Impulse with score 95 must pass as recovery probe under kill switch");
+    assert.strictEqual(res6_1.blockReason, null);
+
+    const gateRes = assertOrderBuyAllowed(snapNeutral, {
+      kind: "new_entry",
+      market: "KRW-BTC",
+      strategyType: "major_impulse",
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        is_recovery_probe: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1" },
+        score: 95,
+        relaxed_multiplier: 0.15,
+        btc_phase: "impulse",
+      },
+    });
+    assert.strictEqual(gateRes.ok, true);
+    assert.strictEqual(gateRes.size_scale, 0.72 * 0.15, "Recovery probe size scale capped at 0.15");
+    console.log("[PASS] Test 6.1: Incident 1 Major Impulse passes as recovery probe (scale capped at 0.15) under kill switch");
+  }
+
+  // Test 6.2 (Negative): BTC CORE_TREND_CONTINUATION score 95 + kill switch => BLOCK
+  {
+    const res6_2 = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: mockKillSwitchTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "core_trend",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "core", // CORE ENGINE
+        is_major_impulse: false,
+        setup: { ok: true, reason: "CORE_TREND_CONTINUATION", score: 95 },
+        score: 95,
+        btc_phase: "continuation",
+        asset_phase: "continuation",
+        is_panic: false,
+      },
+    });
+    assert.strictEqual(res6_2.allowed, false, "Core Trend must be strictly blocked under kill switch");
+    assert.strictEqual(res6_2.blockReason, "global_kill_switch_active");
+    console.log("[PASS] Test 6.2: BTC CORE_TREND_CONTINUATION strictly blocked under kill switch (No side-door)");
+  }
+
+  // Test 6.3 (Negative): ETH normal core + kill switch => BLOCK
+  {
+    const res6_3 = await validateLiveBuyPrecheck({
+      market: "KRW-ETH",
+      trades: mockKillSwitchTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "stable",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-ETH",
+        engine_bucket: "core",
+        is_major_impulse: false,
+        setup: { ok: true, reason: "CORE_BREAKOUT_VOLUME", score: 92 },
+        score: 92,
+        btc_phase: "continuation",
+        asset_phase: "continuation",
+        is_panic: false,
+      },
+    });
+    assert.strictEqual(res6_3.allowed, false, "ETH Core must be blocked under kill switch");
+    assert.strictEqual(res6_3.blockReason, "global_kill_switch_active");
+    console.log("[PASS] Test 6.3: ETH normal core strictly blocked under kill switch");
+  }
+
+  // Test 6.4 (Negative): SUI surge + kill switch => BLOCK
+  {
+    const res6_4 = await validateLiveBuyPrecheck({
+      market: "KRW-SUI",
+      trades: mockKillSwitchTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: { v: 2, signal_type: "HIGH" },
+      strategyType: "momentum",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-SUI",
+        engine_bucket: "surge",
+        is_major_impulse: false,
+        setup: { ok: true, reason: "SURGE_V2_BREAKOUT", score: 95 },
+        score: 95,
+      },
+    });
+    assert.strictEqual(res6_4.allowed, false, "Alt Surge must be blocked under kill switch");
+    assert.strictEqual(res6_4.blockReason, "global_kill_switch_active");
+    console.log("[PASS] Test 6.4: SUI surge strictly blocked under kill switch");
+  }
+
+  // Test 6.5 (Negative): BTC major impulse score 89 (< 90) + kill switch => BLOCK
+  {
+    const res6_5 = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: mockKillSwitchTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 89 },
+        score: 89, // < 90
+        btc_phase: "impulse",
+        asset_phase: "impulse",
+        is_panic: false,
+        relaxed_multiplier: 0.25,
+      },
+    });
+    assert.strictEqual(res6_5.allowed, false, "Major impulse score 89 (< 90) must be blocked under kill switch");
+    assert.strictEqual(res6_5.blockReason, "global_kill_switch_active");
+    console.log("[PASS] Test 6.5: Major impulse score 89 (< 90) strictly blocked under kill switch");
+  }
+
+  // Test 6.6 (Negative): BTC major impulse in exhaustion + kill switch => BLOCK
+  {
+    const res6_6 = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: mockKillSwitchTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        btc_phase: "exhaustion", // Exhaustion
+        asset_phase: "exhaustion",
+        is_panic: false,
+        relaxed_multiplier: 0.25,
+      },
+    });
+    assert.strictEqual(res6_6.allowed, false, "Major impulse in exhaustion must be blocked under kill switch");
+    assert.strictEqual(res6_6.blockReason, "global_kill_switch_active");
+    console.log("[PASS] Test 6.6: Major impulse in exhaustion strictly blocked under kill switch");
+  }
+
+  // Test 6.7 (Negative): BTC major impulse in panic + kill switch => BLOCK
+  {
+    const res6_7 = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: mockKillSwitchTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapRiskOff },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        btc_phase: "panic",
+        asset_phase: "panic",
+        is_panic: true, // Panic
+        relaxed_multiplier: 0.25,
+      },
+    });
+    assert.strictEqual(res6_7.allowed, false, "Panic state must hard-block major impulse under kill switch");
+    assert.strictEqual(res6_7.blockReason, "global_kill_switch_active");
+    console.log("[PASS] Test 6.7: Panic state strictly hard-blocks major impulse under kill switch");
+  }
+
+  // Test 6.8 (Negative Hard Risk): Cumulative PnL <= -5% kill switch => Hard Block even for Major Impulse
+  {
+    const severeLossTrades = [
+      { market: "KRW-BTC", pnl_pct: -2.5, timestamp: new Date(Date.now() - 3600_000).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-ETH", pnl_pct: -3.0, timestamp: new Date(Date.now() - 7200_000).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-SOL", pnl_pct: -0.5, timestamp: new Date(Date.now() - 10800_000).toISOString(), action: "sell", filled_qty: 1 },
+    ];
+    const res6_8 = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: severeLossTrades, // Cumulative PnL = -6.0% <= -5.0%
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        btc_phase: "impulse",
+        asset_phase: "impulse",
+        is_panic: false,
+        relaxed_multiplier: 0.25,
+      },
+    });
+    assert.strictEqual(res6_8.allowed, false, "Cumulative PnL <= -5% must hard-block even Major Impulse");
+    assert.strictEqual(res6_8.blockReason, "global_kill_switch_active");
+    console.log("[PASS] Test 6.8: Cumulative PnL <= -5% hard risk strictly blocks all entries including Major Impulse");
+  }
+
+  // Test 6.9 (Negative Hard Risk): Daily Loss Count >= 5 => Hard Block
+  {
+    const fiveDailyLossTrades = Array.from({ length: 5 }, (_, i) => ({
+      market: "KRW-SOL",
+      pnl_pct: -0.5,
+      timestamp: new Date().toISOString(),
+      action: "sell",
+      filled_qty: 1,
+    }));
+    const res6_9 = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: fiveDailyLossTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        btc_phase: "impulse",
+        asset_phase: "impulse",
+        is_panic: false,
+        relaxed_multiplier: 0.25,
+      },
+    });
+    assert.strictEqual(res6_9.allowed, false, "Daily loss count >= 5 must hard-block");
+    assert.strictEqual(res6_9.blockReason, "global_kill_switch_active");
+    console.log("[PASS] Test 6.9: Daily loss count >= 5 hard limit strictly blocks Major Impulse");
+  }
+
+  // Test 6.10 (Negative Limit): Second Simultaneous Recovery Probe => BLOCK
+  {
+    const res6_10 = await validateLiveBuyPrecheck({
+      market: "KRW-ETH",
+      trades: mockKillSwitchTrades,
+      positions: {
+        "KRW-BTC": { symbol: "KRW-BTC", qty: 0.01, entry_price: 80_000_000 }, // 1 recovery probe already open!
+      },
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-ETH",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        btc_phase: "impulse",
+        asset_phase: "impulse",
+        is_panic: false,
+        relaxed_multiplier: 0.25,
+      },
+    });
+    assert.strictEqual(res6_10.allowed, false, "Second simultaneous recovery probe must be blocked (max 1 position)");
+    assert.strictEqual(res6_10.blockReason, "global_kill_switch_active");
+    console.log("[PASS] Test 6.10: Second simultaneous recovery probe strictly blocked (Max 1 position limit)");
+  }
+
+  // Test 6.11 (Positive): Valid ETH Major Impulse score >= 90 => Recovery Probe PASS
+  {
+    const res6_11 = await validateLiveBuyPrecheck({
+      market: "KRW-ETH",
+      trades: mockKillSwitchTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-ETH",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 92 },
+        score: 92,
+        btc_phase: "impulse",
+        asset_phase: "impulse",
+        is_panic: false,
+        relaxed_multiplier: 0.25,
+      },
+    });
+    assert.strictEqual(res6_11.allowed, true, "Valid ETH Major Impulse score >= 90 must pass as recovery probe");
+    assert.strictEqual(res6_11.blockReason, null);
+    console.log("[PASS] Test 6.11: Valid ETH Major Impulse score >= 90 passes as recovery probe under kill switch");
+  }
+
+  // Test A: total_pnl_pct=-5.1 + reason 임의문구 => BLOCK
+  {
+    const tradesA = [
+      { market: "KRW-BTC", pnl_pct: -2.0, timestamp: new Date(Date.now() - 3600_000 * 3).toISOString(), action: "sell", filled_qty: 1, note: "arbitrary_reason_1" },
+      { market: "KRW-ETH", pnl_pct: -2.0, timestamp: new Date(Date.now() - 3600_000 * 2).toISOString(), action: "sell", filled_qty: 1, note: "arbitrary_reason_2" },
+      { market: "KRW-SOL", pnl_pct: -1.1, timestamp: new Date().toISOString(), action: "sell", filled_qty: 1, note: "arbitrary_reason_3" },
+    ];
+    // Total PnL = -5.1% <= -5.0%.
+    const resA = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: tradesA,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        btc_phase: "impulse",
+        asset_phase: "impulse",
+        is_panic: false,
+        relaxed_multiplier: 0.25,
+      },
+    });
+    assert.strictEqual(resA.allowed, false, "total_pnl_pct=-5.1 with arbitrary reason must BLOCK");
+    assert.strictEqual(resA.blockReason, "global_kill_switch_active");
+    console.log("[PASS] Test A: total_pnl_pct=-5.1 + arbitrary reason string strictly BLOCK");
+  }
+
+  // Test B: total_pnl_pct=-4.9 => cumulative hard-risk is false (Kill switch active on win rate -> allowed as recovery probe)
+  {
+    const tradesB = [
+      { market: "KRW-BTC", pnl_pct: 0.1, timestamp: new Date(Date.now() - 3600_000 * 30).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-BTC", pnl_pct: -1.0, timestamp: new Date(Date.now() - 3600_000 * 28).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-ETH", pnl_pct: -1.0, timestamp: new Date(Date.now() - 3600_000 * 26).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-SOL", pnl_pct: -1.0, timestamp: new Date(Date.now() - 3600_000 * 24).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-XRP", pnl_pct: -1.0, timestamp: new Date(Date.now() - 3600_000 * 22).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-DOGE", pnl_pct: -1.0, timestamp: new Date(Date.now() - 3600_000 * 2).toISOString(), action: "sell", filled_qty: 1 },
+    ];
+    // 6 trades, 1 win -> win rate 16.7% < 20% (Kill switch active). Total PnL = -4.9% > -5.0%.
+    const resB = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: tradesB,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        btc_phase: "impulse",
+        asset_phase: "impulse",
+        is_panic: false,
+        relaxed_multiplier: 0.25,
+      },
+    });
+    assert.strictEqual(resB.allowed, true, "total_pnl_pct=-4.9 must NOT trigger cumulative hard risk");
+    assert.strictEqual(resB.blockReason, null);
+    console.log("[PASS] Test B: total_pnl_pct=-4.9 does not trigger cumulative hard risk -> Recovery probe PASS");
+  }
+
+  // Test C: total_pnl_pct missing / invalid trade structure => exception FAIL-CLOSED BLOCK
+  {
+    // A trade set where Date is valid and kill switch is active (e.g. 5 loss trades), but pnl_pct is missing/null on completed trades
+    const tradesC = Array.from({ length: 6 }, (_, i) => ({
+      market: "KRW-BTC",
+      pnl_pct: null as any,
+      timestamp: new Date(Date.now() - 3600_000 * (i + 1)).toISOString(),
+      action: "sell",
+      filled_qty: 1,
+    }));
+    const resC = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: tradesC,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        btc_phase: "impulse",
+        asset_phase: "impulse",
+        is_panic: false,
+        relaxed_multiplier: 0.25,
+      },
+    });
+    // With missing pnl_pct, structured authority is not finite/valid -> Fail-closed block
+    assert.strictEqual(resC.allowed, false, "Missing total_pnl_pct authority must FAIL-CLOSED BLOCK");
+    console.log("[PASS] Test C: total_pnl_pct missing authority strictly FAIL-CLOSED BLOCK");
+  }
+
+  // Test D: total_pnl_pct NaN => exception FAIL-CLOSED BLOCK
+  {
+    const tradesD = [
+      { market: "KRW-BTC", pnl_pct: NaN, timestamp: new Date(Date.now() - 3600_000 * 20).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-ETH", pnl_pct: -1.0, timestamp: new Date(Date.now() - 3600_000 * 18).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-SOL", pnl_pct: -1.0, timestamp: new Date(Date.now() - 3600_000 * 16).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-XRP", pnl_pct: -1.0, timestamp: new Date(Date.now() - 3600_000 * 14).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-DOGE", pnl_pct: -1.0, timestamp: new Date(Date.now() - 3600_000 * 12).toISOString(), action: "sell", filled_qty: 1 },
+    ];
+    const resD = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: tradesD,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        btc_phase: "impulse",
+        asset_phase: "impulse",
+        is_panic: false,
+        relaxed_multiplier: 0.25,
+      },
+    });
+    assert.strictEqual(resD.allowed, false, "NaN total_pnl_pct must FAIL-CLOSED BLOCK");
+    console.log("[PASS] Test D: total_pnl_pct NaN strictly FAIL-CLOSED BLOCK");
+  }
+
+  // Test E: reason에 "Cumulative PnL under -5%"가 있어도 structured value가 -4.9면 문자열 때문에 hard-risk 오판하지 않음
+  {
+    const tradesE = [
+      { market: "KRW-BTC", pnl_pct: 0.1, timestamp: new Date(Date.now() - 3600_000 * 30).toISOString(), action: "sell", filled_qty: 1, note: "Cumulative PnL under -5% fake string" },
+      { market: "KRW-BTC", pnl_pct: -1.0, timestamp: new Date(Date.now() - 3600_000 * 28).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-ETH", pnl_pct: -1.0, timestamp: new Date(Date.now() - 3600_000 * 26).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-SOL", pnl_pct: -1.0, timestamp: new Date(Date.now() - 3600_000 * 24).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-XRP", pnl_pct: -1.0, timestamp: new Date(Date.now() - 3600_000 * 22).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-DOGE", pnl_pct: -1.0, timestamp: new Date(Date.now() - 3600_000 * 2).toISOString(), action: "sell", filled_qty: 1 },
+    ];
+    // Structured PnL = -4.9%
+    const resE = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: tradesE,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        btc_phase: "impulse",
+        asset_phase: "impulse",
+        is_panic: false,
+        relaxed_multiplier: 0.25,
+      },
+    });
+    assert.strictEqual(resE.allowed, true, "Structured -4.9% must govern over reason string");
+    console.log("[PASS] Test E: Structured value (-4.9%) governs without false-blocking on reason string");
+  }
+
+  // Test F: missing relaxed_multiplier => BLOCK
+  {
+    const filterResF = assertOrderBuyAllowed(
+      baseSnap,
+      {
+        kind: "new_entry",
+        market: "KRW-BTC",
+        strategyType: "major_impulse",
+        majorImpulseScore: 95,
+        candidateMeta: {
+          market: "KRW-BTC",
+          engine_bucket: "major_impulse",
+          is_major_impulse: true,
+          is_recovery_probe: true,
+          setup: { ok: true, score: 95, reason: "STAIRCASE_IMPULSE" },
+          // relaxed_multiplier missing
+        },
+      },
+    );
+    assert.strictEqual(filterResF.ok, false, "Missing relaxed_multiplier must be rejected");
+
+    const precheckResF = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: mockKillSwitchTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        btc_phase: "impulse",
+        asset_phase: "impulse",
+        is_panic: false,
+        // relaxed_multiplier missing
+      },
+    });
+    assert.strictEqual(precheckResF.allowed, false, "Missing relaxed_multiplier must block in precheck");
+    console.log("[PASS] Test F: Missing relaxed_multiplier strictly FAIL-CLOSED BLOCK");
+  }
+
+  // Test G: null relaxed_multiplier => BLOCK
+  {
+    const filterResG = assertOrderBuyAllowed(
+      baseSnap,
+      {
+        kind: "new_entry",
+        market: "KRW-BTC",
+        strategyType: "major_impulse",
+        majorImpulseScore: 95,
+        candidateMeta: {
+          market: "KRW-BTC",
+          engine_bucket: "major_impulse",
+          is_major_impulse: true,
+          is_recovery_probe: true,
+          setup: { ok: true, score: 95, reason: "STAIRCASE_IMPULSE" },
+          relaxed_multiplier: null as any,
+        },
+      },
+    );
+    assert.strictEqual(filterResG.ok, false, "null relaxed_multiplier must be rejected");
+
+    const precheckResG = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: mockKillSwitchTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        btc_phase: "impulse",
+        asset_phase: "impulse",
+        is_panic: false,
+        relaxed_multiplier: null as any,
+      },
+    });
+    assert.strictEqual(precheckResG.allowed, false, "null relaxed_multiplier must block in precheck");
+    console.log("[PASS] Test G: null relaxed_multiplier strictly FAIL-CLOSED BLOCK");
+  }
+
+  // Test H: 0.05 => 0.05
+  {
+    const filterResH = assertOrderBuyAllowed(
+      baseSnap,
+      {
+        kind: "new_entry",
+        market: "KRW-BTC",
+        strategyType: "major_impulse",
+        majorImpulseScore: 95,
+        candidateMeta: {
+          market: "KRW-BTC",
+          engine_bucket: "major_impulse",
+          is_major_impulse: true,
+          is_recovery_probe: true,
+          setup: { ok: true, score: 95, reason: "STAIRCASE_IMPULSE" },
+          relaxed_multiplier: 0.05,
+        },
+      },
+    );
+    assert.strictEqual(filterResH.ok, true);
+    assert.strictEqual(Number(filterResH.size_scale.toFixed(4)), 0.05);
+    console.log("[PASS] Test H: Recovery scale 0.05 strictly preserved as 0.05");
+  }
+
+  // Test I: 0.12 => 0.12
+  {
+    const filterResI = assertOrderBuyAllowed(
+      baseSnap,
+      {
+        kind: "new_entry",
+        market: "KRW-BTC",
+        strategyType: "major_impulse",
+        majorImpulseScore: 95,
+        candidateMeta: {
+          market: "KRW-BTC",
+          engine_bucket: "major_impulse",
+          is_major_impulse: true,
+          is_recovery_probe: true,
+          setup: { ok: true, score: 95, reason: "STAIRCASE_IMPULSE" },
+          relaxed_multiplier: 0.12,
+        },
+      },
+    );
+    assert.strictEqual(filterResI.ok, true);
+    assert.strictEqual(Number(filterResI.size_scale.toFixed(4)), 0.12);
+    console.log("[PASS] Test I: Recovery scale 0.12 strictly preserved as 0.12");
+  }
+
+  // Test J: 0.25 => 0.15 cap
+  {
+    const filterResJ = assertOrderBuyAllowed(
+      baseSnap,
+      {
+        kind: "new_entry",
+        market: "KRW-BTC",
+        strategyType: "major_impulse",
+        majorImpulseScore: 95,
+        candidateMeta: {
+          market: "KRW-BTC",
+          engine_bucket: "major_impulse",
+          is_major_impulse: true,
+          is_recovery_probe: true,
+          setup: { ok: true, score: 95, reason: "STAIRCASE_IMPULSE" },
+          relaxed_multiplier: 0.25,
+        },
+      },
+    );
+    assert.strictEqual(filterResJ.ok, true);
+    assert.strictEqual(Number(filterResJ.size_scale.toFixed(4)), 0.15);
+    console.log("[PASS] Test J: Recovery scale 0.25 strictly capped at 0.15");
+  }
+
+  // Test K: NaN / 0 / negative => BLOCK
+  {
+    const scales = [NaN, 0, -0.1];
+    for (const s of scales) {
+      const filterResK = assertOrderBuyAllowed(
+        baseSnap,
+        {
+          kind: "new_entry",
+          market: "KRW-BTC",
+          strategyType: "major_impulse",
+          majorImpulseScore: 95,
+          candidateMeta: {
+            market: "KRW-BTC",
+            engine_bucket: "major_impulse",
+            is_major_impulse: true,
+            is_recovery_probe: true,
+            setup: { ok: true, score: 95, reason: "STAIRCASE_IMPULSE" },
+            relaxed_multiplier: s,
+          },
+        },
+      );
+      assert.strictEqual(filterResK.ok, false, `Scale ${s} must be rejected in filter`);
+
+      const precheckResK = await validateLiveBuyPrecheck({
+        market: "KRW-BTC",
+        trades: mockKillSwitchTrades,
+        positions: {},
+        cooldown_until: {},
+        marketState: { status: () => snapNeutral },
+        signalPayload: null,
+        strategyType: "major_impulse",
+        entryPath: "precheck",
+        isAdditionalBuy: false,
+        candidateMeta: {
+          market: "KRW-BTC",
+          engine_bucket: "major_impulse",
+          is_major_impulse: true,
+          setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+          score: 95,
+          btc_phase: "impulse",
+          asset_phase: "impulse",
+          is_panic: false,
+          relaxed_multiplier: s,
+        },
+      });
+      assert.strictEqual(precheckResK.allowed, false, `Scale ${s} must be rejected in precheck`);
+    }
+    console.log("[PASS] Test K: NaN / 0 / negative recovery scales strictly FAIL-CLOSED BLOCK");
+  }
+
+  console.log("\n==================================================================");
+  console.log("ALL 6 SECTIONS OF COMPREHENSIVE SAFETY & REGRESSION SUITE PASSED!");
   console.log("==================================================================");
 }
 

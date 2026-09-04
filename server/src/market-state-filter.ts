@@ -434,7 +434,16 @@ export function assertOrderBuyAllowed(
       if (impulseScore < snap.min_entry_score) {
         return deny(`major_impulse_score_low: ${impulseScore} < ${snap.min_entry_score}`, true, false);
       }
-      const probeScale = Math.min(0.35, Math.max(0.20, args.candidateMeta?.relaxed_multiplier ?? 0.30));
+      let probeScale: number;
+      if (args.candidateMeta?.is_recovery_probe) {
+        const rawScale = args.candidateMeta?.relaxed_multiplier;
+        if (typeof rawScale !== "number" || !Number.isFinite(rawScale) || rawScale <= 0) {
+          return deny("major_impulse_recovery_scale_invalid: missing, non-positive or NaN scale", true, false);
+        }
+        probeScale = Math.min(rawScale, 0.15);
+      } else {
+        probeScale = Math.min(0.35, Math.max(0.20, args.candidateMeta?.relaxed_multiplier ?? 0.30));
+      }
       return {
         ok: true,
         market_state,
