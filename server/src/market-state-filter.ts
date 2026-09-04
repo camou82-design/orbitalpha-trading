@@ -281,7 +281,7 @@ export function assertOrderBuyAllowed(
   snap: MarketStateSnapshot,
   args: {
     kind: "new_entry" | "add_to_position";
-    signalPayload: unknown | undefined;
+    signalPayload?: unknown;
     strategyType?: string;
     market?: string;
     entrySignalType?: string;
@@ -289,6 +289,9 @@ export function assertOrderBuyAllowed(
     volumeAccel?: number;
     aboveEma20?: boolean;
     candidateMeta?: any;
+    sourceKind?: string;
+    coreScore?: number;
+    majorImpulseScore?: number;
   },
 ): OrderBuyGateResult {
   const { market_state, entry_policy } = snap;
@@ -310,16 +313,38 @@ export function assertOrderBuyAllowed(
 
   const strategyType = args.strategyType || "";
   const entrySignalType = args.entrySignalType || "";
+  const sourceKind = args.sourceKind || (args.candidateMeta?.source_kind as string) || "";
+  const market = args.market || (args.candidateMeta?.market as string) || "";
+
+  const isMajorImpulseStrategy =
+    strategyType === "major_impulse" ||
+    sourceKind === "MAJOR_IMPULSE_V1" ||
+    args.candidateMeta?.setupReason === "MAJOR_IMPULSE_V1" ||
+    args.candidateMeta?.setup?.reason === "MAJOR_IMPULSE_V1";
 
   const isAggressiveSurgeStrategy =
-    strategyType === "momentum" ||
-    strategyType === "surge_breakout" ||
-    strategyType === "surge_chase";
+    !isMajorImpulseStrategy &&
+    (strategyType === "momentum" ||
+      strategyType === "surge_breakout" ||
+      strategyType === "surge_chase");
 
   const isReclaimStrategy =
-    strategyType === "reclaim" ||
-    strategyType === "surge_reclaim" ||
-    entrySignalType === "reclaim";
+    !isMajorImpulseStrategy &&
+    (strategyType === "reclaim" ||
+      strategyType === "surge_reclaim" ||
+      entrySignalType === "reclaim");
+
+  const isCoreStrategy =
+    !isMajorImpulseStrategy &&
+    !isAggressiveSurgeStrategy &&
+    !isReclaimStrategy &&
+    (strategyType === "core" ||
+      strategyType === "stable" ||
+      strategyType === "core_trend" ||
+      strategyType === "core_pullback" ||
+      sourceKind === "CORE_TRADE" ||
+      args.candidateMeta?.engine_bucket === "core" ||
+      (typeof args.candidateMeta?.setupReason === "string" && args.candidateMeta?.setupReason.startsWith("CORE_")));
 
   // genuine setup PASS evidence: 오직 production의 canonical engine_bucket === "surge" && setup.ok === true 만 인정
   const isSurgeSetupPassed = Boolean(
@@ -329,19 +354,121 @@ export function assertOrderBuyAllowed(
     args.candidateMeta?.setup?.ok === true
   );
 
+  const isMajorImpulseSetupPassed = Boolean(
+    isMajorImpulseStrategy &&
+    (market === "KRW-BTC" || market === "KRW-ETH") &&
+    (args.candidateMeta?.setup?.ok === true || args.candidateMeta?.is_major_impulse === true || (args.majorImpulseScore !== undefined && args.majorImpulseScore >= 85)) &&
+    args.candidateMeta?.is_panic !== true
+  );
+
   if (args.kind === "new_entry") {
+    const isMajorMarket = market === "KRW-BTC" || market === "KRW-ETH";
+    const btcPhase = String(args.candidateMeta?.btc_phase || (args as any).btcPhase || "").toLowerCase();
+    const assetPhase = String(args.candidateMeta?.asset_phase || (args as any).assetPhase || btcPhase).toLowerCase();
+
+    // Panic 상태는 모든 전략 예외 없이 100% 하드 블록
+    if (args.candidateMeta?.is_panic === true || (args as any).is_panic === true) {
+      return deny("panic_hard_risk_blocked: 급락/패닉 상태 신규 진입 차단", true, false);
+    }
+
+    // [COMMON MAJOR MARKET PHASE SAFETY]
+    // KRW-BTC / KRW-ETH 신규 진입 시 sourceKind 무관 공통 Market Phase 보호:
+    // - exhaustion => BTC 또는 자산 자체(ETH 등)가 exhaustion이면 신규 breakout/trend chase 100% BLOCK
+    // - retrace => BTC 또는 자산 자체(ETH 등)가 retrace이면 신규 breakout/trend chase BLOCK (명시적 pullback/reclaim 증거 필요)
+    if (isMajorMarket) {
+      if (btcPhase === "exhaustion" || assetPhase === "exhaustion") {
+        return deny("major_phase_exhaustion_blocked: BTC/ETH exhaustion 상태에서 신규 추격 진입 차단", true, false);
+      }
+      if (btcPhase === "retrace" || assetPhase === "retrace") {
+        const isPullbackReclaimSetup =
+          isReclaimStrategy ||
+          args.candidateMeta?.setupReason === "CORE_PULLBACK_RECLAIM" ||
+          args.candidateMeta?.setup?.reason === "CORE_PULLBACK_RECLAIM" ||
+          (typeof args.candidateMeta?.setupReason === "string" && args.candidateMeta?.setupReason.includes("PULLBACK") && args.candidateMeta?.setup?.ok === true);
+        if (!isPullbackReclaimSetup) {
+          return deny("major_phase_retrace_blocked: BTC/ETH retrace 상태에서 신규 추격 진입 차단", true, false);
+        }
+      }
+    }
+
     if (market_state === "risk_off") {
-      // [SURGE MARKET-STATE EXECUTION ALIGNMENT]
-      // genuine setup.ok를 통과한 일반 Surge momentum에 한해 risk_off 일괄 차단을 해제하고,
-      // 뒤쪽의 기존 BTC RSI 50 및 Entry Score 품질 검증을 거치도록 통과시킴.
-      // 저품질 Surge, Reclaim, Core/Stable, 일반 전략은 기존대로 즉시 차단.
-      if (!isSurgeSetupPassed) {
+      if (isMajorImpulseStrategy) {
+        // [MAJOR_IMPULSE RISK_OFF EXCEPTION AUTHORITY]
+        // BTC/ETH only, genuine setup.ok / impulse score >= 85, panic false 필수
+        if (!isMajorImpulseSetupPassed) {
+          return deny("risk_off: Major Impulse 예외 조건 미충족 (BTC/ETH only, setup.ok 필수, panic 불가)", true, false);
+        }
+      } else if (isAggressiveSurgeStrategy) {
+        // [SURGE MARKET-STATE EXECUTION ALIGNMENT]
+        // genuine setup.ok를 통과한 일반 Surge momentum에 한해 risk_off 일괄 차단을 해제하고,
+        // 뒤쪽의 기존 BTC RSI 50 및 Entry Score 품질 검증을 거치도록 통과시킴.
+        if (!isSurgeSetupPassed) {
+          return deny("risk_off: 신규 진입 금지", true, false);
+        }
+      } else {
+        // Core/Stable, Reclaim, 기타 전략은 risk_off에서 즉시 차단 (불변)
         return deny("risk_off: 신규 진입 금지", true, false);
       }
     }
 
-    if (isReclaimStrategy) {
-      // 1. Reclaim 전용 점수 결정 (우선순위: args.reclaimScore -> signalPayload 내 필드)
+    if (isMajorImpulseStrategy) {
+      // 1. Major Impulse Fast-Track: KRW-BTC / KRW-ETH Only
+      if (args.candidateMeta?.is_panic === true) {
+        return deny("panic_hard_risk_blocked: 급락/패닉 상태 신규 진입 차단", true, false);
+      }
+      if (market && market !== "KRW-BTC" && market !== "KRW-ETH") {
+        return deny("major_impulse_market_not_eligible: KRW-BTC/KRW-ETH only", true, false);
+      }
+      if (!args.candidateMeta?.setup?.ok && args.candidateMeta?.is_major_impulse !== true && (args.majorImpulseScore === undefined || !Number.isFinite(args.majorImpulseScore))) {
+        return deny("major_impulse_setup_not_met: genuine setup evidence required", true, false);
+      }
+      const impulseScore = Math.min(
+        100,
+        Math.max(
+          0,
+          args.majorImpulseScore ??
+            args.candidateMeta?.score ??
+            (args.candidateMeta?.setup?.ok ? 85 : 0) + snap.market_bonus,
+        ),
+      );
+      if (impulseScore < snap.min_entry_score) {
+        return deny(`major_impulse_score_low: ${impulseScore} < ${snap.min_entry_score}`, true, false);
+      }
+      const probeScale = Math.min(0.35, Math.max(0.20, args.candidateMeta?.relaxed_multiplier ?? 0.30));
+      return {
+        ok: true,
+        market_state,
+        entry_policy,
+        new_entry_blocked: false,
+        add_entry_blocked: false,
+        blocked_reason: null,
+        size_scale: size_scale * probeScale,
+      };
+    } else if (isCoreStrategy) {
+      // 2. Core Strategy Score Authority: Setup 기반 점수 적용 (Fail-Closed)
+      let coreScore: number | null = null;
+      if (args.candidateMeta?.setup) {
+        if (args.candidateMeta.setup.ok !== true) {
+          return deny(`core_setup_not_met: ${args.candidateMeta.setup.reason ?? "setup_failed"}`, true, false);
+        }
+        coreScore = Math.min(
+          100,
+          Math.max(0, Number(args.coreScore ?? args.candidateMeta.score ?? (85 + snap.market_bonus))),
+        );
+      } else if (args.coreScore !== undefined && Number.isFinite(args.coreScore) && Number(args.coreScore) > 0) {
+        coreScore = Math.min(100, Math.max(0, Number(args.coreScore) + snap.market_bonus));
+      } else if (args.signalPayload) {
+        const payloadScore = signalStrengthScore(args.signalPayload);
+        if (payloadScore > 0) {
+          coreScore = Math.min(100, Math.max(0, payloadScore + snap.market_bonus));
+        }
+      }
+
+      if (coreScore === null || Number.isNaN(coreScore) || coreScore < snap.min_entry_score) {
+        return deny(`entry score ${coreScore ?? 0} < ${snap.min_entry_score}`, true, false);
+      }
+    } else if (isReclaimStrategy) {
+      // 3. Reclaim 전용 점수 결정 (우선순위: args.reclaimScore -> signalPayload 내 필드)
       let rScore: number | undefined = args.reclaimScore;
       if ((rScore === undefined || rScore === null || Number.isNaN(rScore)) && args.signalPayload) {
         const p = args.signalPayload as any;
@@ -394,7 +521,7 @@ export function assertOrderBuyAllowed(
       }
 
     } else {
-      // 일반 Aggressive Surge 정책
+      // 4. 일반 Aggressive Surge 정책 (불변 유지)
       if (isAggressiveSurgeStrategy) {
         if (market_state === "neutral" && !isSurgeSetupPassed) {
           // genuine setup_ok를 통과하지 못한 Surge는 neutral에서 진입 차단

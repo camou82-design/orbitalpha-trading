@@ -4,6 +4,35 @@ export type MarketState = "risk_on" | "neutral" | "risk_off";
 
 /** 서버 `market-state-filter`와 동일한 신호 강도 점수(0~100). */
 export function signalStrengthScore(payload: unknown): number {
+  if (typeof payload === "object" && payload !== null) {
+    const raw = payload as any;
+    if (raw.source_kind === "MAJOR_IMPULSE_V1" || raw.strategyType === "major_impulse") {
+      if (raw.major_impulse_score !== undefined && Number.isFinite(Number(raw.major_impulse_score))) {
+        return Math.min(100, Math.max(0, Number(raw.major_impulse_score)));
+      }
+      if (raw.setup_ok === true || raw.setup?.ok === true || raw.is_major_impulse === true) {
+        return Math.min(100, Math.max(0, Number(raw.score ?? 85)));
+      }
+      return 0;
+    }
+    if (
+      raw.source_kind === "CORE_TRADE" ||
+      raw.engine_bucket === "core" ||
+      raw.strategyType === "core" ||
+      raw.strategyType === "stable" ||
+      raw.strategyType === "core_trend" ||
+      raw.strategyType === "core_pullback"
+    ) {
+      if (raw.core_score !== undefined && raw.core_score !== null && Number.isFinite(Number(raw.core_score))) {
+        return Math.min(100, Math.max(0, Number(raw.core_score)));
+      }
+      if (raw.setup_ok === true || raw.setup?.ok === true) {
+        return Math.min(100, Math.max(0, Number(raw.score ?? 85)));
+      }
+      return 0;
+    }
+  }
+
   const p = mvpSignalPayloadV2Schema.safeParse(payload);
   if (!p.success) return 0;
   let score = 0;
@@ -39,8 +68,37 @@ export function runEntryScoreGate(
   min_entry_score: number,
   market_bonus: number,
   payload: unknown | undefined,
+  opts?: {
+    sourceKind?: string;
+    strategyType?: string;
+    coreScore?: number;
+    majorImpulseScore?: number;
+    setupOk?: boolean;
+  },
 ): { ok: true; score: number } | { ok: false; reason: string; score: number } {
-  const score = signalStrengthScore(payload) + market_bonus;
+  let baseScore = signalStrengthScore(payload);
+  if (opts?.sourceKind === "MAJOR_IMPULSE_V1" || opts?.strategyType === "major_impulse") {
+    if (opts.majorImpulseScore !== undefined && Number.isFinite(opts.majorImpulseScore)) {
+      baseScore = Number(opts.majorImpulseScore);
+    } else if (opts.setupOk === true) {
+      baseScore = 85;
+    }
+  } else if (
+    opts?.sourceKind === "CORE_TRADE" ||
+    opts?.strategyType === "core" ||
+    opts?.strategyType === "stable" ||
+    opts?.strategyType === "core_trend"
+  ) {
+    if (opts.coreScore !== undefined && Number.isFinite(opts.coreScore)) {
+      baseScore = Number(opts.coreScore);
+    } else if (opts.setupOk === true) {
+      baseScore = 85;
+    } else {
+      baseScore = 0;
+    }
+  }
+
+  const score = baseScore + market_bonus;
   if (market_state === "risk_off") return { ok: false, reason: "market_state risk_off: 신규·추가 진입 차단", score };
   if (score < min_entry_score) return { ok: false, reason: `entry score ${score} < ${min_entry_score}`, score };
   return { ok: true, score };

@@ -352,9 +352,9 @@ console.log("\n--- Fixture R: Core at 60% exposure (900k / 1.5M) -> allowed with
   const cap = computeLiveCapitalPolicyV4({
     balances: [
       { currency: "KRW", balance: 600_000, locked: 0 },
-      { currency: "BTC", balance: 0.009, avg_buy_price: 100_000_000 }, // 900,000 KRW Core exposure (60%)
+      { currency: "XRP", balance: 900, avg_buy_price: 1000 }, // 900,000 KRW Core exposure (60%)
     ],
-    markPriceOrAvgByMarket: (mk) => (mk === "KRW-BTC" ? 100_000_000 : 0),
+    markPriceOrAvgByMarket: (mk) => (mk === "KRW-XRP" ? 1000 : 0),
     accountPortfolioTotalEvaluatedKrw: 1_500_000,
     totalKrwFallback: 1_500_000,
     reservedKrw: 0,
@@ -519,5 +519,5 @@ console.log("\n--- Fixture P: Ticker lock safety preserved ---");
 }
 
 console.log("\n=======================================================");
-console.log("  ALL FIXTURES (A through P) PASSED SUCCESSFULLY! (0)");
+console.log("  ALL 20 FIXTURES (A through T) PASSED SUCCESSFULLY! (0)");
 console.log("=======================================================\n");

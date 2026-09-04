@@ -615,7 +615,7 @@ type CandidateMeta = {
   paper_profile_key?: string;
   paper_pattern_multiplier?: number;
   risk_tag_multiplier?: number;
-  engine_bucket?: "surge" | "core" | "other";
+  engine_bucket?: "surge" | "core" | "major_impulse" | "other";
   surge_shadow_setup?: SurgeEntrySetupResult;
   is_core_relaxed_candidate?: boolean;
   is_relaxed_probe?: boolean;
@@ -631,6 +631,11 @@ type CandidateMeta = {
   entrySignalType?: string;
   isAggressiveSurgeStrategy?: boolean;
   isReclaimStrategy?: boolean;
+  source_kind?: string;
+  is_late_follow?: boolean;
+  btc_phase?: string;
+  asset_phase?: string;
+  is_major_impulse?: boolean;
 };
 
 type SurgeEntrySetupResult = {
@@ -2282,6 +2287,9 @@ async function _validateLiveBuyPrecheckInternal(params: {
       volumeAccel: params.volumeAccel,
       aboveEma20: params.aboveEma20,
       candidateMeta: params.candidateMeta,
+      sourceKind: params.candidateMeta?.source_kind || (params.signalPayload as any)?.source_kind,
+      coreScore: params.candidateMeta?.score,
+      majorImpulseScore: params.candidateMeta?.score,
     });
     if (!r.ok) {
       result.allowed = false;
@@ -2794,6 +2802,322 @@ function calculateStochRsi(rsi: number[], period: number, kSmoothing: number, dS
     }
   }
   return { k, d };
+}
+
+export type BtcMarketPhase = "impulse" | "continuation" | "neutral" | "retrace" | "exhaustion";
+
+export function detectBtcMarketPhase(
+  btcCandles1m: UpbitCandle[],
+  currentBtcPx: number,
+  btc5mTrend?: "up" | "down" | "flat",
+  btc15mTrend?: "up" | "down" | "flat",
+  marketState?: string,
+): {
+  phase: BtcMarketPhase;
+  ret1m: number;
+  ret3m: number;
+  distFrom15mHighPct: number;
+  recent15mHigh: number;
+  isPanic: boolean;
+} {
+  if (!btcCandles1m || btcCandles1m.length < 5 || !(currentBtcPx > 0)) {
+    const isUp = btc5mTrend === "up" && btc15mTrend === "up";
+    const isDown = btc5mTrend === "down" || btc15mTrend === "down";
+    return {
+      phase: isUp ? "continuation" : isDown ? "retrace" : "neutral",
+      ret1m: 0,
+      ret3m: 0,
+      distFrom15mHighPct: 0,
+      recent15mHigh: currentBtcPx,
+      isPanic: false,
+    };
+  }
+
+  const last = btcCandles1m[btcCandles1m.length - 1]!;
+  const open1m = Number(last.opening_price ?? currentBtcPx);
+  const ret1m = open1m > 0 ? ((currentBtcPx / open1m) - 1) * 100 : 0;
+
+  const idx3m = Math.max(0, btcCandles1m.length - 4);
+  const candle3mAgo = btcCandles1m[idx3m] ?? btcCandles1m[0]!;
+  const px3mAgo = Number(candle3mAgo.trade_price ?? currentBtcPx);
+  const ret3m = px3mAgo > 0 ? ((currentBtcPx / px3mAgo) - 1) * 100 : 0;
+
+  const idx5m = Math.max(0, btcCandles1m.length - 6);
+  const candle5mAgo = btcCandles1m[idx5m] ?? btcCandles1m[0]!;
+  const px5mAgo = Number(candle5mAgo.trade_price ?? currentBtcPx);
+  const ret5m = px5mAgo > 0 ? ((currentBtcPx / px5mAgo) - 1) * 100 : 0;
+
+  const recent15 = btcCandles1m.slice(-15);
+  const recent15mHigh = Math.max(...recent15.map((c) => Number(c.high_price ?? c.trade_price ?? 0)));
+  const distFrom15mHighPct = recent15mHigh > 0 ? ((recent15mHigh - currentBtcPx) / recent15mHigh) * 100 : 0;
+
+  // 1m volume ratio check
+  const prev5 = btcCandles1m.slice(-6, -1);
+  const avgPrevVol = prev5.length > 0 ? prev5.reduce((acc, c) => acc + Number(c.candle_acc_trade_volume ?? 0), 0) / prev5.length : 0;
+  const curVol = Number(last.candle_acc_trade_volume ?? 0);
+  const volRatio = avgPrevVol > 0 ? curVol / avgPrevVol : 1;
+
+  const isPanic = ret5m <= -1.4 || ret1m <= -0.8;
+
+  let phase: BtcMarketPhase = "neutral";
+  if (ret1m >= 0.25 || ret3m >= 0.40 || (volRatio >= 1.5 && ret1m >= 0.15)) {
+    phase = "impulse";
+  } else if (distFrom15mHighPct <= 0.15 && (ret3m >= 0.10 || btc5mTrend === "up")) {
+    phase = "continuation";
+  } else if (distFrom15mHighPct >= 0.25 || ret3m <= -0.20 || btc5mTrend === "down") {
+    const highCandle = recent15.find((c) => Number(c.high_price) === recent15mHigh);
+    const highCandleRange = highCandle ? Number(highCandle.high_price) - Number(highCandle.low_price) : 0;
+    const highCandleWick = highCandle && highCandleRange > 0
+      ? (Number(highCandle.high_price) - Math.max(Number(highCandle.trade_price), Number(highCandle.opening_price))) / highCandleRange
+      : 0;
+
+    if (highCandleWick >= 0.45 && ret1m < 0) {
+      phase = "exhaustion";
+    } else {
+      phase = "retrace";
+    }
+  }
+
+  return {
+    phase,
+    ret1m,
+    ret3m,
+    distFrom15mHighPct,
+    recent15mHigh,
+    isPanic,
+  };
+}
+
+export function evaluateMajorImpulseSetup(
+  market: string,
+  candles1m: UpbitCandle[],
+  currentPx: number,
+  btcPhaseInfo?: { phase?: string; isPanic?: boolean; is_panic?: boolean },
+): {
+  ok: boolean;
+  mode?: "SINGLE_IMPULSE" | "STAIRCASE_IMPULSE";
+  score: number;
+  reason: string;
+  ret1m: number;
+  ret3m: number;
+  volRatio1m: number;
+  consecutiveGreenCount: number;
+  probeMultiplier: number;
+  stopPrice: number;
+  targetPrice: number;
+  candleLow: number;
+  swingLow: number;
+  failed_conditions: string[];
+} {
+  const failed: string[] = [];
+  if (market !== "KRW-BTC" && market !== "KRW-ETH") {
+    return {
+      ok: false,
+      score: 0,
+      reason: "major_impulse_market_not_eligible",
+      ret1m: 0,
+      ret3m: 0,
+      volRatio1m: 0,
+      consecutiveGreenCount: 0,
+      probeMultiplier: 0,
+      stopPrice: 0,
+      targetPrice: 0,
+      candleLow: 0,
+      swingLow: 0,
+      failed_conditions: ["major_market_only"],
+    };
+  }
+
+  if (!candles1m || candles1m.length < 20 || !(currentPx > 0)) {
+    return {
+      ok: false,
+      score: 0,
+      reason: "insufficient_candles",
+      ret1m: 0,
+      ret3m: 0,
+      volRatio1m: 0,
+      consecutiveGreenCount: 0,
+      probeMultiplier: 0,
+      stopPrice: 0,
+      targetPrice: 0,
+      candleLow: 0,
+      swingLow: 0,
+      failed_conditions: ["insufficient_candles"],
+    };
+  }
+
+  // Panic / Retrace / Exhaustion check if btcPhaseInfo is provided
+  if (btcPhaseInfo) {
+    if (btcPhaseInfo.isPanic || btcPhaseInfo.is_panic) {
+      failed.push("btc_panic_hard_block");
+    }
+    if (btcPhaseInfo.phase === "exhaustion" || btcPhaseInfo.phase === "retrace") {
+      failed.push(`market_phase_${btcPhaseInfo.phase}`);
+    }
+  }
+
+  const lastCandle = candles1m[candles1m.length - 1]!;
+  const open1m = Number(lastCandle.opening_price ?? currentPx);
+  const high1m = Number(lastCandle.high_price ?? currentPx);
+  const low1m = Number(lastCandle.low_price ?? currentPx);
+  const ret1m = open1m > 0 ? ((currentPx / open1m) - 1) * 100 : 0;
+
+  const idx3m = Math.max(0, candles1m.length - 4);
+  const c3mAgo = candles1m[idx3m] ?? candles1m[0]!;
+  const px3mAgo = Number(c3mAgo.trade_price ?? currentPx);
+  const ret3m = px3mAgo > 0 ? ((currentPx / px3mAgo) - 1) * 100 : 0;
+
+  // 1m volume vs prior 5m avg
+  const prev5 = candles1m.slice(-6, -1);
+  const avgPrevVol = prev5.length > 0 ? prev5.reduce((acc, c) => acc + Number(c.candle_acc_trade_volume ?? 0), 0) / prev5.length : 0;
+  const curVol = Number(lastCandle.candle_acc_trade_volume ?? 0);
+  const volRatio1m = avgPrevVol > 0 ? curVol / avgPrevVol : 0;
+
+  // Consecutive green candle count
+  let consecutiveGreenCount = 0;
+  for (let i = candles1m.length - 1; i >= 0; i--) {
+    const c = candles1m[i]!;
+    const op = Number(c.opening_price ?? 0);
+    const cl = (i === candles1m.length - 1) ? currentPx : Number(c.trade_price ?? 0);
+    const prevCl = i > 0 ? Number(candles1m[i - 1]?.trade_price ?? op) : op;
+    if (cl > op || (cl >= op && cl > prevCl)) {
+      consecutiveGreenCount++;
+    } else {
+      break;
+    }
+  }
+
+  // Sustained Volume Participation for Staircase:
+  // Baseline volume prior to impulse (5~15 bars ago) vs recent 3m average volume
+  const baselineCandles = candles1m.length >= 8
+    ? candles1m.slice(-15, -Math.min(5, candles1m.length - 3))
+    : candles1m.slice(0, Math.max(1, candles1m.length - 3));
+  const avgBaselineVol = baselineCandles.length > 0
+    ? baselineCandles.reduce((acc, c) => acc + Number(c.candle_acc_trade_volume ?? 0), 0) / baselineCandles.length
+    : avgPrevVol;
+  const recent3Candles = candles1m.slice(-3);
+  const avgRecent3Vol = recent3Candles.length > 0
+    ? recent3Candles.reduce((acc, c) => acc + Number(c.candle_acc_trade_volume ?? 0), 0) / recent3Candles.length
+    : curVol;
+  const sustainedVolRatio = avgBaselineVol > 0 ? avgRecent3Vol / avgBaselineVol : volRatio1m;
+  const effectiveVolRatio = Math.max(volRatio1m, sustainedVolRatio);
+
+  // EMA Structure
+  const closes = candles1m.map((c) => Number(c.trade_price));
+  const ema20 = emaLast(closes, 20);
+  const ema50 = emaLast(closes, 50);
+  let emaOk = true;
+  if (ema20 !== null && currentPx < ema20) {
+    emaOk = false;
+    failed.push("price_below_ema20");
+  }
+  if (ema50 !== null && currentPx < ema50) {
+    emaOk = false;
+    failed.push("price_below_ema50");
+  }
+
+  // Upper wick ratio
+  const candleRange = Math.max(1e-9, high1m - low1m);
+  const upperWick = (high1m - Math.max(currentPx, open1m)) / candleRange;
+
+  const recentLows = candles1m.slice(-10).map((c) => Number(c.low_price));
+  const swingLow = Math.min(...recentLows);
+  const candleLow = low1m;
+  const stopPrice = Math.min(candleLow, swingLow) * 0.997;
+  const risk = currentPx - stopPrice;
+  const targetPrice = currentPx + risk * 2.0;
+
+  if (risk <= 0) {
+    failed.push("invalid_risk");
+  }
+
+  // Mode Evaluation:
+  // A. SINGLE_IMPULSE:
+  const min1mRetSingle = market === "KRW-BTC" ? 0.25 : 0.30;
+  const min3mRetSingle = market === "KRW-BTC" ? 0.40 : 0.45;
+  const singleImpulseCandidate =
+    ret1m >= min1mRetSingle &&
+    ret3m >= min3mRetSingle &&
+    volRatio1m >= 1.35 &&
+    upperWick <= 0.40;
+
+  // B. STAIRCASE_IMPULSE:
+  const min3mRetStaircase = market === "KRW-BTC" ? 0.38 : 0.42;
+  const staircaseImpulseCandidate =
+    consecutiveGreenCount >= 3 &&
+    ret3m >= min3mRetStaircase &&
+    ret1m >= 0.08 &&
+    effectiveVolRatio >= 1.25 &&
+    upperWick <= 0.35;
+
+  let mode: "SINGLE_IMPULSE" | "STAIRCASE_IMPULSE" | undefined;
+  let probeMultiplier = 0;
+  let score = 0;
+  const baseOk = failed.length === 0 && emaOk && risk > 0;
+
+  if (baseOk && singleImpulseCandidate) {
+    mode = "SINGLE_IMPULSE";
+    probeMultiplier = 0.30;
+    score = 85;
+    if (ret1m >= min1mRetSingle * 1.5) score += 5;
+    if (ret3m >= min3mRetSingle * 1.5) score += 5;
+    if (volRatio1m >= 2.0) score += 5;
+    score = Math.min(100, score);
+  } else if (baseOk && staircaseImpulseCandidate) {
+    mode = "STAIRCASE_IMPULSE";
+    probeMultiplier = 0.25;
+    score = 85;
+    if (consecutiveGreenCount >= 4) score += 5;
+    if (ret3m >= min3mRetStaircase * 1.2) score += 5;
+    if (effectiveVolRatio >= 1.5) score += 5;
+    score = Math.min(100, score);
+  } else {
+    if (!singleImpulseCandidate && !staircaseImpulseCandidate) {
+      if (ret1m < min1mRetSingle && consecutiveGreenCount < 3) {
+        failed.push(`1m_momentum_low:${ret1m.toFixed(2)}%<${min1mRetSingle}%_and_consecutive_green<3`);
+      }
+      if (ret3m < min3mRetStaircase) {
+        failed.push(`3m_momentum_low:${ret3m.toFixed(2)}%<${min3mRetStaircase}%`);
+      }
+      if (effectiveVolRatio < 1.25) {
+        failed.push(`volume_evidence_low:${effectiveVolRatio.toFixed(2)}<1.25`);
+      }
+      if (upperWick > 0.40) {
+        failed.push(`upper_wick_too_large:${upperWick.toFixed(2)}>0.40`);
+      }
+    }
+  }
+
+  const ok = mode !== undefined && failed.length === 0;
+
+  return {
+    ok,
+    mode,
+    score,
+    reason: ok ? "MAJOR_IMPULSE_V1" : `major_impulse_rejected:${failed.join(",")}`,
+    ret1m,
+    ret3m,
+    volRatio1m,
+    consecutiveGreenCount,
+    probeMultiplier,
+    stopPrice,
+    targetPrice,
+    candleLow,
+    swingLow,
+    failed_conditions: failed,
+  };
+}
+
+function calculateCoreSetupScore(setup: OriginalSpotSetupResult, btcTier?: string): number {
+  if (!setup.ok) return 0;
+  let score = 80;
+  if (setup.mode === "aggressive") score += 5;
+  if (setup.reason === "CORE_BREAKOUT_VOLUME") score += 5;
+  if (setup.reason === "CORE_TREND_CONTINUATION") score += 5;
+  if ((setup.volumeRatio ?? 0) >= 1.2) score += 5;
+  if ((setup.riskReward ?? 0) >= 2.0) score += 5;
+  if (btcTier === "strong") score += 5;
+  return Math.min(100, Math.max(0, score));
 }
 
 function evaluateOriginalSpotScalpingSetup(
@@ -5382,8 +5706,31 @@ export function createLiveDataStrategy(opts: {
     const filterPassCandidatesExcludingHeld = filterPassCandidates.filter((m) => !heldSymbolSet.has(m));
     const marketsWithFilterPassExcludingHeld = filterPassCandidatesExcludingHeld.slice(0, 40);
     const scannerCandidatesExcludingHeld = scannerCandidates.filter((x) => !heldSymbolSet.has(x.market));
+    const btcCandlesCached = precheckCandleCache.get("KRW-BTC")?.candles ?? [];
+    const btcCurrentPx = Number(
+      btcCandlesCached[btcCandlesCached.length - 1]?.trade_price ??
+        lastGoodTickerCache.get("KRW-BTC")?.row?.trade_price ??
+        0,
+    );
+    const btcPhaseInfo = detectBtcMarketPhase(
+      btcCandlesCached,
+      btcCurrentPx,
+      marketState?.btc_5m_trend,
+      marketState?.btc_15m_trend,
+      marketState?.market_state,
+    );
+    const isFastMarketActive = btcPhaseInfo.phase === "impulse" || marketState.market_state === "risk_on";
     const staleThresholdSeconds = LIVE_ENTRY_SIGNAL_STALE_SECONDS;
+    const isAltMarket = (sym: string) => sym !== "KRW-BTC" && sym !== "KRW-ETH";
+    const getEffectiveStaleLimit = (sym: string) => {
+      if (isFastMarketActive && isAltMarket(sym)) {
+        return 40; // Fast Market / BTC impulse active: max age 30~45s for late-follow alts
+      }
+      return staleThresholdSeconds; // 240s for normal market
+    };
+
     for (const c of scannerCandidatesExcludingHeld.slice(0, 80)) {
+      const symStaleLimit = getEffectiveStaleLimit(c.market);
       console.info(
         JSON.stringify({
           tag: "LIVE_SCANNER_STALE_DECISION",
@@ -5393,19 +5740,28 @@ export function createLiveDataStrategy(opts: {
           updated_at: c.updatedAt,
           signal_ts: c.signalTs,
           age_seconds: c.ageSeconds,
-          stale_threshold_seconds: staleThresholdSeconds,
-          dropped: c.ageSeconds === null || c.ageSeconds > staleThresholdSeconds,
+          stale_threshold_seconds: symStaleLimit,
+          is_fast_market: isFastMarketActive,
+          btc_phase: btcPhaseInfo.phase,
+          dropped: c.ageSeconds === null || c.ageSeconds > symStaleLimit,
         }),
       );
     }
     const freshScannerCandidates = scannerCandidatesExcludingHeld.filter(
-      (x) =>
-        x.ageSeconds !== null &&
-        x.ageSeconds <= staleThresholdSeconds &&
-        Boolean(latestAllSignals.get(x.market)?.p?.filter_pass) &&
-        latestAllSignals.get(x.market)?.p?.source_kind !== "scanner_bridge_score_fail",
+      (x) => {
+        const symStaleLimit = getEffectiveStaleLimit(x.market);
+        return (
+          x.ageSeconds !== null &&
+          x.ageSeconds <= symStaleLimit &&
+          Boolean(latestAllSignals.get(x.market)?.p?.filter_pass) &&
+          latestAllSignals.get(x.market)?.p?.source_kind !== "scanner_bridge_score_fail"
+        );
+      },
     );
-    const staleScannerCandidates = scannerCandidatesExcludingHeld.filter((x) => x.ageSeconds === null || x.ageSeconds > staleThresholdSeconds);
+    const staleScannerCandidates = scannerCandidatesExcludingHeld.filter((x) => {
+      const symStaleLimit = getEffectiveStaleLimit(x.market);
+      return x.ageSeconds === null || x.ageSeconds > symStaleLimit;
+    });
     // [LIVE_SURGE_SOURCE_REPAIR_PROOF] scanner source 상태 및 repair 결과 진단 로그
     const newestScannerAgeSeconds = scannerCandidatesExcludingHeld.length > 0
       ? Math.min(...scannerCandidatesExcludingHeld.map((x) => x.ageSeconds ?? Infinity).filter(Number.isFinite))
@@ -5421,6 +5777,8 @@ export function createLiveDataStrategy(opts: {
         selected_source: freshScannerCandidates.length > 0 ? "scanner_filter_fresh" : "fresh_filter_pass_only",
         newest_scanner_age_seconds: Number.isFinite(newestScannerAgeSeconds ?? NaN) ? newestScannerAgeSeconds : null,
         stale_threshold_seconds: staleThresholdSeconds,
+        is_fast_market: isFastMarketActive,
+        btc_phase: btcPhaseInfo.phase,
         scanner_feed_newest_ts: scannerFeedNewestTs,
       }),
     );
@@ -5429,23 +5787,23 @@ export function createLiveDataStrategy(opts: {
         if (!Boolean(sig?.p?.filter_pass) || heldSymbolSet.has(market)) return null;
         const sourceTs = signalCandidateTimestamp(sig);
         const ageSeconds = sourceTs ? Math.max(0, Math.floor((Date.now() - Date.parse(sourceTs)) / 1000)) : null;
+        const symStaleLimit = getEffectiveStaleLimit(market);
+        if (ageSeconds === null || ageSeconds > symStaleLimit) return null;
         const gate = opts.marketState.entryGate(sig.p, marketState);
         return { market, sourceTs, ageSeconds, score: Number(gate.score ?? 0), vol: Number(sig?.p?.volume_ratio ?? 0) };
       })
-      .filter(
-        (x): x is { market: string; sourceTs: string | null; ageSeconds: number | null; score: number; vol: number } =>
-          Boolean(x && x.ageSeconds !== null && x.ageSeconds <= staleThresholdSeconds),
-      )
+      .filter((x): x is NonNullable<typeof x> => x !== null)
       .sort((a, b) => b.score - a.score || b.vol - a.vol);
     const staleFilterPassCandidates = Array.from(latestAllSignals.entries())
       .map(([market, sig]) => {
         if (!Boolean(sig?.p?.filter_pass) || heldSymbolSet.has(market)) return null;
         const sourceTs = signalCandidateTimestamp(sig);
         const ageSeconds = sourceTs ? Math.max(0, Math.floor((Date.now() - Date.parse(sourceTs)) / 1000)) : null;
-        if (ageSeconds !== null && ageSeconds <= staleThresholdSeconds) return null;
+        const symStaleLimit = getEffectiveStaleLimit(market);
+        if (ageSeconds !== null && ageSeconds <= symStaleLimit) return null;
         return { market, ageSeconds };
       })
-      .filter((x): x is { market: string; ageSeconds: number | null } => Boolean(x));
+      .filter((x): x is NonNullable<typeof x> => x !== null);
 
     const selectedSourceRows: Array<{
       market: string;
@@ -10500,13 +10858,14 @@ export function createLiveDataStrategy(opts: {
       Promise.allSettled(
         entryUniverse.map(async (m) => {
         let s = latestAllSignals.get(m);
+        const isCoreMarket = coreMarketSet.has(m);
         const isFallbackSource =
-          !coreMarketSet.has(m) &&
+          !isCoreMarket &&
           (entrySourceKindByMarket.get(m) === "fallback_watch_markets" ||
             sourceMetaByMarket.get(m)?.source_kind === "fallback_watch_markets");
         const realSignalPresent = !!s?.p;
 
-        if (!realSignalPresent && !isFallbackSource) {
+        if (!realSignalPresent && !isFallbackSource && !isCoreMarket) {
           evaluationDroppedReasons[m] = "missing_signal_payload";
           evaluationDiagnostics[m] = {
             marketState: marketState.market_state,
@@ -10520,18 +10879,17 @@ export function createLiveDataStrategy(opts: {
           return null;
         }
 
-        // [DIAGNOSTIC-REPAIR] If signal is missing but it's a fallback market, we continue with real_signal_present: false.
-        // We use a safe empty payload object for downstream logic to avoid crashes, but strictly block entry.
+        // [DIAGNOSTIC-REPAIR] If signal is missing but it's a fallback or core market, we continue safely.
         const effectivePayload = s?.p || {
           v: 2,
           market: m,
           signal_type: "MID",
-          signal_reason: "fallback_watch_market_diagnostic",
-          filter_pass: false,
+          signal_reason: isCoreMarket ? "core_autonomous_entry" : "fallback_watch_market_diagnostic",
+          filter_pass: isCoreMarket,
           filters: [],
           volume_ratio: 0,
           signal_score: 0,
-          source_kind: "fallback_watch_markets",
+          source_kind: isCoreMarket ? "CORE_TRADE" : "fallback_watch_markets",
         };
         const currentPx = Number(priceBy.get(m) ?? 0);
         if (!(currentPx > 0)) {
@@ -10562,8 +10920,6 @@ export function createLiveDataStrategy(opts: {
           (effectivePayload as any).isSurgeSource === true ||
           SURGE_V2_SOURCE_KINDS.has(sourceKindFromPayload) ||
           SURGE_V2_SOURCE_KINDS.has(sourceKindFromMap);
-        
-        const isCoreMarket = coreMarketSet.has(m);
 
         if (isSurgeCandidate) {
           console.info(JSON.stringify({
@@ -10731,8 +11087,61 @@ export function createLiveDataStrategy(opts: {
           volumeRatio: Number(effectivePayload.volume_ratio ?? 0),
         };
         const softenedReasons: string[] = [];
+        const assetPhaseInfo = m === "KRW-BTC" ? btcPhaseInfo : detectBtcMarketPhase(candles1, currentPx);
+
         if (!isSurgeCandidate) {
-          setup = evaluateOriginalSpotScalpingSetup(m, candles1, currentPx);
+          // Check Major Impulse first for BTC/ETH fast-track
+          if (m === "KRW-BTC" || m === "KRW-ETH") {
+            const combinedPhaseInfo = {
+              phase: (btcPhaseInfo.phase === "exhaustion" || assetPhaseInfo.phase === "exhaustion")
+                ? "exhaustion"
+                : (btcPhaseInfo.phase === "retrace" || assetPhaseInfo.phase === "retrace")
+                ? "retrace"
+                : btcPhaseInfo.phase,
+              isPanic: btcPhaseInfo.isPanic || assetPhaseInfo.isPanic,
+              is_panic: btcPhaseInfo.isPanic || assetPhaseInfo.isPanic,
+            };
+            const majorImpulse = evaluateMajorImpulseSetup(m, candles1, currentPx, combinedPhaseInfo);
+            if (majorImpulse.ok) {
+              setup = {
+                ok: true,
+                mode: majorImpulse.mode === "STAIRCASE_IMPULSE" ? "staircase_probe" : "relaxed_probe",
+                reason: "MAJOR_IMPULSE_V1",
+                riskReward: 2.0,
+                stopPrice: majorImpulse.stopPrice,
+                targetPrice: majorImpulse.targetPrice,
+                candleLow: majorImpulse.candleLow,
+                swingLow: majorImpulse.swingLow,
+                volumeRatio: majorImpulse.volRatio1m,
+                failed_conditions: [],
+                score: majorImpulse.score,
+                probe_multiplier: majorImpulse.probeMultiplier,
+                impulse_mode: majorImpulse.mode,
+              } as any;
+              softenedReasons.push("MAJOR_IMPULSE_V1");
+              console.info(
+                JSON.stringify({
+                  tag: "MAJOR_IMPULSE_ENTRY_SETUP_PASS",
+                  ts: new Date().toISOString(),
+                  market: m,
+                  source_kind: "MAJOR_IMPULSE_V1",
+                  impulse_mode: majorImpulse.mode,
+                  ret1m: majorImpulse.ret1m,
+                  ret3m: majorImpulse.ret3m,
+                  consecutive_green_count: majorImpulse.consecutiveGreenCount,
+                  volume_ratio_1m: majorImpulse.volRatio1m,
+                  score: majorImpulse.score,
+                  stopPrice: majorImpulse.stopPrice,
+                  targetPrice: majorImpulse.targetPrice,
+                  probeMultiplier: majorImpulse.probeMultiplier,
+                }),
+              );
+            }
+          }
+
+          if (!setup.ok || setup.reason !== "MAJOR_IMPULSE_V1") {
+            setup = evaluateOriginalSpotScalpingSetup(m, candles1, currentPx);
+          }
 
           if (
             !setup.ok &&
@@ -11076,7 +11485,18 @@ export function createLiveDataStrategy(opts: {
 
         let gateOk = realSignalPresent ? gate.ok : false;
         let gateReason = realSignalPresent ? gate.reason : "missing_real_signal_payload";
-        const score = Number(gate.score ?? 0);
+        let score = Number(gate.score ?? 0);
+
+        if (setup.reason === "MAJOR_IMPULSE_V1") {
+          gateOk = true;
+          gateReason = "MAJOR_IMPULSE_V1";
+          score = (setup as any).score ?? 85;
+        } else if (isCoreMarket && setup.ok) {
+          const coreCalculatedScore = calculateCoreSetupScore(setup, btcTier);
+          score = score > 0 ? score : coreCalculatedScore;
+          gateOk = score >= marketState.min_entry_score;
+          gateReason = gateOk ? "core_setup_passed" : `core_score_low:${score}<${marketState.min_entry_score}`;
+        }
 
         if (gateOk && isCoreRelaxedCandidate && score >= 70 && (
           gateReason === "score_below_threshold" || 
@@ -11143,15 +11563,39 @@ export function createLiveDataStrategy(opts: {
           return null;
         }
 
-        // Apply probe multiplier — CORE_TREND_ENTRY 는 별도 소액 배수
+        // Apply probe multiplier — CORE_TREND_ENTRY 는 별도 소액 배수, MAJOR_IMPULSE_V1 는 mode별 배수 (SINGLE: 0.30, STAIRCASE: 0.25)
         let relaxedMultiplier = 1.0;
-        if (setup.reason === "CORE_TREND_ENTRY") {
+        if (setup.reason === "MAJOR_IMPULSE_V1") {
+          relaxedMultiplier = (setup as any).probe_multiplier ?? 0.30;
+        } else if (setup.reason === "CORE_TREND_ENTRY") {
           relaxedMultiplier = LIVE_CORE_TREND_PROBE_MULTIPLIER;
-        } else if (setup.mode === "relaxed_probe" || softenedReasons.length > 0) {
+        } else if ((setup.mode as string) === "relaxed_probe" || (setup.mode as string) === "staircase_probe" || softenedReasons.length > 0) {
           relaxedMultiplier = 0.35;
         }
 
-        const isFreshSignal = realSignalPresent && !isFallbackSource;
+        // BTC Phase & Late-Follow Alt Control
+        let isLateFollowAlt = false;
+        if (m !== "KRW-BTC" && m !== "KRW-ETH") {
+          if (btcPhaseInfo.isPanic) {
+            evaluationDroppedReasons[m] = "btc_panic_crash_guard";
+            emitCoreCandidateReject(m, "btc_panic_crash_guard");
+            return null;
+          }
+          if (
+            (btcPhaseInfo.phase === "retrace" || btcPhaseInfo.phase === "exhaustion") &&
+            (ageSec !== null && ageSec > 25)
+          ) {
+            isLateFollowAlt = true;
+            score = Math.max(0, score - 15);
+            relaxedMultiplier = relaxedMultiplier * 0.50;
+            gateOk = score >= marketState.min_entry_score;
+            if (!gateOk) {
+              gateReason = `late_follow_alt_score_penalized:${score}<${marketState.min_entry_score}`;
+            }
+          }
+        }
+
+        const isFreshSignal = (realSignalPresent || isCoreMarket || setup.reason === "MAJOR_IMPULSE_V1") && !isFallbackSource;
         const isWatchCandidate = isFallbackSource;
 
         const meta: CandidateMeta = {
@@ -11175,16 +11619,22 @@ export function createLiveDataStrategy(opts: {
           volumeRatio: setup.volumeRatio,
           setup,
           surge_shadow_setup: surgeShadowSetup,
-          engine_bucket: isSurgeCandidate ? "surge" : isCoreMarket ? "core" : "other",
+          engine_bucket: isSurgeCandidate ? "surge" : (setup.reason === "MAJOR_IMPULSE_V1" ? "major_impulse" : isCoreMarket ? "core" : "other"),
           is_core_relaxed_candidate: isCoreRelaxedCandidate,
-          is_relaxed_probe: setup.mode === "relaxed_probe" || setup.reason === "CORE_TREND_ENTRY",
+          is_relaxed_probe: (setup.mode as string) === "relaxed_probe" || (setup.mode as string) === "staircase_probe" || setup.reason === "CORE_TREND_ENTRY" || setup.reason === "MAJOR_IMPULSE_V1",
           softened_reasons: softenedReasons,
           relaxed_multiplier: relaxedMultiplier,
           gate_ok: gateOk,
           gate_reason: gateReason,
-          real_signal_present: realSignalPresent,
+          real_signal_present: realSignalPresent || isCoreMarket || setup.reason === "MAJOR_IMPULSE_V1",
           is_fresh_signal: isFreshSignal,
           is_watch_candidate: isWatchCandidate,
+          is_major_impulse: setup.reason === "MAJOR_IMPULSE_V1",
+          is_late_follow: isLateFollowAlt,
+          btc_phase: btcPhaseInfo.phase,
+          asset_phase: assetPhaseInfo.phase,
+          source_kind: setup.reason === "MAJOR_IMPULSE_V1" ? "MAJOR_IMPULSE_V1" : effectivePayload.source_kind,
+          strategyType: setup.reason === "MAJOR_IMPULSE_V1" ? "major_impulse" : (isCoreMarket ? "stable" : undefined),
         };
 
         const isReclaimFromSignal = 
@@ -12546,7 +12996,14 @@ export function createLiveDataStrategy(opts: {
         (sourceMeta as any)?.source_kind === "surge_scanner_worker" ||
         (sourceMeta as any)?.source_kind === "scanner_tradable_candidate";
 
-      const loopStrategyType = isActualPromotedReclaim
+      const isMajorImpulse =
+        candidateMetaFromSetup?.setupReason === "MAJOR_IMPULSE_V1" ||
+        candidateMetaFromSetup?.is_major_impulse === true ||
+        (sourceMeta as any)?.source_kind === "MAJOR_IMPULSE_V1";
+
+      const loopStrategyType = isMajorImpulse
+        ? "major_impulse"
+        : isActualPromotedReclaim
         ? "surge_reclaim"
         : (sourceMeta?.source_kind === "CORE_TRADE" ? "stable" : "momentum");
       const loopEntrySignalType = isActualPromotedReclaim ? "reclaim" : undefined;
