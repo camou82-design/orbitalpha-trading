@@ -1215,3 +1215,52 @@ export async function fetchTickers(markets: string[], opts?: FetchTickersOptions
   }
   return out;
 }
+
+export async function fetchLiveTickersDirect(
+  markets: string[],
+  opts?: { signal?: AbortSignal; timeoutMs?: number; debugCaller?: string }
+): Promise<{ ok: boolean; source: "live" | "fallback" | "failed"; rows: UpbitTicker[]; fetchedAtMs: number | null }> {
+  if (markets.length === 0) return { ok: false, source: "failed", rows: [], fetchedAtMs: null };
+  const sanitized = await sanitizeKrwMarkets(markets);
+  if (sanitized.length === 0) return { ok: false, source: "failed", rows: [], fetchedAtMs: null };
+
+  let releaseLock: (() => void) | null = null;
+  try {
+    releaseLock = await acquireTickerLock({
+      priority: true,
+      signal: opts?.signal,
+      timeoutMs: opts?.timeoutMs ?? 3000,
+      caller: opts?.debugCaller ?? "fetchLiveTickersDirect",
+    });
+
+    const rows = await fetchTickerBatchGroup({
+      group: sanitized,
+      signal: opts?.signal,
+      batchTimeoutMs: opts?.timeoutMs ? Math.floor(opts.timeoutMs * 0.8) : 2500,
+      debugCaller: opts?.debugCaller ?? "fetchLiveTickersDirect",
+    });
+
+    const now = Date.now();
+    for (const t of rows) {
+      tickerCache.set(t.market, {
+        value: t,
+        fetchedAtMs: now,
+        expiresAtMs: now + TICKER_CACHE_TTL_MS,
+        staleUntilMs: now + TICKER_CACHE_TTL_MS + TICKER_CACHE_STALE_GRACE_MS,
+      });
+      lastGoodTickerCache.set(t.market, t);
+      tickerSourceMap.set(t.market, "live");
+      tickerAgeMap.set(t.market, 0);
+    }
+
+    const allPresent = sanitized.every((m) => rows.some((r) => r.market === m && Number(r.trade_price) > 0));
+    if (allPresent && rows.length > 0) {
+      return { ok: true, source: "live", rows, fetchedAtMs: now };
+    }
+    return { ok: false, source: "failed", rows: [], fetchedAtMs: null };
+  } catch {
+    return { ok: false, source: "failed", rows: [], fetchedAtMs: null };
+  } finally {
+    if (releaseLock) releaseLock();
+  }
+}

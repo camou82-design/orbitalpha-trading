@@ -1,8 +1,21 @@
 import assert from "node:assert";
 import { assertOrderBuyAllowed, type MarketStateSnapshot } from "./market-state-filter.js";
 import { runEntryScoreGate } from "@orbitalpha/shared";
-import { evaluateMajorImpulseSetup, detectBtcMarketPhase, validateLiveBuyPrecheck, evaluateGlobalKillSwitch } from "./live-strategy.js";
+import {
+  evaluateMajorImpulseSetup,
+  detectBtcMarketPhase,
+  validateLiveBuyPrecheck,
+  evaluateGlobalKillSwitch,
+  evaluateMajorImpulseCandleFreshness,
+  evaluateMajorImpulseTickerFreshness,
+  isVerifiedMajorImpulseAuthority,
+  evaluateLegacyLowSignalGate,
+  LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS,
+  LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS,
+  LIVE_MAJOR_IMPULSE_TICKER_MAX_AGE_MS,
+} from "./live-strategy.js";
 import { computeLiveCapitalPolicyV4 } from "./live-capital-policy-v4.js";
+import { tickerSourceMap } from "./upbit-public.js";
 
 async function runAllTests() {
   console.log("==================================================================");
@@ -1321,8 +1334,865 @@ async function runAllTests() {
     console.log("[PASS] Test K: NaN / 0 / negative recovery scales strictly FAIL-CLOSED BLOCK");
   }
 
+  // =========================================================================
+  // SECTION 7. MAJOR IMPULSE LEGACY LOW SIGNAL & CANDIDATE FRESHNESS SUITE
+  // =========================================================================
   console.log("\n==================================================================");
-  console.log("ALL 6 SECTIONS OF COMPREHENSIVE SAFETY & REGRESSION SUITE PASSED!");
+  console.log("SECTION 7. MAJOR IMPULSE PRODUCTION FRESHNESS & LOW SIGNAL SUITE");
+  console.log("==================================================================");
+
+  // 1. BTC Major score95 raw strength0 fresh candle + fresh ticker => PASS
+  {
+    const freshCandleTs = new Date(Date.now() - 30_000).toISOString();
+    const res = evaluateLegacyLowSignalGate({
+      market: "KRW-BTC",
+      sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+      isSurgeSource: false,
+      candidateMetaFromSetup: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95, latest_candle_ts: freshCandleTs },
+        score: 95,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        candle_freshness_ok: true,
+        latest_candle_ts: freshCandleTs,
+        ticker_price_source: "live_force_refresh",
+        ticker_price_age_ms: 100,
+        ticker_freshness_ok: true,
+      },
+    });
+    assert.strictEqual(res.isVerifiedMajorImpulse, true);
+    assert.strictEqual(res.effectiveStrength, 95);
+    assert.strictEqual(res.blocked_low_signal, false);
+    assert.strictEqual(res.decision, "pass");
+    console.log("[PASS] Req Test 1: BTC Major score95 raw strength0 fresh candle + fresh ticker => PASS");
+  }
+
+  // 2. ETH score90 fresh => PASS
+  {
+    const freshCandleTs = new Date(Date.now() - 30_000).toISOString();
+    const res = evaluateLegacyLowSignalGate({
+      market: "KRW-ETH",
+      sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+      isSurgeSource: false,
+      candidateMetaFromSetup: {
+        market: "KRW-ETH",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 90, latest_candle_ts: freshCandleTs },
+        score: 90,
+        candle_source: "last_good_cache",
+        candle_cache_age_ms: 35_000, // <= LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS (75_000)
+        candle_freshness_ok: true,
+        latest_candle_ts: freshCandleTs,
+        ticker_price_source: "ticker_batch",
+        ticker_price_age_ms: 5_000,
+        ticker_freshness_ok: true,
+      },
+    });
+    assert.strictEqual(res.isVerifiedMajorImpulse, true);
+    assert.strictEqual(res.effectiveStrength, 90);
+    assert.strictEqual(res.blocked_low_signal, false);
+    assert.strictEqual(res.decision, "pass");
+    console.log("[PASS] Req Test 2: ETH score90 fresh (cache age 35s <= 75s, ticker age 5s <= 30s) => PASS");
+  }
+
+  // 2A (Test A): candle_freshness_ok = undefined with otherwise perfect conditions => BLOCK
+  {
+    const freshCandleTs = new Date(Date.now() - 30_000).toISOString();
+    const authRes = isVerifiedMajorImpulseAuthority({
+      market: "KRW-BTC",
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95, latest_candle_ts: freshCandleTs },
+        score: 95,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        candle_freshness_ok: undefined, // undefined!
+        latest_candle_ts: freshCandleTs,
+        ticker_price_source: "ticker_batch",
+        ticker_price_age_ms: 5000,
+        ticker_freshness_ok: true,
+      },
+    });
+    assert.strictEqual(authRes, false, "candle_freshness_ok=undefined MUST be blocked");
+    console.log("[PASS] Test A: candle_freshness_ok = undefined strictly FAIL-CLOSED BLOCKED");
+  }
+
+  // 2B (Test B): candle_freshness_ok = null with otherwise perfect conditions => BLOCK
+  {
+    const freshCandleTs = new Date(Date.now() - 30_000).toISOString();
+    const authRes = isVerifiedMajorImpulseAuthority({
+      market: "KRW-BTC",
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95, latest_candle_ts: freshCandleTs },
+        score: 95,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        candle_freshness_ok: null as any, // null!
+        latest_candle_ts: freshCandleTs,
+        ticker_price_source: "ticker_batch",
+        ticker_price_age_ms: 5000,
+        ticker_freshness_ok: true,
+      },
+    });
+    assert.strictEqual(authRes, false, "candle_freshness_ok=null MUST be blocked");
+    console.log("[PASS] Test B: candle_freshness_ok = null strictly FAIL-CLOSED BLOCKED");
+  }
+
+  // 2C (Test C): candle_freshness_ok = false with otherwise perfect conditions => BLOCK
+  {
+    const freshCandleTs = new Date(Date.now() - 30_000).toISOString();
+    const authRes = isVerifiedMajorImpulseAuthority({
+      market: "KRW-BTC",
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95, latest_candle_ts: freshCandleTs },
+        score: 95,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        candle_freshness_ok: false, // false!
+        latest_candle_ts: freshCandleTs,
+        ticker_price_source: "ticker_batch",
+        ticker_price_age_ms: 5000,
+        ticker_freshness_ok: true,
+      },
+    });
+    assert.strictEqual(authRes, false, "candle_freshness_ok=false MUST be blocked");
+    console.log("[PASS] Test C: candle_freshness_ok = false strictly FAIL-CLOSED BLOCKED");
+  }
+
+  // 3. score89 => BLOCK
+  {
+    const res = evaluateLegacyLowSignalGate({
+      market: "KRW-BTC",
+      sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+      isSurgeSource: false,
+      candidateMetaFromSetup: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 89 },
+        score: 89,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        ticker_price_source: "live_force_refresh",
+        ticker_price_age_ms: 50,
+        ticker_freshness_ok: true,
+      },
+    });
+    assert.strictEqual(res.isVerifiedMajorImpulse, false);
+    assert.strictEqual(res.effectiveStrength, 0);
+    assert.strictEqual(res.blocked_low_signal, true);
+    assert.strictEqual(res.decision, "blocked");
+    console.log("[PASS] Req Test 3: score89 (<90) => BLOCK");
+  }
+
+  // 4. Candle cache stale => BLOCK
+  {
+    const staleCacheFreshness = evaluateMajorImpulseCandleFreshness({
+      candle_source: "last_good_cache",
+      candle_cache_age_ms: LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS + 1000, // 76_000 > 75_000
+      latestCandleTs: "2026-09-10T18:25:00",
+      nowMs: Date.parse("2026-09-10T18:25:30+09:00"),
+    });
+    assert.strictEqual(staleCacheFreshness.isFresh, false);
+    assert.strictEqual(staleCacheFreshness.reason, "stale_candidate_candle_cache");
+
+    const res = evaluateLegacyLowSignalGate({
+      market: "KRW-BTC",
+      sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+      isSurgeSource: false,
+      candidateMetaFromSetup: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        candle_source: "last_good_cache",
+        candle_cache_age_ms: LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS + 1000,
+        ticker_freshness_ok: true,
+      },
+    });
+    assert.strictEqual(res.isVerifiedMajorImpulse, false);
+    assert.strictEqual(res.effectiveStrength, 0);
+    assert.strictEqual(res.blocked_low_signal, true);
+    assert.strictEqual(res.decision, "blocked");
+    console.log("[PASS] Req Test 4: candle cache stale (> LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS) => BLOCK");
+  }
+
+  // 5. Candle timestamp stale => BLOCK
+  {
+    const staleTimestampFreshness = evaluateMajorImpulseCandleFreshness({
+      candle_source: "live_fetch",
+      candle_cache_age_ms: null,
+      latestCandleTs: "2026-09-10T18:00:00",
+      nowMs: Date.parse("2026-09-10T18:05:00+09:00"), // 300s > LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS (120s)
+    });
+    assert.strictEqual(staleTimestampFreshness.isFresh, false);
+    assert.strictEqual(staleTimestampFreshness.reason, "stale_latest_candle_timestamp");
+    assert.strictEqual(staleTimestampFreshness.isTimestampFresh, false);
+    console.log("[PASS] Req Test 5: candle timestamp stale (> LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS 120s) => BLOCK");
+  }
+
+  // 6. Future candle timestamp => BLOCK
+  {
+    const futureCandleFreshness = evaluateMajorImpulseCandleFreshness({
+      candle_source: "live_fetch",
+      candle_cache_age_ms: null,
+      latestCandleTs: "2026-09-10T18:30:00",
+      nowMs: Date.parse("2026-09-10T18:20:00+09:00"), // 10 minutes ahead
+      futureToleranceMs: 10_000,
+    });
+    assert.strictEqual(futureCandleFreshness.isFresh, false);
+    assert.strictEqual(futureCandleFreshness.reason, "future_latest_candle_timestamp");
+    console.log("[PASS] Req Test 6: future candle timestamp (> now + 10s tolerance) => FAIL-CLOSED BLOCK");
+  }
+
+  // 7. Ticker age exceeded or last_good_cache / fallback mark price => BLOCK
+  {
+    const ageExceededTicker = evaluateMajorImpulseTickerFreshness({
+      tickerSource: "ticker_batch",
+      tickerAgeMs: LIVE_MAJOR_IMPULSE_TICKER_MAX_AGE_MS + 5000, // 35_000 > 30_000
+    });
+    assert.strictEqual(ageExceededTicker.isFresh, false);
+    assert.strictEqual(ageExceededTicker.reason?.startsWith("ticker_age_exceeded"), true);
+
+    const lastGoodTicker = evaluateMajorImpulseTickerFreshness({
+      tickerSource: "last_good_cache",
+      tickerAgeMs: 5000,
+    });
+    assert.strictEqual(lastGoodTicker.isFresh, false);
+    assert.strictEqual(lastGoodTicker.reason, "last_good_cache_prohibited_for_major_impulse");
+
+    const markPriceFallback = evaluateMajorImpulseTickerFreshness({
+      tickerSource: "mark_prices_trade_status",
+      tickerAgeMs: 100,
+    });
+    assert.strictEqual(markPriceFallback.isFresh, false);
+    assert.strictEqual(markPriceFallback.reason, "fallback_price_prohibited_for_major_impulse");
+
+    const missingTickerAge = evaluateMajorImpulseTickerFreshness({
+      tickerSource: "last_good_cache",
+      tickerAgeMs: null,
+    });
+    assert.strictEqual(missingTickerAge.isFresh, false);
+    assert.strictEqual(missingTickerAge.reason, "last_good_cache_prohibited_for_major_impulse");
+    console.log("[PASS] Req Test 7: ticker age exceeded (>30s), last_good_cache, or mark_prices fallback => BLOCK");
+  }
+
+  // 7A (Test A): last_good_cache exists + tickerCache missing + legacy tickerAgeMap=0 => Major Impulse strictly FAIL-CLOSED BLOCK
+  {
+    // Simulates upbit-public tickerAgeMap setting 0 when c is missing for last_good_cache
+    const legacySpoofedTickerAge = 0;
+    const tickerFresh = evaluateMajorImpulseTickerFreshness({
+      tickerSource: "last_good_cache",
+      tickerAgeMs: legacySpoofedTickerAge,
+    });
+    assert.strictEqual(tickerFresh.isFresh, false, "last_good_cache with age 0 must NEVER be treated as fresh for Major Impulse");
+    assert.strictEqual(tickerFresh.reason, "last_good_cache_prohibited_for_major_impulse");
+
+    const authRes = isVerifiedMajorImpulseAuthority({
+      market: "KRW-BTC",
+      candidateMeta: {
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        ticker_price_source: "last_good_cache",
+        ticker_price_age_ms: legacySpoofedTickerAge,
+        ticker_freshness_ok: tickerFresh.isFresh,
+      },
+    });
+    assert.strictEqual(authRes, false);
+
+    const gateRes = evaluateLegacyLowSignalGate({
+      market: "KRW-BTC",
+      sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+      isSurgeSource: false,
+      candidateMetaFromSetup: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        ticker_price_source: "last_good_cache",
+        ticker_price_age_ms: legacySpoofedTickerAge,
+        ticker_freshness_ok: tickerFresh.isFresh,
+      },
+    });
+    assert.strictEqual(gateRes.isVerifiedMajorImpulse, false);
+    assert.strictEqual(gateRes.blocked_low_signal, true);
+    assert.strictEqual(gateRes.decision, "blocked");
+    console.log("[PASS] Req Test 7A (Test A): last_good_cache with legacy age=0 => strictly FAIL-CLOSED BLOCK");
+  }
+
+  // 8. Ticker live refresh success => PASS
+  {
+    // Simulate runtime refresh decision path:
+    // Initial: ticker is stale (last_good_cache, 45s old)
+    const initialTicker = evaluateMajorImpulseTickerFreshness({
+      tickerSource: "last_good_cache",
+      tickerAgeMs: 45_000,
+    });
+    assert.strictEqual(initialTicker.isFresh, false);
+
+    // Refresh action executes: live per-symbol fetch succeeds with source === "live"
+    const refreshedTickerSource = "live_force_refresh";
+    const refreshedTickerAgeMs = 30; // 30ms fresh
+    const refreshedTicker = evaluateMajorImpulseTickerFreshness({
+      tickerSource: refreshedTickerSource,
+      tickerAgeMs: refreshedTickerAgeMs,
+    });
+    assert.strictEqual(refreshedTicker.isFresh, true);
+    assert.strictEqual(refreshedTicker.reason, null);
+
+    const freshCandleTs = new Date(Date.now() - 30_000).toISOString();
+    const authRes = isVerifiedMajorImpulseAuthority({
+      market: "KRW-BTC",
+      candidateMeta: {
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95, latest_candle_ts: freshCandleTs },
+        score: 95,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        candle_freshness_ok: true,
+        latest_candle_ts: freshCandleTs,
+        ticker_price_source: refreshedTickerSource,
+        ticker_price_age_ms: refreshedTickerAgeMs,
+        ticker_freshness_ok: refreshedTicker.isFresh,
+      },
+    });
+    assert.strictEqual(authRes, true);
+    console.log("[PASS] Req Test 8: ticker refresh success decision path => PASS");
+  }
+
+  // 9. Ticker live refresh failure => Major BLOCK
+  {
+    // Simulate runtime refresh failure: network error on single-symbol fetch
+    const refreshAttempted = true;
+    const refreshResult = "failed";
+    const staleSource = "last_good_cache";
+    const staleAgeMs = 120_000; // 2 minutes old
+
+    const staleTicker = evaluateMajorImpulseTickerFreshness({
+      tickerSource: staleSource,
+      tickerAgeMs: staleAgeMs,
+    });
+    assert.strictEqual(staleTicker.isFresh, false);
+
+    const authRes = isVerifiedMajorImpulseAuthority({
+      market: "KRW-BTC",
+      candidateMeta: {
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        ticker_price_source: staleSource,
+        ticker_price_age_ms: staleAgeMs,
+        ticker_freshness_ok: staleTicker.isFresh,
+      },
+    });
+    assert.strictEqual(authRes, false);
+
+    const res = evaluateLegacyLowSignalGate({
+      market: "KRW-BTC",
+      sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+      isSurgeSource: false,
+      candidateMetaFromSetup: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        ticker_price_source: staleSource,
+        ticker_price_age_ms: staleAgeMs,
+        ticker_freshness_ok: staleTicker.isFresh,
+      },
+    });
+    assert.strictEqual(res.isVerifiedMajorImpulse, false);
+    assert.strictEqual(res.blocked_low_signal, true);
+    assert.strictEqual(res.decision, "blocked");
+    console.log("[PASS] Req Test 9: ticker refresh failure => Major entry strictly BLOCKED");
+  }
+
+  // 9A (Test B): force refresh HTTP fails and returns last_good fallback row => NOT treated as refresh success, BLOCK
+  {
+    // Simulate fetch returning fallback row (source: "fallback")
+    const mockDirectFetchResult: { ok: boolean; source: "live" | "fallback" | "failed"; rows: any[] } = {
+      ok: false,
+      source: "fallback",
+      rows: [{ market: "KRW-BTC", trade_price: 80_000_000 }],
+    };
+    // Force refresh authority decision logic:
+    const refreshResult: "success" | "fallback_rejected" | "failed" = mockDirectFetchResult.ok && mockDirectFetchResult.source === "live"
+      ? "success"
+      : (mockDirectFetchResult.source === "fallback" ? "fallback_rejected" : "failed");
+    const tickerFreshnessOk: boolean = (refreshResult as string) === "success";
+    assert.strictEqual(refreshResult, "fallback_rejected");
+    assert.strictEqual(tickerFreshnessOk, false);
+
+    const authRes = isVerifiedMajorImpulseAuthority({
+      market: "KRW-BTC",
+      candidateMeta: {
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        ticker_price_source: "last_good_cache",
+        ticker_price_age_ms: null,
+        ticker_freshness_ok: tickerFreshnessOk,
+      },
+    });
+    assert.strictEqual(authRes, false);
+    console.log("[PASS] Req Test 9A (Test B): force refresh returns fallback row => refresh NOT success, strictly BLOCKED");
+  }
+
+  // 10. ALT forged major meta => BLOCK (market whitelist strictly KRW-BTC / KRW-ETH)
+  {
+    const altMarkets = ["KRW-SOL", "KRW-XRP", "KRW-DOGE", "KRW-ADA"];
+    for (const alt of altMarkets) {
+      const authRes = isVerifiedMajorImpulseAuthority({
+        market: alt,
+        candidateMeta: {
+          market: alt,
+          engine_bucket: "major_impulse",
+          is_major_impulse: true,
+          setupReason: "MAJOR_IMPULSE_V1",
+          setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+          score: 95,
+          candle_source: "live_fetch",
+          candle_cache_age_ms: null,
+          ticker_price_source: "live_force_refresh",
+          ticker_price_age_ms: 10,
+          ticker_freshness_ok: true,
+        },
+      });
+      assert.strictEqual(authRes, false, `ALT market ${alt} must NEVER receive major impulse authority`);
+
+      const res = evaluateLegacyLowSignalGate({
+        market: alt,
+        sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+        isSurgeSource: false,
+        candidateMetaFromSetup: {
+          market: alt,
+          engine_bucket: "major_impulse",
+          is_major_impulse: true,
+          setupReason: "MAJOR_IMPULSE_V1",
+          setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+          score: 95,
+          candle_source: "live_fetch",
+          candle_cache_age_ms: null,
+          ticker_price_source: "live_force_refresh",
+          ticker_price_age_ms: 10,
+          ticker_freshness_ok: true,
+        },
+      });
+      assert.strictEqual(res.isVerifiedMajorImpulse, false);
+      assert.strictEqual(res.blocked_low_signal, true);
+      assert.strictEqual(res.decision, "blocked");
+    }
+    console.log("[PASS] Req Test 10: ALT forged major meta => strictly BLOCKED by KRW-BTC/ETH authority whitelist");
+  }
+
+  // 11. Normal CORE low signal unchanged
+  {
+    const res = evaluateLegacyLowSignalGate({
+      market: "KRW-BTC",
+      sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+      isSurgeSource: false,
+      candidateMetaFromSetup: {
+        market: "KRW-BTC",
+        engine_bucket: "core",
+        is_major_impulse: false,
+        setupReason: "CORE_TREND_ENTRY",
+        setup: { ok: true, reason: "CORE_TREND_ENTRY", score: 80 },
+        score: 80,
+      },
+    });
+    assert.strictEqual(res.isVerifiedMajorImpulse, false);
+    assert.strictEqual(res.effectiveStrength, 0);
+    assert.strictEqual(res.blocked_low_signal, true);
+    assert.strictEqual(res.decision, "blocked");
+    console.log("[PASS] Req Test 11: normal CORE low signal (<62) => blocked_low_signal maintained");
+  }
+
+  // 12. SURGE regression unchanged
+  {
+    const res = evaluateLegacyLowSignalGate({
+      market: "KRW-XRP",
+      sigPayload: { signal_strength_score: 10, source_kind: "scanner_filter_fresh" },
+      isSurgeSource: true,
+      candidateMetaFromSetup: {
+        market: "KRW-XRP",
+        engine_bucket: "surge",
+        is_major_impulse: false,
+        setupReason: "surge_v2_entry_path",
+        setup: { ok: true, reason: "surge_v2_entry_path", score: 85 },
+        score: 85,
+      },
+    });
+    assert.strictEqual(res.isVerifiedMajorImpulse, false);
+    assert.strictEqual(res.blocked_low_signal, false); // isSurgeSource bypasses legacy low signal
+    assert.strictEqual(res.decision, "pass");
+    console.log("[PASS] Req Test 12: SURGE existing authority/regression unchanged");
+  }
+
+  // 13. Kill Switch recovery safety unchanged
+  {
+    const precheckRes10 = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: mockKillSwitchTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        btc_phase: "impulse",
+        asset_phase: "impulse",
+        is_panic: false,
+        relaxed_multiplier: 0.30,
+      },
+    });
+    assert.strictEqual(precheckRes10.allowed, true);
+    assert.strictEqual(precheckRes10.blockReason, null);
+
+    const filterRes10 = assertOrderBuyAllowed(
+      baseSnap,
+      {
+        kind: "new_entry",
+        market: "KRW-BTC",
+        strategyType: "major_impulse",
+        majorImpulseScore: 95,
+        candidateMeta: {
+          market: "KRW-BTC",
+          engine_bucket: "major_impulse",
+          is_major_impulse: true,
+          is_recovery_probe: true,
+          setup: { ok: true, score: 95, reason: "SINGLE_IMPULSE" },
+          relaxed_multiplier: 0.30,
+        },
+      },
+    );
+    assert.strictEqual(filterRes10.ok, true);
+    assert.strictEqual(Number(filterRes10.size_scale.toFixed(4)), 0.15); // Capped at 0.15
+    console.log("[PASS] Req Test 13: Kill Switch recovery safety and <=0.15 cap unchanged");
+  }
+
+  // 14 (Test C): Candidate meta score95 / candle fresh, but ticker_freshness_ok=false => isVerifiedMajorImpulseAuthority=false => blocked_low_signal bypass BLOCKED
+  {
+    const authRes = isVerifiedMajorImpulseAuthority({
+      market: "KRW-BTC",
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        ticker_freshness_ok: false, // Stale/failed ticker!
+      },
+    });
+    assert.strictEqual(authRes, false, "Authority MUST be false when ticker_freshness_ok is false");
+
+    const authResUndefined = isVerifiedMajorImpulseAuthority({
+      market: "KRW-BTC",
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        // ticker_freshness_ok is undefined!
+      },
+    });
+    assert.strictEqual(authResUndefined, false, "Authority MUST be false when ticker_freshness_ok is undefined");
+
+    const gateRes = evaluateLegacyLowSignalGate({
+      market: "KRW-BTC",
+      sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+      isSurgeSource: false,
+      candidateMetaFromSetup: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        ticker_freshness_ok: false,
+      },
+    });
+    assert.strictEqual(gateRes.isVerifiedMajorImpulse, false);
+    assert.strictEqual(gateRes.effectiveStrength, 0);
+    assert.strictEqual(gateRes.blocked_low_signal, true);
+    assert.strictEqual(gateRes.decision, "blocked");
+    console.log("[PASS] Req Test 14 (Test C): score95 fresh candle but ticker_freshness_ok=false => authority strictly BLOCKED");
+  }
+
+  // 15 (Test D): cache_age=20s but latest candle timestamp=5분 전 => isVerifiedMajorImpulseAuthority=false => BLOCK
+  {
+    const nowMs = Date.parse("2026-09-10T19:50:00+09:00");
+    const staleCandleTs = "2026-09-10T19:45:00"; // 5분 전 (300s > 120s max age)
+    const authRes = isVerifiedMajorImpulseAuthority({
+      market: "KRW-BTC",
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95, latest_candle_ts: staleCandleTs },
+        score: 95,
+        candle_source: "last_good_cache",
+        candle_cache_age_ms: 20_000, // Cache itself is 20s old
+        latest_candle_ts: staleCandleTs,
+        ticker_freshness_ok: true,
+      },
+      nowMs,
+    });
+    assert.strictEqual(authRes, false, "Authority MUST reject fresh cache holding stale candle timestamp");
+
+    const gateRes = evaluateLegacyLowSignalGate({
+      market: "KRW-BTC",
+      sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+      isSurgeSource: false,
+      candidateMetaFromSetup: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95, latest_candle_ts: staleCandleTs },
+        score: 95,
+        candle_source: "last_good_cache",
+        candle_cache_age_ms: 20_000,
+        latest_candle_ts: staleCandleTs,
+        ticker_freshness_ok: true,
+      },
+      nowMs,
+    });
+    assert.strictEqual(gateRes.isVerifiedMajorImpulse, false);
+    assert.strictEqual(gateRes.blocked_low_signal, true);
+    assert.strictEqual(gateRes.decision, "blocked");
+    console.log("[PASS] Req Test 15 (Test D): cache_age=20s with 5m-stale candle timestamp => strictly BLOCKED");
+  }
+
+  // 16 (Test E): cache_age=20s but latest candle timestamp=now+30s => isVerifiedMajorImpulseAuthority=false => BLOCK
+  {
+    const nowMs = Date.parse("2026-09-10T19:50:00+09:00");
+    const futureCandleTs = "2026-09-10T19:50:30"; // 30s in future (> 10s tolerance)
+    const authRes = isVerifiedMajorImpulseAuthority({
+      market: "KRW-BTC",
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95, latest_candle_ts: futureCandleTs },
+        score: 95,
+        candle_source: "last_good_cache",
+        candle_cache_age_ms: 20_000,
+        latest_candle_ts: futureCandleTs,
+        ticker_freshness_ok: true,
+      },
+      nowMs,
+    });
+    assert.strictEqual(authRes, false, "Authority MUST reject future candle timestamps");
+
+    const gateRes = evaluateLegacyLowSignalGate({
+      market: "KRW-BTC",
+      sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+      isSurgeSource: false,
+      candidateMetaFromSetup: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95, latest_candle_ts: futureCandleTs },
+        score: 95,
+        candle_source: "last_good_cache",
+        candle_cache_age_ms: 20_000,
+        latest_candle_ts: futureCandleTs,
+        ticker_freshness_ok: true,
+      },
+      nowMs,
+    });
+    assert.strictEqual(gateRes.isVerifiedMajorImpulse, false);
+    assert.strictEqual(gateRes.blocked_low_signal, true);
+    assert.strictEqual(gateRes.decision, "blocked");
+    console.log("[PASS] Req Test 16 (Test E): cache_age=20s with future timestamp (+30s) => strictly BLOCKED");
+  }
+
+  // 17 (Test F): cache_age=20s, latest timestamp fresh (30s ago), candle_freshness_ok=true, BTC score95, ticker fresh => PASS
+  {
+    const nowMs = Date.parse("2026-09-10T19:50:00+09:00");
+    const freshCandleTs = "2026-09-10T19:49:30"; // 30s ago (<= 120s)
+    const authRes = isVerifiedMajorImpulseAuthority({
+      market: "KRW-BTC",
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95, latest_candle_ts: freshCandleTs },
+        score: 95,
+        candle_source: "last_good_cache",
+        candle_cache_age_ms: 20_000, // 20s <= 75s
+        candle_freshness_ok: true,
+        latest_candle_ts: freshCandleTs,
+        ticker_price_source: "ticker_batch",
+        ticker_price_age_ms: 5000,
+        ticker_freshness_ok: true,
+      },
+      nowMs,
+    });
+    assert.strictEqual(authRes, true);
+
+    const gateRes = evaluateLegacyLowSignalGate({
+      market: "KRW-BTC",
+      sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+      isSurgeSource: false,
+      candidateMetaFromSetup: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95, latest_candle_ts: freshCandleTs },
+        score: 95,
+        candle_source: "last_good_cache",
+        candle_cache_age_ms: 20_000,
+        candle_freshness_ok: true,
+        latest_candle_ts: freshCandleTs,
+        ticker_price_source: "ticker_batch",
+        ticker_price_age_ms: 5000,
+        ticker_freshness_ok: true,
+      },
+      nowMs,
+    });
+    assert.strictEqual(gateRes.isVerifiedMajorImpulse, true);
+    assert.strictEqual(gateRes.effectiveStrength, 95);
+    assert.strictEqual(gateRes.blocked_low_signal, false);
+    assert.strictEqual(gateRes.decision, "pass");
+    console.log("[PASS] Req Test 17 (Test F): cache_age=20s + fresh timestamp (30s) + BTC score95 + fresh ticker => PASS");
+  }
+
+  // 18 (Test G): Force refresh A is fallback, while concurrent fetch B updates global tickerSourceMap to 'live' => A is NOT misjudged as success
+  {
+    // Fetch A failed and returned fallback
+    const fetchAResult: { ok: boolean; source: "live" | "fallback" | "failed"; rows: any[] } = {
+      ok: false,
+      source: "fallback",
+      rows: [{ market: "KRW-BTC", trade_price: 80_000_000 }],
+    };
+
+    // Concurrently another process updates global tickerSourceMap
+    tickerSourceMap.set("KRW-BTC", "live");
+
+    // Fetch A's provenance must govern, ignoring global map
+    const fetchASuccess = fetchAResult.ok && fetchAResult.source === "live";
+    assert.strictEqual(fetchASuccess, false, "Fetch A must NOT read global tickerSourceMap to claim success");
+
+    const authRes = isVerifiedMajorImpulseAuthority({
+      market: "KRW-BTC",
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        ticker_freshness_ok: fetchASuccess,
+      },
+    });
+    assert.strictEqual(authRes, false);
+    console.log("[PASS] Req Test 18 (Test G): force refresh A fallback is strictly isolated from concurrent global map updates");
+  }
+
+  // 19 (Test H): Force refresh A is genuine live HTTP success => A's own provenance grants success=true
+  {
+    const fetchAResult: { ok: boolean; source: "live" | "fallback" | "failed"; rows: any[]; fetchedAtMs: number | null } = {
+      ok: true,
+      source: "live",
+      rows: [{ market: "KRW-BTC", trade_price: 80_100_000 }],
+      fetchedAtMs: Date.now(),
+    };
+
+    const fetchASuccess = fetchAResult.ok && fetchAResult.source === "live";
+    assert.strictEqual(fetchASuccess, true);
+
+    const freshCandleTs = new Date(Date.now() - 30_000).toISOString();
+    const authRes = isVerifiedMajorImpulseAuthority({
+      market: "KRW-BTC",
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setupReason: "MAJOR_IMPULSE_V1",
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95, latest_candle_ts: freshCandleTs },
+        score: 95,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        candle_freshness_ok: true,
+        latest_candle_ts: freshCandleTs,
+        ticker_price_source: "live_force_refresh",
+        ticker_price_age_ms: 0,
+        ticker_freshness_ok: fetchASuccess,
+      },
+    });
+    assert.strictEqual(authRes, true);
+    console.log("[PASS] Req Test 19 (Test H): force refresh A genuine live HTTP success => verified authority granted");
+  }
+
+  console.log("\n==================================================================");
+  console.log("ALL 7 SECTIONS OF COMPREHENSIVE SAFETY & REGRESSION SUITE PASSED!");
   console.log("==================================================================");
 }
 

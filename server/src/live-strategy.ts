@@ -14,6 +14,7 @@ import { normalizeBalanceCurrency } from "./account-portfolio.js";
 import {
   fetchMinuteCandles,
   fetchTickers,
+  fetchLiveTickersDirect,
   partitionKrwMarketsByUpbitValidity,
   peekMinuteCandleCache,
   tickerSourceMap,
@@ -605,6 +606,12 @@ type CandidateMeta = {
   swingLow: number;
   candle_source?: "live_fetch" | "last_good_cache";
   candle_cache_age_ms?: number | null;
+  candle_freshness_ok?: boolean;
+  latest_candle_ts?: string | null;
+  latest_candle_age_ms?: number | null;
+  ticker_price_source?: string;
+  ticker_price_age_ms?: number | null;
+  ticker_freshness_ok?: boolean;
   ema50?: number;
   ema200?: number;
   rsi?: number;
@@ -866,6 +873,234 @@ const LIVE_CANDIDATE_CANDLE_CACHE_SERVE_MAX_AGE_MS = (() => {
   const n = raw === undefined || raw === "" ? 12 * 60_000 : Number(raw);
   return Number.isFinite(n) ? Math.max(120_000, Math.min(45 * 60_000, Math.floor(n))) : 12 * 60_000;
 })();
+/** Major Impulse (BTC/ETH): HTTP 없이 사용할 수 있는 fresh-cache 상한 (75초). */
+export const LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS = (() => {
+  const raw = process.env.LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS;
+  const n = raw === undefined || raw === "" ? 75_000 : Number(raw);
+  return Number.isFinite(n) ? Math.max(30_000, Math.min(120_000, Math.floor(n))) : 75_000;
+})();
+/** Major Impulse (BTC/ETH): 최신 1분봉 타임스탬프 최대 허용 지연 (120초). */
+export const LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS = (() => {
+  const raw = process.env.LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS;
+  const n = raw === undefined || raw === "" ? 120_000 : Number(raw);
+  return Number.isFinite(n) ? Math.max(60_000, Math.min(180_000, Math.floor(n))) : 120_000;
+})();
+/** Major Impulse (BTC/ETH): 티커 가격 최대 허용 지연 (30초). */
+export const LIVE_MAJOR_IMPULSE_TICKER_MAX_AGE_MS = (() => {
+  const raw = process.env.LIVE_MAJOR_IMPULSE_TICKER_MAX_AGE_MS;
+  const n = raw === undefined || raw === "" ? 30_000 : Number(raw);
+  return Number.isFinite(n) ? Math.max(10_000, Math.min(60_000, Math.floor(n))) : 30_000;
+})();
+
+export function parseCandleTimestampMs(tsStr?: string | null): number {
+  if (!tsStr || typeof tsStr !== "string") return NaN;
+  if (tsStr.includes("Z") || /\+[0-9]{2}/.test(tsStr)) {
+    return Date.parse(tsStr);
+  }
+  return Date.parse(tsStr + "+09:00");
+}
+
+export function evaluateMajorImpulseCandleFreshness(params: {
+  candle_source: "live_fetch" | "last_good_cache";
+  candle_cache_age_ms: number | null;
+  latestCandleTs?: string | null;
+  nowMs?: number;
+  maxCacheAgeMs?: number;
+  maxTimestampAgeMs?: number;
+  futureToleranceMs?: number;
+}): {
+  isFresh: boolean;
+  reason: string | null;
+  isCacheFresh: boolean;
+  isTimestampFresh: boolean;
+  latestCandleAgeMs: number | null;
+} {
+  const now = params.nowMs ?? Date.now();
+  const maxCacheAge = params.maxCacheAgeMs ?? LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS;
+  const maxTimestampAge = params.maxTimestampAgeMs ?? LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS;
+  const futureTolerance = params.futureToleranceMs ?? 10_000;
+
+  const isCacheFresh = params.candle_source === "live_fetch" ||
+    (typeof params.candle_cache_age_ms === "number" && params.candle_cache_age_ms <= maxCacheAge);
+
+  if (!isCacheFresh) {
+    return {
+      isFresh: false,
+      reason: "stale_candidate_candle_cache",
+      isCacheFresh: false,
+      isTimestampFresh: false,
+      latestCandleAgeMs: null,
+    };
+  }
+
+  const tsMs = parseCandleTimestampMs(params.latestCandleTs);
+  if (!Number.isFinite(tsMs)) {
+    return {
+      isFresh: false,
+      reason: "invalid_latest_candle_timestamp",
+      isCacheFresh: true,
+      isTimestampFresh: false,
+      latestCandleAgeMs: null,
+    };
+  }
+
+  if (tsMs > now + futureTolerance) {
+    return {
+      isFresh: false,
+      reason: "future_latest_candle_timestamp",
+      isCacheFresh: true,
+      isTimestampFresh: false,
+      latestCandleAgeMs: now - tsMs,
+    };
+  }
+
+  const latestCandleAgeMs = now - tsMs;
+  const isTimestampFresh = latestCandleAgeMs <= maxTimestampAge;
+  if (!isTimestampFresh) {
+    return {
+      isFresh: false,
+      reason: "stale_latest_candle_timestamp",
+      isCacheFresh: true,
+      isTimestampFresh: false,
+      latestCandleAgeMs,
+    };
+  }
+
+  return {
+    isFresh: true,
+    reason: null,
+    isCacheFresh: true,
+    isTimestampFresh: true,
+    latestCandleAgeMs,
+  };
+}
+
+export type LiveTickerPriceSourceTag =
+  | "ticker_batch"
+  | "last_good_cache"
+  | "mark_prices_trade_status"
+  | "per_symbol_fetch"
+  | "live_force_refresh"
+  | "still_missing"
+  | "unknown";
+
+export function evaluateMajorImpulseTickerFreshness(params: {
+  tickerSource: LiveTickerPriceSourceTag | string;
+  tickerAgeMs: number | null;
+  maxAgeMs?: number;
+}): {
+  isFresh: boolean;
+  reason: string | null;
+} {
+  const maxAge = params.maxAgeMs ?? LIVE_MAJOR_IMPULSE_TICKER_MAX_AGE_MS;
+  const src = params.tickerSource;
+
+  // Stale/fallback prices are strictly FAIL-CLOSED for Major Impulse.
+  // last_good_cache is prohibited for Major Impulse even if age is reported as 0 (e.g. from missing tickerCache in upbit-public)
+  if (src === "last_good_cache") {
+    return { isFresh: false, reason: "last_good_cache_prohibited_for_major_impulse" };
+  }
+  if (src === "candle_fallback" || src === "mark_prices_trade_status" || src === "still_missing" || src === "missing" || src === "unknown") {
+    return { isFresh: false, reason: "fallback_price_prohibited_for_major_impulse" };
+  }
+
+  const ALLOWED_FRESH_SOURCES = new Set(["ticker_batch", "per_symbol_fetch", "live", "live_force_refresh", "fresh_cache"]);
+  if (!ALLOWED_FRESH_SOURCES.has(src)) {
+    return { isFresh: false, reason: `untrusted_ticker_source:${src}` };
+  }
+
+  if (params.tickerAgeMs !== null && params.tickerAgeMs !== undefined) {
+    if (!Number.isFinite(params.tickerAgeMs) || params.tickerAgeMs < 0 || params.tickerAgeMs > maxAge) {
+      return { isFresh: false, reason: `ticker_age_exceeded:${params.tickerAgeMs}ms>${maxAge}ms` };
+    }
+  }
+
+  return { isFresh: true, reason: null };
+}
+
+export function isVerifiedMajorImpulseAuthority(params: {
+  market: string;
+  candidateMeta?: any;
+  nowMs?: number;
+}): boolean {
+  if (params.market !== "KRW-BTC" && params.market !== "KRW-ETH") {
+    return false;
+  }
+  const meta = params.candidateMeta;
+  if (!meta) return false;
+  if (meta.engine_bucket !== "major_impulse") return false;
+  if (meta.is_major_impulse !== true) return false;
+  if (meta.setup?.ok !== true) return false;
+  if (meta.setupReason !== "MAJOR_IMPULSE_V1" && meta.setup?.reason !== "MAJOR_IMPULSE_V1") return false;
+  const score = Number(meta.score);
+  if (!Number.isFinite(score) || score < 90) return false;
+
+  // 1) Candle freshness checks (cache age, timestamp age, future tolerance, candle_freshness_ok)
+  if (meta.candle_freshness_ok !== true) return false;
+
+  const isCacheFresh = meta.candle_source === "live_fetch" ||
+    (typeof meta.candle_cache_age_ms === "number" && meta.candle_cache_age_ms >= 0 && meta.candle_cache_age_ms <= LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS);
+  if (!isCacheFresh) return false;
+
+  const latestTs = meta.latest_candle_ts ?? meta.setup?.latest_candle_ts;
+  if (!latestTs) return false;
+  const tsMs = parseCandleTimestampMs(latestTs);
+  if (!Number.isFinite(tsMs)) return false;
+  const now = params.nowMs ?? Date.now();
+  if (tsMs > now + 10_000) return false; // future timestamp rejection
+  if (now - tsMs > LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS) return false; // stale timestamp rejection
+
+  // 2) Ticker freshness checks
+  if (meta.ticker_freshness_ok !== true) return false;
+
+  return true;
+}
+
+export function evaluateLegacyLowSignalGate(params: {
+  market: string;
+  sigPayload: any;
+  isSurgeSource: boolean;
+  candidateMetaFromSetup?: any;
+  scannerBridgeScore?: { signalStrengthScore: number; reason?: string } | null;
+  nowMs?: number;
+}): {
+  effectiveStrength: number;
+  isVerifiedMajorImpulse: boolean;
+  decision: "pass" | "blocked";
+  reason: string;
+  blocked_low_signal: boolean;
+} {
+  const ENTRY_PIPELINE_MID_SCORE_FLOOR = 62;
+  const rawStrength = Number(params.sigPayload?.signal_strength_score ?? params.sigPayload?.signal_score ?? 0);
+  const scannerBridgeScore = params.scannerBridgeScore ?? null;
+  const bridgedStrength = scannerBridgeScore ? Math.max(rawStrength, scannerBridgeScore.signalStrengthScore) : rawStrength;
+
+  const isVerifiedMajorImpulse = isVerifiedMajorImpulseAuthority({
+    market: params.market,
+    candidateMeta: params.candidateMetaFromSetup,
+    nowMs: params.nowMs,
+  });
+
+  const effectiveStrength = isVerifiedMajorImpulse
+    ? Number(params.candidateMetaFromSetup!.score)
+    : bridgedStrength;
+
+  const isSurgeSource = params.isSurgeSource;
+  const blocked_low_signal = !isSurgeSource && effectiveStrength < ENTRY_PIPELINE_MID_SCORE_FLOOR;
+  const decision = blocked_low_signal ? "blocked" : "pass";
+  const reason = isVerifiedMajorImpulse
+    ? "verified_major_impulse_score_applied"
+    : (blocked_low_signal ? (scannerBridgeScore?.reason ?? "legacy_low_signal") : "normal_score_passed");
+
+  return {
+    effectiveStrength,
+    isVerifiedMajorImpulse,
+    decision,
+    reason,
+    blocked_low_signal,
+  };
+}
+
 /** candidate_meta: fetch timeout 후에도 이 이내면 last_good / 공유 캐시로 해당 종목만 구제(그 외는 drop). */
 const LIVE_CANDIDATE_CANDLE_CACHE_DROP_MAX_AGE_MS = (() => {
   const raw = process.env.LIVE_CANDIDATE_CANDLE_CACHE_DROP_MAX_AGE_MS;
@@ -897,13 +1132,6 @@ const lastGoodMinuteCandleCache = new Map<string, LastGoodCandleCacheRow>();
 const lastGoodTickerCache = new Map<string, { ts_ms: number; row: any }>();
 const watchlistCandleCache = new Map<string, { ts: number; c1: UpbitCandle[]; c5: UpbitCandle[] }>();
 
-type LiveTickerPriceSourceTag =
-  | "ticker_batch"
-  | "last_good_cache"
-  | "mark_prices_trade_status"
-  | "per_symbol_fetch"
-  | "still_missing";
-
 async function hydrateLiveTickerPriceMaps(
   priceBy: Map<string, number>,
   changeRateBy: Map<string, number>,
@@ -912,16 +1140,21 @@ async function hydrateLiveTickerPriceMaps(
   markPrices: Record<string, number> | undefined,
 ): Promise<{
   sourceByMarket: Record<string, LiveTickerPriceSourceTag>;
+  ageByMarket: Record<string, number | null>;
+  fetchedAtByMarket: Record<string, number | null>;
   stillMissing: string[];
   fromLastGood: string[];
   fromMarkPrices: string[];
   fromPerSymbol: string[];
 }> {
+  const now0 = Date.now();
   const coreSet = new Set<string>(CORE_TRADE_MARKETS as unknown as string[]);
   const uniq = Array.from(
     new Set(symbolsNeeded.filter((m) => typeof m === "string" && String(m).startsWith("KRW-"))),
   );
   const sourceByMarket: Record<string, LiveTickerPriceSourceTag> = {};
+  const ageByMarket: Record<string, number | null> = {};
+  const fetchedAtByMarket: Record<string, number | null> = {};
   const fromLastGood: string[] = [];
   const fromMarkPrices: string[] = [];
   const fromPerSymbol: string[] = [];
@@ -931,16 +1164,20 @@ async function hydrateLiveTickerPriceMaps(
     const px0 = Number(priceBy.get(m) ?? 0);
     if (Number.isFinite(px0) && px0 > 0) {
       sourceByMarket[m] = "ticker_batch";
+      fetchedAtByMarket[m] = now0;
+      ageByMarket[m] = 0;
       continue;
     }
     const maxAge = coreSet.has(m) ? LIVE_CORE_TICKER_LAST_GOOD_MAX_AGE_MS : LIVE_TICKER_LAST_GOOD_MAX_AGE_MS;
     const cached = lastGoodTickerCache.get(m);
     const row = cached?.row;
     const cpx = Number(row?.trade_price ?? 0);
-    if (cached && Date.now() - cached.ts_ms <= maxAge && Number.isFinite(cpx) && cpx > 0) {
+    if (cached && now0 - cached.ts_ms <= maxAge && Number.isFinite(cpx) && cpx > 0) {
       priceBy.set(m, cpx);
       changeRateBy.set(m, Number(row?.signed_change_rate ?? changeRateBy.get(m) ?? 0));
       sourceByMarket[m] = "last_good_cache";
+      fetchedAtByMarket[m] = cached.ts_ms;
+      ageByMarket[m] = Math.max(0, now0 - cached.ts_ms);
       fromLastGood.push(m);
       continue;
     }
@@ -949,6 +1186,8 @@ async function hydrateLiveTickerPriceMaps(
       priceBy.set(m, mp);
       if (!changeRateBy.has(m)) changeRateBy.set(m, 0);
       sourceByMarket[m] = "mark_prices_trade_status";
+      fetchedAtByMarket[m] = null;
+      ageByMarket[m] = null;
       fromMarkPrices.push(m);
       continue;
     }
@@ -981,10 +1220,13 @@ async function hydrateLiveTickerPriceMaps(
       const r = rows[0];
       const tp = Number(r?.trade_price ?? 0);
       if (r?.market === m && Number.isFinite(tp) && tp > 0) {
+        const fetchNow = Date.now();
         priceBy.set(m, tp);
         changeRateBy.set(m, Number(r.signed_change_rate ?? 0));
-        lastGoodTickerCache.set(m, { ts_ms: Date.now(), row: r });
+        lastGoodTickerCache.set(m, { ts_ms: fetchNow, row: r });
         sourceByMarket[m] = "per_symbol_fetch";
+        fetchedAtByMarket[m] = fetchNow;
+        ageByMarket[m] = 0;
         fromPerSymbol.push(m);
       }
     } catch {
@@ -995,14 +1237,20 @@ async function hydrateLiveTickerPriceMaps(
   for (const m of uniq) {
     const px = Number(priceBy.get(m) ?? 0);
     if (Number.isFinite(px) && px > 0) {
-      if (!sourceByMarket[m]) sourceByMarket[m] = "ticker_batch";
+      if (!sourceByMarket[m]) {
+        sourceByMarket[m] = "ticker_batch";
+        fetchedAtByMarket[m] = now0;
+        ageByMarket[m] = 0;
+      }
     } else {
       stillMissing.push(m);
       sourceByMarket[m] = "still_missing";
+      fetchedAtByMarket[m] = null;
+      ageByMarket[m] = null;
     }
   }
 
-  return { sourceByMarket, stillMissing, fromLastGood, fromMarkPrices, fromPerSymbol };
+  return { sourceByMarket, ageByMarket, fetchedAtByMarket, stillMissing, fromLastGood, fromMarkPrices, fromPerSymbol };
 }
 
 const EXISTING_POSITION_MIN_KRW = Math.max(
@@ -6518,7 +6766,12 @@ export function createLiveDataStrategy(opts: {
         return cands[0]!;
       };
 
-      const fresh = pickFallbackRows(LIVE_CANDIDATE_CANDLE_CACHE_SERVE_MAX_AGE_MS);
+      const isMajorEligible = market === "KRW-BTC" || market === "KRW-ETH";
+      const serveMaxAgeMs = isMajorEligible
+        ? LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS
+        : LIVE_CANDIDATE_CANDLE_CACHE_SERVE_MAX_AGE_MS;
+
+      const fresh = pickFallbackRows(serveMaxAgeMs);
       if (fresh) {
         minute1CandleCache.set(`${market}:${count}`, fresh.rows);
         console.info(
@@ -6531,7 +6784,7 @@ export function createLiveDataStrategy(opts: {
             cache_age_ms: fresh.cache_age_ms,
             via: fresh.via,
             reason: "serve_without_http",
-            max_serve_age_ms: LIVE_CANDIDATE_CANDLE_CACHE_SERVE_MAX_AGE_MS,
+            max_serve_age_ms: serveMaxAgeMs,
           }),
         );
         return { rows: fresh.rows, candle_source: "last_good_cache", cache_age_ms: fresh.cache_age_ms };
@@ -11208,7 +11461,68 @@ export function createLiveDataStrategy(opts: {
               isPanic: btcPhaseInfo.isPanic || assetPhaseInfo.isPanic,
               is_panic: btcPhaseInfo.isPanic || assetPhaseInfo.isPanic,
             };
-            const majorImpulse = evaluateMajorImpulseSetup(m, candles1, currentPx, combinedPhaseInfo);
+
+            let tickerSource = tickerPriceHydrationForCandidates.sourceByMarket[m] ?? "unknown";
+            let tickerAgeMs = tickerPriceHydrationForCandidates.ageByMarket[m] ?? null;
+            let tickerFreshness = evaluateMajorImpulseTickerFreshness({
+              tickerSource,
+              tickerAgeMs,
+              maxAgeMs: LIVE_MAJOR_IMPULSE_TICKER_MAX_AGE_MS,
+            });
+
+            let tickerRefreshAttempted = false;
+            let tickerRefreshResult: "success" | "failed" | "fallback_rejected" | "not_needed" = "not_needed";
+
+            if (!tickerFreshness.isFresh) {
+              tickerRefreshAttempted = true;
+              try {
+                const directRes = await fetchLiveTickersDirect([m], {
+                  debugCaller: "live-strategy:major_impulse_ticker_force_refresh",
+                  signal: tickSignal,
+                  timeoutMs: 3000,
+                });
+                const r0 = directRes.rows?.[0];
+                const tp = Number(r0?.trade_price ?? 0);
+                if (directRes.ok && directRes.source === "live" && r0?.market === m && Number.isFinite(tp) && tp > 0) {
+                  priceBy.set(m, tp);
+                  changeRateBy.set(m, Number(r0.signed_change_rate ?? 0));
+                  lastGoodTickerCache.set(m, { ts_ms: Date.now(), row: r0 });
+                  tickerSource = "live_force_refresh";
+                  tickerAgeMs = 0;
+                  tickerRefreshResult = "success";
+                  tickerFreshness = { isFresh: true, reason: null };
+                } else {
+                  tickerRefreshResult = directRes.source === "fallback" ? "fallback_rejected" : "failed";
+                  tickerFreshness = { isFresh: false, reason: directRes.source === "fallback" ? "fallback_mark_or_last_good_rejected" : "live_force_refresh_failed" };
+                }
+              } catch {
+                tickerRefreshResult = "failed";
+                tickerFreshness = { isFresh: false, reason: "live_force_refresh_exception" };
+              }
+            }
+
+            const currentPxMajor = Number(priceBy.get(m) ?? 0);
+            const lastCandle = candles1 && candles1.length > 0 ? candles1[candles1.length - 1] : null;
+            const latestCandleTs = lastCandle?.candle_date_time_kst ?? null;
+
+            const candleFreshness = evaluateMajorImpulseCandleFreshness({
+              candle_source,
+              candle_cache_age_ms,
+              latestCandleTs,
+              nowMs: Date.now(),
+              maxCacheAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS,
+              maxTimestampAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS,
+            });
+
+            const isDataFresh = candleFreshness.isFresh && tickerFreshness.isFresh;
+            const freshnessRejectReason = !candleFreshness.isFresh
+              ? candleFreshness.reason
+              : (!tickerFreshness.isFresh ? tickerFreshness.reason : null);
+
+            const majorImpulse = isDataFresh
+              ? evaluateMajorImpulseSetup(m, candles1, currentPxMajor, combinedPhaseInfo)
+              : { ok: false, score: 0, reason: freshnessRejectReason ?? "data_not_fresh", ret1m: 0, ret3m: 0, volRatio1m: 0, consecutiveGreenCount: 0, probeMultiplier: 0, stopPrice: 0, targetPrice: 0, candleLow: 0, swingLow: 0, failed_conditions: [freshnessRejectReason ?? "data_not_fresh"] };
+
             if (majorImpulse.ok) {
               setup = {
                 ok: true,
@@ -11224,6 +11538,14 @@ export function createLiveDataStrategy(opts: {
                 score: majorImpulse.score,
                 probe_multiplier: majorImpulse.probeMultiplier,
                 impulse_mode: majorImpulse.mode,
+                candle_freshness_ok: candleFreshness.isFresh,
+                latest_candle_ts: latestCandleTs,
+                latest_candle_age_ms: candleFreshness.latestCandleAgeMs,
+                ticker_price_source: tickerSource,
+                ticker_price_age_ms: tickerAgeMs,
+                ticker_freshness_ok: tickerFreshness.isFresh,
+                ticker_refresh_attempted: tickerRefreshAttempted,
+                ticker_refresh_result: tickerRefreshResult,
               } as any;
               softenedReasons.push("MAJOR_IMPULSE_V1");
               console.info(
@@ -11231,6 +11553,16 @@ export function createLiveDataStrategy(opts: {
                   tag: "MAJOR_IMPULSE_ENTRY_SETUP_PASS",
                   ts: new Date().toISOString(),
                   market: m,
+                  current_price: currentPxMajor,
+                  ticker_price_source: tickerSource,
+                  ticker_price_age_ms: tickerAgeMs,
+                  ticker_freshness_ok: tickerFreshness.isFresh,
+                  ticker_refresh_attempted: tickerRefreshAttempted,
+                  ticker_refresh_result: tickerRefreshResult,
+                  candle_source,
+                  candle_cache_age_ms,
+                  latest_candle_ts: latestCandleTs,
+                  latest_candle_age_ms: candleFreshness.latestCandleAgeMs,
                   source_kind: "MAJOR_IMPULSE_V1",
                   impulse_mode: majorImpulse.mode,
                   ret1m: majorImpulse.ret1m,
@@ -11241,6 +11573,27 @@ export function createLiveDataStrategy(opts: {
                   stopPrice: majorImpulse.stopPrice,
                   targetPrice: majorImpulse.targetPrice,
                   probeMultiplier: majorImpulse.probeMultiplier,
+                }),
+              );
+            } else if (!isDataFresh) {
+              console.info(
+                JSON.stringify({
+                  tag: "MAJOR_IMPULSE_FRESHNESS_REJECT_PROOF",
+                  ts: new Date().toISOString(),
+                  market: m,
+                  current_price: currentPxMajor,
+                  ticker_price_source: tickerSource,
+                  ticker_price_age_ms: tickerAgeMs,
+                  ticker_freshness_ok: tickerFreshness.isFresh,
+                  ticker_refresh_attempted: tickerRefreshAttempted,
+                  ticker_refresh_result: tickerRefreshResult,
+                  candle_source,
+                  candle_cache_age_ms,
+                  latest_candle_ts: latestCandleTs,
+                  latest_candle_age_ms: candleFreshness.latestCandleAgeMs,
+                  reason: freshnessRejectReason,
+                  is_candle_fresh: candleFreshness.isFresh,
+                  is_ticker_fresh: tickerFreshness.isFresh,
                 }),
               );
             }
@@ -11718,6 +12071,12 @@ export function createLiveDataStrategy(opts: {
           swingLow: setup.swingLow ?? 0,
           candle_source,
           candle_cache_age_ms,
+          candle_freshness_ok: (setup as any)?.candle_freshness_ok,
+          latest_candle_ts: (setup as any)?.latest_candle_ts,
+          latest_candle_age_ms: (setup as any)?.latest_candle_age_ms,
+          ticker_price_source: (setup as any)?.ticker_price_source,
+          ticker_price_age_ms: (setup as any)?.ticker_price_age_ms,
+          ticker_freshness_ok: (setup as any)?.ticker_freshness_ok,
           ema50: setup.ema50,
           ema200: setup.ema200,
           rsi: setup.rsi,
@@ -13672,8 +14031,35 @@ export function createLiveDataStrategy(opts: {
           }),
         );
       }
-      const rawStrength = signalStrengthScore(sig.p);
+      const lowSignalEval = evaluateLegacyLowSignalGate({
+        market,
+        sigPayload: sig.p,
+        isSurgeSource,
+        candidateMetaFromSetup,
+        scannerBridgeScore,
+      });
+      const rawStrength = Number(sig.p?.signal_strength_score ?? sig.p?.signal_score ?? 0);
       const bridgedStrength = scannerBridgeScore ? Math.max(rawStrength, scannerBridgeScore.signalStrengthScore) : rawStrength;
+      const isVerifiedMajorImpulse = lowSignalEval.isVerifiedMajorImpulse;
+      const effectiveStrength = lowSignalEval.effectiveStrength;
+
+      console.info(
+        JSON.stringify({
+          tag: "MAJOR_IMPULSE_LEGACY_LOW_SIGNAL_AUTHORITY_PROOF",
+          ts: new Date().toISOString(),
+          market,
+          raw_signal_strength: rawStrength,
+          candidate_major_impulse_score: candidateMetaFromSetup?.score !== undefined && Number.isFinite(Number(candidateMetaFromSetup.score)) ? Number(candidateMetaFromSetup.score) : null,
+          effective_strength: effectiveStrength,
+          floor: ENTRY_PIPELINE_MID_SCORE_FLOOR,
+          engine_bucket: candidateMetaFromSetup?.engine_bucket ?? null,
+          is_major_impulse: Boolean(candidateMetaFromSetup?.is_major_impulse),
+          setup_ok: Boolean(candidateMetaFromSetup?.setup?.ok),
+          decision: lowSignalEval.decision === "pass" ? (isVerifiedMajorImpulse ? "authority_delegated" : "pass") : "blocked",
+          reason: lowSignalEval.reason,
+        }),
+      );
+
       if (scannerBridgeScore) {
         const filtersArr = Array.isArray(sig.p.filters) ? (sig.p.filters as Array<{ id?: unknown; passed?: unknown }>) : [];
         const failedFilterIds = filtersArr.filter(f => f && f.passed === false).map(f => String(f.id ?? ""));
@@ -13699,7 +14085,7 @@ export function createLiveDataStrategy(opts: {
           }),
         );
       }
-      if (bridgedStrength >= ENTRY_PIPELINE_MID_SCORE_FLOOR) {
+      if (effectiveStrength >= ENTRY_PIPELINE_MID_SCORE_FLOOR) {
         await appendLog({
           company_id: companyIdSchema.parse(opts.companyId),
           service_id: serviceIdSchema.parse(opts.serviceId),
@@ -13708,17 +14094,17 @@ export function createLiveDataStrategy(opts: {
           message: "candidate_detected",
           payload: {
             symbol: market,
-            signal_strength_score: bridgedStrength,
+            signal_strength_score: effectiveStrength,
             filter_pass: Boolean(sig.p.filter_pass),
           },
         });
         emitEval("candidate_detected", {
-          signal_strength_score: bridgedStrength,
+          signal_strength_score: effectiveStrength,
           filter_pass: Boolean(sig.p.filter_pass),
         });
       }
       // Surge sources use a separate centralized evaluator (surge-v2), so we bypass the legacy bridged strength floor here.
-      if (!isSurgeSource && bridgedStrength < ENTRY_PIPELINE_MID_SCORE_FLOOR) {
+      if (!isSurgeSource && effectiveStrength < ENTRY_PIPELINE_MID_SCORE_FLOOR) {
         await appendLog({
           company_id: companyIdSchema.parse(opts.companyId),
           service_id: serviceIdSchema.parse(opts.serviceId),
@@ -13727,13 +14113,13 @@ export function createLiveDataStrategy(opts: {
           message: "blocked_low_signal",
           payload: {
             symbol: market,
-            signal_strength_score: bridgedStrength,
+            signal_strength_score: effectiveStrength,
             floor: ENTRY_PIPELINE_MID_SCORE_FLOOR,
             reason: scannerBridgeScore?.reason ?? "legacy_low_signal",
           },
         });
-        emitEval("blocked_low_signal", { signal_strength_score: bridgedStrength, reason: scannerBridgeScore?.reason ?? "legacy_low_signal" });
-        logPlacebuyFinalGateBlocked("blocked_low_signal", { signal_strength_score: bridgedStrength, floor: ENTRY_PIPELINE_MID_SCORE_FLOOR, reason: scannerBridgeScore?.reason ?? "legacy_low_signal" });
+        emitEval("blocked_low_signal", { signal_strength_score: effectiveStrength, reason: scannerBridgeScore?.reason ?? "legacy_low_signal" });
+        logPlacebuyFinalGateBlocked("blocked_low_signal", { signal_strength_score: effectiveStrength, floor: ENTRY_PIPELINE_MID_SCORE_FLOOR, reason: scannerBridgeScore?.reason ?? "legacy_low_signal" });
         continue;
       }
       // Late-entry diagnostics & guard (entry timing)
