@@ -612,6 +612,10 @@ type CandidateMeta = {
   ticker_price_source?: string;
   ticker_price_age_ms?: number | null;
   ticker_freshness_ok?: boolean;
+  core_setup_score?: number | null;
+  upstream_gate_score?: number | null;
+  upstream_min_entry_score?: number | null;
+  upstream_core_gate_ok?: boolean;
   ema50?: number;
   ema200?: number;
   rsi?: number;
@@ -1056,6 +1060,105 @@ export function isVerifiedMajorImpulseAuthority(params: {
   return true;
 }
 
+const STRICT_CORE_ALLOWED_REASONS = new Set([
+  "CORE_TREND_CONTINUATION",
+  "CORE_PULLBACK_REVERSAL",
+  "CORE_BREAKOUT_VOLUME",
+]);
+
+export function isVerifiedStrictCoreAuthority(params: {
+  market: string;
+  candidateMeta?: any;
+  nowMs?: number;
+}): {
+  verified: boolean;
+  rejectReason: string | null;
+} {
+  const meta = params.candidateMeta;
+  if (!meta) return { verified: false, rejectReason: "missing_candidate_meta" };
+
+  // A. Market whitelist check
+  if (!CORE_TRADE_MARKETS.includes(params.market as (typeof CORE_TRADE_MARKETS)[number])) {
+    return { verified: false, rejectReason: `market_not_in_core_whitelist:${params.market}` };
+  }
+
+  // B. Engine bucket check
+  if (meta.engine_bucket !== "core") {
+    return { verified: false, rejectReason: `invalid_engine_bucket:${meta.engine_bucket}` };
+  }
+
+  // C. Setup OK check
+  if (meta.setup?.ok !== true) {
+    return { verified: false, rejectReason: "setup_not_ok" };
+  }
+
+  // D. Strict setup reason check
+  const reason = meta.setupReason ?? meta.setup?.reason;
+  if (!STRICT_CORE_ALLOWED_REASONS.has(reason)) {
+    return { verified: false, rejectReason: `disallowed_setup_reason:${reason}` };
+  }
+
+  // Explicit exclusion of relaxed / probe modes
+  if (meta.setupMode === "relaxed_probe" || meta.setupMode === "staircase_probe" || meta.setup?.mode === "relaxed_probe" || meta.setup?.mode === "staircase_probe") {
+    return { verified: false, rejectReason: `probe_mode_excluded:${meta.setupMode}` };
+  }
+  if (meta.is_relaxed_probe === true || meta.is_core_relaxed_candidate === true) {
+    return { verified: false, rejectReason: "relaxed_probe_flag_excluded" };
+  }
+
+  // E & F. core_setup_score check
+  const coreScore = Number(meta.core_setup_score);
+  if (!Number.isFinite(coreScore) || coreScore < 85) {
+    return { verified: false, rejectReason: `core_setup_score_insufficient:${coreScore}<85` };
+  }
+
+  // G. Upstream core gate OK check
+  if (meta.upstream_core_gate_ok !== true) {
+    return { verified: false, rejectReason: "upstream_core_gate_not_ok" };
+  }
+
+  // H. core_setup_score >= upstream_min_entry_score check
+  if (meta.upstream_min_entry_score === null || meta.upstream_min_entry_score === undefined) {
+    return { verified: false, rejectReason: "missing_upstream_min_entry_score" };
+  }
+  const minEntryScore = Number(meta.upstream_min_entry_score);
+  if (!Number.isFinite(minEntryScore) || coreScore < minEntryScore) {
+    return { verified: false, rejectReason: `core_setup_score_below_market_min:${coreScore}<${minEntryScore}` };
+  }
+
+  // I. Candle freshness checks (cache age, timestamp age, future tolerance, candle_freshness_ok)
+  if (meta.candle_freshness_ok !== true) {
+    return { verified: false, rejectReason: "candle_freshness_not_ok" };
+  }
+  const isCacheFresh = meta.candle_source === "live_fetch" ||
+    (typeof meta.candle_cache_age_ms === "number" && meta.candle_cache_age_ms >= 0 && meta.candle_cache_age_ms <= LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS);
+  if (!isCacheFresh) {
+    return { verified: false, rejectReason: "candle_cache_stale" };
+  }
+  const latestTs = meta.latest_candle_ts ?? meta.setup?.latest_candle_ts;
+  if (!latestTs) {
+    return { verified: false, rejectReason: "missing_latest_candle_ts" };
+  }
+  const tsMs = parseCandleTimestampMs(latestTs);
+  if (!Number.isFinite(tsMs)) {
+    return { verified: false, rejectReason: "invalid_latest_candle_ts" };
+  }
+  const now = params.nowMs ?? Date.now();
+  if (tsMs > now + 10_000) {
+    return { verified: false, rejectReason: "future_latest_candle_ts" };
+  }
+  if (now - tsMs > LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS) {
+    return { verified: false, rejectReason: "stale_latest_candle_ts" };
+  }
+
+  // J. Ticker freshness check
+  if (meta.ticker_freshness_ok !== true) {
+    return { verified: false, rejectReason: "ticker_freshness_not_ok" };
+  }
+
+  return { verified: true, rejectReason: null };
+}
+
 export function evaluateLegacyLowSignalGate(params: {
   market: string;
   sigPayload: any;
@@ -1066,6 +1169,8 @@ export function evaluateLegacyLowSignalGate(params: {
 }): {
   effectiveStrength: number;
   isVerifiedMajorImpulse: boolean;
+  isVerifiedStrictCore: boolean;
+  strictCoreRejectReason: string | null;
   decision: "pass" | "blocked";
   reason: string;
   blocked_low_signal: boolean;
@@ -1081,20 +1186,37 @@ export function evaluateLegacyLowSignalGate(params: {
     nowMs: params.nowMs,
   });
 
-  const effectiveStrength = isVerifiedMajorImpulse
-    ? Number(params.candidateMetaFromSetup!.score)
-    : bridgedStrength;
+  const strictCoreEval = isVerifiedStrictCoreAuthority({
+    market: params.market,
+    candidateMeta: params.candidateMetaFromSetup,
+    nowMs: params.nowMs,
+  });
+  const isVerifiedStrictCore = strictCoreEval.verified;
+
+  let effectiveStrength = bridgedStrength;
+  let reason = "normal_score_passed";
+
+  if (isVerifiedMajorImpulse) {
+    effectiveStrength = Number(params.candidateMetaFromSetup!.score);
+    reason = "verified_major_impulse_score_applied";
+  } else if (isVerifiedStrictCore) {
+    effectiveStrength = Number(params.candidateMetaFromSetup!.core_setup_score);
+    reason = "verified_strict_core_score_applied";
+  }
 
   const isSurgeSource = params.isSurgeSource;
   const blocked_low_signal = !isSurgeSource && effectiveStrength < ENTRY_PIPELINE_MID_SCORE_FLOOR;
   const decision = blocked_low_signal ? "blocked" : "pass";
-  const reason = isVerifiedMajorImpulse
-    ? "verified_major_impulse_score_applied"
-    : (blocked_low_signal ? (scannerBridgeScore?.reason ?? "legacy_low_signal") : "normal_score_passed");
+
+  if (blocked_low_signal) {
+    reason = scannerBridgeScore?.reason ?? "legacy_low_signal";
+  }
 
   return {
     effectiveStrength,
     isVerifiedMajorImpulse,
+    isVerifiedStrictCore,
+    strictCoreRejectReason: strictCoreEval.rejectReason,
     decision,
     reason,
     blocked_low_signal,
@@ -11946,6 +12068,10 @@ export function createLiveDataStrategy(opts: {
         let gateOk = realSignalPresent ? gate.ok : false;
         let gateReason = realSignalPresent ? gate.reason : "missing_real_signal_payload";
         let score = Number(gate.score ?? 0);
+        let coreSetupScore: number | null = null;
+        let upstreamGateScore: number | null = Number(gate.score ?? 0);
+        let upstreamMinEntryScore: number | null = marketState.min_entry_score;
+        let upstreamCoreGateOk: boolean = false;
 
         if (setup.reason === "MAJOR_IMPULSE_V1") {
           gateOk = true;
@@ -11953,7 +12079,9 @@ export function createLiveDataStrategy(opts: {
           score = (setup as any).score ?? 85;
         } else if (isCoreMarket && setup.ok) {
           const coreCalculatedScore = calculateCoreSetupScore(setup, btcTier);
+          coreSetupScore = coreCalculatedScore;
           score = score > 0 ? score : coreCalculatedScore;
+          upstreamCoreGateOk = coreCalculatedScore >= marketState.min_entry_score;
           gateOk = score >= marketState.min_entry_score;
           gateReason = gateOk ? "core_setup_passed" : `core_score_low:${score}<${marketState.min_entry_score}`;
         }
@@ -12058,9 +12186,32 @@ export function createLiveDataStrategy(opts: {
         const isFreshSignal = (realSignalPresent || isCoreMarket || setup.reason === "MAJOR_IMPULSE_V1") && !isFallbackSource;
         const isWatchCandidate = isFallbackSource;
 
+        const lastCandleForMeta = candles1 && candles1.length > 0 ? candles1[candles1.length - 1] : null;
+        const latestCandleTsForMeta = lastCandleForMeta?.candle_date_time_kst ?? null;
+        const candleFreshnessForMeta = evaluateMajorImpulseCandleFreshness({
+          candle_source,
+          candle_cache_age_ms,
+          latestCandleTs: latestCandleTsForMeta,
+          nowMs: Date.now(),
+          maxCacheAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS,
+          maxTimestampAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS,
+        });
+
+        const tickerSourceForMeta = tickerPriceHydrationForCandidates.sourceByMarket[m] ?? "unknown";
+        const tickerAgeMsForMeta = tickerPriceHydrationForCandidates.ageByMarket[m] ?? null;
+        const tickerFreshnessForMeta = evaluateMajorImpulseTickerFreshness({
+          tickerSource: tickerSourceForMeta,
+          tickerAgeMs: tickerAgeMsForMeta,
+          maxAgeMs: LIVE_MAJOR_IMPULSE_TICKER_MAX_AGE_MS,
+        });
+
         const meta: CandidateMeta = {
           market: m,
           score,
+          core_setup_score: coreSetupScore,
+          upstream_gate_score: upstreamGateScore,
+          upstream_min_entry_score: upstreamMinEntryScore,
+          upstream_core_gate_ok: isCoreMarket && setup.ok ? upstreamCoreGateOk : undefined,
           tier: eq.tier,
           setupMode: setup.mode,
           riskReward,
@@ -12071,12 +12222,12 @@ export function createLiveDataStrategy(opts: {
           swingLow: setup.swingLow ?? 0,
           candle_source,
           candle_cache_age_ms,
-          candle_freshness_ok: (setup as any)?.candle_freshness_ok,
-          latest_candle_ts: (setup as any)?.latest_candle_ts,
-          latest_candle_age_ms: (setup as any)?.latest_candle_age_ms,
-          ticker_price_source: (setup as any)?.ticker_price_source,
-          ticker_price_age_ms: (setup as any)?.ticker_price_age_ms,
-          ticker_freshness_ok: (setup as any)?.ticker_freshness_ok,
+          candle_freshness_ok: setup.reason === "MAJOR_IMPULSE_V1" ? (setup as any)?.candle_freshness_ok : candleFreshnessForMeta.isFresh,
+          latest_candle_ts: setup.reason === "MAJOR_IMPULSE_V1" ? (setup as any)?.latest_candle_ts : latestCandleTsForMeta,
+          latest_candle_age_ms: setup.reason === "MAJOR_IMPULSE_V1" ? (setup as any)?.latest_candle_age_ms : candleFreshnessForMeta.latestCandleAgeMs,
+          ticker_price_source: setup.reason === "MAJOR_IMPULSE_V1" ? (setup as any)?.ticker_price_source : tickerSourceForMeta,
+          ticker_price_age_ms: setup.reason === "MAJOR_IMPULSE_V1" ? (setup as any)?.ticker_price_age_ms : tickerAgeMsForMeta,
+          ticker_freshness_ok: setup.reason === "MAJOR_IMPULSE_V1" ? (setup as any)?.ticker_freshness_ok : tickerFreshnessForMeta.isFresh,
           ema50: setup.ema50,
           ema200: setup.ema200,
           rsi: setup.rsi,
@@ -14041,6 +14192,7 @@ export function createLiveDataStrategy(opts: {
       const rawStrength = Number(sig.p?.signal_strength_score ?? sig.p?.signal_score ?? 0);
       const bridgedStrength = scannerBridgeScore ? Math.max(rawStrength, scannerBridgeScore.signalStrengthScore) : rawStrength;
       const isVerifiedMajorImpulse = lowSignalEval.isVerifiedMajorImpulse;
+      const isVerifiedStrictCore = lowSignalEval.isVerifiedStrictCore;
       const effectiveStrength = lowSignalEval.effectiveStrength;
 
       console.info(
@@ -14057,6 +14209,33 @@ export function createLiveDataStrategy(opts: {
           setup_ok: Boolean(candidateMetaFromSetup?.setup?.ok),
           decision: lowSignalEval.decision === "pass" ? (isVerifiedMajorImpulse ? "authority_delegated" : "pass") : "blocked",
           reason: lowSignalEval.reason,
+        }),
+      );
+
+      console.info(
+        JSON.stringify({
+          tag: "STRICT_CORE_LEGACY_LOW_SIGNAL_AUTHORITY_PROOF",
+          ts: new Date().toISOString(),
+          market,
+          setup_reason: candidateMetaFromSetup?.setupReason ?? candidateMetaFromSetup?.setup?.reason ?? null,
+          raw_signal_strength: rawStrength,
+          bridged_strength: bridgedStrength,
+          core_setup_score: candidateMetaFromSetup?.core_setup_score ?? null,
+          upstream_gate_score: candidateMetaFromSetup?.upstream_gate_score ?? null,
+          upstream_min_entry_score: candidateMetaFromSetup?.upstream_min_entry_score ?? null,
+          upstream_core_gate_ok: candidateMetaFromSetup?.upstream_core_gate_ok ?? null,
+          candle_source: candidateMetaFromSetup?.candle_source ?? null,
+          candle_cache_age_ms: candidateMetaFromSetup?.candle_cache_age_ms ?? null,
+          latest_candle_age_ms: candidateMetaFromSetup?.latest_candle_age_ms ?? null,
+          candle_freshness_ok: candidateMetaFromSetup?.candle_freshness_ok ?? null,
+          ticker_price_source: candidateMetaFromSetup?.ticker_price_source ?? null,
+          ticker_price_age_ms: candidateMetaFromSetup?.ticker_price_age_ms ?? null,
+          ticker_freshness_ok: candidateMetaFromSetup?.ticker_freshness_ok ?? null,
+          authority_verified: isVerifiedStrictCore,
+          effective_strength: effectiveStrength,
+          floor: ENTRY_PIPELINE_MID_SCORE_FLOOR,
+          decision: lowSignalEval.decision === "pass" ? (isVerifiedStrictCore ? "authority_delegated" : "pass") : "blocked",
+          reject_reason: lowSignalEval.strictCoreRejectReason,
         }),
       );
 
