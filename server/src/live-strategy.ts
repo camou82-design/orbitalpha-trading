@@ -979,6 +979,49 @@ export function evaluateMajorImpulseCandleFreshness(params: {
   };
 }
 
+export function evaluateCandidateMetaCandleCacheServeDecision(params: {
+  market: string;
+  candidate: { rows: UpbitCandle[]; cache_age_ms: number; via?: string };
+  nowMs?: number;
+}): {
+  shouldServe: boolean;
+  reason: string;
+  maxServeAgeMs: number;
+} {
+  const isCoreTradeMarket = CORE_TRADE_MARKETS.includes(params.market as (typeof CORE_TRADE_MARKETS)[number]);
+  const isStrictCoreOrMajor = params.market === "KRW-BTC" || params.market === "KRW-ETH" || isCoreTradeMarket;
+  const maxServeAgeMs = isStrictCoreOrMajor
+    ? LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS
+    : LIVE_CANDIDATE_CANDLE_CACHE_SERVE_MAX_AGE_MS;
+
+  if (params.candidate.cache_age_ms > maxServeAgeMs) {
+    return { shouldServe: false, reason: "cache_age_exceeded", maxServeAgeMs };
+  }
+
+  if (isStrictCoreOrMajor) {
+    const rows = params.candidate.rows;
+    const last = rows && rows.length > 0 ? rows[rows.length - 1] : null;
+    const latestCandleTs = last?.candle_date_time_kst ?? null;
+    const freshness = evaluateMajorImpulseCandleFreshness({
+      candle_source: "last_good_cache",
+      candle_cache_age_ms: params.candidate.cache_age_ms,
+      latestCandleTs,
+      nowMs: params.nowMs,
+      maxCacheAgeMs: maxServeAgeMs,
+      maxTimestampAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS,
+    });
+    if (!freshness.isFresh) {
+      return {
+        shouldServe: false,
+        reason: freshness.reason ?? "candle_freshness_not_ok",
+        maxServeAgeMs,
+      };
+    }
+  }
+
+  return { shouldServe: true, reason: "serve_without_http", maxServeAgeMs };
+}
+
 export type LiveTickerPriceSourceTag =
   | "ticker_batch"
   | "last_good_cache"
@@ -6888,28 +6931,48 @@ export function createLiveDataStrategy(opts: {
         return cands[0]!;
       };
 
-      const isMajorEligible = market === "KRW-BTC" || market === "KRW-ETH";
+      const isCoreTradeMarket = CORE_TRADE_MARKETS.includes(market as (typeof CORE_TRADE_MARKETS)[number]);
+      const isMajorEligible = market === "KRW-BTC" || market === "KRW-ETH" || isCoreTradeMarket;
       const serveMaxAgeMs = isMajorEligible
         ? LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS
         : LIVE_CANDIDATE_CANDLE_CACHE_SERVE_MAX_AGE_MS;
 
       const fresh = pickFallbackRows(serveMaxAgeMs);
       if (fresh) {
-        minute1CandleCache.set(`${market}:${count}`, fresh.rows);
-        console.info(
-          JSON.stringify({
-            tag: "LIVE_CANDIDATE_CANDLE_CACHE_HIT",
-            ts: new Date().toISOString(),
-            market,
-            timeframe: `${unit}m`,
-            rows: fresh.rows.length,
-            cache_age_ms: fresh.cache_age_ms,
-            via: fresh.via,
-            reason: "serve_without_http",
-            max_serve_age_ms: serveMaxAgeMs,
-          }),
-        );
-        return { rows: fresh.rows, candle_source: "last_good_cache", cache_age_ms: fresh.cache_age_ms };
+        const serveDecision = evaluateCandidateMetaCandleCacheServeDecision({
+          market,
+          candidate: fresh,
+          nowMs: Date.now(),
+        });
+        if (serveDecision.shouldServe) {
+          minute1CandleCache.set(`${market}:${count}`, fresh.rows);
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_CANDIDATE_CANDLE_CACHE_HIT",
+              ts: new Date().toISOString(),
+              market,
+              timeframe: `${unit}m`,
+              rows: fresh.rows.length,
+              cache_age_ms: fresh.cache_age_ms,
+              via: fresh.via,
+              reason: "serve_without_http",
+              max_serve_age_ms: serveMaxAgeMs,
+            }),
+          );
+          return { rows: fresh.rows, candle_source: "last_good_cache", cache_age_ms: fresh.cache_age_ms };
+        } else {
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_CANDIDATE_CANDLE_CACHE_SERVE_BYPASS_FOR_REFRESH",
+              ts: new Date().toISOString(),
+              market,
+              timeframe: `${unit}m`,
+              cache_age_ms: fresh.cache_age_ms,
+              bypass_reason: serveDecision.reason,
+              max_serve_age_ms: serveMaxAgeMs,
+            }),
+          );
+        }
       }
 
       const abortCtrl = new AbortController();

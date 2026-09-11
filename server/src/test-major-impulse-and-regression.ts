@@ -8,6 +8,7 @@ import {
   evaluateGlobalKillSwitch,
   evaluateMajorImpulseCandleFreshness,
   evaluateMajorImpulseTickerFreshness,
+  evaluateCandidateMetaCandleCacheServeDecision,
   isVerifiedMajorImpulseAuthority,
   isVerifiedStrictCoreAuthority,
   evaluateLegacyLowSignalGate,
@@ -2880,6 +2881,182 @@ async function runAllTests() {
       assert.strictEqual(authEval.verified, false, `upstream_min_entry_score=${invalidMinScore} must be rejected`);
     }
     console.log("[PASS] Strict Core Test W: upstream_min_entry_score undefined/NaN => strictly BLOCKED");
+  }
+
+  // Test X: Production fetch decision helper path (CORE DOGE/XRP cache age 70s + timestamp 125s vs 30s + Non-CORE ALT 12m)
+  {
+    const now = Date.now();
+    const staleCandleKst = new Date(now - 125_000).toISOString();
+    const freshCandleKst = new Date(now - 30_000).toISOString();
+
+    const makeCandleRows = (kst: string) => [
+      {
+        market: "KRW-DOGE",
+        candle_date_time_utc: new Date(kst).toISOString(),
+        candle_date_time_kst: kst,
+        opening_price: 200,
+        high_price: 205,
+        low_price: 198,
+        trade_price: 203,
+        timestamp: Date.parse(kst),
+        candle_acc_trade_price: 1000000,
+        candle_acc_trade_volume: 5000,
+        unit: 1,
+      } as any,
+    ];
+
+    // X.1: CORE DOGE/XRP cache age 70s (<75s) but latest candle timestamp 125s (>120s) => cache serve FORBIDDEN, live HTTP refresh REQUIRED
+    for (const coreMarket of ["KRW-DOGE", "KRW-XRP"]) {
+      const decisionStaleTs = evaluateCandidateMetaCandleCacheServeDecision({
+        market: coreMarket,
+        candidate: {
+          rows: makeCandleRows(staleCandleKst),
+          cache_age_ms: 70_000,
+          via: "last_good_process",
+        },
+        nowMs: now,
+      });
+      assert.strictEqual(decisionStaleTs.shouldServe, false, `${coreMarket} cache age 70s with 125s candle timestamp must NOT be served without HTTP`);
+      assert.strictEqual(decisionStaleTs.reason, "stale_latest_candle_timestamp");
+      assert.strictEqual(decisionStaleTs.maxServeAgeMs, LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS);
+    }
+
+    // X.2: CORE DOGE/XRP cache age 70s (<75s) and latest candle timestamp 30s (<=120s) => cache serve ALLOWED without HTTP
+    for (const coreMarket of ["KRW-DOGE", "KRW-XRP"]) {
+      const decisionFresh = evaluateCandidateMetaCandleCacheServeDecision({
+        market: coreMarket,
+        candidate: {
+          rows: makeCandleRows(freshCandleKst),
+          cache_age_ms: 70_000,
+          via: "last_good_process",
+        },
+        nowMs: now,
+      });
+      assert.strictEqual(decisionFresh.shouldServe, true, `${coreMarket} cache age 70s with fresh 30s candle timestamp must be served without HTTP`);
+      assert.strictEqual(decisionFresh.reason, "serve_without_http");
+      assert.strictEqual(decisionFresh.maxServeAgeMs, LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS);
+    }
+
+    // X.3: Non-CORE ALT (KRW-SAND) preserves 12-minute cache TTL policy
+    const decisionAltFresh = evaluateCandidateMetaCandleCacheServeDecision({
+      market: "KRW-SAND",
+      candidate: {
+        rows: makeCandleRows(staleCandleKst),
+        cache_age_ms: 70_000,
+        via: "last_good_process",
+      },
+      nowMs: now,
+    });
+    assert.strictEqual(decisionAltFresh.shouldServe, true, "Non-CORE ALT must preserve 12m cache serve policy");
+    assert.strictEqual(decisionAltFresh.reason, "serve_without_http");
+    assert.strictEqual(decisionAltFresh.maxServeAgeMs, 12 * 60_000);
+
+    const decisionAltExpired = evaluateCandidateMetaCandleCacheServeDecision({
+      market: "KRW-SAND",
+      candidate: {
+        rows: makeCandleRows(staleCandleKst),
+        cache_age_ms: 750_000, // > 12m
+        via: "last_good_process",
+      },
+      nowMs: now,
+    });
+    assert.strictEqual(decisionAltExpired.shouldServe, false, "Non-CORE ALT >12m cache must be rejected");
+    assert.strictEqual(decisionAltExpired.reason, "cache_age_exceeded");
+
+    console.log("[PASS] Strict Core Test X: Production fetch decision helper path (70s/125s bypass, 70s/30s serve, ALT 12m preserve) => PASS");
+  }
+
+  // Test Y: DOGE / XRP Strict CORE cache age 80~120s => live refresh success (candle_source="live_fetch") grants authority PASS
+  {
+    const freshCandleTs = new Date(Date.now() - 30_000).toISOString();
+    for (const coreMarket of ["KRW-DOGE", "KRW-XRP"]) {
+      const meta = {
+        market: coreMarket,
+        engine_bucket: "core",
+        setupReason: "CORE_TREND_CONTINUATION",
+        setup: { ok: true, reason: "CORE_TREND_CONTINUATION", score: 95 },
+        score: 95,
+        core_setup_score: 95,
+        upstream_gate_score: 0,
+        upstream_min_entry_score: 82,
+        upstream_core_gate_ok: true,
+        candle_source: "live_fetch", // simulated result after 75s cache TTL expired and live HTTP refresh succeeded
+        candle_cache_age_ms: null,
+        candle_freshness_ok: true,
+        latest_candle_ts: freshCandleTs,
+        ticker_price_source: "ticker_batch",
+        ticker_price_age_ms: 1000,
+        ticker_freshness_ok: true,
+      };
+      const authEval = isVerifiedStrictCoreAuthority({ market: coreMarket, candidateMeta: meta });
+      assert.strictEqual(authEval.verified, true, `${coreMarket} live refresh success must pass Strict CORE authority`);
+
+      const gateEval = evaluateLegacyLowSignalGate({
+        market: coreMarket,
+        sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+        isSurgeSource: false,
+        candidateMetaFromSetup: meta,
+      });
+      assert.strictEqual(gateEval.isVerifiedStrictCore, true);
+      assert.strictEqual(gateEval.effectiveStrength, 95);
+      assert.strictEqual(gateEval.blocked_low_signal, false);
+      assert.strictEqual(gateEval.decision, "pass");
+    }
+    console.log("[PASS] Strict Core Test Y: DOGE / XRP Strict CORE live refresh success => authority PASS");
+  }
+
+  // Test Z: DOGE / XRP Strict CORE refresh failure fallback (stale cache age > 75s or stale candle timestamp) => strictly FAIL-CLOSED BLOCKED
+  {
+    const now = Date.now();
+    const freshCandleTs = new Date(now - 30_000).toISOString();
+    for (const coreMarket of ["KRW-DOGE", "KRW-XRP"]) {
+      for (const staleAgeMs of [80_000, 95_000, 120_000]) {
+        const freshnessEval = evaluateMajorImpulseCandleFreshness({
+          candle_source: "last_good_cache",
+          candle_cache_age_ms: staleAgeMs,
+          latestCandleTs: freshCandleTs,
+          nowMs: now,
+          maxCacheAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS,
+          maxTimestampAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS,
+        });
+        assert.strictEqual(freshnessEval.isFresh, false, `${coreMarket} stale cache age ${staleAgeMs}ms must fail candle freshness`);
+        assert.strictEqual(freshnessEval.reason, "stale_candidate_candle_cache");
+
+        const meta = {
+          market: coreMarket,
+          engine_bucket: "core",
+          setupReason: "CORE_TREND_CONTINUATION",
+          setup: { ok: true, reason: "CORE_TREND_CONTINUATION", score: 95 },
+          score: 95,
+          core_setup_score: 95,
+          upstream_gate_score: 0,
+          upstream_min_entry_score: 82,
+          upstream_core_gate_ok: true,
+          candle_source: "last_good_cache", // stale fallback after refresh failure
+          candle_cache_age_ms: staleAgeMs,
+          candle_freshness_ok: freshnessEval.isFresh, // false
+          latest_candle_ts: freshCandleTs,
+          ticker_price_source: "ticker_batch",
+          ticker_price_age_ms: 1000,
+          ticker_freshness_ok: true,
+        };
+        const authEval = isVerifiedStrictCoreAuthority({ market: coreMarket, candidateMeta: meta });
+        assert.strictEqual(authEval.verified, false, `${coreMarket} stale fallback must be rejected by Strict CORE authority`);
+        assert.strictEqual(authEval.rejectReason, "candle_freshness_not_ok");
+
+        const gateEval = evaluateLegacyLowSignalGate({
+          market: coreMarket,
+          sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+          isSurgeSource: false,
+          candidateMetaFromSetup: meta,
+        });
+        assert.strictEqual(gateEval.isVerifiedStrictCore, false);
+        assert.strictEqual(gateEval.effectiveStrength, 0);
+        assert.strictEqual(gateEval.blocked_low_signal, true);
+        assert.strictEqual(gateEval.decision, "blocked");
+      }
+    }
+    console.log("[PASS] Strict Core Test Z: DOGE / XRP Strict CORE refresh failure fallback => strictly FAIL-CLOSED BLOCKED");
   }
 
   console.log("\n==================================================================");
