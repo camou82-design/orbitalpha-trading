@@ -2317,16 +2317,16 @@ async function runAllTests() {
     console.log("[PASS] Strict Core Test C: CORE_PULLBACK_REVERSAL score85 min_entry_score82 fresh => PASS");
   }
 
-  // Test D: CORE_PULLBACK_REVERSAL score80 (<85) => BLOCK
+  // Test D: ETH 실운영 재현: CORE_PULLBACK_REVERSAL score80 min76 upstream_core_gate_ok=true => authority PASS
   {
     const freshCandleTs = new Date(Date.now() - 30_000).toISOString();
     const meta = {
-      market: "KRW-BTC",
+      market: "KRW-ETH",
       engine_bucket: "core",
       setupReason: "CORE_PULLBACK_REVERSAL",
       setup: { ok: true, reason: "CORE_PULLBACK_REVERSAL", score: 80 },
       score: 80,
-      core_setup_score: 80, // < 85
+      core_setup_score: 80,
       upstream_gate_score: 0,
       upstream_min_entry_score: 76,
       upstream_core_gate_ok: true,
@@ -2338,20 +2338,75 @@ async function runAllTests() {
       ticker_price_age_ms: 1000,
       ticker_freshness_ok: true,
     };
-    const authEval = isVerifiedStrictCoreAuthority({ market: "KRW-BTC", candidateMeta: meta });
-    assert.strictEqual(authEval.verified, false);
+    const authEval = isVerifiedStrictCoreAuthority({ market: "KRW-ETH", candidateMeta: meta });
+    assert.strictEqual(authEval.verified, true);
+    assert.strictEqual(authEval.rejectReason, null);
 
     const gateEval = evaluateLegacyLowSignalGate({
-      market: "KRW-BTC",
+      market: "KRW-ETH",
       sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
       isSurgeSource: false,
       candidateMetaFromSetup: meta,
     });
-    assert.strictEqual(gateEval.isVerifiedStrictCore, false);
-    assert.strictEqual(gateEval.effectiveStrength, 0);
-    assert.strictEqual(gateEval.blocked_low_signal, true);
-    assert.strictEqual(gateEval.decision, "blocked");
-    console.log("[PASS] Strict Core Test D: CORE_PULLBACK_REVERSAL score80 (<85) => strictly BLOCKED");
+    assert.strictEqual(gateEval.isVerifiedStrictCore, true);
+    assert.strictEqual(gateEval.effectiveStrength, 80);
+    assert.strictEqual(gateEval.blocked_low_signal, false);
+    assert.strictEqual(gateEval.decision, "pass");
+    console.log("[PASS] Strict Core Test D: ETH 실운영 재현 (CORE_PULLBACK_REVERSAL 80/76) => authority_verified=true, effective_strength=80, blocked_low_signal=false");
+  }
+
+  // Test D1: core=75, min=76 => strictly BLOCKED by market min
+  {
+    const freshCandleTs = new Date(Date.now() - 30_000).toISOString();
+    const meta = {
+      market: "KRW-ETH",
+      engine_bucket: "core",
+      setupReason: "CORE_PULLBACK_REVERSAL",
+      setup: { ok: true, reason: "CORE_PULLBACK_REVERSAL", score: 75 },
+      score: 75,
+      core_setup_score: 75,
+      upstream_gate_score: 0,
+      upstream_min_entry_score: 76,
+      upstream_core_gate_ok: true,
+      candle_source: "live_fetch",
+      candle_cache_age_ms: null,
+      candle_freshness_ok: true,
+      latest_candle_ts: freshCandleTs,
+      ticker_price_source: "ticker_batch",
+      ticker_price_age_ms: 1000,
+      ticker_freshness_ok: true,
+    };
+    const authEval = isVerifiedStrictCoreAuthority({ market: "KRW-ETH", candidateMeta: meta });
+    assert.strictEqual(authEval.verified, false);
+    assert.strictEqual(authEval.rejectReason, "core_setup_score_below_market_min:75<76");
+    console.log("[PASS] Strict Core Test D1: core=75, min=76 => strictly BLOCKED (core < min)");
+  }
+
+  // Test D2: setup.ok=false => strictly BLOCKED
+  {
+    const freshCandleTs = new Date(Date.now() - 30_000).toISOString();
+    const meta = {
+      market: "KRW-ETH",
+      engine_bucket: "core",
+      setupReason: "CORE_PULLBACK_REVERSAL",
+      setup: { ok: false, reason: "CORE_PULLBACK_REVERSAL", score: 80 },
+      score: 80,
+      core_setup_score: 80,
+      upstream_gate_score: 0,
+      upstream_min_entry_score: 76,
+      upstream_core_gate_ok: true,
+      candle_source: "live_fetch",
+      candle_cache_age_ms: null,
+      candle_freshness_ok: true,
+      latest_candle_ts: freshCandleTs,
+      ticker_price_source: "ticker_batch",
+      ticker_price_age_ms: 1000,
+      ticker_freshness_ok: true,
+    };
+    const authEval = isVerifiedStrictCoreAuthority({ market: "KRW-ETH", candidateMeta: meta });
+    assert.strictEqual(authEval.verified, false);
+    assert.strictEqual(authEval.rejectReason, "setup_not_ok");
+    console.log("[PASS] Strict Core Test D2: setup.ok=false => strictly BLOCKED");
   }
 
   // Test E: core score95지만 upstream_core_gate_ok=false => BLOCK
@@ -2737,7 +2792,7 @@ async function runAllTests() {
     };
     const authEval = isVerifiedStrictCoreAuthority({ market: "KRW-BTC", candidateMeta: meta });
     assert.strictEqual(authEval.verified, false);
-    assert.strictEqual(authEval.rejectReason?.startsWith("core_setup_score_insufficient"), true);
+    assert.strictEqual(authEval.rejectReason, "core_setup_score_below_market_min:80<82");
 
     const gateEval = evaluateLegacyLowSignalGate({
       market: "KRW-BTC",

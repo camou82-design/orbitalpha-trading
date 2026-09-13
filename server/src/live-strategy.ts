@@ -1155,8 +1155,8 @@ export function isVerifiedStrictCoreAuthority(params: {
 
   // E & F. core_setup_score check
   const coreScore = Number(meta.core_setup_score);
-  if (!Number.isFinite(coreScore) || coreScore < 85) {
-    return { verified: false, rejectReason: `core_setup_score_insufficient:${coreScore}<85` };
+  if (!Number.isFinite(coreScore)) {
+    return { verified: false, rejectReason: "invalid_core_setup_score" };
   }
 
   // G. Upstream core gate OK check
