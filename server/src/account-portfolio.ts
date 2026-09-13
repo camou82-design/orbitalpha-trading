@@ -9,6 +9,27 @@ const UPBIT_FEE_RATE = 0.0005;
 
 const MANAGED_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-TRX"] as const;
 
+/** Dashboard / Account Valuation 전용 가격 신선도 임계치 (기본 5초, 1~30초 범위 클램프) */
+export const DEFAULT_ACCOUNT_VALUATION_TICKER_FRESH_MAX_AGE_MS = 5000;
+export const ACCOUNT_VALUATION_TICKER_FRESH_MAX_AGE_MS = Math.max(
+  1000,
+  Math.min(30000, Number(process.env.ACCOUNT_VALUATION_TICKER_FRESH_MAX_AGE_MS ?? DEFAULT_ACCOUNT_VALUATION_TICKER_FRESH_MAX_AGE_MS)),
+);
+
+/** Dashboard polling용 REST fetch 전체 예산 (기본 800ms, 300~2000ms 클램프) */
+export const DEFAULT_ACCOUNT_VALUATION_TOTAL_TIMEOUT_MS = 800;
+export const ACCOUNT_VALUATION_TOTAL_TIMEOUT_MS = Math.max(
+  300,
+  Math.min(2000, Number(process.env.ACCOUNT_VALUATION_TOTAL_TIMEOUT_MS ?? DEFAULT_ACCOUNT_VALUATION_TOTAL_TIMEOUT_MS)),
+);
+
+/** Dashboard polling용 REST fetch 배치 예산 (기본 600ms, 200~1500ms 클램프) */
+export const DEFAULT_ACCOUNT_VALUATION_BATCH_TIMEOUT_MS = 600;
+export const ACCOUNT_VALUATION_BATCH_TIMEOUT_MS = Math.max(
+  200,
+  Math.min(1500, Number(process.env.ACCOUNT_VALUATION_BATCH_TIMEOUT_MS ?? DEFAULT_ACCOUNT_VALUATION_BATCH_TIMEOUT_MS)),
+);
+
 export type BalanceRow = {
   currency: string;
   balance: number;
@@ -24,7 +45,7 @@ export function normalizeBalanceCurrency(raw: string): string {
 }
 
 function marketCodeForCurrency(currency: string): string {
-  return `KRW-${normalizeBalanceCurrency(currency)}`;
+  return "KRW-" + normalizeBalanceCurrency(currency);
 }
 
 export type AccountPortfolioSnapshot = {
@@ -101,18 +122,15 @@ export function computeAccountValuationFromPrices(balances: BalanceRow[], tradeP
       passive_holding_value_krw += evalAmt;
     }
 
-    // 평단가가 0이거나 미산정(avg <= 0)인 자산인 경우
-    if (!Number.isFinite(avg) || avg <= 0) {
+    if (avg <= 0) {
       cost_basis_unknown_krw += evalAmt;
-      // 손익 계산 대상 및 수익률 분모에서 별도 제외 (net_pnl 기여 0원, 수익률 분모 왜곡 방지)
-    } else {
-      const cost = qty * avg;
-      known_buy_cost += cost;
-      known_evaluated += evalAmt;
-      if (evalAmt > 0 && cost > 0) {
-        estimated_fees += UPBIT_FEE_RATE * (evalAmt + cost);
-      }
+      continue;
     }
+
+    const buyCost = qty * avg;
+    known_buy_cost += buyCost;
+    known_evaluated += evalAmt;
+    estimated_fees += evalAmt * UPBIT_FEE_RATE;
   }
 
   const net_pnl_krw = known_evaluated - known_buy_cost - estimated_fees;
@@ -206,10 +224,29 @@ function parseTickerRow(t: { market?: unknown; trade_price?: unknown }): { marke
   return { market: t.market, price: p };
 }
 
+export type FetchTickerPriceMapOptions = {
+  forceRefresh?: boolean;
+  debugCaller?: string;
+  totalTimeoutMs?: number;
+  batchTimeoutMs?: number;
+  signal?: AbortSignal;
+};
+
 /** 공개 티커 조회 실패 시 throw — 호출부에서 마지막 정상 가격맵으로 폴백한다. */
-export async function fetchTickerPriceMap(markets: string[], isPriority = true): Promise<Record<string, number>> {
+export async function fetchTickerPriceMap(
+  markets: string[],
+  isPriority = true,
+  opts?: FetchTickerPriceMapOptions,
+): Promise<Record<string, number>> {
   if (markets.length === 0) return {};
-  const tickerRows = await fetchTickers(markets, { isPriority });
+  const tickerRows = await fetchTickers(markets, {
+    isPriority,
+    forceRefresh: opts?.forceRefresh,
+    debugCaller: opts?.debugCaller,
+    totalTimeoutMs: opts?.totalTimeoutMs,
+    batchTimeoutMs: opts?.batchTimeoutMs,
+    signal: opts?.signal,
+  });
   const tradePriceByMarket: Record<string, number> = {};
   for (const t of tickerRows) {
     const parsed = parseTickerRow(t as { market?: unknown; trade_price?: unknown });
@@ -233,12 +270,16 @@ function heldMarketsNeedingPrice(balances: BalanceRow[], priceMap: Record<string
 
 const TICKER_CHUNK = 10; // Chunk 크기를 10 이하로 조정
 
-async function fetchTickerPriceMapChunked(markets: string[], isPriority = true): Promise<Record<string, number>> {
+async function fetchTickerPriceMapChunked(
+  markets: string[],
+  isPriority = true,
+  opts?: FetchTickerPriceMapOptions,
+): Promise<Record<string, number>> {
   const out: Record<string, number> = {};
   for (let i = 0; i < markets.length; i += TICKER_CHUNK) {
     const chunk = markets.slice(i, i + TICKER_CHUNK);
     try {
-      const part = await fetchTickerPriceMap(chunk, isPriority);
+      const part = await fetchTickerPriceMap(chunk, isPriority, opts);
       Object.assign(out, part);
     } catch {
       /* 청크 단위 실패는 무시 — 단건 보충에서 이어짐 */
@@ -247,69 +288,173 @@ async function fetchTickerPriceMapChunked(markets: string[], isPriority = true):
   return out;
 }
 
+export type InitialMarketFreshnessResult = {
+  initialMerged: Record<string, number>;
+  freshMarkets: Set<string>;
+  staleMarkets: string[];
+};
+
+/**
+ * 캐시(tickerCache / lastGoodTickerCache)와 직전 시드(seed)로부터
+ * 마켓별 초기 fallback 가격 및 freshness(5초 이내 live 여부)를 평가하는 순수 함수.
+ * 네트워크 I/O 없이 완전히 결정론적으로 동작한다.
+ */
+export function evaluateInitialMarketFreshness(params: {
+  markets: string[];
+  tickerCacheMap: Map<string, { value?: { trade_price?: unknown } | null; fetchedAtMs?: number | null }>;
+  lastGoodMap: Map<string, { trade_price?: unknown } | null>;
+  seed: Record<string, number> | null;
+  now: number;
+  freshMaxAgeMs: number;
+}): InitialMarketFreshnessResult {
+  const { markets, tickerCacheMap, lastGoodMap, seed, now, freshMaxAgeMs } = params;
+  const initialMerged: Record<string, number> = {};
+  const freshMarkets = new Set<string>();
+  const staleMarkets: string[] = [];
+
+  // 1) Seed 가격을 fallback 기본값으로 먼저 탑재
+  if (seed) {
+    for (const [k, v] of Object.entries(seed)) {
+      if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+        initialMerged[k] = v;
+      }
+    }
+  }
+
+  // 2) 대상 마켓별 캐시 검사
+  for (const m of markets) {
+    const c = tickerCacheMap.get(m);
+    const lg = lastGoodMap.get(m);
+
+    const cachePrice = c && c.value && Number(c.value.trade_price) > 0 ? Number(c.value.trade_price) : null;
+    const lastGoodPrice = lg && Number(lg.trade_price) > 0 ? Number(lg.trade_price) : null;
+
+    if (cachePrice !== null && c && typeof c.fetchedAtMs === "number" && c.fetchedAtMs > 0) {
+      initialMerged[m] = cachePrice;
+      const age = now - c.fetchedAtMs;
+      if (age >= 0 && age <= freshMaxAgeMs) {
+        // Fresh: 최근 5초 이내 캐시
+        freshMarkets.add(m);
+      } else {
+        // Stale: 5초 초과 캐시 -> fallback 가격은 유지하되 refresh 대상으로 분류
+        staleMarkets.push(m);
+      }
+    } else if (lastGoodPrice !== null) {
+      // lastGoodTickerCache만 있는 경우: fallback 가격은 보존하되 fresh로는 넣지 않고 refresh 대상
+      initialMerged[m] = lastGoodPrice;
+      staleMarkets.push(m);
+    } else {
+      // tickerCache/lastGood 모두 없는 경우 (seed에 있더라도 stale로 분류하여 REST refresh 시도)
+      staleMarkets.push(m);
+    }
+  }
+
+  return { initialMerged, freshMarkets, staleMarkets };
+}
+
 /**
  * seed(직전 성공 맵) + 엔진 최신 캐시(tickerCache/lastGoodTickerCache) + 배치 티커(재시도)로 가격맵을 채운다.
- * 대시보드/계좌 조회가 Live Execution의 Ticker Lock을 침범/경합하지 않도록 캐시를 우선 활용하고 비우선순위(isPriority: false)를 사용한다.
- * `rest_fresh_markets`: 이번 호출 또는 최신 캐시로 유효 가격을 확보한 마켓 집합.
+ * 대시보드/계좌 조회가 Live Execution의 Ticker Lock을 침범/경합하지 않도록 비우선순위(isPriority: false)를 사용하고 짧은 타임아웃 예산을 적용한다.
+ * `rest_fresh_markets`: 이번 호출 시점에 5초 이내 신선도가 보장된 마켓 집합 (stale/lastGood fallback은 제외).
  */
 export async function resolveTickerPricesForBalances(
   balances: BalanceRow[],
   seed: Record<string, number> | null,
-  opts?: { isPriority?: boolean },
+  opts?: {
+    isPriority?: boolean;
+    freshMaxAgeMs?: number;
+    totalTimeoutMs?: number;
+    batchTimeoutMs?: number;
+    signal?: AbortSignal;
+  },
 ): Promise<{ merged: Record<string, number>; rest_fresh_markets: Set<string> }> {
   const isPriority = opts?.isPriority ?? false;
-  const restFresh = new Set<string>();
-  let merged: Record<string, number> = { ...(seed ?? {}) };
+  const freshMaxAgeMs = opts?.freshMaxAgeMs ?? ACCOUNT_VALUATION_TICKER_FRESH_MAX_AGE_MS;
+  const totalTimeoutMs = opts?.totalTimeoutMs ?? ACCOUNT_VALUATION_TOTAL_TIMEOUT_MS;
+  const batchTimeoutMs = opts?.batchTimeoutMs ?? ACCOUNT_VALUATION_BATCH_TIMEOUT_MS;
+  const now = Date.now();
 
   const allValuationMarkets = marketsForAccountValuation(balances);
   const { accepted: markets } = await partitionKrwMarketsByUpbitValidity(allValuationMarkets);
 
-  // 1. Live Engine이 이미 갱신 중인 tickerCache / lastGoodTickerCache에서 우선 흡수 (0ms, 락 경합 없음)
-  for (const m of markets) {
-    const c = tickerCache.get(m);
-    if (c && c.value && Number(c.value.trade_price) > 0) {
-      merged[m] = Number(c.value.trade_price);
-      restFresh.add(m);
-    } else {
-      const lg = lastGoodTickerCache.get(m);
-      if (lg && Number(lg.trade_price) > 0) {
-        merged[m] = Number(lg.trade_price);
-        restFresh.add(m);
+  // 1. Live Engine이 이미 갱신 중인 tickerCache / lastGoodTickerCache 및 seed에서 초기 상태 평가
+  const { initialMerged, freshMarkets, staleMarkets } = evaluateInitialMarketFreshness({
+    markets,
+    tickerCacheMap: tickerCache,
+    lastGoodMap: lastGoodTickerCache,
+    seed,
+    now,
+    freshMaxAgeMs,
+  });
+
+  const merged: Record<string, number> = { ...initialMerged };
+  const restFresh = new Set<string>(freshMarkets);
+
+  // 2. Stale하거나 아직 가격이 없는 마켓이 존재하면 forceRefresh로 REST 조회 (isPriority: false로 Live Engine 보호)
+  if (staleMarkets.length > 0) {
+    const fetchStartMs = Date.now();
+    try {
+      const freshPrices = staleMarkets.length <= TICKER_CHUNK
+        ? await fetchTickerPriceMap(staleMarkets, isPriority, {
+            forceRefresh: true,
+            debugCaller: "account_portfolio_dashboard_refresh",
+            totalTimeoutMs,
+            batchTimeoutMs,
+            signal: opts?.signal,
+          })
+        : await fetchTickerPriceMapChunked(staleMarkets, isPriority, {
+            forceRefresh: true,
+            debugCaller: "account_portfolio_dashboard_refresh",
+            totalTimeoutMs,
+            batchTimeoutMs,
+            signal: opts?.signal,
+          });
+
+      for (const [k, v] of Object.entries(freshPrices)) {
+        if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+          const c = tickerCache.get(k);
+          // fetch 시작 이후 실제로 REST를 통해 최신 캐시가 갱신된 마켓만 fresh로 인정
+          if (c && typeof c.fetchedAtMs === "number" && c.fetchedAtMs >= fetchStartMs) {
+            merged[k] = v;
+            restFresh.add(k);
+          } else {
+            // REST 실패로 fetchTickers 내부 lastGood fallback이 반환된 경우: 가격이 아예 없던 경우에만 fallback 채움
+            if (!(Number(merged[k] ?? 0) > 0)) {
+              merged[k] = v;
+            }
+          }
+        }
       }
+    } catch {
+      /* REST 실패 시 기존 fallback(seed/lastGood/tickerCache) 유지 */
     }
   }
 
-  const absorb = (part: Record<string, number>) => {
-    for (const [k, v] of Object.entries(part)) {
-      if (typeof v === "number" && Number.isFinite(v) && v > 0) {
-        merged[k] = v;
-        restFresh.add(k);
-      }
-    }
-  };
-
-  // 2. 캐시로도 아직 가격이 없는 유효 마켓이 남아있을 때만 REST 조회 (isPriority: false로 Live Engine 보호)
-  const needingPrice = markets.filter((m) => !(Number(merged[m] ?? 0) > 0));
-  if (needingPrice.length > 0) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const fresh = needingPrice.length <= TICKER_CHUNK
-          ? await fetchTickerPriceMap(needingPrice, isPriority)
-          : await fetchTickerPriceMapChunked(needingPrice, isPriority);
-        absorb(fresh);
-        break;
-      } catch {
-        if (attempt < 1) await new Promise((r) => setTimeout(r, 200));
-      }
-    }
-  }
-
-  // 3. 보유 마켓 중 여전히 가격이 없는 종목 단건 보충 (유효 마켓 대상만)
+  // 3. 보유 마켓 중 여전히 유효 가격(>0)이 전혀 없는 종목 단건 보충 (유효 마켓 대상만)
   const heldNeeding = heldMarketsNeedingPrice(balances, merged).filter((m) => markets.includes(m));
   for (const m of heldNeeding) {
     try {
-      const one = await fetchTickerPriceMap([m], isPriority);
-      absorb(one);
+      const singleStart = Date.now();
+      const one = await fetchTickerPriceMap([m], isPriority, {
+        forceRefresh: true,
+        debugCaller: "account_portfolio_held_single_refresh",
+        totalTimeoutMs: Math.min(500, totalTimeoutMs),
+        batchTimeoutMs: Math.min(400, batchTimeoutMs),
+        signal: opts?.signal,
+      });
+      for (const [k, v] of Object.entries(one)) {
+        if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+          const c = tickerCache.get(k);
+          if (c && typeof c.fetchedAtMs === "number" && c.fetchedAtMs >= singleStart) {
+            merged[k] = v;
+            restFresh.add(k);
+          } else {
+            if (!(Number(merged[k] ?? 0) > 0)) {
+              merged[k] = v;
+            }
+          }
+        }
+      }
     } catch {
       /* 다음 종목 */
     }
