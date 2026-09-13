@@ -45,7 +45,7 @@ export function normalizeBalanceCurrency(raw: string): string {
 }
 
 function marketCodeForCurrency(currency: string): string {
-  return "KRW-" + normalizeBalanceCurrency(currency);
+  return `KRW-${normalizeBalanceCurrency(currency)}`;
 }
 
 export type AccountPortfolioSnapshot = {
@@ -122,15 +122,18 @@ export function computeAccountValuationFromPrices(balances: BalanceRow[], tradeP
       passive_holding_value_krw += evalAmt;
     }
 
-    if (avg <= 0) {
+    // 평단가가 0이거나 미산정(avg <= 0)인 자산인 경우
+    if (!Number.isFinite(avg) || avg <= 0) {
       cost_basis_unknown_krw += evalAmt;
-      continue;
+      // 손익 계산 대상 및 수익률 분모에서 별도 제외 (net_pnl 기여 0원, 수익률 분모 왜곡 방지)
+    } else {
+      const cost = qty * avg;
+      known_buy_cost += cost;
+      known_evaluated += evalAmt;
+      if (evalAmt > 0 && cost > 0) {
+        estimated_fees += UPBIT_FEE_RATE * (evalAmt + cost);
+      }
     }
-
-    const buyCost = qty * avg;
-    known_buy_cost += buyCost;
-    known_evaluated += evalAmt;
-    estimated_fees += evalAmt * UPBIT_FEE_RATE;
   }
 
   const net_pnl_krw = known_evaluated - known_buy_cost - estimated_fees;
