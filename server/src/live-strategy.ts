@@ -9434,7 +9434,9 @@ export function createLiveDataStrategy(opts: {
           ) {
             exitAuthorityClass = "emergency_exit";
             stopTriggerKind = "price_stop";
-          } else if (decision.reason === "SURGE_TIMEOUT_EXIT") {
+          } else if (decision.reason === "SURGE_TIMEOUT_EXIT" ||
+            decision.reason === "SURGE_TIMEOUT_WEAK_EXIT" ||
+            decision.reason === "SURGE_EXTENDED_TIMEOUT_EXIT") {
             exitAuthorityClass = "time_stop";
             stopTriggerKind = "time_stop";
           } else {
@@ -10517,7 +10519,9 @@ export function createLiveDataStrategy(opts: {
                   : reasonExit === "momentum_time_stop" ||
                       reasonExit === "stable_time_stop_weak_rebound" ||
                       reasonExit === "residual_full_exit_escalation" ||
-                      reasonExit === "SURGE_TIMEOUT_EXIT"
+                      reasonExit === "SURGE_TIMEOUT_EXIT" ||
+                      reasonExit === "SURGE_TIMEOUT_WEAK_EXIT" ||
+                      reasonExit === "SURGE_EXTENDED_TIMEOUT_EXIT"
                     ? "time_stop_exit"
                     : "stop_loss",
         type: isFinalClose ? "position_closed" : "partial_take_profit",

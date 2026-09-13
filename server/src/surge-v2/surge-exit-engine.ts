@@ -126,9 +126,25 @@ export function evaluateSurgeExit(pos: any, currentPx: number, rise3mPct?: numbe
   if (!decision && maxPnlPct >= trailingStartPct && pnlPct <= breakevenProtectTrigger) {
     decision = { action: "sell", reason: "SURGE_BREAKEVEN_PROTECT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
-  // 7. Timeout Exit
-  if (!decision && holdMinutes >= 30 && pnlPct < 1.0 && !tp1Done) {
-    decision = { action: "sell", reason: "SURGE_TIMEOUT_EXIT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+  // 7. Timeout Exits (Tiered 30m Weak Exit & 60m Extended Timeout Exit)
+  if (!decision && holdMinutes >= 30 && !tp1Done) {
+    const isRise3mValid = rise3mPct !== undefined && Number.isFinite(rise3mPct);
+    const isRise3mNonPositive = isRise3mValid && (rise3mPct as number) <= 0;
+
+    if (holdMinutes < 60) {
+      // 30m ~ 60m: TIMEOUT REVIEW (Do not sell at near buy price)
+      // Only exit if: pnlPct <= -0.8% AND rise3mPct is a valid number <= 0
+      if (pnlPct <= -0.8 && isRise3mNonPositive) {
+        decision = { action: "sell", reason: "SURGE_TIMEOUT_WEAK_EXIT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+      }
+    } else {
+      // >= 60m: EXTENDED TIMEOUT (Prevent infinite capital lockup)
+      // Fee-aware gross break-even: round-trip fee 0.10% + buffer 0.25% = 0.35%
+      // Exit if: pnlPct < 0.35% OR (pnlPct < 1.0% AND rise3mPct is valid <= 0)
+      if (pnlPct < 0.35 || (pnlPct < 1.0 && isRise3mNonPositive)) {
+        decision = { action: "sell", reason: "SURGE_EXTENDED_TIMEOUT_EXIT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
+      }
+    }
   }
 
   if (!decision) {

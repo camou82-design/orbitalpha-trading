@@ -901,7 +901,11 @@ async function runTests() {
         ) {
           exitAuthorityClass = "emergency_exit";
           stopTriggerKind = "price_stop";
-        } else if (decision.reason === "SURGE_TIMEOUT_EXIT") {
+        } else if (
+          decision.reason === "SURGE_TIMEOUT_EXIT" ||
+          decision.reason === "SURGE_TIMEOUT_WEAK_EXIT" ||
+          decision.reason === "SURGE_EXTENDED_TIMEOUT_EXIT"
+        ) {
           exitAuthorityClass = "time_stop";
           stopTriggerKind = "time_stop";
         } else {
