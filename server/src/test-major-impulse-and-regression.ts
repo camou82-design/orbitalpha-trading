@@ -4,7 +4,7 @@ import { runEntryScoreGate } from "@orbitalpha/shared";
 import {
   evaluateMajorImpulseSetup,
   detectBtcMarketPhase,
-  validateLiveBuyPrecheck,
+  validateLiveBuyPrecheck as validateLiveBuyPrecheckProduction,
   evaluateGlobalKillSwitch,
   evaluateMajorImpulseCandleFreshness,
   evaluateMajorImpulseTickerFreshness,
@@ -18,6 +18,14 @@ import {
 } from "./live-strategy.js";
 import { computeLiveCapitalPolicyV4 } from "./live-capital-policy-v4.js";
 import { tickerSourceMap } from "./upbit-public.js";
+
+// Test helper: provides default safe actualDailyPnlPct for unit tests focusing on other invariants
+async function validateLiveBuyPrecheck(params: Parameters<typeof validateLiveBuyPrecheckProduction>[0]) {
+  return validateLiveBuyPrecheckProduction({
+    actualDailyPnlPct: 0,
+    ...params,
+  });
+}
 
 async function runAllTests() {
   console.log("==================================================================");

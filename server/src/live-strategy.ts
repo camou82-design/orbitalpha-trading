@@ -2322,9 +2322,11 @@ async function fetchPrecheckCandlesSafe(market: string, timeoutMs = 5000): Promi
   }
 }
 
+export const LIVE_DAILY_PNL_LIMIT_PCT = -2.5;
+
 export async function validateLiveBuyPrecheck(params: {
   market: string;
-  trades: Array<{ market: string; pnl_pct?: number | null; timestamp?: string; action?: string; note?: string }>,
+  trades: Array<{ market: string; pnl_pct?: number | null; timestamp?: string; action?: string; note?: string; filled_qty?: number; order_krw?: number; [k: string]: any }>,
   positions: Record<string, any>;
   cooldown_until: Record<string, string>;
   marketState: any;
@@ -2338,6 +2340,7 @@ export async function validateLiveBuyPrecheck(params: {
   aboveEma20?: boolean;
   currentPrice?: number;
   candidateMeta?: any;
+  actualDailyPnlPct?: number | null;
 }): Promise<{
   allowed: boolean;
   blockReason: string | null;
@@ -2345,6 +2348,7 @@ export async function validateLiveBuyPrecheck(params: {
   cooldownRemainingSec: number;
   dailyLossCount: number;
   dailyPnlPct: number;
+  legacyTradePnlPctSum?: number;
   marketStateStr: string;
   btcRsi: number | null;
 }> {
@@ -2551,7 +2555,7 @@ export async function validateLiveBuyPrecheck(params: {
 
 async function _validateLiveBuyPrecheckInternal(params: {
   market: string;
-  trades: Array<{ market: string; pnl_pct?: number | null; timestamp?: string; action?: string; note?: string }>,
+  trades: Array<{ market: string; pnl_pct?: number | null; timestamp?: string; action?: string; note?: string; filled_qty?: number; order_krw?: number; [k: string]: any }>,
   positions: Record<string, any>;
   cooldown_until: Record<string, string>;
   marketState: any;
@@ -2570,6 +2574,7 @@ async function _validateLiveBuyPrecheckInternal(params: {
   volumeAccelComputed?: number | null;
   fallbackUsed?: boolean;
   fetchError?: string | null;
+  actualDailyPnlPct?: number | null;
 }, snap: any): Promise<{
   allowed: boolean;
   blockReason: string | null;
@@ -2577,6 +2582,7 @@ async function _validateLiveBuyPrecheckInternal(params: {
   cooldownRemainingSec: number;
   dailyLossCount: number;
   dailyPnlPct: number;
+  legacyTradePnlPctSum?: number;
   marketStateStr: string;
   btcRsi: number | null;
 }> {
@@ -2599,6 +2605,7 @@ async function _validateLiveBuyPrecheckInternal(params: {
     cooldownRemainingSec: 0,
     dailyLossCount: 0,
     dailyPnlPct: 0,
+    legacyTradePnlPctSum: 0,
     marketStateStr: "unknown",
     btcRsi: null as number | null,
   };
@@ -2618,7 +2625,12 @@ async function _validateLiveBuyPrecheckInternal(params: {
   });
   
   result.dailyLossCount = dailyTrades.filter((t) => (t.pnl_pct ?? 0) < 0).length;
-  result.dailyPnlPct = dailyTrades.reduce((acc, t) => acc + (t.pnl_pct ?? 0), 0);
+  const legacyTradePnlPctSum = dailyTrades.reduce((acc, t) => acc + (t.pnl_pct ?? 0), 0);
+  result.legacyTradePnlPctSum = legacyTradePnlPctSum;
+
+  if (typeof params.actualDailyPnlPct === "number" && Number.isFinite(params.actualDailyPnlPct)) {
+    result.dailyPnlPct = params.actualDailyPnlPct;
+  }
 
   const cool = params.cooldown_until[params.market];
   if (cool) {
@@ -2626,6 +2638,12 @@ async function _validateLiveBuyPrecheckInternal(params: {
   }
 
   if (!params.isAdditionalBuy) {
+    if (typeof params.actualDailyPnlPct !== "number" || !Number.isFinite(params.actualDailyPnlPct)) {
+      result.allowed = false;
+      result.blockReason = "daily_pnl_authority_missing";
+      return result;
+    }
+    result.dailyPnlPct = params.actualDailyPnlPct;
     const killSwitch = evaluateGlobalKillSwitch(params.trades);
     if (killSwitch.active) {
       const isMajorMarket = params.market === "KRW-BTC" || params.market === "KRW-ETH";
@@ -2646,7 +2664,7 @@ async function _validateLiveBuyPrecheckInternal(params: {
       const isCumulativePnlAuthorityValid = typeof structuredCumulativePnl === "number" && Number.isFinite(structuredCumulativePnl);
       const isHardCumulativePnl = !isCumulativePnlAuthorityValid || structuredCumulativePnl <= -5.0;
       const isDailyLossLimit = result.dailyLossCount >= 5;
-      const isDailyPnlLimit = result.dailyPnlPct <= -3.0;
+      const isDailyPnlLimit = result.dailyPnlPct <= LIVE_DAILY_PNL_LIMIT_PCT;
       const rawMultiplier = cMeta?.relaxed_multiplier;
       const isScaleValid = typeof rawMultiplier === "number" && Number.isFinite(rawMultiplier) && rawMultiplier > 0;
       const isHardRiskBlocked = isPanic || isHardCumulativePnl || isDailyLossLimit || isDailyPnlLimit || !isScaleValid;
@@ -2760,7 +2778,7 @@ async function _validateLiveBuyPrecheckInternal(params: {
       return result;
     }
 
-    if (result.dailyPnlPct <= -3.0) {
+    if (result.dailyPnlPct <= LIVE_DAILY_PNL_LIMIT_PCT) {
       result.allowed = false;
       result.blockReason = "daily_pnl_limit_reached";
       return result;
@@ -4272,7 +4290,7 @@ export function evaluateDailyPnLLimitGuard(params: {
   isDailyPnlLimitReached: boolean;
   reason: string | null;
 } {
-  const limitPct = params.dailyLossLimitPct ?? -2.5;
+  const limitPct = params.dailyLossLimitPct ?? LIVE_DAILY_PNL_LIMIT_PCT;
   const todayRealized = Number(params.todayRealizedPnlKrw ?? 0);
 
   let dayStartEquity = Number(params.startOfDayEquityKrw ?? 0);
@@ -7490,6 +7508,7 @@ export function createLiveDataStrategy(opts: {
               strategyType: "momentum",
               entryPath: "early_promote_fill",
               isAdditionalBuy: true,
+              actualDailyPnlPct: state.daily.actual_daily_pnl_pct ?? 0,
             });
             if (!guard.allowed) {
               logPlacebuyFinalGateBlocked(guard.blockReason!, {
@@ -8297,6 +8316,7 @@ export function createLiveDataStrategy(opts: {
           strategyType: p.strategy_type || "stable",
           entryPath: "rescue_add",
           isAdditionalBuy: true,
+          actualDailyPnlPct: state.daily.actual_daily_pnl_pct ?? 0,
         });
         if (!guard.allowed) {
           return block(guard.blockReason ?? "precheck_blocked");
@@ -8670,6 +8690,7 @@ export function createLiveDataStrategy(opts: {
           strategyType: p.strategy_type || "stable",
           entryPath: "rescue_add",
           isAdditionalBuy: true,
+          actualDailyPnlPct: state.daily.actual_daily_pnl_pct ?? 0,
         });
         if (!guard.allowed) {
           logPlacebuyFinalGateBlocked(guard.blockReason!, {
@@ -10799,7 +10820,7 @@ export function createLiveDataStrategy(opts: {
       todayRealizedPnlKrw,
       startOfDayEquityKrw: state.daily.start_of_day_equity_krw,
       currentTradingEquityKrw: currentSpotEquity,
-      dailyLossLimitPct: -2.5,
+      dailyLossLimitPct: LIVE_DAILY_PNL_LIMIT_PCT,
     });
 
     state.daily.today_realized_pnl_krw = todayRealizedPnlKrw;
@@ -13487,6 +13508,7 @@ export function createLiveDataStrategy(opts: {
               volumeAccel: volumeRatio1m5,
               aboveEma20: evalRes.isAboveEma,
               candidateMeta: undefined,
+              actualDailyPnlPct: state.daily.actual_daily_pnl_pct,
             });
             if (!guard.allowed) {
               logPlacebuyFinalGateBlocked(guard.blockReason!, {
@@ -14014,6 +14036,7 @@ export function createLiveDataStrategy(opts: {
         currentPrice: Number(priceBy.get(market) ?? 0),
         reclaimScore: isActualPromotedReclaim ? ((sigPre?.p as any)?.surge_capture_score ?? (sigPre?.p as any)?.reclaim_score) : undefined,
         candidateMeta: candidateMetaFromSetup,
+        actualDailyPnlPct: state.daily.actual_daily_pnl_pct,
       });
 
       console.info(
@@ -15191,6 +15214,7 @@ export function createLiveDataStrategy(opts: {
             strategyType: "momentum",
             entryPath: "early_entry",
             isAdditionalBuy: false,
+            actualDailyPnlPct: state.daily.actual_daily_pnl_pct,
           });
           if (!guard.allowed) {
             logPlacebuyFinalGateBlocked(guard.blockReason!, {
@@ -17038,6 +17062,7 @@ export function createLiveDataStrategy(opts: {
           currentPrice: Number(priceBy.get(market) ?? 0),
           reclaimScore: isActualPromotedReclaimForBuy ? ((sig?.p as any)?.surge_capture_score ?? (sig?.p as any)?.reclaim_score) : undefined,
           candidateMeta: candidateMetaFromSetup,
+          actualDailyPnlPct: state.daily.actual_daily_pnl_pct,
         });
         if (!guard.allowed) {
           logPlacebuyFinalGateBlocked(guard.blockReason!, {
