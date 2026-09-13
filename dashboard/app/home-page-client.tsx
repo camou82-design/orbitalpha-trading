@@ -490,7 +490,37 @@ function deriveDisplayMarkets(trade: TradeStatus | null, strategy: StrategyStatu
   return [...DASHBOARD_MARKETS, ...extrasSorted];
 }
 
+function formatSpotDisplayPrice(val: number | null | undefined): string {
+  if (val == null || !Number.isFinite(val) || val <= 0) return "—";
+  if (val >= 1000) {
+    return `${Math.round(val).toLocaleString()}원`;
+  }
+  if (val >= 100) {
+    return `${val.toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}원`;
+  }
+  if (val >= 10) {
+    return `${val.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}원`;
+  }
+  if (val >= 1) {
+    return `${val.toLocaleString(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}원`;
+  }
+  return `${val.toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 6 })}원`;
+}
+
 type PumpScannerStatus = {
+  liquidity_shadow?: {
+    mode?: string;
+    live_authority?: string;
+    shadow_order_authority?: string;
+    sample_count?: number;
+    summary?: {
+      A?: { avg_return_10m?: number | null; win_rate_10m?: number | null };
+      B?: { avg_return_10m?: number | null; win_rate_10m?: number | null };
+      A_only?: { avg_return_10m?: number | null; win_rate_10m?: number | null; sample_count?: number };
+      B_only?: { avg_return_10m?: number | null; win_rate_10m?: number | null; sample_count?: number };
+      overlap_count?: number;
+    };
+  };
   mode?: string;
   updated_at: string | null;
   items: Array<{
@@ -2921,10 +2951,10 @@ export default function HomePage() {
                           {item.qty.toLocaleString(undefined, { maximumFractionDigits: 4 })}
                         </td>
                         <td style={{ padding: "0.55rem 0.4rem", textAlign: "right", fontFamily: "monospace" }}>
-                          {isKrw ? "—" : `${Math.round(item.avg_buy_price).toLocaleString()}원`}
+                          {isKrw ? "—" : formatSpotDisplayPrice(item.avg_buy_price)}
                         </td>
                         <td style={{ padding: "0.55rem 0.4rem", textAlign: "right", fontFamily: "monospace" }}>
-                          {isKrw ? "—" : `${Math.round(item.current_price).toLocaleString()}원`}
+                          {isKrw ? "—" : formatSpotDisplayPrice(item.current_price)}
                         </td>
                         <td style={{
                           padding: "0.55rem 0.4rem",

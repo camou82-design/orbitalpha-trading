@@ -1,3 +1,4 @@
+import { LiquidityShadowTracker, computeShadowLiquidityScore, type ShadowCandidateMeta } from "./scanner-liquidity-shadow.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { tradingDataRoot } from "./paths.js";
@@ -35,6 +36,10 @@ type ScannerRow = {
   return_3m_pct?: number | null;
   return_5m_pct?: number | null;
   return_10m_pct?: number | null;
+  shadow_liquidity_rank?: number;
+  shadow_liquidity_bonus?: number;
+  shadow_liquidity_score?: number;
+  shadow_liquidity_acc_trade_price_24h?: number;
   updated_at: string;
 };
 
@@ -355,6 +360,9 @@ export function createPumpScanner(
   getHeldMarkets: () => string[] = () => [],
   opts: { onEvent?: (row: any) => Promise<void> } = {}
 ) {
+  const shadowTracker = new LiquidityShadowTracker();
+  void shadowTracker.load();
+
   const state: ScannerState = {
     rows: [] as ScannerRow[],
     allResults: [] as ScannerRow[],
@@ -412,6 +420,11 @@ export function createPumpScanner(
     await fs.writeFile(perfFile, JSON.stringify(state.perf.slice(-5000), null, 2), "utf8");
     const snapData = { updated_at: state.updatedAt, rows: state.rows };
     await fs.writeFile(snapFile, JSON.stringify(snapData, null, 2), "utf8");
+    try {
+      await shadowTracker.persist();
+    } catch {
+      // shadow persistence failure should not disrupt scanner
+    }
     
     // [SURGE-REPAIR] live-strategy (shadow/external mode) expects surge-candidates.json
     try {
@@ -481,6 +494,11 @@ export function createPumpScanner(
       }
     }
     state.pending = state.pending.filter((p) => !(p.done3 && p.done5 && p.done10));
+    try {
+      shadowTracker.updatePending(priceBy);
+    } catch (e) {
+      console.warn("[pump-scanner] shadowTracker.updatePending failed", e);
+    }
   };
 
   const getCandlesSafe = async (market: string, signal?: AbortSignal): Promise<{ c1: UpbitCandle[]; c5: UpbitCandle[] } | null> => {
@@ -903,7 +921,7 @@ export function createPumpScanner(
       }
       const tAfterCandles = Date.now();
 
-      // UI/API Exposure: Only tradable candidates
+      // UI/API Exposure: Only tradable candidates (LIVE authority: momentum_A)
       tradableCandidates.sort((a, b) => b.score - a.score);
       tradableCandidates.forEach((r, i) => {
         r.rank = i + 1;
@@ -911,6 +929,54 @@ export function createPumpScanner(
       state.rows = tradableCandidates.slice(0, 15);
       state.allResults = rawDetected;
       state.updatedAt = new Date().toISOString();
+
+      // Shadow Comparison: 24h trade price rank bonus comparison (SHADOW ONLY)
+      const acc24ByMarket = new Map<string, number>(
+        allTickers.map((t) => [t.market, Number(t.acc_trade_price_24h ?? 0)]),
+      );
+      const sortedByAcc24 = [...allTickers].sort(
+        (a, b) => Number(b.acc_trade_price_24h ?? 0) - Number(a.acc_trade_price_24h ?? 0),
+      );
+      const liquidityRankByMarket = new Map<string, number>();
+      sortedByAcc24.forEach((t, i) => {
+        liquidityRankByMarket.set(t.market, i + 1);
+      });
+
+      const shadowCandidates: ShadowCandidateMeta[] = tradableCandidates.map((r) => {
+        const rank = liquidityRankByMarket.get(r.market) ?? 999;
+        const acc24 = acc24ByMarket.get(r.market) ?? 0;
+        const { shadow_liquidity_bonus, shadow_liquidity_score } = computeShadowLiquidityScore(r.score, rank);
+        r.shadow_liquidity_rank = rank;
+        r.shadow_liquidity_bonus = shadow_liquidity_bonus;
+        r.shadow_liquidity_score = shadow_liquidity_score;
+        r.shadow_liquidity_acc_trade_price_24h = acc24;
+        return {
+          market: r.market,
+          score_a: r.score,
+          score_b: shadow_liquidity_score,
+          acc_trade_price_24h: acc24,
+          liquidity_rank: rank,
+          liquidity_bonus: shadow_liquidity_bonus,
+          volume_multiple: r.volume_multiple,
+          rise_3m_pct: r.rise_3m_pct,
+          breakout: r.breakout,
+          close_upper_hold: r.close_upper_hold,
+          early_entry_eligible: r.early_entry_eligible,
+          add_entry_eligible: r.add_entry_eligible,
+          entry_price: r.price,
+        };
+      });
+
+      try {
+        const tickPriceBy = new Map(allTickers.map((t) => [t.market, t.trade_price]));
+        shadowTracker.onTick({
+          ts: state.updatedAt,
+          tradableCandidates: shadowCandidates,
+          priceBy: tickPriceBy,
+        });
+      } catch (e) {
+        console.warn("[pump-scanner] shadowTracker.onTick failed", e);
+      }
 
       if (PUMP_TIMING_LOG) {
         const tickerBatchesAlt = Math.ceil(altMarkets.length / PUMP_TICKER_BATCH_SIZE);
@@ -1119,6 +1185,7 @@ export function createPumpScanner(
       return {
         mode: "paper_validation",
         updated_at: state.updatedAt,
+        liquidity_shadow: shadowTracker.getSummaryReport(),
         items: state.rows.map((r) => {
           const p = latestPerfByMarket.get(r.market);
           return {
