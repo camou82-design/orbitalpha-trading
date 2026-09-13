@@ -4223,6 +4223,20 @@ function evaluateSurgeEntrySetup(
   };
 }
 
+export function isAuthoritativeFreshScannerSurgeCandidate(params: {
+  payloadSourceKind: string | null | undefined;
+  sourceKindForJudgment: string | null | undefined;
+  engineBucket: string | null | undefined;
+  setupOk: boolean | null | undefined;
+}): boolean {
+  return (
+    params.payloadSourceKind === "scanner_tradable_candidate" &&
+    params.sourceKindForJudgment === "scanner_filter_fresh" &&
+    params.engineBucket === "surge" &&
+    params.setupOk === true
+  );
+}
+
 export type MorningSoftPrewatchShadowResult = {
   ok: boolean;
   market: string;
@@ -14045,6 +14059,13 @@ export function createLiveDataStrategy(opts: {
           }),
         );
 
+        const isAuthoritativeFreshScannerSurge = isAuthoritativeFreshScannerSurgeCandidate({
+          payloadSourceKind,
+          sourceKindForJudgment,
+          engineBucket: candidateMetaFromSetup?.engine_bucket,
+          setupOk: candidateMetaFromSetup?.setup?.ok,
+        });
+
         // --- Immediate Entry Block & Watchlist Registration ---
         if (isPromotedReclaim) {
           console.info(
@@ -14053,6 +14074,19 @@ export function createLiveDataStrategy(opts: {
               ts: new Date().toISOString(),
               market,
               message: "Bypassing watchlist registration for promoted reclaim candidate",
+            })
+          );
+        } else if (isAuthoritativeFreshScannerSurge) {
+          console.info(
+            JSON.stringify({
+              tag: "AUTHORITATIVE_SCANNER_SURGE_BYPASS_WATCHLIST",
+              ts: new Date().toISOString(),
+              market,
+              message: "Bypassing legacy watchlist-only block for authoritative fresh scanner surge candidate",
+              payload_source_kind: payloadSourceKind,
+              source_kind_for_judgment: sourceKindForJudgment,
+              engine_bucket: candidateMetaFromSetup?.engine_bucket,
+              setup_ok: candidateMetaFromSetup?.setup?.ok ?? false,
             })
           );
         } else {
