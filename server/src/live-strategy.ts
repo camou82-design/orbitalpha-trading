@@ -768,6 +768,10 @@ type DailyStats = {
   entry_count: number;
   loss_pct: number;
   stop_by_market: Record<string, number>;
+  start_of_day_equity_krw?: number | null;
+  day_start_equity_krw?: number | null;
+  today_realized_pnl_krw?: number;
+  actual_daily_pnl_pct?: number;
 };
 
 type SurgeWatchItem = {
@@ -4257,6 +4261,51 @@ export function isDownstreamLateTimingHardBlocked(params: {
   return false;
 }
 
+export function evaluateDailyPnLLimitGuard(params: {
+  todayRealizedPnlKrw: number;
+  startOfDayEquityKrw: number | null | undefined;
+  currentTradingEquityKrw?: number | null | undefined;
+  dailyLossLimitPct?: number;
+}): {
+  actualDailyPnlPct: number;
+  effectiveDayStartEquityKrw: number;
+  isDailyPnlLimitReached: boolean;
+  reason: string | null;
+} {
+  const limitPct = params.dailyLossLimitPct ?? -2.5;
+  const todayRealized = Number(params.todayRealizedPnlKrw ?? 0);
+
+  let dayStartEquity = Number(params.startOfDayEquityKrw ?? 0);
+  if (!Number.isFinite(dayStartEquity) || dayStartEquity <= 0) {
+    const currentEquity = Number(params.currentTradingEquityKrw ?? 0);
+    if (Number.isFinite(currentEquity) && currentEquity > 0) {
+      // Midday recovery: dayStartEquity = currentEquity - today's realized PnL
+      dayStartEquity = Math.max(1, currentEquity - todayRealized);
+    } else {
+      dayStartEquity = 0;
+    }
+  }
+
+  if (dayStartEquity <= 0) {
+    return {
+      actualDailyPnlPct: 0,
+      effectiveDayStartEquityKrw: 0,
+      isDailyPnlLimitReached: false,
+      reason: null,
+    };
+  }
+
+  const actualDailyPnlPct = (todayRealized / dayStartEquity) * 100;
+  const isDailyPnlLimitReached = actualDailyPnlPct <= limitPct;
+
+  return {
+    actualDailyPnlPct,
+    effectiveDayStartEquityKrw: dayStartEquity,
+    isDailyPnlLimitReached,
+    reason: isDailyPnlLimitReached ? `daily_pnl_limit_${limitPct}` : null,
+  };
+}
+
 export type MorningSoftPrewatchShadowResult = {
   ok: boolean;
   market: string;
@@ -4574,6 +4623,10 @@ export function createLiveDataStrategy(opts: {
     final_close?: boolean;
     partial_exit?: boolean;
     stage?: string;
+    today_realized_pnl_krw?: number | null;
+    day_start_equity_krw?: number | null;
+    actual_daily_pnl_pct?: number | null;
+    [k: string]: any;
   }) => Promise<void>;
 }) {
   const engineStartedAtMs = Date.now();
@@ -4761,6 +4814,8 @@ export function createLiveDataStrategy(opts: {
       today_realized_pnl_krw: todayRealizedPnlKrw,
       cumulative_realized_pnl_krw: cumulativeRealizedPnlKrw,
       unrealized_pnl_krw: unrealizedPnlKrw,
+      start_of_day_equity_krw: state.daily.start_of_day_equity_krw ?? null,
+      actual_daily_pnl_pct: state.daily.actual_daily_pnl_pct ?? 0,
       strategy_win_rate: sells.length > 0 ? (wins / sells.length) * 100 : 0,
       strategy_total_fills: state.trades.length,
       strategy_take_profit_count: tpCount,
@@ -10723,9 +10778,48 @@ export function createLiveDataStrategy(opts: {
       await racePersist("early_exit_daily_entry_cap");
       return;
     }
-    if (state.daily.loss_pct <= -2.5) {
+    const summary = summarize();
+    const todayRealizedPnlKrw = Number(summary.today_realized_pnl_krw ?? 0);
+    const currentSpotEquity = Number(
+      (tstatus as any).spot_trading_equity_krw ??
+      (tstatus as any).spotTradingEquityKrw ??
+      (tstatus as any).account_portfolio?.total_evaluated_krw ??
+      (tstatus as any).total_krw ??
+      0
+    );
+
+    if (
+      (!state.daily.start_of_day_equity_krw || state.daily.start_of_day_equity_krw <= 0) &&
+      currentSpotEquity > 0
+    ) {
+      state.daily.start_of_day_equity_krw = Math.max(1, currentSpotEquity - todayRealizedPnlKrw);
+    }
+
+    const dailyPnLEval = evaluateDailyPnLLimitGuard({
+      todayRealizedPnlKrw,
+      startOfDayEquityKrw: state.daily.start_of_day_equity_krw,
+      currentTradingEquityKrw: currentSpotEquity,
+      dailyLossLimitPct: -2.5,
+    });
+
+    state.daily.today_realized_pnl_krw = todayRealizedPnlKrw;
+    state.daily.actual_daily_pnl_pct = dailyPnLEval.actualDailyPnlPct;
+
+    if (dailyPnLEval.isDailyPnlLimitReached) {
       state.safety_guard.state = "자동정지";
       state.safety_guard.reason = "daily_pnl_limit_-2.5";
+      console.warn(
+        JSON.stringify({
+          tag: "SAFETY_GUARD_DAILY_PNL_LIMIT_STOPPED",
+          ts: new Date().toISOString(),
+          reason: "daily_pnl_limit_-2.5",
+          today_realized_pnl_krw: todayRealizedPnlKrw,
+          day_start_equity_krw: dailyPnLEval.effectiveDayStartEquityKrw,
+          actual_daily_pnl_pct: dailyPnLEval.actualDailyPnlPct,
+          legacy_trade_loss_pct_sum: state.daily.loss_pct,
+          current_trading_equity_krw: currentSpotEquity,
+        })
+      );
       await opts.trade.setAutoTradeEnabled?.(false);
       await opts.onEvent?.({
         timestamp: new Date().toISOString(),
@@ -10739,9 +10833,12 @@ export function createLiveDataStrategy(opts: {
         position_qty: Object.keys(state.positions).length,
         avg_buy_price: null,
         current_price: null,
-        pnl_net: Number(summarize().strategy_pnl_krw ?? 0),
-        pnl_net_pct: state.daily.loss_pct,
-        note: null,
+        pnl_net: todayRealizedPnlKrw,
+        pnl_net_pct: dailyPnLEval.actualDailyPnlPct,
+        today_realized_pnl_krw: todayRealizedPnlKrw,
+        day_start_equity_krw: dailyPnLEval.effectiveDayStartEquityKrw,
+        actual_daily_pnl_pct: dailyPnLEval.actualDailyPnlPct,
+        note: `daily PnL limit reached: ${dailyPnLEval.actualDailyPnlPct.toFixed(2)}% (limit -2.5%)`,
       });
       await racePersist("after_daily_pnl_guard_stop");
       return;
