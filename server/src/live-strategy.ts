@@ -4237,6 +4237,26 @@ export function isAuthoritativeFreshScannerSurgeCandidate(params: {
   );
 }
 
+export function isDownstreamLateTimingHardBlocked(params: {
+  lateTimingTier: string | null | undefined;
+  entryAllowedByTiming: boolean;
+  lateEntryGuardTriggered: boolean;
+  isNearHighProbeAllowed?: boolean;
+  surgeHardBlockTriggered?: boolean;
+}): boolean {
+  const hasIndependentHardBlock =
+    params.lateTimingTier === "hard_block" ||
+    params.entryAllowedByTiming === false ||
+    params.lateEntryGuardTriggered === true ||
+    params.surgeHardBlockTriggered === true;
+
+  if (hasIndependentHardBlock) {
+    return true;
+  }
+
+  return false;
+}
+
 export type MorningSoftPrewatchShadowResult = {
   ok: boolean;
   market: string;
@@ -15215,14 +15235,22 @@ export function createLiveDataStrategy(opts: {
       const isNearHighHardBlock = lateEntryGuardTriggered && (typeof lateEntryGuardReason === "string" && lateEntryGuardReason.includes("too_near_local_high"));
       const isNearHighProbeAllowed = !lateEntryGuardTriggered && lateEntryGuardReason === "near_high_probe_allowed";
 
-      if (!entryAllowedByTiming || isNearHighProbeAllowed) {
+      const isHardTimingBlocked = isDownstreamLateTimingHardBlocked({
+        lateTimingTier,
+        entryAllowedByTiming,
+        lateEntryGuardTriggered,
+        surgeHardBlockTriggered,
+        isNearHighProbeAllowed,
+      });
+
+      if (!entryAllowedByTiming || isNearHighProbeAllowed || isHardTimingBlocked) {
         const reasonStd = stdBlockReason(lateEntryGuardReason);
         console.info(
           JSON.stringify({
             tag: "DEBUG_LIVE_ENTRY_SUMMARY",
             ts: new Date().toISOString(),
             symbol: market,
-            line: `${market} | early_candidate=yes | decision=${isNearHighProbeAllowed ? "scout" : "block"} | reason=${reasonStd} | score=${Math.round(score)} | vr=${Number(
+            line: `${market} | early_candidate=yes | decision=${!isHardTimingBlocked && isNearHighProbeAllowed ? "scout" : "block"} | reason=${reasonStd} | score=${Math.round(score)} | vr=${Number(
               (volumeRatio1m5 ?? volumeRatio) || 0,
             ).toFixed(2)}`,
           }),
@@ -15244,7 +15272,7 @@ export function createLiveDataStrategy(opts: {
             late_entry_sizing_multiplier: lateEntrySizingMultiplier,
             stop_loss_price: metaForGuard?.stopPrice ?? 0,
             reason: reasonStd,
-            block_reason: isNearHighProbeAllowed ? null : reasonStd,
+            block_reason: (!isHardTimingBlocked && isNearHighProbeAllowed) ? null : reasonStd,
             late_entry_guard_triggered: lateEntryGuardTriggered,
             late_entry_guard_reason: lateEntryGuardReason,
             seconds_since_signal: secondsSinceSignal,
@@ -15253,34 +15281,42 @@ export function createLiveDataStrategy(opts: {
             age_seconds_source: sourceMetaResolved.age_seconds,
           })
         );
-        if (!isNearHighProbeAllowed) {
-          if (!isSurgeSource) {
-            if (
-              metaForGuard?.setupReason === "CORE_TREND_ENTRY" &&
-              typeof lateEntryGuardReason === "string" &&
-              lateEntryGuardReason.startsWith("too_near_local_high:")
-            ) {
-              logPlacebuyFinalGateBlocked("core_trend_late_guard:too_near_local_high", {
-                entry_mode: "CORE_TREND_ENTRY",
-                late_entry_guard_reason: lateEntryGuardReason,
-                candle_source: metaForGuard?.candle_source ?? null,
-                candle_cache_age_ms: metaForGuard?.candle_cache_age_ms ?? null,
-              });
-            }
-            bumpSkip("late_entry_guard");
-            if (evaluationDiagnostics[market]) {
-              evaluationDiagnostics[market].buyGate = {
-                checked: true,
-                allowed: false,
-                reason: lateEntryGuardReason ?? "late_entry_guard"
-              };
-              evaluationDiagnostics[market].final = {
-                action: "blocked",
-                reason: lateEntryGuardReason ?? "late_entry_guard"
-              };
-            }
-            continue;
+        if (isHardTimingBlocked || (!isNearHighProbeAllowed && !isSurgeSource)) {
+          const blockReason = lateEntryGuardReason ?? "late_entry_guard";
+          if (
+            metaForGuard?.setupReason === "CORE_TREND_ENTRY" &&
+            typeof lateEntryGuardReason === "string" &&
+            lateEntryGuardReason.startsWith("too_near_local_high:")
+          ) {
+            logPlacebuyFinalGateBlocked("core_trend_late_guard:too_near_local_high", {
+              entry_mode: "CORE_TREND_ENTRY",
+              late_entry_guard_reason: lateEntryGuardReason,
+              candle_source: metaForGuard?.candle_source ?? null,
+              candle_cache_age_ms: metaForGuard?.candle_cache_age_ms ?? null,
+            });
+          } else {
+            logPlacebuyFinalGateBlocked(blockReason, {
+              entry_mode: isSurgeSource
+                ? "SURGE_V2"
+                : (metaForGuard?.setupReason === "CORE_TREND_ENTRY" ? "CORE_TREND_ENTRY" : "CORE_SPOT_DEFAULT"),
+              late_entry_guard_reason: lateEntryGuardReason,
+              late_timing_tier: lateTimingTier,
+            });
           }
+          emitEval("DEBUG_LIVE_PRECHECK", { return_reason: blockReason });
+          bumpSkip(blockReason);
+          if (evaluationDiagnostics[market]) {
+            evaluationDiagnostics[market].buyGate = {
+              checked: true,
+              allowed: false,
+              reason: blockReason
+            };
+            evaluationDiagnostics[market].final = {
+              action: "blocked",
+              reason: blockReason
+            };
+          }
+          continue;
         }
       }
 
@@ -16653,6 +16689,31 @@ export function createLiveDataStrategy(opts: {
       }
       const isNearHighProbeAllowedAtGate = !lateEntryGuardTriggered && lateEntryGuardReason === "near_high_probe_allowed";
       const isNearHighHardBlockAtGate = lateEntryGuardTriggered && (typeof lateEntryGuardReason === "string" && lateEntryGuardReason.includes("too_near_local_high"));
+
+      const isHardTimingBlockedAtFinalGate = isDownstreamLateTimingHardBlocked({
+        lateTimingTier,
+        entryAllowedByTiming,
+        lateEntryGuardTriggered,
+        isNearHighProbeAllowed: isNearHighProbeAllowedAtGate,
+        surgeHardBlockTriggered,
+      });
+
+      if (isHardTimingBlockedAtFinalGate) {
+        const finalTimingBlockReason = lateEntryGuardReason ?? "late_timing_hard_blocked";
+        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: finalTimingBlockReason });
+        logPlacebuyFinalGateBlocked(finalTimingBlockReason, {
+          entry_mode: isSurgeSource ? "SURGE_V2" : (metaForGuard?.setupReason === "CORE_TREND_ENTRY" ? "CORE_TREND_ENTRY" : "CORE_SPOT_DEFAULT"),
+          late_entry_guard_reason: lateEntryGuardReason,
+          late_timing_tier: lateTimingTier,
+          strong_symbol_override_applied: strongSymbolOverride,
+        });
+        bumpSkip(finalTimingBlockReason);
+        if (evaluationDiagnostics[market]) {
+          evaluationDiagnostics[market].buyGate = { checked: true, allowed: false, reason: finalTimingBlockReason };
+          evaluationDiagnostics[market].final = { action: "blocked", reason: finalTimingBlockReason };
+        }
+        continue;
+      }
 
       console.info(
         JSON.stringify({
