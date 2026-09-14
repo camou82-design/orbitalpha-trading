@@ -2568,8 +2568,12 @@ export default function HomePage() {
 
     actualBalances.forEach((item) => {
       if (item.currency === "KRW") return;
-      totalCount++;
       totalPnlKrw += item.pnl_krw;
+    });
+
+    visibleBalances.forEach((item) => {
+      if (item.currency === "KRW") return;
+      totalCount++;
       if (item.pnl_krw < 0) {
         lossCount++;
         if (!maxLossItem || item.pnl_krw < maxLossItem.pnl_krw) {
@@ -2588,7 +2592,7 @@ export default function HomePage() {
       maxLossItem,
       dailyLossPct,
     };
-  }, [actualBalances, liveCapitalApi]);
+  }, [actualBalances, visibleBalances, liveCapitalApi]);
 
   if (authState === "expired") {
     return (
