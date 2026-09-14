@@ -15,9 +15,8 @@ import {
 } from "./upbit-public.js";
 import { appendLog } from "./log-store.js";
 import { fetchAccounts, placeMarketBuy, placeMarketSell, fetchOrderDetails, fetchOrderByIdentifier, type UpbitAccount } from "./upbit-private.js";
-import { companyIdSchema, serviceIdSchema } from "@orbitalpha/shared";
+import { companyIdSchema, serviceIdSchema, ORDER_LIMITS, MANAGED_DUST_NOTIONAL_KRW } from "@orbitalpha/shared";
 import type { StrategyType } from "./strategy-risk-config.js";
-import { ORDER_LIMITS } from "@orbitalpha/shared";
 import { STRATEGY_RISK_CONFIG, grossPnlPct, netPnlPctPerUnit } from "./strategy-risk-config.js";
 import { computeLiveCapitalPolicyV4 } from "./live-capital-policy-v4.js";
 import crypto from "node:crypto";
@@ -514,10 +513,13 @@ export function createTradeControl(
     };
   };
 
-  /** 계좌 실물 수량(balance+locked)이 전략 장부보다 작거나 0이면 strategyPositions를 즉시 맞춘다(수동 청산·외부 매도 후 장부 유령 방지). */
+  /** 계좌 실물 수량(balance+locked)이 전략 장부보다 작거나 0이면 strategyPositions를 즉시 맞춘다(수동 청산·외부 매도 후 장부 유령 방지).
+   * 또한 실제 계좌 잔량의 평가액이 MANAGED_DUST_NOTIONAL_KRW (1,000원) 미만이면 managed dust로 간주하여 전략 포지션을 0으로 정리한다.
+   */
   const reconcileAuthoritativeStrategyBook = (balances: ConnectionBalances) => {
     const zeroed: string[] = [];
     const clamped: string[] = [];
+    const dust_zeroed: string[] = [];
     const allStrategyMarkets = new Set([...MANAGED_MARKETS, ...Object.keys(state.strategyPositions)]);
     for (const market of allStrategyMarkets) {
       const currency = market.replace("KRW-", "");
@@ -534,6 +536,34 @@ export function createTradeControl(
         zeroed.push(market);
         continue;
       }
+
+      // Check dust: 우선순위 mark_price * totalQty, fallback: avg_buy_price * totalQty
+      const markPrice = Number(state.lastGoodMarkPrices?.[market] ?? 0);
+      const avgBuyPrice = Number(account?.avg_buy_price ?? pos?.avg ?? 0);
+      const effectivePrice = markPrice > 0 ? markPrice : (avgBuyPrice > 0 ? avgBuyPrice : 0);
+      const evalKrw = totalQty * effectivePrice;
+
+      if (effectivePrice > 0 && evalKrw < MANAGED_DUST_NOTIONAL_KRW && market !== "KRW-TRUST") {
+        pos.qty = 0;
+        pos.avg = 0;
+        pos.entries = 0;
+        pos.invested_krw_total = 0;
+        dust_zeroed.push(market);
+        zeroed.push(market);
+        console.info(JSON.stringify({
+          tag: "SPOT_MANAGED_DUST_RECONCILE_PROOF",
+          ts: new Date().toISOString(),
+          market,
+          account_qty: totalQty,
+          mark_price: markPrice > 0 ? markPrice : null,
+          avg_buy_price: avgBuyPrice > 0 ? avgBuyPrice : null,
+          eval_krw: evalKrw,
+          threshold_krw: MANAGED_DUST_NOTIONAL_KRW,
+          action: "zero_managed_dust"
+        }));
+        continue;
+      }
+
       if (prevQty > totalQty + 1e-12) {
         const nextQty = Math.max(0, totalQty);
         const inv = Number(pos.invested_krw_total ?? 0);
@@ -548,7 +578,7 @@ export function createTradeControl(
         clamped.push(market);
       }
     }
-    return { zeroed, clamped };
+    return { zeroed, clamped, dust_zeroed };
   };
 
   const syncLegacyBuckets = (balances: ConnectionBalances) => {
@@ -595,13 +625,20 @@ export function createTradeControl(
     if (state.lastOrderKey === key) throw new Error("Duplicate order blocked");
     if (side === "buy" && bucket === "strategy") {
       const p = state.strategyPositions[market];
-      const openingNewMarket = (p?.qty ?? 0) <= 0;
+      const curMark = Number(state.lastGoodMarkPrices?.[market] ?? 0);
+      const curAvg = Number(p?.avg ?? 0);
+      const curPx = curMark > 0 ? curMark : (curAvg > 0 ? curAvg : 0);
+      const curEval = (p?.qty ?? 0) * curPx;
+      const isCurEffective = (p?.qty ?? 0) > 0 && (market === "KRW-TRUST" || curPx <= 0 || curEval >= MANAGED_DUST_NOTIONAL_KRW);
+      const openingNewMarket = !isCurEffective;
       if (openingNewMarket) {
         const openPositions = Object.entries(state.strategyPositions).filter(([m, x]) => {
           if (x.qty <= 0) return false;
           if (m === "KRW-TRUST") return true;
-          const evalKrw = x.qty * x.avg;
-          const isDust = evalKrw < 5000 || x.qty < 0.0001;
+          const mark = Number(state.lastGoodMarkPrices?.[m] ?? 0);
+          const effectivePrice = mark > 0 ? mark : (x.avg > 0 ? x.avg : 0);
+          const evalKrw = x.qty * effectivePrice;
+          const isDust = effectivePrice > 0 && evalKrw < MANAGED_DUST_NOTIONAL_KRW;
           if (isDust) {
             console.info(JSON.stringify({
               tag: "SPOT_DUST_POSITION_EXCLUDED_FROM_SLOT_PROOF",
@@ -609,6 +646,7 @@ export function createTradeControl(
               market: m,
               qty: x.qty,
               eval_krw: evalKrw,
+              threshold_krw: MANAGED_DUST_NOTIONAL_KRW,
               reason: "dust_evaluation_excluded_from_slot_count"
             }));
             return false;
@@ -619,7 +657,7 @@ export function createTradeControl(
           throw new Error(`Max concurrent strategy positions is ${MAX_CONCURRENT_STRATEGY_POSITIONS}`);
         }
       }
-      if (p && p.entries >= ORDER_LIMITS.MAX_STRATEGY_ENTRIES_PER_MARKET) {
+      if (p && isCurEffective && p.entries >= ORDER_LIMITS.MAX_STRATEGY_ENTRIES_PER_MARKET) {
         throw new Error(`Additional entry limit reached for ${market}`);
       }
     }
@@ -1102,8 +1140,10 @@ export function createTradeControl(
       Object.entries(state.strategyPositions).filter(([m, x]) => {
         if (x.qty <= 0) return false;
         if (m === "KRW-TRUST") return true;
-        const evalKrw = x.qty * x.avg;
-        const isDust = evalKrw < 5000 || x.qty < 0.0001;
+        const mark = Number(state.lastGoodMarkPrices?.[m] ?? 0);
+        const effectivePrice = mark > 0 ? mark : (x.avg > 0 ? x.avg : 0);
+        const evalKrw = x.qty * effectivePrice;
+        const isDust = effectivePrice > 0 && evalKrw < MANAGED_DUST_NOTIONAL_KRW;
         if (isDust) {
           console.info(JSON.stringify({
             tag: "SPOT_ACCOUNT_HOLDING_CLASSIFICATION_PROOF",
@@ -1111,6 +1151,7 @@ export function createTradeControl(
             market: m,
             qty: x.qty,
             eval_krw: evalKrw,
+            threshold_krw: MANAGED_DUST_NOTIONAL_KRW,
             reason: "classified_as_dust_in_status_read"
           }));
           return false;
@@ -1118,7 +1159,7 @@ export function createTradeControl(
         return true;
       })
     );
-    let ledger_reconcile: { zeroed: string[]; clamped: string[] } | null = null;
+    let ledger_reconcile: { zeroed: string[]; clamped: string[]; dust_zeroed: string[] } | null = null;
     if (conn.connected && Array.isArray(conn.balances) && conn.balances.length > 0) {
       ledger_reconcile = reconcileAuthoritativeStrategyBook(conn.balances);
     }

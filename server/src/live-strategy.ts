@@ -283,7 +283,7 @@ type TradeStatus = {
   api_connected: boolean;
   live_enabled: boolean;
   balances: UpbitBalance[];
-  ledger_reconcile?: { zeroed: string[]; clamped: string[] } | null;
+  ledger_reconcile?: { zeroed: string[]; clamped: string[]; dust_zeroed?: string[] } | null;
   strategy_positions?: Record<string, { qty: number; invested_krw_total?: number }>;
   legacy_positions?: { market: string; qty: number }[] | Record<string, { market: string; qty: number }>;
   krw_available?: number;
@@ -292,6 +292,7 @@ type TradeStatus = {
   last_order?: any;
   entry_time_window_open?: boolean;
   next_entry_allowed_at_kst?: string;
+  mark_prices?: Record<string, number> | null;
 };
 
 type SignalPayloadV2 = {
@@ -1554,13 +1555,77 @@ export function evaluateReclaimConditions(params: {
   };
 }
 
+export const MANAGED_DUST_NOTIONAL_KRW = 1000;
 const LIVE_MIN_SAFE_ENTRY_KRW = 12000;
 const LIVE_MIN_STOP_SELL_VALUE_KRW = 5500;
-const DUST_THRESHOLD_KRW = 5000;
+const DUST_THRESHOLD_KRW = MANAGED_DUST_NOTIONAL_KRW;
 const UPBIT_MIN_ORDER_LIMIT_KRW = 5000;
 const RECOVERY_EXIT_BREAKEVEN_RATIO = 1.001; // 0.1% profit to cover fees
 /** last_order 매수 증거 기반 복구: 타임스탬프 왜곡·무한 과거만 차단(진입 조건 완화와 무관). */
 const LAST_ORDER_MANAGED_RECOVERY_MAX_EVIDENCE_AGE_MS = 180 * 24 * 60 * 60 * 1000;
+
+export function isEffectiveManagedPosition(
+  market: string,
+  pos: { qty?: number; remaining_qty?: number; avg?: number; entry_price?: number; order_krw?: number } | null | undefined,
+  markPrice?: number | null
+): boolean {
+  if (!pos) return false;
+  if (market === "KRW-TRUST") return true;
+  const qty = Number(pos.remaining_qty ?? pos.qty ?? 0);
+  if (qty <= 0) return false;
+  const mark = typeof markPrice === "number" && Number.isFinite(markPrice) && markPrice > 0 ? markPrice : 0;
+  const avg = Number(pos.avg ?? pos.entry_price ?? 0);
+  const effectivePrice = mark > 0 ? mark : (avg > 0 ? avg : 0);
+  const evalKrw = effectivePrice > 0 ? qty * effectivePrice : Number(pos.order_krw ?? 0);
+  return evalKrw >= MANAGED_DUST_NOTIONAL_KRW;
+}
+
+export function getEffectiveManagedPositions<T extends { qty?: number; remaining_qty?: number; avg?: number; entry_price?: number; order_krw?: number }>(
+  positions: Record<string, T> | null | undefined,
+  markPrices?: Record<string, number> | Map<string, number> | null
+): Record<string, T> {
+  if (!positions) return {};
+  const result: Record<string, T> = {};
+  for (const [market, pos] of Object.entries(positions)) {
+    if (!pos) continue;
+    let mark: number | undefined;
+    if (markPrices instanceof Map) {
+      mark = markPrices.get(market);
+    } else if (markPrices && typeof markPrices === "object") {
+      mark = (markPrices as Record<string, number>)[market];
+    }
+    if (isEffectiveManagedPosition(market, pos, mark)) {
+      result[market] = pos;
+    }
+  }
+  return result;
+}
+
+export function countEffectiveManagedPositions(
+  positions: Record<string, any> | null | undefined,
+  markPrices?: Record<string, number> | Map<string, number> | null
+): number {
+  return Object.keys(getEffectiveManagedPositions(positions, markPrices)).length;
+}
+
+export function isMeaningfulAccountBalance(
+  market: string,
+  balanceRow: { balance?: number | string; locked?: number | string; avg_buy_price?: number | string } | null | undefined,
+  markPrice?: number | null
+): boolean {
+  if (!balanceRow) return false;
+  const qty = Number(balanceRow.balance ?? 0) + Number(balanceRow.locked ?? 0);
+  if (qty <= 0) return false;
+  const avg = Number(balanceRow.avg_buy_price ?? 0);
+  const mark = typeof markPrice === "number" && Number.isFinite(markPrice) && markPrice > 0 ? markPrice : 0;
+  const hasPrice = mark > 0 || avg > 0;
+  if (hasPrice) {
+    const effectivePrice = mark > 0 ? mark : avg;
+    const evalKrw = qty * effectivePrice;
+    return evalKrw >= MANAGED_DUST_NOTIONAL_KRW;
+  }
+  return true;
+}
 
 async function loadPaperSurgePatternStats(companyId: string, serviceId: string): Promise<Record<string, PaperSurgePatternStats>> {
   try {
@@ -4843,8 +4908,8 @@ export function createLiveDataStrategy(opts: {
       strategy_asset_pnl: pnl,
       total_asset_pnl: null,
       files: { trades: tradesFile, daily: dailyFile },
-      open_positions: state.positions,
-      early_positions: state.early_positions,
+      open_positions: getEffectiveManagedPositions(state.positions),
+      early_positions: getEffectiveManagedPositions(state.early_positions),
       safety_guard_state: state.safety_guard.state,
       safety_guard_reason: state.safety_guard.reason,
       order_fail_count_today: state.safety_guard.order_fail_count_today,
@@ -5076,7 +5141,7 @@ export function createLiveDataStrategy(opts: {
     const allowEntry =
       tstatus.auto_trade_enabled === true && tstatus.live_enabled === true && tstatus.api_connected === true;
     const liveTradingOn = allowEntry;
-    const hasOpenPositions = Object.keys(state.positions).length > 0 || Object.keys(state.early_positions).length > 0;
+    const hasOpenPositions = countEffectiveManagedPositions(state.positions) > 0 || countEffectiveManagedPositions(state.early_positions) > 0;
     const tradeStatusEntryBlocked = !allowEntry;
     if (tradeStatusEntryBlocked) {
       console.info(
@@ -5720,113 +5785,165 @@ export function createLiveDataStrategy(opts: {
 
       const totalSpot = accountTotalSpotQtyForMarket(m, balArr);
       const stratQty = Number(strategyPosSnap[m]?.qty ?? 0);
-      if (state.positions[m]) {
-        if (totalSpot <= 0 && stratQty <= 0) {
-          delete state.positions[m];
-          delete state.cooldown_until[m];
-          reconcileActions.push(`${m}:cleared_strategy_state_account_and_ledger_zero`);
-        } else if (stratQty <= 0 && totalSpot > 0) {
-          // [FIX] 봇 매수 흔적 확인 후 삭제 차단 — 수동 보유분은 건드리지 않음
-          const posM = state.positions[m]!;
-          const isAutoBotPosition =
-            (posM.entry_origin as string) === "auto_trade" ||
-            Boolean(posM.position_id) ||
-            posM.managed === true ||
-            (Number(posM.order_krw ?? 0) > 0);
-          const recentBotBuyMs = (() => {
-            const recentBuy = state.trades.slice().reverse().find(
-              t => t.market === m && t.action === "buy" && (t as any).strategy_tag === "live_data_mode_v1"
-            );
-            return recentBuy ? Date.now() - Date.parse(recentBuy.timestamp) : Infinity;
-          })();
-          const isRecentBotBuy = recentBotBuyMs <= 5 * 60_000; // 5분 이내
+      const markPrice = Number((tstatus as any)?.mark_prices?.[m] ?? 0);
+      const avgBuyPrice = accountAvgBuyPriceForMarket(m, balArr);
+      const effectivePrice = markPrice > 0 ? markPrice : (avgBuyPrice > 0 ? avgBuyPrice : (state.positions[m]?.entry_price ?? 0));
+      const evalKrw = totalSpot * effectivePrice;
+      const isManagedDust = totalSpot > 0 && effectivePrice > 0 && evalKrw < MANAGED_DUST_NOTIONAL_KRW && m !== "KRW-TRUST";
 
-          if (isAutoBotPosition || isRecentBotBuy) {
-            // 삭제 차단 — 실물 잔고로 qty 보정
-            const avgBuyPrice = accountAvgBuyPriceForMarket(m, balArr);
-            const prevQty = posM.qty;
-            posM.qty = totalSpot;
-            posM.remaining_qty = totalSpot;
-            reconcileActions.push(`${m}:POSITION_QTY_REPAIRED_FROM_SPOT_AFTER_BUY:spot=${totalSpot}`);
-            console.error(
-              JSON.stringify({
-                tag: "STRATEGY_POSITION_SNAP_ZERO_BUT_SPOT_NONZERO_REPAIRED",
-                ts: new Date().toISOString(),
-                market: m,
-                prev_qty: prevQty,
-                repaired_qty: totalSpot,
-                avg_buy_price: avgBuyPrice,
-                trade_control_qty: stratQty,
-                entry_origin: posM.entry_origin,
-                position_id: posM.position_id ?? null,
-                managed: posM.managed,
-                order_krw: posM.order_krw ?? 0,
-                is_auto_bot_position: isAutoBotPosition,
-                is_recent_bot_buy: isRecentBotBuy,
-                recent_bot_buy_ms: isRecentBotBuy ? recentBotBuyMs : null,
-                reason: "stratQty_zero_but_spot_nonzero_with_bot_evidence_repaired_instead_of_deleted",
-              }),
-            );
-            console.info(
-              JSON.stringify({
-                tag: "POSITION_DELETE_SKIPPED_RECENT_BOT_BUY",
-                ts: new Date().toISOString(),
-                market: m,
-                reason: isRecentBotBuy
-                  ? "recent_bot_buy_within_5min"
-                  : "auto_trade_origin_or_managed_flag",
-                totalSpot,
-                stratQty,
-              }),
-            );
-            // trade-control strategyPositions도 보정
-            try {
-              await opts.trade.syncManagedPosition?.(m, totalSpot, avgBuyPrice > 0 ? avgBuyPrice : posM.entry_price, posM.strategy_type ?? "stable");
-            } catch (syncErr) {
-              console.error(`[reconcile-fix] syncManagedPosition failed for ${m}:`, syncErr);
-            }
-            await racePersist("after_position_qty_repaired_from_spot");
-          } else {
-            // 봇 매수 흔적 없음 — 기존 동작 (삭제)
+      if (isManagedDust) {
+        if (state.positions[m]) {
+          const prevQty = state.positions[m]!.qty;
+          delete state.positions[m];
+          // 기존 reentry cooldown은 임의 삭제하지 않음 (보존)
+          reconcileActions.push(`${m}:cleared_dust_ghost_position`);
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_DUST_GHOST_POSITION_CLEARED",
+              ts: new Date().toISOString(),
+              market: m,
+              account_qty: totalSpot,
+              eval_krw: evalKrw,
+              threshold_krw: MANAGED_DUST_NOTIONAL_KRW,
+              previous_state_qty: prevQty,
+              action: "cleared_dust_ghost_position",
+            }),
+          );
+        }
+        if (state.early_positions[m]) {
+          const prevEarlyQty = state.early_positions[m]!.qty;
+          delete state.early_positions[m];
+          // 기존 reentry cooldown은 임의 삭제하지 않음 (보존)
+          reconcileActions.push(`${m}:cleared_early_dust_ghost_position`);
+          console.info(
+            JSON.stringify({
+              tag: "LIVE_DUST_GHOST_POSITION_CLEARED",
+              ts: new Date().toISOString(),
+              market: m,
+              account_qty: totalSpot,
+              eval_krw: evalKrw,
+              threshold_krw: MANAGED_DUST_NOTIONAL_KRW,
+              previous_state_qty: prevEarlyQty,
+              action: "cleared_early_dust_ghost_position",
+            }),
+          );
+        }
+      } else {
+        if (state.positions[m]) {
+          if (totalSpot <= 0 && stratQty <= 0) {
             delete state.positions[m];
             delete state.cooldown_until[m];
-            reconcileActions.push(`${m}:cleared_orphan_strategy_state_ledger_zero_nonzero_spot`);
-          }
+            reconcileActions.push(`${m}:cleared_strategy_state_account_and_ledger_zero`);
+          } else if (stratQty <= 0 && totalSpot > 0) {
+            // [FIX] 봇 매수 흔적 확인 후 삭제 차단 — 수동 보유분은 건드리지 않음
+            const posM = state.positions[m]!;
+            const isAutoBotPosition =
+              (posM.entry_origin as string) === "auto_trade" ||
+              Boolean(posM.position_id) ||
+              posM.managed === true ||
+              (Number(posM.order_krw ?? 0) > 0);
+            const recentBotBuyMs = (() => {
+              const recentBuy = state.trades.slice().reverse().find(
+                t => t.market === m && t.action === "buy" && (t as any).strategy_tag === "live_data_mode_v1"
+              );
+              return recentBuy ? Date.now() - Date.parse(recentBuy.timestamp) : Infinity;
+            })();
+            const isRecentBotBuy = recentBotBuyMs <= 5 * 60_000; // 5분 이내
 
-        } else if (stratQty > 0) {
-          const p = state.positions[m]!;
-          if ((p.remaining_qty === 0 || !p.remaining_qty) && totalSpot > 0) {
-            const previousQty = p.qty;
-            p.qty = totalSpot;
-            p.remaining_qty = totalSpot;
-            reconcileActions.push(`${m}:repaired_zero_remaining_qty_to_spot_qty=${totalSpot}`);
-            console.error(
-              JSON.stringify({
-                tag: "POSITION_QTY_REPAIR_PROOF",
-                ts: new Date().toISOString(),
-                market: m,
-                previous_qty: previousQty,
-                repaired_qty: totalSpot,
-                trade_control_qty: stratQty,
-                spot_qty: totalSpot,
-                reason: "remaining_qty_was_zero_but_account_held_balance",
-              })
-            );
-          } else if (Math.abs(p.qty - stratQty) > 1e-10) {
-            p.qty = stratQty;
-            p.remaining_qty = stratQty;
-            reconcileActions.push(`${m}:synced_qty_to_ledger_qty=${stratQty}`);
+            if (isAutoBotPosition || isRecentBotBuy) {
+              // 삭제 차단 — 실물 잔고로 qty 보정
+              const avgBuyPrice = accountAvgBuyPriceForMarket(m, balArr);
+              const prevQty = posM.qty;
+              posM.qty = totalSpot;
+              posM.remaining_qty = totalSpot;
+              reconcileActions.push(`${m}:POSITION_QTY_REPAIRED_FROM_SPOT_AFTER_BUY:spot=${totalSpot}`);
+              console.error(
+                JSON.stringify({
+                  tag: "STRATEGY_POSITION_SNAP_ZERO_BUT_SPOT_NONZERO_REPAIRED",
+                  ts: new Date().toISOString(),
+                  market: m,
+                  prev_qty: prevQty,
+                  repaired_qty: totalSpot,
+                  avg_buy_price: avgBuyPrice,
+                  trade_control_qty: stratQty,
+                  entry_origin: posM.entry_origin,
+                  position_id: posM.position_id ?? null,
+                  managed: posM.managed,
+                  order_krw: posM.order_krw ?? 0,
+                  is_auto_bot_position: isAutoBotPosition,
+                  is_recent_bot_buy: isRecentBotBuy,
+                  recent_bot_buy_ms: isRecentBotBuy ? recentBotBuyMs : null,
+                  reason: "stratQty_zero_but_spot_nonzero_with_bot_evidence_repaired_instead_of_deleted",
+                }),
+              );
+              console.info(
+                JSON.stringify({
+                  tag: "POSITION_DELETE_SKIPPED_RECENT_BOT_BUY",
+                  ts: new Date().toISOString(),
+                  market: m,
+                  reason: isRecentBotBuy
+                    ? "recent_bot_buy_within_5min"
+                    : "auto_trade_origin_or_managed_flag",
+                  totalSpot,
+                  stratQty,
+                }),
+              );
+              // trade-control strategyPositions도 보정
+              try {
+                await opts.trade.syncManagedPosition?.(m, totalSpot, avgBuyPrice > 0 ? avgBuyPrice : posM.entry_price, posM.strategy_type ?? "stable");
+              } catch (syncErr) {
+                console.error(`[reconcile-fix] syncManagedPosition failed for ${m}:`, syncErr);
+              }
+              await racePersist("after_position_qty_repaired_from_spot");
+            } else {
+              // 봇 매수 흔적 없음 — 기존 동작 (삭제)
+              delete state.positions[m];
+              delete state.cooldown_until[m];
+              reconcileActions.push(`${m}:cleared_orphan_strategy_state_ledger_zero_nonzero_spot`);
+            }
+
+          } else if (stratQty > 0) {
+            const p = state.positions[m]!;
+            if ((p.remaining_qty === 0 || !p.remaining_qty) && totalSpot > 0) {
+              const previousQty = p.qty;
+              p.qty = totalSpot;
+              p.remaining_qty = totalSpot;
+              reconcileActions.push(`${m}:repaired_zero_remaining_qty_to_spot_qty=${totalSpot}`);
+              console.error(
+                JSON.stringify({
+                  tag: "POSITION_QTY_REPAIR_PROOF",
+                  ts: new Date().toISOString(),
+                  market: m,
+                  previous_qty: previousQty,
+                  repaired_qty: totalSpot,
+                  trade_control_qty: stratQty,
+                  spot_qty: totalSpot,
+                  reason: "remaining_qty_was_zero_but_account_held_balance",
+                })
+              );
+            } else if (Math.abs(p.qty - stratQty) > 1e-10) {
+              p.qty = stratQty;
+              p.remaining_qty = stratQty;
+              reconcileActions.push(`${m}:synced_qty_to_ledger_qty=${stratQty}`);
+            }
           }
         }
-      }
-      if (state.early_positions[m] && totalSpot <= 0) {
-        delete state.early_positions[m];
-        delete state.cooldown_until[m];
-        reconcileActions.push(`${m}:cleared_early_state_zero_spot`);
+        if (state.early_positions[m] && totalSpot <= 0) {
+          delete state.early_positions[m];
+          delete state.cooldown_until[m];
+          reconcileActions.push(`${m}:cleared_early_state_zero_spot`);
+        }
       }
     }
+    if (lr?.dust_zeroed?.length) {
+      for (const m of lr.dust_zeroed) reconcileActions.push(`${m}:trade_control_strategy_qty_dust_zeroed`);
+    }
     if (lr?.zeroed?.length) {
-      for (const m of lr.zeroed) reconcileActions.push(`${m}:trade_control_strategy_qty_zeroed`);
+      for (const m of lr.zeroed) {
+        if (!lr?.dust_zeroed?.includes(m)) {
+          reconcileActions.push(`${m}:trade_control_strategy_qty_zeroed`);
+        }
+      }
     }
     if (lr?.clamped?.length) {
       for (const m of lr.clamped) reconcileActions.push(`${m}:trade_control_strategy_qty_clamped`);
@@ -5838,8 +5955,8 @@ export function createLiveDataStrategy(opts: {
           ts: new Date().toISOString(),
           actions: reconcileActions,
           ledger_reconcile: lr ?? null,
-          strategy_positions_count: Object.keys(state.positions).length,
-          early_positions_count: Object.keys(state.early_positions).length,
+          strategy_positions_count: countEffectiveManagedPositions(state.positions),
+          early_positions_count: countEffectiveManagedPositions(state.early_positions),
         }),
       );
       console.info(
@@ -5853,16 +5970,33 @@ export function createLiveDataStrategy(opts: {
       await racePersist("after_reconcile_actions");
     }
 
-    const heldSymbolSet = new Set<string>([...heldSymbols, ...Object.keys(state.positions)]);
+    const heldMeaningfulSymbols = balArr
+      .map((b) => {
+        const currency = String(b?.currency ?? "").toUpperCase();
+        const qty = Number(b?.balance ?? 0) + Number(b?.locked ?? 0);
+        if (!currency || currency === "KRW" || !(qty > 0)) return null;
+        const mk = `KRW-${currency}`;
+        const mark = Number((tstatus as any)?.mark_prices?.[mk] ?? 0);
+        const avg = Number(b?.avg_buy_price ?? 0);
+        const hasPrice = mark > 0 || avg > 0;
+        const evalKrw = mark > 0 ? qty * mark : (avg > 0 ? qty * avg : 0);
+        if (hasPrice && evalKrw < MANAGED_DUST_NOTIONAL_KRW) return null;
+        return mk;
+      })
+      .filter((x): x is string => Boolean(x) && String(x).startsWith("KRW-"));
+
+    const effectiveOpenPositions = getEffectiveManagedPositions(state.positions);
+    const effectiveEarlyPositions = getEffectiveManagedPositions(state.early_positions);
+    const heldSymbolSet = new Set<string>([...heldMeaningfulSymbols, ...Object.keys(effectiveOpenPositions)]);
 
     {
-      const managedSet = new Set<string>([...Object.keys(state.positions), ...Object.keys(state.early_positions)]);
-      const passive = heldSymbols.filter((m) => !managedSet.has(m));
+      const managedSet = new Set<string>([...Object.keys(effectiveOpenPositions), ...Object.keys(effectiveEarlyPositions)]);
+      const passive = heldMeaningfulSymbols.filter((m) => !managedSet.has(m));
       console.info(
         JSON.stringify({
           tag: "SPOT_ACCOUNT_HOLDING_CLASSIFICATION_PROOF",
           ts: new Date().toISOString(),
-          held_count: heldSymbols.length,
+          held_count: heldMeaningfulSymbols.length,
           managed_count: managedSet.size,
           passive_count: passive.length,
           managed_markets: [...managedSet].slice(0, 25),
@@ -5873,11 +6007,11 @@ export function createLiveDataStrategy(opts: {
         JSON.stringify({
           tag: "SPOT_SLOT_USAGE_RECONCILE_PROOF",
           ts: new Date().toISOString(),
-          used_slots: Object.keys(state.positions).length + Object.keys(state.early_positions).length,
-          used_slots_normal: Object.keys(state.positions).length,
-          used_slots_early: Object.keys(state.early_positions).length,
-          held_count: heldSymbols.length,
-          note: "used_slots counts only strategy-managed positions; passive holdings excluded",
+          used_slots: Object.keys(effectiveOpenPositions).length + Object.keys(effectiveEarlyPositions).length,
+          used_slots_normal: Object.keys(effectiveOpenPositions).length,
+          used_slots_early: Object.keys(effectiveEarlyPositions).length,
+          held_count: heldMeaningfulSymbols.length,
+          note: "used_slots counts only strategy-managed positions; passive holdings and dust residuals excluded",
         }),
       );
     }
@@ -10980,7 +11114,7 @@ export function createLiveDataStrategy(opts: {
     );
 
     // max_positions cap 상태를 더 자세히 로깅하고, 조기 종료되더라도 입력 source 로그는 이미 남긴 상태여야 함.
-    const openCount = Object.keys(state.positions).length;
+    const openCount = countEffectiveManagedPositions(state.positions, priceBy);
     if (openCount >= state.safety_guard.max_positions) {
       console.info(
         JSON.stringify({
@@ -10995,7 +11129,7 @@ export function createLiveDataStrategy(opts: {
       await racePersist("early_exit_max_positions_cap");
       return;
     }
-    const openStrategyMarkets = new Set(Object.keys(state.positions));
+    const openStrategyMarkets = new Set(Object.keys(getEffectiveManagedPositions(state.positions, priceBy)));
     const heldMeaningfulMarkets = new Set<string>();
     if (EXCLUDE_HELD_SYMBOLS_FROM_UNIVERSE) {
       for (const b of Array.isArray(tstatus.balances) ? tstatus.balances : []) {
@@ -11339,12 +11473,12 @@ export function createLiveDataStrategy(opts: {
     const acceptedSurgeMarketsThisTick = new Set<string>();
     const getEffectiveSurgeOpenCount = (): number => {
       const canonicalCount =
-        Object.values(state.positions).filter((p) => p.engine_bucket === "surge").length +
-        Object.values(state.early_positions).filter((p) => p.engine_bucket === "surge").length;
+        Object.values(getEffectiveManagedPositions(state.positions, priceBy)).filter((p) => p.engine_bucket === "surge").length +
+        Object.values(getEffectiveManagedPositions(state.early_positions, priceBy)).filter((p) => p.engine_bucket === "surge").length;
       let pendingAcceptedNotInStateCount = 0;
       for (const mk of acceptedSurgeMarketsThisTick) {
-        const inPos = state.positions[mk]?.engine_bucket === "surge";
-        const inEarly = state.early_positions[mk]?.engine_bucket === "surge";
+        const inPos = isEffectiveManagedPosition(mk, state.positions[mk], priceBy.get(mk)) && state.positions[mk]?.engine_bucket === "surge";
+        const inEarly = isEffectiveManagedPosition(mk, state.early_positions[mk], priceBy.get(mk)) && state.early_positions[mk]?.engine_bucket === "surge";
         if (!inPos && !inEarly) {
           pendingAcceptedNotInStateCount++;
         }
@@ -13810,11 +13944,11 @@ export function createLiveDataStrategy(opts: {
           symbol: market,
           entry_score: gatePre ? Number(gatePre.score ?? 0) : null,
           market_state: marketState.market_state,
-          position_exists: Boolean(state.positions[market]),
+          position_exists: isEffectiveManagedPosition(market, state.positions[market], priceBy.get(market)),
           source_kind: sourceMeta?.source_kind ?? null,
           source_ts: sourceMeta?.source_ts ?? null,
           age_seconds: sourceMeta?.age_seconds ?? null,
-          open_positions: Object.keys(state.positions).length,
+          open_positions: countEffectiveManagedPositions(state.positions, priceBy),
           max_positions: state.safety_guard.max_positions,
         }),
       );
@@ -13866,8 +14000,8 @@ export function createLiveDataStrategy(opts: {
           symbol: market,
           ts: new Date().toISOString(),
           live_allow_entry_eval_on_open_strategy_symbol: LIVE_ALLOW_ENTRY_EVAL_ON_OPEN_STRATEGY_SYMBOL,
-          open_strategy_positions_count: Object.keys(state.positions).length,
-          strategy_position_exists: Boolean(state.positions[market]),
+          open_strategy_positions_count: countEffectiveManagedPositions(state.positions, priceBy),
+          strategy_position_exists: isEffectiveManagedPosition(market, state.positions[market], priceBy.get(market)),
           account_existing_qty: acctSnap?.qty ?? 0,
           account_existing_value_krw: acctSnap?.value_krw ?? 0,
           account_meaningful_hold: acctSnap?.meaningful ?? false,
@@ -13980,9 +14114,9 @@ export function createLiveDataStrategy(opts: {
         }
         continue;
       }
-      if (Object.keys(state.positions).length >= state.safety_guard.max_positions) {
+      if (countEffectiveManagedPositions(state.positions, priceBy) >= state.safety_guard.max_positions) {
         emitEval("DEBUG_LIVE_PRECHECK", { return_reason: "max_positions_reached" });
-        logPlacebuyFinalGateBlocked("max_positions_reached", { open_count: Object.keys(state.positions).length, max_positions: state.safety_guard.max_positions });
+        logPlacebuyFinalGateBlocked("max_positions_reached", { open_count: countEffectiveManagedPositions(state.positions, priceBy), max_positions: state.safety_guard.max_positions });
         bumpSkip("max_positions_reached");
         
         if (evaluationDiagnostics[market]) {
@@ -14015,7 +14149,7 @@ export function createLiveDataStrategy(opts: {
       }
 
       // (moved to top of loop) keep only one PRECHECK_ENTER per symbol
-      if (state.positions[market]) {
+      if (isEffectiveManagedPosition(market, state.positions[market], priceBy.get(market))) {
         emitEval("DEBUG_LIVE_PRECHECK", {
           return_reason: "same_symbol_open_continue_entry_eval",
           precheck_domain: "strategy_state",
@@ -14755,7 +14889,7 @@ export function createLiveDataStrategy(opts: {
         const isFreshFilterSource = sourceKindForJudgment === "fresh_filter_pass" || sourceKindForJudgment === "scanner_filter_fresh";
         const hasValidStopLoss = metaForGuard?.stopPrice !== undefined && metaForGuard.stopPrice !== null && metaForGuard.stopPrice > 0;
         const marketStateBlock = !isSurgeSource && marketState.market_state === "risk_off";
-        const maxPositionsReached = Object.keys(state.positions).length >= state.safety_guard.max_positions;
+        const maxPositionsReached = countEffectiveManagedPositions(state.positions, priceBy) >= state.safety_guard.max_positions;
 
         const nearHighSoftenEligible =
           isFreshFilterSource &&
@@ -16261,12 +16395,12 @@ export function createLiveDataStrategy(opts: {
         account_existing_value_krw: Number(existingValueKrw.toFixed(2)),
         meaningful_exchange_hold: meaningfulExistingHold,
         existing_position_min_krw: EXISTING_POSITION_MIN_KRW,
-        strategy_position_exists: Boolean(state.positions[market]),
+        strategy_position_exists: isEffectiveManagedPosition(market, state.positions[market], priceBy.get(market)),
         blocks_entry: false,
         note: "exchange_hold_does_not_block_strategy_entry_eval",
       });
       const liveOrderAvailableKrw = Math.max(0, Number(st.live_order_available_krw ?? st.krw_available ?? 0));
-      const openCountNow = Object.keys(state.positions).length;
+      const openCountNow = countEffectiveManagedPositions(state.positions, priceBy);
       const remainingSlots = Math.max(0, state.safety_guard.max_positions - openCountNow);
       const bridgePassForLog = Boolean(scannerBridgeScore?.pass);
       const scannerScoreForLog = Number(sig?.p?.scanner_score ?? sig?.p?.signal_score ?? 0);

@@ -1165,8 +1165,26 @@ async function main() {
     const openPositions = (strategyStatus?.open_positions ?? {}) as Record<string, any>;
     const earlyPositions = (strategyStatus?.early_positions ?? {}) as Record<string, any>;
     const managedMarkets = new Set<string>([
-      ...Object.keys(openPositions).filter((m) => Number(openPositions[m]?.qty ?? 0) > 0),
-      ...Object.keys(earlyPositions).filter((m) => Number(earlyPositions[m]?.qty ?? 0) > 0),
+      ...Object.keys(openPositions).filter((m) => {
+        const p = openPositions[m];
+        const q = Number(p?.qty ?? p?.remaining_qty ?? 0);
+        if (q <= 0) return false;
+        const mark = Number(markPrices[m] ?? 0);
+        const avg = Number(p?.avg ?? p?.entry_price ?? 0);
+        const px = mark > 0 ? mark : avg;
+        const ev = px > 0 ? q * px : 0;
+        return px <= 0 || ev >= DUST_NOTIONAL_KRW;
+      }),
+      ...Object.keys(earlyPositions).filter((m) => {
+        const p = earlyPositions[m];
+        const q = Number(p?.qty ?? p?.remaining_qty ?? 0);
+        if (q <= 0) return false;
+        const mark = Number(markPrices[m] ?? 0);
+        const avg = Number(p?.avg ?? p?.entry_price ?? 0);
+        const px = mark > 0 ? mark : avg;
+        const ev = px > 0 ? q * px : 0;
+        return px <= 0 || ev >= DUST_NOTIONAL_KRW;
+      }),
     ]);
 
     // Latest signal meta (for holding monitor) from logs, scoped to held+managed set only.
