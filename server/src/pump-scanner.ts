@@ -193,27 +193,37 @@ function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btc
   if (liquidityBad) exclude_reasons.push("유동성 부족");
   if (upperWickRatio > 0.55) exclude_reasons.push("윗꼬리 과다");
   if (oneMinPump > 4.5) exclude_reasons.push("과열 (추격주의)");
+  // "거래대금 부족" = volumeMultiple < 0.95 (직전 20봉 대비 현재 봉 거래대금 비율 미달)
   if (volumeMultiple < 0.95) exclude_reasons.push("거래대금 부족");
   if (btcDropPenalty > 0) exclude_reasons.push("BTC 역풍");
 
   // --- FAKEOUT PATTERN REJECTION ---
+  // freshFakeoutReasons: 이번 tick에서 새로 발생한 fakeout 판단 (cooldown 연장의 대상)
+  // fakeoutCooldownActive: 이미 cooldown 중 — 재평가로 인한 자동 연장 방지용 플래그
+  const freshFakeoutReasons: string[] = [];
+  let fakeoutCooldownActive = false;
   if (fState) {
     const now = Date.now();
     // 1) VOLUME_FADE: 50% drop from peak multiple
     if (volumeMultiple < fState.peakVolumeMultiple * 0.5) {
-      exclude_reasons.push("VOLUME_FADE_REJECTED");
+      freshFakeoutReasons.push("VOLUME_FADE_REJECTED");
     }
     // 2) HIGH_REJECTED: failed to hold peak price
     if (last.trade_price < fState.peakPrice * 0.993) {
-      exclude_reasons.push("HIGH_REJECTED");
+      freshFakeoutReasons.push("HIGH_REJECTED");
     }
     // 3) RETEST_FAIL: failed to hold high20 after breakout
     if (!breakout && last.trade_price < high20 * 0.995 && (now - fState.detectedAtMs < 300_000)) {
-      exclude_reasons.push("RETEST_FAIL_REJECTED");
+      freshFakeoutReasons.push("RETEST_FAIL_REJECTED");
     }
-    // 4) Persistence Cooldown
+    // 4) Persistence Cooldown — 이미 cooldown 중이면 exclude에 추가하되 freshFakeout으로 분류하지 않음
+    //    (self-renewal 방지: cooldown 자체로 인한 재평가 rejection은 타이머를 갱신하지 않음)
     if (now < fState.rejectedUntilMs) {
+      fakeoutCooldownActive = true;
       exclude_reasons.push(fState.lastReason || "FAKEOUT_COOLDOWN");
+    } else {
+      // cooldown이 만료된 상태에서 새 fakeout이 없으면 freshFakeoutReasons만 반영
+      exclude_reasons.push(...freshFakeoutReasons);
     }
   }
 
@@ -262,6 +272,10 @@ function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btc
     boxTopBreakout,
     price: ticker.trade_price,
     exclude_reasons: status === "제외" ? Array.from(new Set(exclude_reasons.length > 0 ? exclude_reasons : ["기타 필터 탈락"])) : undefined,
+    /** 이번 tick에서 실제로 새로 발생한 fakeout 이유 (cooldown 연장 판단에만 사용) */
+    freshFakeoutReasons,
+    /** true = 이미 cooldown 타이머가 활성화 중 — 재연장 방지 플래그 */
+    fakeoutCooldownActive,
   };
 }
 
@@ -822,30 +836,67 @@ export function createPumpScanner(
           const s = scoreOne(candles.c1, candles.c5, t as UpbitTicker, btcDropPenalty, fState);
           if (!s) continue;
 
+          const now = Date.now();
+
           // Update Peaks if not currently rejected
           if (s.status !== "제외") {
             if (!fState) {
+              // 신규 후보: fakeout state 초기화
               fState = {
                 peakVolumeMultiple: s.volumeMultiple,
                 peakPrice: t.trade_price,
-                detectedAtMs: Date.now(),
+                detectedAtMs: now,
                 rejectedUntilMs: 0
               };
               fakeoutStateMap.set(t.market, fState);
+            } else if (now >= fState.rejectedUntilMs) {
+              // cooldown 만료 후 정상 setup 복귀: peak 기준을 새 session으로 재초기화
+              fState.peakVolumeMultiple = s.volumeMultiple;
+              fState.peakPrice = t.trade_price;
+              fState.detectedAtMs = now;
+              fState.rejectedUntilMs = 0;
+              fState.lastReason = undefined;
             } else {
+              // 아직 cooldown 중이지만 score 통과 (이론적으로 발생하지 않음, 방어적 처리)
               fState.peakVolumeMultiple = Math.max(fState.peakVolumeMultiple, s.volumeMultiple);
               fState.peakPrice = Math.max(fState.peakPrice, t.trade_price);
             }
           } else {
-            // If rejected by fakeout specifically, apply persistence
-            const fakeoutReasons = (s.exclude_reasons || []).filter(r =>
-              ["VOLUME_FADE_REJECTED", "HIGH_REJECTED", "RETEST_FAIL_REJECTED"].includes(r)
-            );
-            if (fakeoutReasons.length > 0) {
-              if (fState) {
-                fState.rejectedUntilMs = Date.now() + 10 * 60_000; // 10 min cooldown
-                fState.lastReason = fakeoutReasons[0];
-              }
+            // 제외 상태: fakeout cooldown 설정 판단
+            //
+            // [핵심 정책] self-renewal 방지:
+            //   - cooldown 활성 중(s.fakeoutCooldownActive=true)이면 타이머 갱신 절대 금지
+            //   - freshFakeoutReasons가 있어도 이미 cooldown 중이라면 기존 만료 시각 유지
+            //   - 새 cooldown은 now >= fState.rejectedUntilMs(만료)일 때만 설정 가능
+            //
+            // [10분 고정 보장]:
+            //   최초 rejection T0에서만 rejectedUntilMs = T0+10m 설정됨.
+            //   이후 1분 주기 재스캔에서 cooldown 중이면 s.fakeoutCooldownActive=true이므로
+            //   아래 조건이 false → rejectedUntilMs 갱신 불가 → T0+10m 고정 보장.
+            const hasFreshFakeout = s.freshFakeoutReasons.length > 0;
+            const cooldownAlreadyActive = s.fakeoutCooldownActive;
+
+            if (hasFreshFakeout && !cooldownAlreadyActive && fState && now >= fState.rejectedUntilMs) {
+              // 만료 후 새로운 독립 fakeout: 새 10분 cooldown 설정
+              fState.rejectedUntilMs = now + 10 * 60_000;
+              fState.lastReason = s.freshFakeoutReasons[0];
+            } else if (hasFreshFakeout && !cooldownAlreadyActive && !fState) {
+              // fState 없이 첫 fakeout: state 신규 생성 후 cooldown 설정
+              fState = {
+                peakVolumeMultiple: s.volumeMultiple,
+                peakPrice: t.trade_price,
+                detectedAtMs: now,
+                rejectedUntilMs: now + 10 * 60_000,
+              };
+              fState.lastReason = s.freshFakeoutReasons[0];
+              fakeoutStateMap.set(t.market, fState);
+            }
+            // cooldownAlreadyActive=true 이면 → rejectedUntilMs 절대 갱신하지 않음 (self-renewal 차단)
+
+            // cooldown 만료된 entry 중 추가 fakeout 없으면 map에서 제거 (stale state 정리)
+            if (fState && now >= fState.rejectedUntilMs && !hasFreshFakeout) {
+              fakeoutStateMap.delete(t.market);
+              fState = undefined;
             }
           }
 
