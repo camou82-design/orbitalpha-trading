@@ -12,6 +12,7 @@ import {
   isVerifiedMajorImpulseAuthority,
   isVerifiedStrictCoreAuthority,
   evaluateLegacyLowSignalGate,
+  evaluateCoreTrendEntrySetup,
   LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS,
   LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS,
   LIVE_MAJOR_IMPULSE_TICKER_MAX_AGE_MS,
@@ -2545,19 +2546,19 @@ async function runAllTests() {
     console.log("[PASS] Strict Core Test I: ticker fallback / stale => strictly BLOCKED");
   }
 
-  // Test J: CORE_TREND_ENTRY score95 => authority BLOCK
+  // Test J: KRW-TRX CORE_TREND_ENTRY score85 min76 upstream_core_gate_ok=true => authority PASS
   {
     const freshCandleTs = new Date(Date.now() - 30_000).toISOString();
     const meta = {
-      market: "KRW-BTC",
+      market: "KRW-TRX",
       engine_bucket: "core",
-      setupReason: "CORE_TREND_ENTRY", // Relaxed probe!
+      setupReason: "CORE_TREND_ENTRY",
       setupMode: "relaxed_probe",
-      setup: { ok: true, reason: "CORE_TREND_ENTRY", mode: "relaxed_probe", score: 95 },
-      score: 95,
-      core_setup_score: 95,
+      setup: { ok: true, reason: "CORE_TREND_ENTRY", mode: "relaxed_probe", score: 85 },
+      score: 85,
+      core_setup_score: 85,
       upstream_gate_score: 0,
-      upstream_min_entry_score: 82,
+      upstream_min_entry_score: 76,
       upstream_core_gate_ok: true,
       candle_source: "live_fetch",
       candle_cache_age_ms: null,
@@ -2567,10 +2568,21 @@ async function runAllTests() {
       ticker_price_age_ms: 1000,
       ticker_freshness_ok: true,
     };
-    const authEval = isVerifiedStrictCoreAuthority({ market: "KRW-BTC", candidateMeta: meta });
-    assert.strictEqual(authEval.verified, false);
-    assert.strictEqual(authEval.rejectReason, "disallowed_setup_reason:CORE_TREND_ENTRY");
-    console.log("[PASS] Strict Core Test J: CORE_TREND_ENTRY score95 => strictly BLOCKED");
+    const authEval = isVerifiedStrictCoreAuthority({ market: "KRW-TRX", candidateMeta: meta });
+    assert.strictEqual(authEval.verified, true);
+    assert.strictEqual(authEval.rejectReason, null);
+
+    const gateEval = evaluateLegacyLowSignalGate({
+      market: "KRW-TRX",
+      sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+      isSurgeSource: false,
+      candidateMetaFromSetup: meta,
+    });
+    assert.strictEqual(gateEval.isVerifiedStrictCore, true);
+    assert.strictEqual(gateEval.effectiveStrength, 85);
+    assert.strictEqual(gateEval.blocked_low_signal, false);
+    assert.strictEqual(gateEval.decision, "pass");
+    console.log("[PASS] Strict Core Test J: KRW-TRX CORE_TREND_ENTRY score85 min76 fresh => authority PASS (effectiveStrength=85)");
   }
 
   // Test K: relaxed_probe forged strict reason => BLOCK
@@ -3122,8 +3134,400 @@ async function runAllTests() {
     console.log("[PASS] Strict Core Test Z: DOGE / XRP Strict CORE refresh failure fallback => strictly FAIL-CLOSED BLOCKED");
   }
 
+  // =========================================================================
+  // SECTION 9. CORE TREND ENTRY AUTHORITY & FRESH CACHE SUITE (TESTS A - J)
+  // =========================================================================
   console.log("\n==================================================================");
-  console.log("ALL 8 SECTIONS OF COMPREHENSIVE SAFETY & REGRESSION SUITE PASSED!");
+  console.log("SECTION 9. CORE TREND ENTRY AUTHORITY & FRESH CACHE SUITE (TESTS A - J)");
+  console.log("==================================================================");
+
+  // Test 9.A: CORE_TREND_ENTRY score 85, min 76, upstream gate true, fresh live candle, fresh ticker => VERIFIED, effective_strength=85, no blocked_low_signal
+  {
+    const freshCandleTs = new Date(Date.now() - 30_000).toISOString();
+    const meta = {
+      market: "KRW-TRX",
+      engine_bucket: "core",
+      setupReason: "CORE_TREND_ENTRY",
+      setupMode: "relaxed_probe",
+      setup: { ok: true, reason: "CORE_TREND_ENTRY", score: 85 },
+      score: 85,
+      core_setup_score: 85,
+      upstream_gate_score: 0,
+      upstream_min_entry_score: 76,
+      upstream_core_gate_ok: true,
+      candle_source: "live_fetch",
+      candle_cache_age_ms: null,
+      candle_freshness_ok: true,
+      latest_candle_ts: freshCandleTs,
+      ticker_price_source: "ticker_batch",
+      ticker_price_age_ms: 1000,
+      ticker_freshness_ok: true,
+    };
+    const authEval = isVerifiedStrictCoreAuthority({ market: "KRW-TRX", candidateMeta: meta });
+    assert.strictEqual(authEval.verified, true);
+    assert.strictEqual(authEval.rejectReason, null);
+
+    const gateEval = evaluateLegacyLowSignalGate({
+      market: "KRW-TRX",
+      sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+      isSurgeSource: false,
+      candidateMetaFromSetup: meta,
+    });
+    assert.strictEqual(gateEval.isVerifiedStrictCore, true);
+    assert.strictEqual(gateEval.effectiveStrength, 85);
+    assert.strictEqual(gateEval.blocked_low_signal, false);
+    assert.strictEqual(gateEval.decision, "pass");
+    console.log("[PASS] Req 9.A: CORE_TREND_ENTRY score85 min76 upstream_gate_ok=true => authority VERIFIED, effective_strength=85, pass");
+  }
+
+  // Test 9.B: CORE_TREND_ENTRY + score 70 < min 76 => block 유지
+  {
+    const freshCandleTs = new Date(Date.now() - 30_000).toISOString();
+    const meta = {
+      market: "KRW-TRX",
+      engine_bucket: "core",
+      setupReason: "CORE_TREND_ENTRY",
+      setupMode: "relaxed_probe",
+      setup: { ok: true, reason: "CORE_TREND_ENTRY", score: 70 },
+      score: 70,
+      core_setup_score: 70,
+      upstream_gate_score: 0,
+      upstream_min_entry_score: 76,
+      upstream_core_gate_ok: true,
+      candle_source: "live_fetch",
+      candle_cache_age_ms: null,
+      candle_freshness_ok: true,
+      latest_candle_ts: freshCandleTs,
+      ticker_price_source: "ticker_batch",
+      ticker_price_age_ms: 1000,
+      ticker_freshness_ok: true,
+    };
+    const authEval = isVerifiedStrictCoreAuthority({ market: "KRW-TRX", candidateMeta: meta });
+    assert.strictEqual(authEval.verified, false);
+    assert.strictEqual(authEval.rejectReason, "core_setup_score_below_market_min:70<76");
+
+    const gateEval = evaluateLegacyLowSignalGate({
+      market: "KRW-TRX",
+      sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+      isSurgeSource: false,
+      candidateMetaFromSetup: meta,
+    });
+    assert.strictEqual(gateEval.isVerifiedStrictCore, false);
+    assert.strictEqual(gateEval.effectiveStrength, 0);
+    assert.strictEqual(gateEval.blocked_low_signal, true);
+    assert.strictEqual(gateEval.decision, "blocked");
+    console.log("[PASS] Req 9.B: CORE_TREND_ENTRY score70 < min76 => strictly BLOCKED");
+  }
+
+  // Test 9.C: CORE_TREND_ENTRY + upstream_core_gate_ok=false => block 유지
+  {
+    const freshCandleTs = new Date(Date.now() - 30_000).toISOString();
+    const meta = {
+      market: "KRW-TRX",
+      engine_bucket: "core",
+      setupReason: "CORE_TREND_ENTRY",
+      setupMode: "relaxed_probe",
+      setup: { ok: true, reason: "CORE_TREND_ENTRY", score: 85 },
+      score: 85,
+      core_setup_score: 85,
+      upstream_gate_score: 0,
+      upstream_min_entry_score: 76,
+      upstream_core_gate_ok: false,
+      candle_source: "live_fetch",
+      candle_cache_age_ms: null,
+      candle_freshness_ok: true,
+      latest_candle_ts: freshCandleTs,
+      ticker_price_source: "ticker_batch",
+      ticker_price_age_ms: 1000,
+      ticker_freshness_ok: true,
+    };
+    const authEval = isVerifiedStrictCoreAuthority({ market: "KRW-TRX", candidateMeta: meta });
+    assert.strictEqual(authEval.verified, false);
+    assert.strictEqual(authEval.rejectReason, "upstream_core_gate_not_ok");
+    console.log("[PASS] Req 9.C: CORE_TREND_ENTRY upstream_core_gate_ok=false => strictly BLOCKED");
+  }
+
+  // Test 9.D: CORE_TREND_ENTRY + stale candle => block 유지
+  {
+    const staleCandleTs = new Date(Date.now() - 200_000).toISOString();
+    const meta = {
+      market: "KRW-TRX",
+      engine_bucket: "core",
+      setupReason: "CORE_TREND_ENTRY",
+      setupMode: "relaxed_probe",
+      setup: { ok: true, reason: "CORE_TREND_ENTRY", score: 85 },
+      score: 85,
+      core_setup_score: 85,
+      upstream_gate_score: 0,
+      upstream_min_entry_score: 76,
+      upstream_core_gate_ok: true,
+      candle_source: "last_good_cache",
+      candle_cache_age_ms: 80_000, // > 75s
+      candle_freshness_ok: false,
+      latest_candle_ts: staleCandleTs,
+      ticker_price_source: "ticker_batch",
+      ticker_price_age_ms: 1000,
+      ticker_freshness_ok: true,
+    };
+    const authEval = isVerifiedStrictCoreAuthority({ market: "KRW-TRX", candidateMeta: meta });
+    assert.strictEqual(authEval.verified, false);
+    assert.strictEqual(authEval.rejectReason, "candle_freshness_not_ok");
+    console.log("[PASS] Req 9.D: CORE_TREND_ENTRY stale candle => strictly BLOCKED");
+  }
+
+  // Test 9.E: fresh last_good_cache age 30s, latest candle age 60s, ticker fresh => CORE Trend evaluation allowed & authority PASS
+  {
+    const now = Date.now();
+    const freshCandleTs = new Date(now - 60_000).toISOString();
+    const candleFreshness = evaluateMajorImpulseCandleFreshness({
+      candle_source: "last_good_cache",
+      candle_cache_age_ms: 30_000,
+      latestCandleTs: freshCandleTs,
+      nowMs: now,
+      maxCacheAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS,
+      maxTimestampAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS,
+    });
+    const tickerFreshness = evaluateMajorImpulseTickerFreshness({
+      tickerSource: "ticker_batch",
+      tickerAgeMs: 1500,
+      maxAgeMs: LIVE_MAJOR_IMPULSE_TICKER_MAX_AGE_MS,
+    });
+    assert.strictEqual(candleFreshness.isFresh, true);
+    assert.strictEqual(tickerFreshness.isFresh, true);
+
+    const srcLastGood: string = "last_good_cache";
+    const isCoreTrendCandleAllowed =
+      srcLastGood === "live_fetch" ||
+      (srcLastGood === "last_good_cache" && candleFreshness.isFresh && tickerFreshness.isFresh);
+    assert.strictEqual(isCoreTrendCandleAllowed, true);
+
+    const meta = {
+      market: "KRW-TRX",
+      engine_bucket: "core",
+      setupReason: "CORE_TREND_ENTRY",
+      setupMode: "relaxed_probe",
+      setup: { ok: true, reason: "CORE_TREND_ENTRY", score: 85 },
+      score: 85,
+      core_setup_score: 85,
+      upstream_gate_score: 0,
+      upstream_min_entry_score: 76,
+      upstream_core_gate_ok: true,
+      candle_source: "last_good_cache",
+      candle_cache_age_ms: 30_000,
+      candle_freshness_ok: candleFreshness.isFresh,
+      latest_candle_ts: freshCandleTs,
+      ticker_price_source: "ticker_batch",
+      ticker_price_age_ms: 1500,
+      ticker_freshness_ok: tickerFreshness.isFresh,
+    };
+    const authEval = isVerifiedStrictCoreAuthority({ market: "KRW-TRX", candidateMeta: meta, nowMs: now });
+    assert.strictEqual(authEval.verified, true);
+    assert.strictEqual(authEval.rejectReason, null);
+
+    const gateEval = evaluateLegacyLowSignalGate({
+      market: "KRW-TRX",
+      sigPayload: { signal_strength_score: 0, source_kind: "CORE_TRADE" },
+      isSurgeSource: false,
+      candidateMetaFromSetup: meta,
+      nowMs: now,
+    });
+    assert.strictEqual(gateEval.isVerifiedStrictCore, true);
+    assert.strictEqual(gateEval.effectiveStrength, 85);
+    assert.strictEqual(gateEval.decision, "pass");
+    console.log("[PASS] Req 9.E: fresh last_good_cache age 30s / candle age 60s / ticker fresh => evaluation allowed & authority PASS");
+  }
+
+  // Test 9.F: fresh last_good_cache age 74s (<75s limit) => 허용 가능
+  {
+    const now = Date.now();
+    const freshCandleTs = new Date(now - 80_000).toISOString();
+    const candleFreshness = evaluateMajorImpulseCandleFreshness({
+      candle_source: "last_good_cache",
+      candle_cache_age_ms: 74_000,
+      latestCandleTs: freshCandleTs,
+      nowMs: now,
+      maxCacheAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS,
+      maxTimestampAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS,
+    });
+    assert.strictEqual(candleFreshness.isFresh, true);
+    assert.strictEqual(candleFreshness.reason, null);
+
+    const meta = {
+      market: "KRW-TRX",
+      engine_bucket: "core",
+      setupReason: "CORE_TREND_ENTRY",
+      setupMode: "relaxed_probe",
+      setup: { ok: true, reason: "CORE_TREND_ENTRY", score: 85 },
+      score: 85,
+      core_setup_score: 85,
+      upstream_gate_score: 0,
+      upstream_min_entry_score: 76,
+      upstream_core_gate_ok: true,
+      candle_source: "last_good_cache",
+      candle_cache_age_ms: 74_000,
+      candle_freshness_ok: true,
+      latest_candle_ts: freshCandleTs,
+      ticker_price_source: "ticker_batch",
+      ticker_price_age_ms: 1000,
+      ticker_freshness_ok: true,
+    };
+    const authEval = isVerifiedStrictCoreAuthority({ market: "KRW-TRX", candidateMeta: meta, nowMs: now });
+    assert.strictEqual(authEval.verified, true);
+    console.log("[PASS] Req 9.F: fresh last_good_cache age 74s (<= 75s) => authority PASS");
+  }
+
+  // Test 9.G: cache age freshness limit exceeded (76s > 75s) => block 유지
+  {
+    const now = Date.now();
+    const freshCandleTs = new Date(now - 30_000).toISOString();
+    const candleFreshness = evaluateMajorImpulseCandleFreshness({
+      candle_source: "last_good_cache",
+      candle_cache_age_ms: 76_000,
+      latestCandleTs: freshCandleTs,
+      nowMs: now,
+      maxCacheAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS,
+      maxTimestampAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS,
+    });
+    assert.strictEqual(candleFreshness.isFresh, false);
+    assert.strictEqual(candleFreshness.reason, "stale_candidate_candle_cache");
+
+    const srcStaleCache: string = "last_good_cache";
+    const isCoreTrendCandleAllowed =
+      srcStaleCache === "live_fetch" ||
+      (srcStaleCache === "last_good_cache" && candleFreshness.isFresh && true);
+    assert.strictEqual(isCoreTrendCandleAllowed, false);
+
+    const meta = {
+      market: "KRW-TRX",
+      engine_bucket: "core",
+      setupReason: "CORE_TREND_ENTRY",
+      setupMode: "relaxed_probe",
+      setup: { ok: true, reason: "CORE_TREND_ENTRY", score: 85 },
+      score: 85,
+      core_setup_score: 85,
+      upstream_gate_score: 0,
+      upstream_min_entry_score: 76,
+      upstream_core_gate_ok: true,
+      candle_source: "last_good_cache",
+      candle_cache_age_ms: 76_000,
+      candle_freshness_ok: false,
+      latest_candle_ts: freshCandleTs,
+      ticker_price_source: "ticker_batch",
+      ticker_price_age_ms: 1000,
+      ticker_freshness_ok: true,
+    };
+    const authEval = isVerifiedStrictCoreAuthority({ market: "KRW-TRX", candidateMeta: meta, nowMs: now });
+    assert.strictEqual(authEval.verified, false);
+    assert.strictEqual(authEval.rejectReason, "candle_freshness_not_ok");
+    console.log("[PASS] Req 9.G: cache age 76s > 75s limit => candles_fallback/stale block maintained");
+  }
+
+  // Test 9.H: latest candle timestamp limit exceeded (130s > 120s) => block 유지
+  {
+    const now = Date.now();
+    const staleCandleTs = new Date(now - 130_000).toISOString();
+    const candleFreshness = evaluateMajorImpulseCandleFreshness({
+      candle_source: "last_good_cache",
+      candle_cache_age_ms: 20_000,
+      latestCandleTs: staleCandleTs,
+      nowMs: now,
+      maxCacheAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS,
+      maxTimestampAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS,
+    });
+    assert.strictEqual(candleFreshness.isFresh, false);
+    assert.strictEqual(candleFreshness.reason, "stale_latest_candle_timestamp");
+
+    const meta = {
+      market: "KRW-TRX",
+      engine_bucket: "core",
+      setupReason: "CORE_TREND_ENTRY",
+      setupMode: "relaxed_probe",
+      setup: { ok: true, reason: "CORE_TREND_ENTRY", score: 85 },
+      score: 85,
+      core_setup_score: 85,
+      upstream_gate_score: 0,
+      upstream_min_entry_score: 76,
+      upstream_core_gate_ok: true,
+      candle_source: "last_good_cache",
+      candle_cache_age_ms: 20_000,
+      candle_freshness_ok: false,
+      latest_candle_ts: staleCandleTs,
+      ticker_price_source: "ticker_batch",
+      ticker_price_age_ms: 1000,
+      ticker_freshness_ok: true,
+    };
+    const authEval = isVerifiedStrictCoreAuthority({ market: "KRW-TRX", candidateMeta: meta, nowMs: now });
+    assert.strictEqual(authEval.verified, false);
+    assert.strictEqual(authEval.rejectReason, "candle_freshness_not_ok");
+    console.log("[PASS] Req 9.H: latest candle timestamp 130s > 120s limit => strictly BLOCKED");
+  }
+
+  // Test 9.I: CORE_TREND_CONTINUATION / PULLBACK_REVERSAL / BREAKOUT_VOLUME authority regression intact
+  {
+    const freshCandleTs = new Date(Date.now() - 30_000).toISOString();
+    const reasons = ["CORE_TREND_CONTINUATION", "CORE_PULLBACK_REVERSAL", "CORE_BREAKOUT_VOLUME"] as const;
+    for (const r of reasons) {
+      const meta = {
+        market: "KRW-BTC",
+        engine_bucket: "core",
+        setupReason: r,
+        setup: { ok: true, reason: r, score: 95 },
+        score: 95,
+        core_setup_score: 95,
+        upstream_gate_score: 0,
+        upstream_min_entry_score: 82,
+        upstream_core_gate_ok: true,
+        candle_source: "live_fetch",
+        candle_cache_age_ms: null,
+        candle_freshness_ok: true,
+        latest_candle_ts: freshCandleTs,
+        ticker_price_source: "ticker_batch",
+        ticker_price_age_ms: 1000,
+        ticker_freshness_ok: true,
+      };
+      const authEval = isVerifiedStrictCoreAuthority({ market: "KRW-BTC", candidateMeta: meta });
+      assert.strictEqual(authEval.verified, true, `${r} must remain verified`);
+    }
+    console.log("[PASS] Req 9.I: CONTINUATION / PULLBACK_REVERSAL / BREAKOUT_VOLUME authority regression intact");
+  }
+
+  // Test 9.J: EMA / volume / risk invalid 조건 회귀 없음
+  {
+    // 1. Mock insufficient candles
+    const emptyCandles: any[] = [];
+    const resEmpty = evaluateCoreTrendEntrySetup("KRW-TRX", emptyCandles, 100, { volume_ratio: 1.5 });
+    assert.strictEqual(resEmpty.ok, false);
+    assert.ok(resEmpty.reason.startsWith("core_trend_insufficient_candles"));
+
+    // 2. Mock 205 candles with below EMA stack
+    const baseCandles: any[] = [];
+    const now = Date.now();
+    for (let i = 205; i >= 0; i--) {
+      baseCandles.push({
+        market: "KRW-TRX",
+        candle_date_time_kst: new Date(now - i * 60_000).toISOString(),
+        opening_price: 100,
+        high_price: 102,
+        low_price: 98,
+        trade_price: 100,
+        candle_acc_trade_volume: 1000,
+      });
+    }
+    // Price way below EMA stack (e.g. currentPrice = 50 while closes = 100)
+    const resBelowEma = evaluateCoreTrendEntrySetup("KRW-TRX", baseCandles, 50, { volume_ratio: 1.5 });
+    assert.strictEqual(resBelowEma.ok, false);
+    assert.strictEqual(resBelowEma.reason, "core_trend_below_ema_stack");
+
+    // 3. Volume ratio low
+    const resLowVol = evaluateCoreTrendEntrySetup("KRW-TRX", baseCandles, 105, { volume_ratio: 0.5 });
+    assert.strictEqual(resLowVol.ok, false);
+    assert.strictEqual(resLowVol.reason, "core_trend_volume_ratio_low");
+
+    console.log("[PASS] Req 9.J: EMA / volume / risk invalid guards intact (no false passes)");
+  }
+
+  console.log("\n==================================================================");
+  console.log("ALL 9 SECTIONS OF COMPREHENSIVE SAFETY & REGRESSION SUITE PASSED!");
   console.log("==================================================================");
 }
 

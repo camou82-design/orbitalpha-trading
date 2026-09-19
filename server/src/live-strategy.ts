@@ -1112,6 +1112,7 @@ const STRICT_CORE_ALLOWED_REASONS = new Set([
   "CORE_TREND_CONTINUATION",
   "CORE_PULLBACK_REVERSAL",
   "CORE_BREAKOUT_VOLUME",
+  "CORE_TREND_ENTRY",
 ]);
 
 export function isVerifiedStrictCoreAuthority(params: {
@@ -1147,11 +1148,16 @@ export function isVerifiedStrictCoreAuthority(params: {
   }
 
   // Explicit exclusion of relaxed / probe modes
-  if (meta.setupMode === "relaxed_probe" || meta.setupMode === "staircase_probe" || meta.setup?.mode === "relaxed_probe" || meta.setup?.mode === "staircase_probe") {
-    return { verified: false, rejectReason: `probe_mode_excluded:${meta.setupMode}` };
-  }
-  if (meta.is_relaxed_probe === true || meta.is_core_relaxed_candidate === true) {
+  if (meta.is_core_relaxed_candidate === true) {
     return { verified: false, rejectReason: "relaxed_probe_flag_excluded" };
+  }
+  if (reason !== "CORE_TREND_ENTRY") {
+    if (meta.setupMode === "relaxed_probe" || meta.setupMode === "staircase_probe" || meta.setup?.mode === "relaxed_probe" || meta.setup?.mode === "staircase_probe") {
+      return { verified: false, rejectReason: `probe_mode_excluded:${meta.setupMode}` };
+    }
+    if (meta.is_relaxed_probe === true) {
+      return { verified: false, rejectReason: "relaxed_probe_flag_excluded" };
+    }
   }
 
   // E & F. core_setup_score check
@@ -3904,7 +3910,7 @@ function evaluateOriginalSpotScalpingSetup(
  * 반등형 original setup과 달리 stoch 눌림목 교차는 필수가 아니며 보조 점수로만 반영한다.
  * fresh signal + 비-fallback 에서만 호출될 것(호출부에서 보장).
  */
-function evaluateCoreTrendEntrySetup(
+export function evaluateCoreTrendEntrySetup(
   market: string,
   candles1: UpbitCandle[],
   currentPrice: number,
@@ -12078,13 +12084,37 @@ export function createLiveDataStrategy(opts: {
             setup = evaluateOriginalSpotScalpingSetup(m, candles1, currentPx);
           }
 
+          const lastCandleForTrend = candles1 && candles1.length > 0 ? candles1[candles1.length - 1] : null;
+          const latestCandleTsForTrend = lastCandleForTrend?.candle_date_time_kst ?? null;
+          const candleFreshnessForTrend = evaluateMajorImpulseCandleFreshness({
+            candle_source,
+            candle_cache_age_ms,
+            latestCandleTs: latestCandleTsForTrend,
+            nowMs: Date.now(),
+            maxCacheAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_CACHE_SERVE_MAX_AGE_MS,
+            maxTimestampAgeMs: LIVE_MAJOR_IMPULSE_CANDLE_TIMESTAMP_MAX_AGE_MS,
+          });
+          const tickerSourceForTrend = tickerPriceHydrationForCandidates.sourceByMarket[m] ?? "unknown";
+          const tickerAgeMsForTrend = tickerPriceHydrationForCandidates.ageByMarket[m] ?? null;
+          const tickerFreshnessForTrend = evaluateMajorImpulseTickerFreshness({
+            tickerSource: tickerSourceForTrend,
+            tickerAgeMs: tickerAgeMsForTrend,
+            maxAgeMs: LIVE_MAJOR_IMPULSE_TICKER_MAX_AGE_MS,
+          });
+
+          const isCoreTrendCandleAllowed =
+            candle_source === "live_fetch" ||
+            (candle_source === "last_good_cache" &&
+              candleFreshnessForTrend.isFresh &&
+              tickerFreshnessForTrend.isFresh);
+
           if (
             !setup.ok &&
             setup.reason === "setup_conditions_not_met" &&
             CORE_TREND_ENTRY_MARKETS.has(m) &&
             realSignalPresent &&
             !isFallbackSource &&
-            candle_source !== "live_fetch"
+            !isCoreTrendCandleAllowed
           ) {
             console.info(
               JSON.stringify({
@@ -12108,14 +12138,14 @@ export function createLiveDataStrategy(opts: {
             CORE_TREND_ENTRY_MARKETS.has(m) &&
             realSignalPresent &&
             !isFallbackSource &&
-            candle_source === "live_fetch"
+            isCoreTrendCandleAllowed
           ) {
             const allowMajorVolumeRelax =
               CORE_TREND_ENTRY_MARKETS.has(m) &&
               CORE_TREND_VOLUME_RELAX_MARKETS.has(m) &&
               realSignalPresent &&
               !isFallbackSource &&
-              candle_source === "live_fetch" &&
+              isCoreTrendCandleAllowed &&
               !isSurgeCandidate &&
               marketState.market_state !== "risk_off";
             const trendSetup = evaluateCoreTrendEntrySetup(m, candles1, currentPx, effectivePayload, {
@@ -14922,7 +14952,8 @@ export function createLiveDataStrategy(opts: {
 
           const coreTrendNearHighSoftAllowed =
             metaForGuard?.setupReason === "CORE_TREND_ENTRY" &&
-            metaForGuard?.candle_source === "live_fetch" &&
+            (metaForGuard?.candle_source === "live_fetch" ||
+              (metaForGuard?.candle_source === "last_good_cache" && metaForGuard?.candle_freshness_ok === true)) &&
             Number(metaForGuard?.riskReward ?? 0) >= 1.15 &&
             Number(metaForGuard?.volumeRatio ?? 0) >= LIVE_CORE_TREND_MIN_VOLUME_RATIO &&
             Number(metaForGuard?.stopPrice ?? 0) > 0;
