@@ -322,22 +322,8 @@ export function assertOrderBuyAllowed(
     args.candidateMeta?.setupReason === "MAJOR_IMPULSE_V1" ||
     args.candidateMeta?.setup?.reason === "MAJOR_IMPULSE_V1";
 
-  const isAggressiveSurgeStrategy =
-    !isMajorImpulseStrategy &&
-    (strategyType === "momentum" ||
-      strategyType === "surge_breakout" ||
-      strategyType === "surge_chase");
-
-  const isReclaimStrategy =
-    !isMajorImpulseStrategy &&
-    (strategyType === "reclaim" ||
-      strategyType === "surge_reclaim" ||
-      entrySignalType === "reclaim");
-
   const isCoreStrategy =
     !isMajorImpulseStrategy &&
-    !isAggressiveSurgeStrategy &&
-    !isReclaimStrategy &&
     (strategyType === "core" ||
       strategyType === "stable" ||
       strategyType === "core_trend" ||
@@ -345,6 +331,27 @@ export function assertOrderBuyAllowed(
       sourceKind === "CORE_TRADE" ||
       args.candidateMeta?.engine_bucket === "core" ||
       (typeof args.candidateMeta?.setupReason === "string" && args.candidateMeta?.setupReason.startsWith("CORE_")));
+
+  const isReclaimStrategy =
+    !isMajorImpulseStrategy &&
+    !isCoreStrategy &&
+    (strategyType === "reclaim" ||
+      strategyType === "surge_reclaim" ||
+      entrySignalType === "reclaim");
+
+  const isAggressiveSurgeStrategy =
+    !isMajorImpulseStrategy &&
+    !isCoreStrategy &&
+    !isReclaimStrategy &&
+    (strategyType === "momentum" ||
+      strategyType === "surge_breakout" ||
+      strategyType === "surge_chase" ||
+      args.candidateMeta?.engine_bucket === "surge" ||
+      (typeof args.candidateMeta?.setupReason === "string" && args.candidateMeta?.setupReason.startsWith("SURGE_")) ||
+      sourceKind.includes("SURGE") ||
+      sourceKind.includes("scanner") ||
+      sourceKind === "fresh_filter_pass" ||
+      sourceKind === "scanner_filter_fresh");
 
   // genuine setup PASS evidence: 오직 production의 canonical engine_bucket === "surge" && setup.ok === true 만 인정
   const isSurgeSetupPassed = Boolean(
@@ -400,13 +407,10 @@ export function assertOrderBuyAllowed(
         }
       } else if (isAggressiveSurgeStrategy) {
         // [SURGE MARKET-STATE EXECUTION ALIGNMENT]
-        // genuine setup.ok를 통과한 일반 Surge momentum에 한해 risk_off 일괄 차단을 해제하고,
-        // 뒤쪽의 기존 BTC RSI 50 및 Entry Score 품질 검증을 거치도록 통과시킴.
-        if (!isSurgeSetupPassed) {
-          return deny("risk_off: 신규 진입 금지", true, false);
-        }
+        // SURGE source에 한해서는 generic risk_off hard block으로 종료하지 않고 SURGE V2 평가에 위임.
+        // SURGE V2의 기존 품질/위험 검증 통과 시 multiplier 0.45 적용.
       } else {
-        // Core/Stable, Reclaim, 기타 전략은 risk_off에서 즉시 차단 (불변)
+        // Core/Stable, Reclaim, 기타 non-SURGE 전략은 risk_off에서 즉시 차단 (유지)
         return deny("risk_off: 신규 진입 금지", true, false);
       }
     }
@@ -532,10 +536,7 @@ export function assertOrderBuyAllowed(
     } else {
       // 4. 일반 Aggressive Surge 정책 (불변 유지)
       if (isAggressiveSurgeStrategy) {
-        if (market_state === "neutral" && !isSurgeSetupPassed) {
-          // genuine setup_ok를 통과하지 못한 Surge는 neutral에서 진입 차단
-          return deny("neutral_market_surge_blocked: 중립 장세에서는 surge 진입 차단", true, false);
-        }
+        // [SURGE V2 권한 위임] neutral/risk_off 장세에서 generic hard block 금지 -> SURGE V2 평가로 위임
         // [불변] BTC RSI < 50 기존 기준 100% 유지
         if (snap.btc_rsi !== undefined && snap.btc_rsi < 50) {
           return deny(`btc_rsi_low_surge_blocked: BTC RSI가 50 미만이라 진입 차단 (${snap.btc_rsi.toFixed(1)})`, true, false);
@@ -543,7 +544,10 @@ export function assertOrderBuyAllowed(
       }
 
       // [품질 판정] Entry Score 품질 검증: 기존 min_entry_score 및 market_bonus 기준 100% 적용
-      const score = signalStrengthScore(args.signalPayload) + snap.market_bonus;
+      const score =
+        (args.candidateMeta?.score !== undefined && Number.isFinite(Number(args.candidateMeta.score))
+          ? Number(args.candidateMeta.score)
+          : signalStrengthScore(args.signalPayload)) + snap.market_bonus;
       if (score < snap.min_entry_score) {
         return deny(`entry score ${score} < ${snap.min_entry_score}`, true, false);
       }

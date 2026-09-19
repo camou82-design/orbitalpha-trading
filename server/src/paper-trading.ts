@@ -2424,7 +2424,9 @@ export function createPaperTradingEngine(opts: {
       const chase = priceChangeSinceSignalPct !== null && priceChangeSinceSignalPct > PAPER_MAX_CHASE_FROM_SIGNAL_PCT;
       const faded = volumeRatio1m5 !== null && volumeRatio1m5 < 0.65;
       const nearHighRisk =
-        distanceFromLocalHighPct !== null && distanceFromLocalHighPct < PAPER_MAX_ENTRY_NEAR_HIGH_PCT;
+        distanceFromLocalHighPct !== null &&
+        distanceFromLocalHighPct >= 0 &&
+        distanceFromLocalHighPct < PAPER_MAX_ENTRY_NEAR_HIGH_PCT;
 
       /** stale/chase/faded 없이 near_high만 걸린 초입 구간이면 timing 차단 면제 */
       const nearHighBypassApplied =

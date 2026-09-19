@@ -97,14 +97,14 @@ console.log("\n--- Case B: Genuine Surge in Neutral with BTC RSI=40.75 -> btc_rs
 }
 
 // =========================================================================
-// Case C: Non-genuine Surge (setup.ok=false or missing candidateMeta) in Neutral Market
+// Case C: Surge in Neutral Market (Generic neutral block removed; delegates to SURGE V2 evaluator)
 // =========================================================================
-console.log("\n--- Case C: Non-genuine Surge (setup.ok=false or missing candidateMeta) in Neutral -> neutral_market_surge_blocked MAINTAINED ---");
+console.log("\n--- Case C: Surge in Neutral Market -> generic neutral hard block removed, scale 0.72 allowed ---");
 {
   const snap = createSnap("neutral", 55);
   const payload = makeValidPayload("KRW-SOL");
 
-  // C1: Missing candidateMeta
+  // C1: Missing candidateMeta -> Evaluates under SURGE rules with valid signal payload and RSI 55 -> allowed (0.72)
   const resMissing = assertOrderBuyAllowed(snap, {
     kind: "new_entry",
     signalPayload: payload,
@@ -112,21 +112,22 @@ console.log("\n--- Case C: Non-genuine Surge (setup.ok=false or missing candidat
     market: "KRW-SOL",
     candidateMeta: undefined,
   });
-  assert.strictEqual(resMissing.ok, false);
-  assert.ok(resMissing.blocked_reason.includes("neutral_market_surge_blocked"));
+  assert.strictEqual(resMissing.ok, true);
+  assert.strictEqual(resMissing.size_scale, 0.72);
 
-  // C2: setup.ok = false
-  const resSetupFailed = assertOrderBuyAllowed(snap, {
+  // C2: Low score payload -> blocked by entry score gate
+  const lowPayload = { ...payload, signal_type: "LOW", volume_ratio: 0.1 };
+  const resLowScore = assertOrderBuyAllowed(snap, {
     kind: "new_entry",
-    signalPayload: payload,
+    signalPayload: lowPayload,
     strategyType: "momentum",
     market: "KRW-SOL",
-    candidateMeta: { engine_bucket: "surge", setup: { ok: false, reason: "low_volume" } },
+    candidateMeta: { engine_bucket: "surge", score: 45 },
   });
-  assert.strictEqual(resSetupFailed.ok, false);
-  assert.ok(resSetupFailed.blocked_reason.includes("neutral_market_surge_blocked"));
+  assert.strictEqual(resLowScore.ok, false);
+  assert.ok(resLowScore.blocked_reason.includes("entry score"));
 
-  console.log("[PASS] Case C: neutral_market_surge_blocked safely maintained for non-passing setups");
+  console.log("[PASS] Case C: generic neutral hard block removed; delegated to SURGE V2 & quality gates (0.72 sizing)");
 }
 
 // =========================================================================
@@ -142,7 +143,8 @@ console.log("\n--- Case D: Core Stable Strategy Unaffected ---");
     signalPayload: payload,
     strategyType: "stable",
     market: "KRW-BTC",
-    candidateMeta: { engine_bucket: "core" },
+    candidateMeta: { engine_bucket: "core", setup: { ok: true, reason: "CORE_TREND_ENTRY" }, score: 85 },
+    coreScore: 85,
   });
 
   assert.strictEqual(res.ok, true, "Core stable strategy must pass under standard neutral market scoring");

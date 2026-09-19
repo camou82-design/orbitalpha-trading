@@ -14939,13 +14939,30 @@ export function createLiveDataStrategy(opts: {
           (volumeRatio1m5 !== null && volumeRatio1m5 >= 1.2) &&
           (Number(metaForGuard?.riskReward ?? 0) >= 1.2);
 
+        if (distanceFromLocalHighPct !== null && distanceFromLocalHighPct < 0) {
+          console.info(JSON.stringify({
+            tag: "SURGE_NEGATIVE_NEAR_HIGH_BREAKOUT_PROOF",
+            ts: new Date().toISOString(),
+            market,
+            current_price: currentPrice,
+            local_high: localHigh,
+            distance_from_local_high_pct: distanceFromLocalHighPct,
+            near_high_block_applied: false,
+            reason: "above_local_high_not_near_high",
+          }));
+        }
+
         const nearHighProblem =
-          distanceFromLocalHighPct !== null && distanceFromLocalHighPct < LIVE_MAX_ENTRY_NEAR_HIGH_PCT;
+          distanceFromLocalHighPct !== null &&
+          distanceFromLocalHighPct >= 0 &&
+          distanceFromLocalHighPct < LIVE_MAX_ENTRY_NEAR_HIGH_PCT;
         const volFadeProblem =
           volumeFadeTriggered || (volumeRatio1m5 !== null && volumeRatio1m5 < 0.65);
         if (nearHighProblem) {
           const severeNearHigh =
-            distanceFromLocalHighPct !== null && distanceFromLocalHighPct < 0.12; // 김 사장 지시: 0.12% 미만은 하드 블락
+            distanceFromLocalHighPct !== null &&
+            distanceFromLocalHighPct >= 0 &&
+            distanceFromLocalHighPct < 0.12; // 김 사장 지시: 0.12% 미만은 하드 블락
           
           const coreRelaxedAllowNearHigh = (metaForGuard?.is_core_relaxed_candidate === true) && 
                                            (distanceFromLocalHighPct !== null && distanceFromLocalHighPct >= 0.12 && distanceFromLocalHighPct < 0.35);
@@ -15068,7 +15085,9 @@ export function createLiveDataStrategy(opts: {
       const lateChaseBy5m = recent5mRet !== null && recent5mRet >= 5.0;
       const lateChaseBy15m = recent5mRet !== null && recent5mRet >= 8.0; // 15m 데이터 없을 경우 5m으로 보수적 판단
       const lateChaseNearHighAndRising =
-        distanceFromLocalHighPct !== null && distanceFromLocalHighPct < 0.15 &&
+        distanceFromLocalHighPct !== null &&
+        distanceFromLocalHighPct >= 0 &&
+        distanceFromLocalHighPct < 0.15 &&
         recent3mRet !== null && recent3mRet >= 2.0;
       const isLateChase = lateChaseBy3m || lateChaseBy5m || lateChaseBy15m || lateChaseNearHighAndRising;
 
@@ -15194,7 +15213,7 @@ export function createLiveDataStrategy(opts: {
           (recent3mRet === null || recent3mRet <= 2.0) &&
           (recent5mRet === null || recent5mRet <= 3.5) &&
           (priceChangeSinceSignalPct === null || priceChangeSinceSignalPct <= (LIVE_MAX_CHASE_FROM_SIGNAL_PCT ?? 3.0)) &&
-          !(distanceFromLocalHighPct !== null && distanceFromLocalHighPct < 0.15 && recent3mRet !== null && recent3mRet >= 2.0);
+          !(distanceFromLocalHighPct !== null && distanceFromLocalHighPct >= 0 && distanceFromLocalHighPct < 0.15 && recent3mRet !== null && recent3mRet >= 2.0);
 
         const earlyAllowed =
           realSignalPresent && notAlready && earlySlotOk && weakOk && secondsFreshOk && nearHighOk && volOk && scoreOk && currentPrice > 0 && localHigh !== null && earlyChaseOk;

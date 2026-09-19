@@ -354,7 +354,7 @@ console.log("\n--- Test 7: Exit Authority, Core Rescue & Morning Surge Invariant
     },
   });
   assert.strictEqual(failedSetupRes.ok, false);
-  assert.ok(failedSetupRes.blocked_reason?.includes("neutral_market_surge_blocked"));
+  assert.ok(failedSetupRes.blocked_reason?.includes("entry score"));
 
   console.log("[PASS] Test 7: Safety scopes, exit gates, and neutral/risk_off authorities confirmed unchanged");
 }
