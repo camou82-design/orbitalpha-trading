@@ -19,6 +19,7 @@ import {
   peekMinuteCandleCache,
   tickerSourceMap,
   tickerAgeMap,
+  tickerCache,
   type UpbitCandle,
 } from "./upbit-public.js";
 import { LogDeduper } from "./log-deduper.js";
@@ -7459,6 +7460,7 @@ export function createLiveDataStrategy(opts: {
               pnl_pct_decision: guard.decisionPnlPct,
               sell_ratio: ratio,
               price_source: guard.forceRefreshSource,
+              cache_age_ms: guard.cacheAgeMs ?? tickerAgeMap.get(market) ?? null,
               hold_ms: 0,
             })
           );
@@ -7474,6 +7476,7 @@ export function createLiveDataStrategy(opts: {
             pnl_pct_decision: guard.decisionPnlPct,
             sell_ratio: ratio,
             price_source: guard.forceRefreshSource,
+            cache_age_ms: guard.cacheAgeMs ?? tickerAgeMap.get(market) ?? null,
           })
         );
 
@@ -7866,6 +7869,7 @@ export function createLiveDataStrategy(opts: {
             pnl_pct_decision: guard.decisionPnlPct,
             sell_ratio: 1,
             price_source: guard.forceRefreshSource,
+            cache_age_ms: guard.cacheAgeMs ?? tickerAgeMap.get(market) ?? null,
             hold_ms: heldSec * 1000,
           })
         );
@@ -7881,6 +7885,7 @@ export function createLiveDataStrategy(opts: {
           pnl_pct_decision: guard.decisionPnlPct,
           sell_ratio: 1,
           price_source: guard.forceRefreshSource,
+          cache_age_ms: guard.cacheAgeMs ?? tickerAgeMap.get(market) ?? null,
         })
       );
 
@@ -7997,6 +8002,7 @@ export function createLiveDataStrategy(opts: {
       decisionPrice: number;
       decisionPnlPct: number;
       forceRefreshSource: string;
+      cacheAgeMs?: number | null;
     }> {
       const p = state.positions[params.market] || state.early_positions[params.market];
       const entryOriginStr = p ? (p as any).entry_origin : undefined;
@@ -8013,6 +8019,7 @@ export function createLiveDataStrategy(opts: {
           decisionPrice: 0,
           decisionPnlPct: 0,
           forceRefreshSource: "boot_grace",
+          cacheAgeMs: null,
         };
       }
 
@@ -8026,6 +8033,7 @@ export function createLiveDataStrategy(opts: {
           decisionPrice: 0,
           decisionPnlPct: 0,
           forceRefreshSource: "passive_holding_guard",
+          cacheAgeMs: null,
         };
       }
 
@@ -8037,6 +8045,7 @@ export function createLiveDataStrategy(opts: {
           decisionPrice: 0,
           decisionPnlPct: 0,
           forceRefreshSource: "exit_policy_guard",
+          cacheAgeMs: null,
         };
       }
 
@@ -8052,34 +8061,115 @@ export function createLiveDataStrategy(opts: {
             decisionPrice: 0,
             decisionPnlPct: 0,
             forceRefreshSource: "recovery_grace",
+            cacheAgeMs: null,
           };
         }
       }
 
       let forceRefreshedTicker: any = null;
       let forceRefreshSource = "missing";
+      let cacheAgeMs: number | null = null;
+
       try {
         const res = await fetchTickers([params.market], { isPriority: true, forceRefresh: true, debugCaller: "exit_force_refresh" });
         forceRefreshedTicker = res.find((t) => t.market === params.market);
         forceRefreshSource = tickerSourceMap.get(params.market) ?? "missing";
+        cacheAgeMs = tickerAgeMap.get(params.market) ?? null;
       } catch (err) {
         console.warn(`[exit-force-refresh] Failed to force-refresh ticker for ${params.market}:`, err);
       }
 
-      // 1. fresh live ticker 및 가격 소스 검증
-      // [수정] 매도 허용 가격 소스는 ticker_batch 또는 per_symbol_fetch만 허용
-      const isValidSource = forceRefreshSource === "ticker_batch" || forceRefreshSource === "per_symbol_fetch" || forceRefreshSource === "live";
-      if (!forceRefreshedTicker || forceRefreshedTicker.trade_price <= 0 || !isValidSource) {
+      let isLiveSource = forceRefreshSource === "ticker_batch" || forceRefreshSource === "per_symbol_fetch" || forceRefreshSource === "live";
+
+      // 만약 force refresh 결과가 live가 아니거나(last_good_cache, cache 등), ticker가 없으면 direct live ticker 1회 추가 시도
+      if (!isLiveSource || !forceRefreshedTicker || Number(forceRefreshedTicker.trade_price) <= 0) {
+        try {
+          const directRes = await fetchLiveTickersDirect([params.market], { timeoutMs: 3000, debugCaller: "exit_sell_guard_direct_live" });
+          if (directRes.ok && directRes.rows.length > 0) {
+            const row = directRes.rows.find((t) => t.market === params.market) ?? directRes.rows[0];
+            if (row && Number(row.trade_price) > 0) {
+              forceRefreshedTicker = row;
+              forceRefreshSource = directRes.source ?? "live";
+              isLiveSource = true;
+              cacheAgeMs = 0;
+            }
+          }
+        } catch (err) {
+          console.warn(`[exit-direct-live] Failed direct live ticker for ${params.market}:`, err);
+        }
+      }
+
+      // 캐시 엔트리로부터 cacheAgeMs 보강 계산
+      if (cacheAgeMs === null || Number.isNaN(cacheAgeMs)) {
+        const cEntry = tickerCache.get(params.market);
+        if (cEntry && typeof cEntry.fetchedAtMs === "number") {
+          cacheAgeMs = Math.max(0, Date.now() - cEntry.fetchedAtMs);
+        }
+      }
+
+      // 긴급 손절 / 비상 탈출 계열 판별
+      const isEmergencyOrStopLoss =
+        params.exitAuthorityClass === "emergency_exit" ||
+        params.stopTriggerKind === "price_stop" ||
+        params.reasonExit === "SURGE_STOP_LOSS" ||
+        params.reasonExit === "SURGE_REVERSAL_CUT" ||
+        params.reasonExit === "SURGE_EXIT_POLICY_INVALID_FORCE_EXIT" ||
+        /emergency|hard|strict|stop|loss|reversal/i.test(params.reasonExit);
+
+      const MAX_EMERGENCY_CACHE_AGE_MS = 60_000; // 60초 이내의 신선한 캐시만 긴급 손절 탈출용 fail-safe 허용
+      const isFreshCache = typeof cacheAgeMs === "number" && !Number.isNaN(cacheAgeMs) && cacheAgeMs >= 0 && cacheAgeMs <= MAX_EMERGENCY_CACHE_AGE_MS;
+
+      // 1. 유효 가격 존재 여부 검증
+      if (!forceRefreshedTicker || Number(forceRefreshedTicker.trade_price) <= 0) {
         return {
           allowed: false,
-          blockReason: `invalid_source_or_price:${forceRefreshSource}`,
-          decisionPrice: forceRefreshedTicker?.trade_price ?? 0,
+          blockReason: `missing_ticker_or_invalid_price:${forceRefreshSource}:age=${cacheAgeMs ?? "unknown"}`,
+          decisionPrice: 0,
           decisionPnlPct: 0,
           forceRefreshSource,
+          cacheAgeMs,
         };
       }
 
-      const decisionPrice = forceRefreshedTicker.trade_price;
+      // 1.1. Live 소스 및 stale cache 검증
+      if (!isLiveSource) {
+        if (!isEmergencyOrStopLoss) {
+          // 일반 timeout 청산 및 비긴급 매도는 stale/cached 가격 사용 전면 금지
+          return {
+            allowed: false,
+            blockReason: `stale_cache_disallowed_for_timeout_or_regular_exit:source=${forceRefreshSource}:age=${cacheAgeMs ?? "unknown"}ms`,
+            decisionPrice: Number(forceRefreshedTicker.trade_price),
+            decisionPnlPct: 0,
+            forceRefreshSource,
+            cacheAgeMs,
+          };
+        } else if (!isFreshCache) {
+          // 긴급 탈출이어도 캐시가 충분히 신선하지 않다면(>60s or unverified) 차단
+          return {
+            allowed: false,
+            blockReason: `stale_cache_disallowed_for_emergency_exit:source=${forceRefreshSource}:age=${cacheAgeMs ?? "unknown"}ms_need<=${MAX_EMERGENCY_CACHE_AGE_MS}ms`,
+            decisionPrice: Number(forceRefreshedTicker.trade_price),
+            decisionPnlPct: 0,
+            forceRefreshSource,
+            cacheAgeMs,
+          };
+        } else {
+          // 긴급 탈출 + 충분히 신선한 캐시(<=60s) -> fail-safe 탈출 허용
+          console.info(
+            JSON.stringify({
+              tag: "SELL_GUARD_EMERGENCY_FRESH_CACHE_FAILSAFE_ALLOWED",
+              market: params.market,
+              reason_exit: params.reasonExit,
+              source: forceRefreshSource,
+              cache_age_ms: cacheAgeMs,
+              trade_price: Number(forceRefreshedTicker.trade_price),
+              ts: new Date().toISOString(),
+            }),
+          );
+        }
+      }
+
+      const decisionPrice = Number(forceRefreshedTicker.trade_price);
       const decisionPnlPct = ((decisionPrice - params.entryPrice) / params.entryPrice) * 100;
 
       // 1.1. account balance 재확인
@@ -8100,6 +8190,7 @@ export function createLiveDataStrategy(opts: {
             decisionPrice,
             decisionPnlPct,
             forceRefreshSource,
+            cacheAgeMs,
           };
         }
       } catch (err) {
@@ -8109,6 +8200,7 @@ export function createLiveDataStrategy(opts: {
           decisionPrice,
           decisionPnlPct,
           forceRefreshSource,
+          cacheAgeMs,
         };
       }
 
@@ -8153,6 +8245,7 @@ export function createLiveDataStrategy(opts: {
             decisionPrice,
             decisionPnlPct,
             forceRefreshSource,
+            cacheAgeMs,
           };
         }
       }
@@ -8168,6 +8261,7 @@ export function createLiveDataStrategy(opts: {
           decisionPrice,
           decisionPnlPct,
           forceRefreshSource,
+          cacheAgeMs,
         };
       }
 
@@ -8180,6 +8274,7 @@ export function createLiveDataStrategy(opts: {
           decisionPrice,
           decisionPnlPct,
           forceRefreshSource,
+          cacheAgeMs,
         };
       }
 
@@ -8191,6 +8286,7 @@ export function createLiveDataStrategy(opts: {
           decisionPrice,
           decisionPnlPct,
           forceRefreshSource,
+          cacheAgeMs,
         };
       }
 
@@ -8219,6 +8315,7 @@ export function createLiveDataStrategy(opts: {
         decisionPrice,
         decisionPnlPct,
         forceRefreshSource,
+        cacheAgeMs,
       };
     }
 
@@ -10282,6 +10379,7 @@ export function createLiveDataStrategy(opts: {
             pnl_pct_decision: guard.decisionPnlPct,
             sell_ratio: ratio,
             price_source: guard.forceRefreshSource,
+            cache_age_ms: guard.cacheAgeMs ?? tickerAgeMap.get(market) ?? null,
             hold_ms: heldMs,
             symbol: market,
             avgBuyPrice: p.entry_price,
@@ -10308,6 +10406,7 @@ export function createLiveDataStrategy(opts: {
           pnl_pct_decision: guard.decisionPnlPct,
           sell_ratio: ratio,
           price_source: guard.forceRefreshSource,
+          cache_age_ms: guard.cacheAgeMs ?? tickerAgeMap.get(market) ?? null,
         })
       );
 

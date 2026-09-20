@@ -2290,6 +2290,337 @@ async function runTests() {
 
   console.log("-> Test 8 Passed!");
 
+  // ────────────────────────────────────────────────────────────────
+  // Test Case 9: SELL_GUARD Price Source & Cache Age Integrity Regression Tests
+  // ────────────────────────────────────────────────────────────────
+  console.log("\n[Test 9] Verifying SELL_GUARD Price Source & Cache Age Integrity...");
+
+  interface SellGuardSimInput {
+    market: string;
+    ratio: number;
+    entryPrice: number;
+    reasonExit: string;
+    exitAuthorityClass: string;
+    stopTriggerKind: any;
+    heldMs: number;
+    hasPosition?: boolean;
+    isRecovered?: boolean;
+    exitPolicyAttached?: boolean;
+    balanceQty?: number;
+    engineBootElapsedMs?: number;
+    // Mock network & cache state
+    forceRefreshSource: string;
+    forceRefreshPrice: number;
+    forceRefreshThrows?: boolean;
+    forceRefreshAgeMs?: number | null;
+    directLiveSuccess?: boolean;
+    directLivePrice?: number;
+    directLiveThrows?: boolean;
+    tickerCacheEntry?: { fetchedAtMs: number } | null;
+    nowMs?: number;
+  }
+
+  const simulateSellGuardValidation = (input: SellGuardSimInput) => {
+    const now = input.nowMs ?? 1_000_000;
+    const isRecoveredPosition = Boolean(input.isRecovered);
+    const hasPos = input.hasPosition ?? true;
+    const exitPolicyAttached = input.exitPolicyAttached ?? true;
+    const bootElapsed = input.engineBootElapsedMs ?? 15 * 60_000; // default 15m (> 10m)
+
+    // 0. Boot grace
+    if (bootElapsed < 10 * 60_000 && !isRecoveredPosition) {
+      return {
+        allowed: false,
+        blockReason: `engine_boot_grace_period_active:${Math.ceil((10 * 60_000 - bootElapsed) / 1000)}s_remain`,
+        decisionPrice: 0,
+        decisionPnlPct: 0,
+        forceRefreshSource: "boot_grace",
+        cacheAgeMs: null,
+      };
+    }
+
+    // 0.1 Passive holding guard
+    if (!hasPos) {
+      return {
+        allowed: false,
+        blockReason: "passive_holding_protection_active",
+        decisionPrice: 0,
+        decisionPnlPct: 0,
+        forceRefreshSource: "passive_holding_guard",
+        cacheAgeMs: null,
+      };
+    }
+
+    // 0.2 Exit policy attached
+    if (!exitPolicyAttached) {
+      return {
+        allowed: false,
+        blockReason: "missing_exit_policy_attached",
+        decisionPrice: 0,
+        decisionPnlPct: 0,
+        forceRefreshSource: "exit_policy_guard",
+        cacheAgeMs: null,
+      };
+    }
+
+    // 1. Force refresh ticker
+    let forceRefreshedTicker: any = null;
+    let forceRefreshSource = "missing";
+    let cacheAgeMs: number | null = null;
+
+    if (!input.forceRefreshThrows) {
+      if (input.forceRefreshPrice > 0) {
+        forceRefreshedTicker = { market: input.market, trade_price: input.forceRefreshPrice };
+      }
+      forceRefreshSource = input.forceRefreshSource;
+      cacheAgeMs = input.forceRefreshAgeMs ?? null;
+    }
+
+    let isLiveSource = forceRefreshSource === "ticker_batch" || forceRefreshSource === "per_symbol_fetch" || forceRefreshSource === "live";
+
+    // Direct live fetch retry if not live or price missing
+    if (!isLiveSource || !forceRefreshedTicker || Number(forceRefreshedTicker.trade_price) <= 0) {
+      if (!input.directLiveThrows && input.directLiveSuccess && (input.directLivePrice ?? 0) > 0) {
+        forceRefreshedTicker = { market: input.market, trade_price: input.directLivePrice };
+        forceRefreshSource = "live";
+        isLiveSource = true;
+        cacheAgeMs = 0;
+      }
+    }
+
+    // Cache age fallback calculation
+    if (cacheAgeMs === null || Number.isNaN(cacheAgeMs)) {
+      if (input.tickerCacheEntry && typeof input.tickerCacheEntry.fetchedAtMs === "number") {
+        cacheAgeMs = Math.max(0, now - input.tickerCacheEntry.fetchedAtMs);
+      }
+    }
+
+    // Emergency / Stop-loss detection
+    const isEmergencyOrStopLoss =
+      input.exitAuthorityClass === "emergency_exit" ||
+      input.stopTriggerKind === "price_stop" ||
+      input.reasonExit === "SURGE_STOP_LOSS" ||
+      input.reasonExit === "SURGE_REVERSAL_CUT" ||
+      input.reasonExit === "SURGE_EXIT_POLICY_INVALID_FORCE_EXIT" ||
+      /emergency|hard|strict|stop|loss|reversal/i.test(input.reasonExit);
+
+    const MAX_EMERGENCY_CACHE_AGE_MS = 60_000;
+    const isFreshCache = typeof cacheAgeMs === "number" && !Number.isNaN(cacheAgeMs) && cacheAgeMs >= 0 && cacheAgeMs <= MAX_EMERGENCY_CACHE_AGE_MS;
+
+    // Price existence validation
+    if (!forceRefreshedTicker || Number(forceRefreshedTicker.trade_price) <= 0) {
+      return {
+        allowed: false,
+        blockReason: `missing_ticker_or_invalid_price:${forceRefreshSource}:age=${cacheAgeMs ?? "unknown"}`,
+        decisionPrice: 0,
+        decisionPnlPct: 0,
+        forceRefreshSource,
+        cacheAgeMs,
+      };
+    }
+
+    // Price source & staleness verification
+    if (!isLiveSource) {
+      if (!isEmergencyOrStopLoss) {
+        return {
+          allowed: false,
+          blockReason: `stale_cache_disallowed_for_timeout_or_regular_exit:source=${forceRefreshSource}:age=${cacheAgeMs ?? "unknown"}ms`,
+          decisionPrice: Number(forceRefreshedTicker.trade_price),
+          decisionPnlPct: 0,
+          forceRefreshSource,
+          cacheAgeMs,
+        };
+      } else if (!isFreshCache) {
+        return {
+          allowed: false,
+          blockReason: `stale_cache_disallowed_for_emergency_exit:source=${forceRefreshSource}:age=${cacheAgeMs ?? "unknown"}ms_need<=${MAX_EMERGENCY_CACHE_AGE_MS}ms`,
+          decisionPrice: Number(forceRefreshedTicker.trade_price),
+          decisionPnlPct: 0,
+          forceRefreshSource,
+          cacheAgeMs,
+        };
+      }
+    }
+
+    const decisionPrice = Number(forceRefreshedTicker.trade_price);
+    const decisionPnlPct = ((decisionPrice - input.entryPrice) / input.entryPrice) * 100;
+
+    // Balance check
+    const currentQty = input.balanceQty ?? 10;
+    const intendedQty = 10 * input.ratio;
+    if (currentQty <= 0 || currentQty < intendedQty * 0.99) {
+      return {
+        allowed: false,
+        blockReason: `insufficient_account_balance:has=${currentQty},need=${intendedQty}`,
+        decisionPrice,
+        decisionPnlPct,
+        forceRefreshSource,
+        cacheAgeMs,
+      };
+    }
+
+    // Min holding minutes check (5m, bypass for stop-loss and recovered)
+    if (input.heldMs < 5 * 60_000 && !isEmergencyOrStopLoss && !isRecoveredPosition) {
+      return {
+        allowed: false,
+        blockReason: `holding_time_under_min_limit:held=${Math.floor(input.heldMs / 1000)}s_need=300s`,
+        decisionPrice,
+        decisionPnlPct,
+        forceRefreshSource,
+        cacheAgeMs,
+      };
+    }
+
+    // Profit check for profit exits
+    const isProfitExit = input.exitAuthorityClass === "profit_protect" || input.exitAuthorityClass === "take_profit" || /tp1|tp2|profit|trail/i.test(input.reasonExit);
+    if (isProfitExit && decisionPnlPct < 0.12) {
+      return {
+        allowed: false,
+        blockReason: `profit_under_fee_safe_margin:pnl=${decisionPnlPct.toFixed(3)}%_need>=0.12%`,
+        decisionPrice,
+        decisionPnlPct,
+        forceRefreshSource,
+        cacheAgeMs,
+      };
+    }
+
+    return {
+      allowed: true,
+      blockReason: "",
+      decisionPrice,
+      decisionPnlPct,
+      forceRefreshSource,
+      cacheAgeMs,
+    };
+  };
+
+  // Scenario 9.1: timeout + fresh live (initial forceRefresh=last_good_cache -> direct live retry success -> ALLOWED)
+  const sc91 = simulateSellGuardValidation({
+    market: "KRW-PIEVERSE",
+    ratio: 1,
+    entryPrice: 100,
+    reasonExit: "SURGE_EXTENDED_TIMEOUT_EXIT",
+    exitAuthorityClass: "surge-v2",
+    stopTriggerKind: "time_stop",
+    heldMs: 150 * 60_000,
+    forceRefreshSource: "last_good_cache",
+    forceRefreshPrice: 98,
+    forceRefreshAgeMs: 5000,
+    directLiveSuccess: true,
+    directLivePrice: 102,
+  });
+  console.log(`Test 9.1 (timeout + fresh live retry): allowed=${sc91.allowed}, source=${sc91.forceRefreshSource}, price=${sc91.decisionPrice} (Expected: true, live, 102)`);
+  if (!sc91.allowed || sc91.forceRefreshSource !== "live" || sc91.decisionPrice !== 102) {
+    throw new Error(`Test 9.1 Failed: Expected allowed=true, live, 102 but got allowed=${sc91.allowed}, ${sc91.forceRefreshSource}, ${sc91.decisionPrice}`);
+  }
+
+  // Scenario 9.2: timeout + stale cache (direct live retry fails -> stale cache disallowed for timeout -> BLOCKED)
+  const sc92 = simulateSellGuardValidation({
+    market: "KRW-PIEVERSE",
+    ratio: 1,
+    entryPrice: 100,
+    reasonExit: "SURGE_EXTENDED_TIMEOUT_EXIT",
+    exitAuthorityClass: "surge-v2",
+    stopTriggerKind: "time_stop",
+    heldMs: 150 * 60_000,
+    forceRefreshSource: "last_good_cache",
+    forceRefreshPrice: 98,
+    forceRefreshAgeMs: 150 * 60_000,
+    directLiveSuccess: false,
+    tickerCacheEntry: { fetchedAtMs: 1_000_000 - 150 * 60_000 },
+    nowMs: 1_000_000,
+  });
+  console.log(`Test 9.2 (timeout + stale cache): allowed=${sc92.allowed}, blockReason=${sc92.blockReason} (Expected: false, stale_cache_disallowed_for_timeout...)`);
+  if (sc92.allowed || !sc92.blockReason.startsWith("stale_cache_disallowed_for_timeout_or_regular_exit")) {
+    throw new Error(`Test 9.2 Failed: Timeout must not execute on stale cache, got allowed=${sc92.allowed}`);
+  }
+
+  // Scenario 9.3: emergency (SURGE_STOP_LOSS) + fresh cache (cache age 15s <= 60s -> fail-safe ALLOWED)
+  const sc93 = simulateSellGuardValidation({
+    market: "KRW-PIEVERSE",
+    ratio: 1,
+    entryPrice: 100,
+    reasonExit: "SURGE_STOP_LOSS",
+    exitAuthorityClass: "emergency_exit",
+    stopTriggerKind: "price_stop",
+    heldMs: 60_000,
+    forceRefreshSource: "last_good_cache",
+    forceRefreshPrice: 95,
+    forceRefreshAgeMs: 15_000,
+    directLiveSuccess: false,
+    tickerCacheEntry: { fetchedAtMs: 1_000_000 - 15_000 },
+    nowMs: 1_000_000,
+  });
+  console.log(`Test 9.3 (emergency + fresh cache <=60s): allowed=${sc93.allowed}, source=${sc93.forceRefreshSource}, price=${sc93.decisionPrice} (Expected: true, last_good_cache, 95)`);
+  if (!sc93.allowed || sc93.decisionPrice !== 95 || sc93.cacheAgeMs !== 15000) {
+    throw new Error(`Test 9.3 Failed: Emergency stop loss must be allowed with fresh cache fail-safe`);
+  }
+
+  // Scenario 9.4: emergency (SURGE_STOP_LOSS) + stale cache (cache age 75s > 60s -> BLOCKED)
+  const sc94 = simulateSellGuardValidation({
+    market: "KRW-PIEVERSE",
+    ratio: 1,
+    entryPrice: 100,
+    reasonExit: "SURGE_STOP_LOSS",
+    exitAuthorityClass: "emergency_exit",
+    stopTriggerKind: "price_stop",
+    heldMs: 60_000,
+    forceRefreshSource: "last_good_cache",
+    forceRefreshPrice: 95,
+    forceRefreshAgeMs: 75_000,
+    directLiveSuccess: false,
+    tickerCacheEntry: { fetchedAtMs: 1_000_000 - 75_000 },
+    nowMs: 1_000_000,
+  });
+  console.log(`Test 9.4 (emergency + stale cache >60s): allowed=${sc94.allowed}, blockReason=${sc94.blockReason} (Expected: false, stale_cache_disallowed_for_emergency_exit...)`);
+  if (sc94.allowed || !sc94.blockReason.startsWith("stale_cache_disallowed_for_emergency_exit")) {
+    throw new Error(`Test 9.4 Failed: Emergency stop loss must NOT execute on unverified/stale cache >60s`);
+  }
+
+  // Scenario 9.5: emergency (SURGE_REVERSAL_CUT) + fresh cache (cache age 20s <= 60s -> ALLOWED)
+  const sc95 = simulateSellGuardValidation({
+    market: "KRW-BTC",
+    ratio: 1,
+    entryPrice: 100_000_000,
+    reasonExit: "SURGE_REVERSAL_CUT",
+    exitAuthorityClass: "surge-v2",
+    stopTriggerKind: "reversal_stop",
+    heldMs: 120_000,
+    forceRefreshSource: "last_good_cache",
+    forceRefreshPrice: 97_000_000,
+    forceRefreshAgeMs: 20_000,
+    directLiveSuccess: false,
+    tickerCacheEntry: { fetchedAtMs: 1_000_000 - 20_000 },
+    nowMs: 1_000_000,
+  });
+  console.log(`Test 9.5 (SURGE_REVERSAL_CUT + fresh cache): allowed=${sc95.allowed}, price=${sc95.decisionPrice} (Expected: true, 97000000)`);
+  if (!sc95.allowed || sc95.decisionPrice !== 97_000_000) {
+    throw new Error("Test 9.5 Failed");
+  }
+
+  // Scenario 9.6: emergency (SURGE_EXIT_POLICY_INVALID_FORCE_EXIT) + fresh cache (cache age 30s <= 60s -> ALLOWED)
+  const sc96 = simulateSellGuardValidation({
+    market: "KRW-ETH",
+    ratio: 1,
+    entryPrice: 3_000_000,
+    reasonExit: "SURGE_EXIT_POLICY_INVALID_FORCE_EXIT",
+    exitAuthorityClass: "surge-v2",
+    stopTriggerKind: "invalid_state_emergency",
+    heldMs: 30_000,
+    forceRefreshSource: "last_good_cache",
+    forceRefreshPrice: 2_900_000,
+    forceRefreshAgeMs: 30_000,
+    directLiveSuccess: false,
+    tickerCacheEntry: { fetchedAtMs: 1_000_000 - 30_000 },
+    nowMs: 1_000_000,
+  });
+  console.log(`Test 9.6 (SURGE_EXIT_POLICY_INVALID_FORCE_EXIT + fresh cache): allowed=${sc96.allowed}, price=${sc96.decisionPrice} (Expected: true, 2900000)`);
+  if (!sc96.allowed || sc96.decisionPrice !== 2_900_000) {
+    throw new Error("Test 9.6 Failed");
+  }
+
+  console.log("-> Test 9 Passed!");
+
   // Restore fetch
   global.fetch = originalFetch;
 
