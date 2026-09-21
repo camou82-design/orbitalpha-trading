@@ -649,7 +649,7 @@ async function runAllTests() {
     console.log("[PASS] Test 6.1: Incident 1 Major Impulse passes as recovery probe (scale capped at 0.15) under kill switch");
   }
 
-  // Test 6.2 (Negative): BTC CORE_TREND_CONTINUATION score 95 + kill switch => BLOCK
+  // Test 6.2 (Negative): BTC CORE_TREND_CONTINUATION normal score 85 (< 90) + kill switch => BLOCK
   {
     const res6_2 = await validateLiveBuyPrecheck({
       market: "KRW-BTC",
@@ -665,19 +665,19 @@ async function runAllTests() {
         market: "KRW-BTC",
         engine_bucket: "core", // CORE ENGINE
         is_major_impulse: false,
-        setup: { ok: true, reason: "CORE_TREND_CONTINUATION", score: 95 },
-        score: 95,
+        setup: { ok: true, reason: "CORE_TREND_CONTINUATION", score: 85 },
+        score: 85, // Normal / weak CORE (< 90)
         btc_phase: "continuation",
         asset_phase: "continuation",
         is_panic: false,
       },
     });
-    assert.strictEqual(res6_2.allowed, false, "Core Trend must be strictly blocked under kill switch");
+    assert.strictEqual(res6_2.allowed, false, "Normal Core (< 90) must be strictly blocked under kill switch");
     assert.strictEqual(res6_2.blockReason, "global_kill_switch_active");
-    console.log("[PASS] Test 6.2: BTC CORE_TREND_CONTINUATION strictly blocked under kill switch (No side-door)");
+    console.log("[PASS] Test 6.2: BTC normal CORE (score 85 < 90) strictly blocked under kill switch");
   }
 
-  // Test 6.3 (Negative): ETH normal core + kill switch => BLOCK
+  // Test 6.3 (Negative): ETH normal core score 82 (< 90) + kill switch => BLOCK
   {
     const res6_3 = await validateLiveBuyPrecheck({
       market: "KRW-ETH",
@@ -693,14 +693,14 @@ async function runAllTests() {
         market: "KRW-ETH",
         engine_bucket: "core",
         is_major_impulse: false,
-        setup: { ok: true, reason: "CORE_BREAKOUT_VOLUME", score: 92 },
-        score: 92,
+        setup: { ok: true, reason: "CORE_BREAKOUT_VOLUME", score: 82 },
+        score: 82, // Normal / weak CORE (< 90)
         btc_phase: "continuation",
         asset_phase: "continuation",
         is_panic: false,
       },
     });
-    assert.strictEqual(res6_3.allowed, false, "ETH Core must be blocked under kill switch");
+    assert.strictEqual(res6_3.allowed, false, "ETH normal Core (< 90) must be blocked under kill switch");
     assert.strictEqual(res6_3.blockReason, "global_kill_switch_active");
     console.log("[PASS] Test 6.3: ETH normal core strictly blocked under kill switch");
   }
@@ -851,7 +851,7 @@ async function runAllTests() {
     console.log("[PASS] Test 6.8: Cumulative PnL <= -5% hard risk strictly blocks all entries including Major Impulse");
   }
 
-  // Test 6.9 (Negative Hard Risk): Daily Loss Count >= 5 => Hard Block
+  // Test 6.9 (Performance Kill vs Probe): Daily Loss Count >= 5 is PERFORMANCE_KILL => Normal (<90) Blocked, Strong (>=90) Allowed 25% probe
   {
     const fiveDailyLossTrades = Array.from({ length: 5 }, (_, i) => ({
       market: "KRW-SOL",
@@ -860,31 +860,57 @@ async function runAllTests() {
       action: "sell",
       filled_qty: 1,
     }));
-    const res6_9 = await validateLiveBuyPrecheck({
+    // 6.9a: Normal CORE (<90) under 5 daily losses => BLOCKED
+    const res6_9a = await validateLiveBuyPrecheck({
       market: "KRW-BTC",
       trades: fiveDailyLossTrades,
       positions: {},
       cooldown_until: {},
       marketState: { status: () => snapNeutral },
       signalPayload: null,
-      strategyType: "major_impulse",
+      strategyType: "core",
       entryPath: "precheck",
       isAdditionalBuy: false,
       candidateMeta: {
         market: "KRW-BTC",
-        engine_bucket: "major_impulse",
-        is_major_impulse: true,
-        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
-        score: 95,
-        btc_phase: "impulse",
-        asset_phase: "impulse",
+        engine_bucket: "core",
+        is_major_impulse: false,
+        setup: { ok: true, reason: "CORE_TREND_CONTINUATION", score: 85 },
+        score: 85, // < 90
+        btc_phase: "continuation",
+        asset_phase: "continuation",
         is_panic: false,
-        relaxed_multiplier: 0.25,
       },
     });
-    assert.strictEqual(res6_9.allowed, false, "Daily loss count >= 5 must hard-block");
-    assert.strictEqual(res6_9.blockReason, "global_kill_switch_active");
-    console.log("[PASS] Test 6.9: Daily loss count >= 5 hard limit strictly blocks Major Impulse");
+    assert.strictEqual(res6_9a.allowed, false, "Normal Core (<90) under 5 losses must be blocked");
+    assert.strictEqual(res6_9a.blockReason, "global_kill_switch_active");
+
+    // 6.9b: Strong CORE (>=90) under 5 daily losses => ALLOWED (25% probe)
+    const strongMeta: any = {
+      market: "KRW-BTC",
+      engine_bucket: "core",
+      setup: { ok: true, reason: "CORE_TREND_CONTINUATION", score: 95 },
+      score: 95,
+      btc_phase: "continuation",
+      asset_phase: "continuation",
+      is_panic: false,
+      relaxed_multiplier: 1.0,
+    };
+    const res6_9b = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: fiveDailyLossTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "core",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: strongMeta,
+    });
+    assert.strictEqual(res6_9b.allowed, true, "Strong Core (>=90) under 5 losses must be allowed 25% probe");
+    assert.strictEqual(strongMeta.relaxed_multiplier, 0.25);
+    console.log("[PASS] Test 6.9: Daily loss count >= 5 is PERFORMANCE_KILL (Normal blocked, Strong allowed 25% probe)");
   }
 
   // Test 6.10 (Negative Limit): Second Simultaneous Recovery Probe => BLOCK
@@ -2715,9 +2741,10 @@ async function runAllTests() {
     console.log("[PASS] Strict Core Test O: normal non-authoritative CORE raw0 => blocked_low_signal maintained");
   }
 
-  // Test P: Kill Switch / hard risk / cooldown / position limit / capital policy => 기존 테스트 전부 PASS
+  // Test P: PERFORMANCE_KILL vs HARD_RISK_KILL for Strict CORE
   {
-    const precheckRes = await validateLiveBuyPrecheck({
+    // P1: Weak CORE (<90) under PERFORMANCE_KILL => strictly BLOCKED
+    const precheckWeak = await validateLiveBuyPrecheck({
       market: "KRW-BTC",
       trades: mockKillSwitchTrades,
       positions: {},
@@ -2732,17 +2759,65 @@ async function runAllTests() {
         engine_bucket: "core",
         is_major_impulse: false,
         setupReason: "CORE_TREND_CONTINUATION",
-        setup: { ok: true, reason: "CORE_TREND_CONTINUATION", score: 95 },
-        score: 95,
-        core_setup_score: 95,
+        setup: { ok: true, reason: "CORE_TREND_CONTINUATION", score: 85 },
+        score: 85,
         btc_phase: "continuation",
         asset_phase: "continuation",
         is_panic: false,
       },
     });
-    assert.strictEqual(precheckRes.allowed, false, "Core Trend must be strictly blocked under kill switch");
-    assert.strictEqual(precheckRes.blockReason, "global_kill_switch_active");
-    console.log("[PASS] Strict Core Test P: Kill Switch / hard risk strictly blocks Core Trend without side-door");
+    assert.strictEqual(precheckWeak.allowed, false, "Normal Core (<90) must be blocked under PERFORMANCE_KILL");
+    assert.strictEqual(precheckWeak.blockReason, "global_kill_switch_active");
+
+    // P2: Strong CORE (>=90) under PERFORMANCE_KILL => 25% probe ALLOWED
+    const strongMetaP: any = {
+      market: "KRW-BTC",
+      engine_bucket: "core",
+      is_major_impulse: false,
+      setupReason: "CORE_TREND_CONTINUATION",
+      setup: { ok: true, reason: "CORE_TREND_CONTINUATION", score: 95 },
+      score: 95,
+      core_setup_score: 95,
+      btc_phase: "continuation",
+      asset_phase: "continuation",
+      is_panic: false,
+      relaxed_multiplier: 1.0,
+    };
+    const precheckStrong = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: mockKillSwitchTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "stable",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: strongMetaP,
+    });
+    assert.strictEqual(precheckStrong.allowed, true, "Strong Core (>=90) must be allowed 25% probe under PERFORMANCE_KILL");
+    assert.strictEqual(strongMetaP.relaxed_multiplier, 0.25);
+
+    // P3: Strong CORE (>=90) under HARD_RISK_KILL (cumulative <= -5%) => 100% BLOCKED
+    const hardRiskTrades = [
+      { market: "KRW-BTC", pnl_pct: -2.0, timestamp: new Date(Date.now() - 3600_000).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-ETH", pnl_pct: -2.0, timestamp: new Date(Date.now() - 7200_000).toISOString(), action: "sell", filled_qty: 1 },
+      { market: "KRW-SOL", pnl_pct: -1.5, timestamp: new Date(Date.now() - 10800_000).toISOString(), action: "sell", filled_qty: 1 },
+    ];
+    const precheckHardRisk = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: hardRiskTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "stable",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: { ...strongMetaP, relaxed_multiplier: 1.0 },
+    });
+    assert.strictEqual(precheckHardRisk.allowed, false, "HARD_RISK_KILL must strictly block even Strong CORE");
+    console.log("[PASS] Strict Core Test P: PERFORMANCE_KILL (probe 25%) and HARD_RISK_KILL (0% block) verified");
   }
 
   // Test Q: upstream_gate_score=70, core_setup_score=95, upstream_min_entry_score=82, upstream_core_gate_ok=true => effectiveStrength=95 => PASS
