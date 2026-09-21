@@ -588,6 +588,13 @@ type OriginalSpotSetupResult = {
   aggressiveRiskRewardOk?: boolean;
   aggressive_condition_pass?: boolean;
   failed_conditions?: string[];
+  /** CORE_SETUP branch-specific diagnostic flags */
+  trend_entry_pass?: boolean;
+  trend_entry_failed_conditions?: string[];
+  pullback_pass?: boolean;
+  pullback_failed_conditions?: string[];
+  breakout_pass?: boolean;
+  breakout_failed_conditions?: string[];
   /** CORE_TREND_ENTRY 전용 — original aggressive_* 의미와 분리 */
   stoch_assist_pass?: boolean;
   stoch_assist_score?: number;
@@ -3734,7 +3741,7 @@ function calculateCoreSetupScore(setup: OriginalSpotSetupResult, btcTier?: strin
   return Math.min(100, Math.max(0, score));
 }
 
-function evaluateOriginalSpotScalpingSetup(
+export function evaluateOriginalSpotScalpingSetup(
   market: string,
   candles1: UpbitCandle[],
   currentPrice: number,
@@ -3779,6 +3786,25 @@ function evaluateOriginalSpotScalpingSetup(
 
   const prevRsi = rsiValues[lastIdx - 1] ?? 0;
 
+  // Candle guard: 급락 및 윗꼬리 방어
+  const candleGuardFails: string[] = [];
+  for (let i = Math.max(0, lastIdx - 2); i <= lastIdx; i++) {
+    const row = completed[i];
+    if (!row) continue;
+    const o = Number(row.opening_price ?? 0);
+    const c = Number(row.trade_price ?? 0);
+    const h = Number(row.high_price ?? 0);
+    const low = Number(row.low_price ?? 0);
+    if (o > 0 && c / o - 1 < -0.018) {
+      candleGuardFails.push(`bar_${i}_drop_steep`);
+    }
+    const rng = Math.max(1e-9, h - low);
+    const upWick = (h - c) / rng;
+    if (upWick > 0.52 && c <= o) {
+      candleGuardFails.push(`bar_${i}_upper_wick_heavy`);
+    }
+  }
+
   const safePriceAboveEma200 = currentPrice > ema200Last || Number(lastCandle.trade_price) > ema200Last;
   const pullbackToEma200 = lows.slice(-20).some(l => l <= ema200Last * 1.015);
   const stochOversoldBullishCross = prevK <= 25 && prevD <= 25 && k > d;
@@ -3788,14 +3814,44 @@ function evaluateOriginalSpotScalpingSetup(
   const rsiBullish = rsi > 45 || (prevRsi <= 50 && rsi > 50) || rsi > prevRsi;
   const volSpike = volRatio > 0.95;
 
-  // 1. CORE_TREND_CONTINUATION: 추세 지속 (EMA 정배열 및 가격 우위)
-  const coreTrendContPass = safePriceAboveEma200 && aggressiveEmaStack && aggressivePriceAbove;
+  // Price structures
+  const trendPriceOk = safePriceAboveEma200 && (currentPrice > ema50Last || (currentPrice >= ema50Last * 0.995 && currentPrice > ema200Last) || Number(lastCandle.trade_price) > ema50Last);
+  const recentHighs = highs.slice(-10);
+  const prevSwingHigh = recentHighs.length > 1 ? Math.max(...recentHighs.slice(0, -1)) : (highs[lastIdx] ?? 0);
+  const recentMaxClose = closes.length > 1 ? Math.max(...closes.slice(-10, -1)) : (closes[lastIdx] ?? 0);
+  const isPriceBreakout = currentPrice > prevSwingHigh || Number(lastCandle.high_price) > prevSwingHigh || currentPrice > recentMaxClose;
 
-  // 2. CORE_PULLBACK_REVERSAL: 눌림목 반등 (Stoch 침체권 상향 돌파 및 RSI 강세)
-  const corePullbackRevPass = stochOversoldBullishCross && stochReversal && rsiBullish;
+  // 1. CORE_PULLBACK_REVERSAL: 눌림목 반등 (Stoch 침체권 상향 돌파 및 RSI 강세 독립 평가)
+  const pullbackFailed: string[] = [];
+  if (!stochOversoldBullishCross) pullbackFailed.push("stochOversoldBullishCross");
+  if (!stochReversal) pullbackFailed.push("stochReversal");
+  if (!rsiBullish) pullbackFailed.push("rsiBullish");
+  if (!safePriceAboveEma200 && !pullbackToEma200) pullbackFailed.push("price_below_ema200_pullback_failed");
+  if (rsi >= 70) pullbackFailed.push(`rsi_overheated:${rsi.toFixed(1)}>=70`);
+  for (const fail of candleGuardFails) pullbackFailed.push(fail);
+  const corePullbackRevPass = pullbackFailed.length === 0;
 
-  // 3. CORE_BREAKOUT_VOLUME: 거래량 실린 돌파 (가격 우위 및 거래량 급증)
-  const coreBreakoutVolPass = aggressivePriceAbove && volSpike;
+  // 2. CORE_TREND_CONTINUATION: 추세 지속 (EMA 정배열 및 모멘텀 지속 독립 평가 - stochOversold 불필요)
+  const trendFailed: string[] = [];
+  if (!safePriceAboveEma200) trendFailed.push("safePriceAboveEma200");
+  if (!aggressiveEmaStack) trendFailed.push("aggressiveEmaStack");
+  if (!trendPriceOk) trendFailed.push("trendPriceBelowEma50And200");
+  if (!rsiBullish) trendFailed.push("rsiBullish");
+  if (!stochReversal) trendFailed.push("stochReversal");
+  if (!volSpike) trendFailed.push("volRatio<=0.95");
+  if (rsi >= 75) trendFailed.push(`rsi_overheated:${rsi.toFixed(1)}>=75`);
+  for (const fail of candleGuardFails) trendFailed.push(fail);
+  const coreTrendContPass = trendFailed.length === 0;
+
+  // 3. CORE_BREAKOUT_VOLUME: 거래량 실린 돌파 (돌파 가격 구조 및 거래량 급증 독립 평가 - stochOversold 불필요, 단순 볼륨만 큰 케이스 차단)
+  const breakoutFailed: string[] = [];
+  if (!isPriceBreakout) breakoutFailed.push("price_not_breakout_structure");
+  if (!volSpike) breakoutFailed.push("volRatio<=0.95");
+  if (!safePriceAboveEma200) breakoutFailed.push("safePriceAboveEma200");
+  if (!rsiBullish) breakoutFailed.push("rsiBullish");
+  if (rsi >= 80) breakoutFailed.push(`rsi_overheated:${rsi.toFixed(1)}>=80`);
+  for (const fail of candleGuardFails) breakoutFailed.push(fail);
+  const coreBreakoutVolPass = breakoutFailed.length === 0;
 
   const branchProof = {
     market,
@@ -3809,6 +3865,12 @@ function evaluateOriginalSpotScalpingSetup(
     coreTrendContPass,
     corePullbackRevPass,
     coreBreakoutVolPass,
+    trend_entry_pass: coreTrendContPass,
+    trend_entry_failed_conditions: trendFailed,
+    pullback_pass: corePullbackRevPass,
+    pullback_failed_conditions: pullbackFailed,
+    breakout_pass: coreBreakoutVolPass,
+    breakout_failed_conditions: breakoutFailed,
   };
 
   console.info(JSON.stringify({
@@ -3859,7 +3921,13 @@ function evaluateOriginalSpotScalpingSetup(
         stopPrice, targetPrice, riskReward: rr,
         candleLow, swingLow,
         safePriceAboveEma200, pullbackToEma200, stochOversoldBullishCross, isBullish, safe_condition_pass: corePullbackRevPass,
-        aggressiveEmaStack, aggressivePriceAbove, aggressiveRsiOk: rsiBullish, aggressiveVolumeOk: volSpike, aggressiveRiskRewardOk: true, aggressive_condition_pass: coreTrendContPass || coreBreakoutVolPass
+        aggressiveEmaStack, aggressivePriceAbove, aggressiveRsiOk: rsiBullish, aggressiveVolumeOk: volSpike, aggressiveRiskRewardOk: true, aggressive_condition_pass: coreTrendContPass || coreBreakoutVolPass,
+        trend_entry_pass: coreTrendContPass,
+        trend_entry_failed_conditions: trendFailed,
+        pullback_pass: corePullbackRevPass,
+        pullback_failed_conditions: pullbackFailed,
+        breakout_pass: coreBreakoutVolPass,
+        breakout_failed_conditions: breakoutFailed,
       };
     } else {
       console.info(JSON.stringify({
@@ -3875,20 +3943,16 @@ function evaluateOriginalSpotScalpingSetup(
     }
   }
 
-  const failed: string[] = [];
-  if (!safePriceAboveEma200) failed.push("safePriceAboveEma200");
-  if (!aggressiveEmaStack) failed.push("aggressiveEmaStack");
-  if (!aggressivePriceAbove) failed.push("aggressivePriceAbove");
-  if (!stochOversoldBullishCross) failed.push("stochOversoldBullishCross");
-  if (!stochReversal) failed.push("stochReversal");
-  if (!rsiBullish) failed.push("rsiBullish");
-  if (volRatio <= 0.95) failed.push("volRatio<=0.95");
+  const allFailed: string[] = [];
+  if (trendFailed.length > 0) allFailed.push(`trend:${trendFailed.join("&")}`);
+  if (pullbackFailed.length > 0) allFailed.push(`pullback:${pullbackFailed.join("&")}`);
+  if (breakoutFailed.length > 0) allFailed.push(`breakout:${breakoutFailed.join("&")}`);
 
   console.info(JSON.stringify({
     tag: "CORE_SETUP_BRANCH_REJECTED_PROOF",
     ts: new Date().toISOString(),
     market,
-    failed_conditions: failed
+    failed_conditions: allFailed
   }));
 
   return {
@@ -3903,6 +3967,13 @@ function evaluateOriginalSpotScalpingSetup(
     volumeRatio: volRatio,
     safePriceAboveEma200, pullbackToEma200, stochOversoldBullishCross, isBullish, safe_condition_pass: corePullbackRevPass,
     aggressiveEmaStack, aggressivePriceAbove, aggressiveRsiOk: rsiBullish, aggressiveVolumeOk: volSpike, aggressiveRiskRewardOk: true, aggressive_condition_pass: coreTrendContPass || coreBreakoutVolPass,
+    trend_entry_pass: coreTrendContPass,
+    trend_entry_failed_conditions: trendFailed,
+    pullback_pass: corePullbackRevPass,
+    pullback_failed_conditions: pullbackFailed,
+    breakout_pass: coreBreakoutVolPass,
+    breakout_failed_conditions: breakoutFailed,
+    failed_conditions: allFailed,
   };
 }
 
