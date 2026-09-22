@@ -15234,6 +15234,21 @@ export function createLiveDataStrategy(opts: {
         secondsSinceSignal <= LIVE_LATE_ENTRY_SOFT_MAX_SIGNAL_SEC &&
         (priceChangeSinceSignalPct === null || priceChangeSinceSignalPct <= chaseSoftCap);
 
+      const hasValidVolumeEvidence = typeof volumeRatio1m5 === "number" && Number.isFinite(volumeRatio1m5) && volumeRatio1m5 >= 0.35;
+      const hasValidSignalAgeEvidence = typeof secondsSinceSignal === "number" && Number.isFinite(secondsSinceSignal) && secondsSinceSignal <= LIVE_ENTRY_SIGNAL_STALE_SECONDS;
+      const hasValidChaseEvidence = typeof priceChangeSinceSignalPct === "number" && Number.isFinite(priceChangeSinceSignalPct) && priceChangeSinceSignalPct <= chaseLimit;
+
+      const breakoutConfirmed = Boolean(sig?.p?.breakout ?? (metaForGuard as any)?.highReclaim);
+      const isAuthoritativeSurgeBreakoutFirstEntry =
+        Boolean(isSurgeSource) &&
+        breakoutConfirmed &&
+        Boolean(candidateMetaFromSetup?.setup?.ok ?? metaForGuard?.setup?.ok) &&
+        !state.positions[market] &&
+        !volumeFadeTriggered &&
+        hasValidVolumeEvidence &&
+        hasValidSignalAgeEvidence &&
+        hasValidChaseEvidence;
+
       if (secondsSinceSignal !== null && secondsSinceSignal > staleLimit) {
         lateEntryGuardTriggered = true;
         lateTimingTier = "hard_block";
@@ -15310,7 +15325,30 @@ export function createLiveDataStrategy(opts: {
             Number(metaForGuard?.volumeRatio ?? 0) >= LIVE_CORE_TREND_MIN_VOLUME_RATIO &&
             Number(metaForGuard?.stopPrice ?? 0) > 0;
 
-          if (nearHighSoftenEligible) {
+          if (isAuthoritativeSurgeBreakoutFirstEntry) {
+            // [권위 분리] 스캐너 Tradable + Breakout 확정 + Setup 통과 첫 진입:
+            // 돌파 직후 고점 일치(dist=0%) 및 근접(dist<0.12%)은 정상 돌파 상태이므로 hard block 면제.
+            lateTimingTier = "pass";
+            lateEntryGuardReason = null;
+            if (metaForGuard) {
+              if (!metaForGuard.softened_reasons) metaForGuard.softened_reasons = [];
+              metaForGuard.softened_reasons.push("SURGE_BREAKOUT_NEAR_HIGH_AUTHORITY_PASSED");
+            }
+            console.info(JSON.stringify({
+              tag: "SURGE_BREAKOUT_NEAR_HIGH_AUTHORITY_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              source_kind: sourceKindForJudgment,
+              score,
+              age_seconds: secondsSinceSignal,
+              distance_from_local_high_pct: distanceFromLocalHighPct,
+              breakout: true,
+              setup_ok: true,
+              near_high_hard_block: false,
+              decision: "pass",
+              reason: "authoritative_surge_breakout_first_entry_exempt_from_near_high_block"
+            }));
+          } else if (nearHighSoftenEligible) {
             lateTimingTier = "reduced_size_allowed";
             lateEntrySizingMultiplier *= 0.45;
             lateEntryGuardReason = "near_high_probe_allowed";
@@ -15420,6 +15458,7 @@ export function createLiveDataStrategy(opts: {
       const lateChaseBy5m = recent5mRet !== null && recent5mRet >= 5.0;
       const lateChaseBy15m = recent5mRet !== null && recent5mRet >= 8.0; // 15m 데이터 없을 경우 5m으로 보수적 판단
       const lateChaseNearHighAndRising =
+        !isAuthoritativeSurgeBreakoutFirstEntry &&
         distanceFromLocalHighPct !== null &&
         distanceFromLocalHighPct >= 0 &&
         distanceFromLocalHighPct < 0.15 &&
