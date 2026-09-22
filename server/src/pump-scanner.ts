@@ -51,7 +51,7 @@ interface ScannerState {
   pending: PendingEval[];
 }
 
-interface FakeoutState {
+export interface FakeoutState {
   peakVolumeMultiple: number;
   peakPrice: number;
   detectedAtMs: number;
@@ -162,7 +162,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btcDropPenalty: number, fState?: FakeoutState) {
+export function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btcDropPenalty: number, fState?: FakeoutState) {
   const last = c1[c1.length - 1];
   if (!last) return null;
   const prev20 = c1.slice(-21, -1);
@@ -195,7 +195,6 @@ function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btc
   if (oneMinPump > 4.5) exclude_reasons.push("과열 (추격주의)");
   // "거래대금 부족" = volumeMultiple < 0.95 (직전 20봉 대비 현재 봉 거래대금 비율 미달)
   if (volumeMultiple < 0.95) exclude_reasons.push("거래대금 부족");
-  if (btcDropPenalty > 0) exclude_reasons.push("BTC 역풍");
 
   // --- FAKEOUT PATTERN REJECTION ---
   // freshFakeoutReasons: 이번 tick에서 새로 발생한 fakeout 판단 (cooldown 연장의 대상)
@@ -255,6 +254,8 @@ function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btc
 
   if (earlyEntryEligible) score = Math.max(score, 54);
   if (addEntryEligible) score = Math.max(score, 56);
+
+  if (btcDropPenalty > 0) score = Math.max(0, score - btcDropPenalty);
 
   // --- STATUS ---
   const status = isFatal ? "제외" : toStatus(score);
@@ -923,7 +924,9 @@ export function createPumpScanner(
             market: row.market,
             score: row.score,
             status: row.status,
-            volume_multiple: row.volume_multiple
+            volume_multiple: row.volume_multiple,
+            exclude_reasons: row.exclude_reasons ?? [],
+            btc_drop_penalty: btcDropPenalty,
           }));
           rawDetected.push(row);
 
