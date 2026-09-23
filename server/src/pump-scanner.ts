@@ -395,6 +395,200 @@ export function selectMomentumTopM(
   };
 }
 
+export interface CandleEvalHistory {
+  lastEvaluatedAtMs: number;
+  lastStatus: ScannerRow["status"] | null;
+  lastScore: number;
+  lastExcludeReasons?: string[];
+  lastMomentumScore: number;
+  lastPrice: number;
+  consecutiveFatalLowCount: number;
+}
+
+/**
+ * 10분(기본 600,000ms) 이상 평가되지 않은 stale candle evaluation history를 정리하여 Map 무한 증가 방지.
+ */
+export function pruneCandleEvalHistory(
+  historyMap: Map<string, CandleEvalHistory>,
+  nowMs: number = Date.now(),
+  maxAgeMs: number = 600_000,
+): number {
+  const threshold = nowMs - maxAgeMs;
+  let deletedCount = 0;
+  for (const [m, h] of historyMap.entries()) {
+    if (h.lastEvaluatedAtMs < threshold) {
+      historyMap.delete(m);
+      deletedCount++;
+    }
+  }
+  return deletedCount;
+}
+
+export type CandleTargetSelectionReason =
+  | "HELD"
+  | "ACTIVE_TRACKING"
+  | "CORE"
+  | "FRESH_SURGE"
+  | "ROTATION";
+
+export interface SelectedCandleTarget {
+  ticker: UpbitTicker;
+  reason: CandleTargetSelectionReason;
+  momentumScore: number;
+}
+
+/**
+ * Anti-starvation 및 Freshness 기반 candleTargets 선정.
+ * 
+ * 슬롯 배분 원칙:
+ *  1. HELD: 보유 종목 우선 보호 (topM 제한 없이 항상 최우선)
+ *  2. ACTIVE_TRACKING: 직전 tick에 진입직전/모니터링(tradable) 상태였던 종목 (exploration 슬롯 침해 방지 상한 적용)
+ *  3. CORE: 현재 momentum 최상위 종목 (직전 평가에서 식은 종목은 cooling down 적용)
+ *  4. FRESH_SURGE: 새로운 거래대금 유입(volD > 0), 순위 급상승(rankDelta >= 2), 또는 양의 단기 가격 반등 발생 종목
+ *  5. ROTATION: MOMENTUM_TOP_M (상위 40개) 중 오랫동안 또는 한 번도 평가받지 못한 후보 순환 (starvation 차단)
+ */
+export function selectCandleTargets(opts: {
+  heldTickers: UpbitTicker[];
+  momentumScored: MomentumScoredCandidate[];
+  dynamicCandleTarget: number;
+  candleEvalHistoryMap: Map<string, CandleEvalHistory>;
+  nowMs: number;
+  topM?: number;
+}): SelectedCandleTarget[] {
+  const budget = Math.max(1, Math.min(CANDLE_MAX_MARKETS_PER_TICK, opts.dynamicCandleTarget));
+  const topM = Math.max(1, opts.topM ?? MOMENTUM_TOP_M ?? 40);
+  const selectedMap = new Map<string, SelectedCandleTarget>();
+
+  const add = (t: UpbitTicker, reason: CandleTargetSelectionReason, score: number): boolean => {
+    if (selectedMap.has(t.market)) return false;
+    if (selectedMap.size >= budget) return false;
+    selectedMap.set(t.market, { ticker: t, reason, momentumScore: score });
+    return true;
+  };
+
+  // 1. Phase 1: HELD markets (보유 종목 최우선 보호 - topM 제한 없음)
+  for (const ht of opts.heldTickers) {
+    const mom = opts.momentumScored.find((x) => x.t.market === ht.market)?.momentum ?? 0;
+    add(ht, "HELD", mom);
+    if (selectedMap.size >= budget) return Array.from(selectedMap.values());
+  }
+
+  // 비보유 후보 풀은 MOMENTUM_TOP_M(기본 40) 상위로 엄격 한정 (rank 41+ 비보유 제외)
+  const topCandidates = opts.momentumScored.slice(0, topM);
+
+  // 2. Phase 2: ACTIVE_TRACKING (직전 평가에서 진입직전 또는 모니터링 상태였던 종목)
+  // [탐색 슬롯 보장]: budget >= 2이고 HELD가 전체를 차지하지 않은 경우, 최소 1개 슬롯은 CORE/FRESH/ROTATION 탐색에 보장
+  const heldCount = selectedMap.size;
+  const remainingBudget = budget - heldCount;
+  const maxActiveTrackingSlots = remainingBudget >= 2 ? remainingBudget - 1 : remainingBudget;
+
+  // [ACTIVE 후보 내부 starvation 방지]:
+  // 여러 ACTIVE 후보가 존재할 때 동일 종목이 매 tick ACTIVE 슬롯을 독점하지 않도록
+  // lastEvaluatedAtMs가 가장 오래된 종목을 우선 선발 (동률 시 momentum 내림차순 tie-breaker)
+  const activeCandidates = topCandidates
+    .filter((cand) => {
+      if (selectedMap.has(cand.t.market)) return false;
+      const hist = opts.candleEvalHistoryMap.get(cand.t.market);
+      if (!hist) return false;
+      const ageMs = opts.nowMs - hist.lastEvaluatedAtMs;
+      return (hist.lastStatus === "진입직전" || hist.lastStatus === "모니터링") && ageMs <= 180_000;
+    })
+    .sort((a, b) => {
+      const histA = opts.candleEvalHistoryMap.get(a.t.market)!;
+      const histB = opts.candleEvalHistoryMap.get(b.t.market)!;
+      if (histA.lastEvaluatedAtMs !== histB.lastEvaluatedAtMs) {
+        return histA.lastEvaluatedAtMs - histB.lastEvaluatedAtMs; // 더 오래 전에 평가된 것 우선
+      }
+      return b.momentum - a.momentum; // 동률 시 momentum 높은 것 우선
+    });
+
+  let activeTrackingAdded = 0;
+  for (const cand of activeCandidates) {
+    if (activeTrackingAdded >= maxActiveTrackingSlots) break;
+    if (add(cand.t, "ACTIVE_TRACKING", cand.momentum)) {
+      activeTrackingAdded++;
+      if (selectedMap.size >= budget) return Array.from(selectedMap.values());
+    }
+  }
+
+  // 3. Phase 3: Anti-starvation & Cooling-down 판별
+  const isActiveTrackingEligible = (cand: MomentumScoredCandidate): boolean => {
+    const hist = opts.candleEvalHistoryMap.get(cand.t.market);
+    if (!hist) return false;
+    const ageMs = opts.nowMs - hist.lastEvaluatedAtMs;
+    return (hist.lastStatus === "진입직전" || hist.lastStatus === "모니터링") && ageMs <= 180_000;
+  };
+
+  // 쿨다운 해제 조건:
+  //  1) 거래대금 유입: volD > 0
+  //  2) 순위 급상승: rankDelta >= 2
+  //  3) 양의 단기 가격 반등: 직전 평가 가격 대비 유의미한 상승 (cand.t.trade_price > hist.lastPrice * 1.002)
+  //  (하락 절댓값이나 음수 수익률은 절대 쿨다운 해제 증거가 되지 않음)
+  const isCoolingDown = (cand: MomentumScoredCandidate): boolean => {
+    const hist = opts.candleEvalHistoryMap.get(cand.t.market);
+    if (!hist) return false;
+    const ageMs = opts.nowMs - hist.lastEvaluatedAtMs;
+    if (ageMs > 90_000) return false;
+    if (hist.lastStatus !== "제외") return false;
+
+    const hasVolIncrease = cand.volD > 0;
+    const hasRankImprovement = cand.rankDelta >= 2;
+    const hasPositivePriceMove = hist.lastPrice > 0 && cand.t.trade_price > hist.lastPrice * 1.002;
+
+    const hasFreshMomentumEvidence = hasVolIncrease || hasRankImprovement || hasPositivePriceMove;
+    return !hasFreshMomentumEvidence;
+  };
+
+  // 탐색 후보 풀: 이미 ACTIVE_TRACKING 대상인 종목을 제외한 신규 탐색 후보 우선 배정
+  const explorationPool = topCandidates.filter(
+    (c) => !selectedMap.has(c.t.market) && !isActiveTrackingEligible(c),
+  );
+
+  // 3-A: CORE 슬롯 (탐색 풀 중 쿨다운이 아닌 최상위 momentum 후보)
+  const nonCooling = explorationPool.filter((c) => !isCoolingDown(c));
+  if (nonCooling.length > 0) {
+    const coreCandidate = nonCooling[0]!;
+    add(coreCandidate.t, "CORE", coreCandidate.momentum);
+    if (selectedMap.size >= budget) return Array.from(selectedMap.values());
+  }
+
+  // 3-B: FRESH_SURGE 슬롯 (탐색 풀 중 단기 거래대금 급증 또는 순위 개선 신규 후보)
+  const freshCandidates = explorationPool
+    .filter((c) => !selectedMap.has(c.t.market) && (c.volD > 0 || c.rankDelta >= 2))
+    .sort((a, b) => (b.nv + b.nrd) - (a.nv + a.nrd));
+
+  if (freshCandidates.length > 0) {
+    const freshCand = freshCandidates[0]!;
+    add(freshCand.t, "FRESH_SURGE", freshCand.momentum);
+    if (selectedMap.size >= budget) return Array.from(selectedMap.values());
+  }
+
+  // 3-C: ROTATION 슬롯 (탐색 풀 중 가장 오랫동안 또는 한 번도 평가받지 못한 종목 순환)
+  const unscannedOrOldest = [...explorationPool]
+    .filter((c) => !selectedMap.has(c.t.market))
+    .sort((a, b) => {
+      const histA = opts.candleEvalHistoryMap.get(a.t.market);
+      const histB = opts.candleEvalHistoryMap.get(b.t.market);
+      const ageA = histA ? opts.nowMs - histA.lastEvaluatedAtMs : Number.MAX_SAFE_INTEGER;
+      const ageB = histB ? opts.nowMs - histB.lastEvaluatedAtMs : Number.MAX_SAFE_INTEGER;
+      if (ageA !== ageB) return ageB - ageA; // 더 오래 안 본 것 우선
+      return b.momentum - a.momentum;
+    });
+
+  for (const cand of unscannedOrOldest) {
+    add(cand.t, "ROTATION", cand.momentum);
+    if (selectedMap.size >= budget) return Array.from(selectedMap.values());
+  }
+
+  // 4. Fallback: 남은 슬롯을 topCandidates momentum 상위 순서로 채움
+  for (const cand of topCandidates) {
+    add(cand.t, "CORE", cand.momentum);
+    if (selectedMap.size >= budget) break;
+  }
+
+  return Array.from(selectedMap.values());
+}
+
 export function createPumpScanner(
   getHeldMarkets: () => string[] = () => [],
   opts: { onEvent?: (row: any) => Promise<void> } = {}
@@ -422,6 +616,7 @@ export function createPumpScanner(
 
   // Fakeout Management
   const fakeoutStateMap = new Map<string, FakeoutState>();
+  const candleEvalHistoryMap = new Map<string, CandleEvalHistory>();
 
   let isTickInFlight = false;
   let lastTickStartedAt = 0;
@@ -814,34 +1009,36 @@ export function createPumpScanner(
         .filter((t): t is UpbitTicker => Boolean(t))
         .filter((t) => !is429Excluded(t.market));
 
-      const seen = new Set<string>();
-      const marketsToScore = [...heldTickers, ...momentumCandidates].filter((t) => {
-        if (seen.has(t.market)) return false;
-        seen.add(t.market);
-        return true;
+      const selectedCandleTargets = selectCandleTargets({
+        heldTickers,
+        momentumScored: momSel.scoredCandidates,
+        dynamicCandleTarget,
+        candleEvalHistoryMap,
+        nowMs: Date.now(),
       });
-
+      const candleTargets = selectedCandleTargets.map((st) => st.ticker);
+      const selectedReasonByMarket = new Map(selectedCandleTargets.map((st) => [st.ticker.market, st.reason]));
+      const candleTargetSet = new Set(candleTargets.map((t) => t.market));
       const tradableCandidates: ScannerRow[] = [];
 
-      const heldSet = new Set(heldMarkets);
-      const marketsRanked = [...marketsToScore].sort((a, b) => {
-        const heldBiasA = heldSet.has(a.market) ? 1 : 0;
-        const heldBiasB = heldSet.has(b.market) ? 1 : 0;
-        if (heldBiasA !== heldBiasB) return heldBiasB - heldBiasA;
-        return (momentumScoreByMarket.get(b.market) ?? 0) - (momentumScoreByMarket.get(a.market) ?? 0);
+      const momentumAuditTop = momSel.scoredCandidates.slice(0, 15).map((x, idx) => {
+        const hist = candleEvalHistoryMap.get(x.t.market);
+        const evalAgeSec = hist ? Math.round((Date.now() - hist.lastEvaluatedAtMs) / 1000) : null;
+        const selectedReason = selectedReasonByMarket.get(x.t.market) ?? null;
+        const inCandleTargets = candleTargetSet.has(x.t.market);
+        return {
+          rank: idx + 1,
+          market: x.t.market,
+          momentum_score: Number(x.momentum.toFixed(2)),
+          price_comp: Number(x.priceComp.toFixed(4)),
+          vol_comp: Number(x.volD.toFixed(0)),
+          rank_delta: x.rankDelta,
+          last_candle_eval_age_sec: evalAgeSec,
+          selected_reason: selectedReason,
+          in_candle_targets: inCandleTargets,
+          cut_from_candle_targets: !inCandleTargets,
+        };
       });
-      const candleTargets = marketsRanked.slice(0, dynamicCandleTarget);
-      const candleTargetSet = new Set(candleTargets.map((t) => t.market));
-      const momentumAuditTop = momSel.scoredCandidates.slice(0, 15).map((x, idx) => ({
-        rank: idx + 1,
-        market: x.t.market,
-        momentum_score: Number(x.momentum.toFixed(2)),
-        price_comp: Number(x.priceComp.toFixed(4)),
-        vol_comp: Number(x.volD.toFixed(0)),
-        rank_delta: x.rankDelta,
-        in_candle_targets: candleTargetSet.has(x.t.market),
-        cut_from_candle_targets: !candleTargetSet.has(x.t.market),
-      }));
 
       console.info(
         JSON.stringify({
@@ -850,6 +1047,7 @@ export function createPumpScanner(
           dynamic_candle_target: dynamicCandleTarget,
           candle_target_max: CANDLE_MAX_MARKETS_PER_TICK,
           candle_targets: candleTargets.map((t) => t.market),
+          candle_target_reasons: selectedCandleTargets.map((st) => ({ market: st.ticker.market, reason: st.reason })),
           top_momentum_audit: momentumAuditTop,
         }),
       );
@@ -862,7 +1060,7 @@ export function createPumpScanner(
         for (const t of batch) {
           if (Date.now() - tickT0 > TICK_BUDGET_SECONDS * 1000) {
             console.warn(JSON.stringify({ tag: "PUMP_SCANNER_TICK_BUDGET_EXCEEDED", market: t.market, elapsed_ms: Date.now() - tickT0 }));
-            skippedDueToBudget += (marketsRanked.length - rawDetected.length);
+            skippedDueToBudget += (candleTargets.length - rawDetected.length);
             releaseReason = "budget_exceeded";
             tickAbort.abort();
             break;
@@ -947,6 +1145,18 @@ export function createPumpScanner(
               fState = undefined;
             }
           }
+
+          // 캔들 평가 완료 후 history 갱신
+          const prevHist = candleEvalHistoryMap.get(t.market);
+          candleEvalHistoryMap.set(t.market, {
+            lastEvaluatedAtMs: now,
+            lastStatus: s.status,
+            lastScore: s.score,
+            lastExcludeReasons: s.exclude_reasons,
+            lastMomentumScore: momentumScoreByMarket.get(t.market) ?? 0,
+            lastPrice: t.trade_price,
+            consecutiveFatalLowCount: s.status === "제외" ? ((prevHist?.consecutiveFatalLowCount ?? 0) + 1) : 0,
+          });
 
           const row: ScannerRow = {
             rank: 0,
@@ -1102,7 +1312,7 @@ export function createPumpScanner(
             ticker_batch_delay_ms: PUMP_TICKER_BATCH_DELAY_MS,
             momentum_considered: momSel.totalConsidered,
             momentum_top_m: MOMENTUM_TOP_M,
-            markets_to_score: marketsToScore.length,
+            markets_to_score: momSel.momentumTop.length + heldTickers.length,
             candle_targets_count: candleTargets.length,
             candle_timeouts: candleTimeouts,
             skipped_due_to_budget: skippedDueToBudget,
@@ -1205,6 +1415,10 @@ export function createPumpScanner(
       }
 
       updatePending(priceBy);
+
+      // Stale candle eval history prune (10분 이상 지난 항목 매 tick 무조건 정리하여 map 무한 증가 원천 방지)
+      pruneCandleEvalHistory(candleEvalHistoryMap, Date.now(), 600_000);
+
       try {
         await persist();
       } catch {

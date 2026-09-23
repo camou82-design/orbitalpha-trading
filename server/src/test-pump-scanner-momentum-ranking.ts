@@ -17,7 +17,7 @@
  * 실행: npx tsx server/src/test-pump-scanner-momentum-ranking.ts
  */
 
-import { selectMomentumTopM, scoreOne, type FakeoutState } from "./pump-scanner.js";
+import { selectMomentumTopM, selectCandleTargets, scoreOne, pruneCandleEvalHistory, type FakeoutState, type CandleEvalHistory } from "./pump-scanner.js";
 import type { UpbitTicker, UpbitCandle } from "./upbit-public.js";
 
 let passed = 0;
@@ -293,12 +293,636 @@ section("TC7: 기존 scoreOne / FATAL / 윗꼬리 / 429 회귀 불변 검증");
   assert(scoreRes?.status === "진입직전" || scoreRes?.status === "모니터링", `TC7: scoreOne 정상 상태 (${scoreRes?.status}, 점수: ${scoreRes?.score})`);
 }
 
+// ─── TC8: Anti-Starvation & Slot Rotation 검증 (B3 식은 종목 vs BLAST/BSV 도달) ──
+section("TC8: Anti-Starvation & Slot Rotation (식은 상위주 독점 방지 및 BLAST/BSV 캔들 도달)");
+{
+  const now = Date.now();
+  // 10개 종목 생성:
+  // Rank 1: KRW-B3 (+38%, momentum 최고)
+  // Rank 2: KRW-CPOOL (+33%)
+  // Rank 3: KRW-SUPER (+14%)
+  // Rank 4: KRW-UP2 (+13%)
+  // Rank 5: KRW-SLX (+12%)
+  // Rank 6: KRW-QUID (+11.6%)
+  // Rank 7: KRW-BLAST (+11.6%)
+  // Rank 8: KRW-BSV (+8.68%)
+  // Rank 9: KRW-SENT (+8.36%)
+  // Rank 10: KRW-PENGU (+8.15%)
+  const tickers: UpbitTicker[] = [
+    makeTicker({ market: "KRW-B3", signed_change_rate: 0.3886, trade_price: 2500, acc_trade_price_24h: 30_000_000_000 }),
+    makeTicker({ market: "KRW-CPOOL", signed_change_rate: 0.3316, trade_price: 150, acc_trade_price_24h: 25_000_000_000 }),
+    makeTicker({ market: "KRW-SUPER", signed_change_rate: 0.1429, trade_price: 1000, acc_trade_price_24h: 10_000_000_000 }),
+    makeTicker({ market: "KRW-UP2", signed_change_rate: 0.1321, trade_price: 500, acc_trade_price_24h: 8_000_000_000 }),
+    makeTicker({ market: "KRW-SLX", signed_change_rate: 0.1196, trade_price: 300, acc_trade_price_24h: 7_000_000_000 }),
+    makeTicker({ market: "KRW-QUID", signed_change_rate: 0.1162, trade_price: 200, acc_trade_price_24h: 6_000_000_000 }),
+    makeTicker({ market: "KRW-BLAST", signed_change_rate: 0.1160, trade_price: 320, acc_trade_price_24h: 5_000_000_000 }),
+    makeTicker({ market: "KRW-BSV", signed_change_rate: 0.0868, trade_price: 85000, acc_trade_price_24h: 5_000_000_000 }),
+    makeTicker({ market: "KRW-SENT", signed_change_rate: 0.0836, trade_price: 40, acc_trade_price_24h: 4_000_000_000 }),
+    makeTicker({ market: "KRW-PENGU", signed_change_rate: 0.0815, trade_price: 10, acc_trade_price_24h: 3_000_000_000 }),
+  ];
+
+  const momRes = selectMomentumTopM(tickers, {
+    is429Excluded: () => false,
+    lookbackMin: 3,
+    topM: 10,
+    useVolumeWeight: true,
+    snapshot: new Map(),
+    prevRankByMarket: new Map(),
+  });
+
+  const candleEvalHistoryMap = new Map<string, CandleEvalHistory>();
+
+  // [Tick 1] 최초: 아무 평가 이력 없음, dynamicCandleTarget = 2
+  const targetsTick1 = selectCandleTargets({
+    heldTickers: [],
+    momentumScored: momRes.scoredCandidates,
+    dynamicCandleTarget: 2,
+    candleEvalHistoryMap,
+    nowMs: now,
+  });
+  assert(targetsTick1.length === 2, "TC8-Tick1: 2개 target 선택됨");
+  assert(targetsTick1[0].ticker.market === "KRW-B3", "TC8-Tick1: 1위 B3 선택 (CORE)");
+  assert(targetsTick1[1].ticker.market === "KRW-CPOOL", "TC8-Tick1: 2위 CPOOL 선택 (ROTATION)");
+
+  // Tick 1 캔들 평가 시뮬레이션: B3와 CPOOL 둘 다 식어서 status="제외" 처리됨
+  candleEvalHistoryMap.set("KRW-B3", {
+    lastEvaluatedAtMs: now,
+    lastStatus: "제외",
+    lastScore: 0,
+    lastMomentumScore: targetsTick1[0].momentumScore,
+    lastPrice: 2500,
+    consecutiveFatalLowCount: 1,
+  });
+  candleEvalHistoryMap.set("KRW-CPOOL", {
+    lastEvaluatedAtMs: now,
+    lastStatus: "제외",
+    lastScore: 28,
+    lastMomentumScore: targetsTick1[1].momentumScore,
+    lastPrice: 150,
+    consecutiveFatalLowCount: 1,
+  });
+
+  // [Tick 2] 30초 후: B3와 CPOOL은 제외 상태이고 신규 증거 없음 -> 쿨다운 적용
+  // dynamicCandleTarget = 2 에서 아직 한 번도 평가받지 않은 SUPER, UP2 또는 BLAST, BSV 등으로 순환!
+  const targetsTick2 = selectCandleTargets({
+    heldTickers: [],
+    momentumScored: momRes.scoredCandidates,
+    dynamicCandleTarget: 2,
+    candleEvalHistoryMap,
+    nowMs: now + 30_000,
+  });
+
+  assert(targetsTick2.length === 2, "TC8-Tick2: 2개 target 선택됨");
+  const t2Markets = targetsTick2.map((t) => t.ticker.market);
+  assert(!t2Markets.includes("KRW-B3"), "TC8-Tick2: 식은 B3는 쿨다운되어 Tick2 슬롯 독점 차단");
+  assert(!t2Markets.includes("KRW-CPOOL"), "TC8-Tick2: 식은 CPOOL도 Tick2 슬롯 독점 차단");
+  assert(targetsTick2[0].reason === "CORE" || targetsTick2[0].reason === "ROTATION", "TC8-Tick2: 다음 순위 un-scanned 종목이 선택됨");
+
+  // Tick 2 평가 기록
+  for (const t of targetsTick2) {
+    candleEvalHistoryMap.set(t.ticker.market, {
+      lastEvaluatedAtMs: now + 30_000,
+      lastStatus: "제외",
+      lastScore: 0,
+      lastMomentumScore: t.momentumScore,
+      lastPrice: t.ticker.trade_price,
+      consecutiveFatalLowCount: 1,
+    });
+  }
+
+  // [Tick 3] 60초 후: dynamicCandleTarget = 5 환경에서 순환 시 BLAST와 BSV가 반드시 포함됨!
+  const targetsTick3 = selectCandleTargets({
+    heldTickers: [],
+    momentumScored: momRes.scoredCandidates,
+    dynamicCandleTarget: 5,
+    candleEvalHistoryMap,
+    nowMs: now + 60_000,
+  });
+
+  const t3Markets = targetsTick3.map((t) => t.ticker.market);
+  assert(t3Markets.includes("KRW-BLAST"), "TC8-Tick3: rank 7인 KRW-BLAST가 candleTargets에 진입 성공 (Starvation 해결)");
+  assert(t3Markets.includes("KRW-BSV"), "TC8-Tick3: rank 8인 KRW-BSV가 candleTargets에 진입 성공 (Starvation 해결)");
+}
+
+// ─── TC9: Tradable / Monitoring 후보 연속 추적(ACTIVE_TRACKING) 검증 ───
+section("TC9: Tradable / Monitoring 후보 연속 추적 (ACTIVE_TRACKING)");
+{
+  const now = Date.now();
+  const tickers: UpbitTicker[] = [
+    makeTicker({ market: "KRW-B3", signed_change_rate: 0.35 }),
+    makeTicker({ market: "KRW-SOPH", signed_change_rate: 0.05 }), // 모멘텀 순위는 2위지만 현재 진입직전
+  ];
+
+  const momRes = selectMomentumTopM(tickers, {
+    is429Excluded: () => false,
+    lookbackMin: 3,
+    topM: 2,
+    useVolumeWeight: true,
+    snapshot: new Map(),
+    prevRankByMarket: new Map(),
+  });
+
+  const candleEvalHistoryMap = new Map<string, CandleEvalHistory>([
+    ["KRW-SOPH", {
+      lastEvaluatedAtMs: now - 30_000,
+      lastStatus: "진입직전",
+      lastScore: 75.0,
+      lastMomentumScore: 20.0,
+      lastPrice: 1000,
+      consecutiveFatalLowCount: 0,
+    }],
+  ]);
+
+  const targets = selectCandleTargets({
+    heldTickers: [],
+    momentumScored: momRes.scoredCandidates,
+    dynamicCandleTarget: 2,
+    candleEvalHistoryMap,
+    nowMs: now,
+  });
+
+  const sophTarget = targets.find((t) => t.ticker.market === "KRW-SOPH");
+  assert(sophTarget !== undefined, "TC9: 진입직전 종목 KRW-SOPH는 candleTargets에 포함");
+  assert(sophTarget?.reason === "ACTIVE_TRACKING", "TC9: KRW-SOPH 선택 이유는 ACTIVE_TRACKING");
+}
+
+// ─── TC10: HELD 보유 종목 최우선 보호 검증 ─────────────────────────────
+section("TC10: HELD 보유 종목 최우선 슬롯 배정 검증");
+{
+  const now = Date.now();
+  const heldTickers = [makeTicker({ market: "KRW-HELD1", signed_change_rate: -0.02 })];
+  const tickers = [
+    makeTicker({ market: "KRW-HELD1", signed_change_rate: -0.02 }),
+    makeTicker({ market: "KRW-SURGE1", signed_change_rate: 0.20 }),
+    makeTicker({ market: "KRW-SURGE2", signed_change_rate: 0.15 }),
+  ];
+
+  const momRes = selectMomentumTopM(tickers, {
+    is429Excluded: () => false,
+    lookbackMin: 3,
+    topM: 3,
+    useVolumeWeight: true,
+    snapshot: new Map(),
+    prevRankByMarket: new Map(),
+  });
+
+  const targets = selectCandleTargets({
+    heldTickers,
+    momentumScored: momRes.scoredCandidates,
+    dynamicCandleTarget: 2,
+    candleEvalHistoryMap: new Map(),
+    nowMs: now,
+  });
+
+  assert(targets[0].ticker.market === "KRW-HELD1", "TC10: 1위 슬롯은 보유 종목 KRW-HELD1");
+  assert(targets[0].reason === "HELD", "TC10: 선택 이유는 HELD");
+  assert(targets.length === 2, "TC10: dynamicCandleTarget(2) 한도 준수");
+}
+
+// ─── TC11: CANDLE_MAX_MARKETS_PER_TICK (5개) 초과 금지 검증 ───────────
+section("TC11: 최대 슬롯 수(CANDLE_MAX_MARKETS_PER_TICK = 5) 엄격 제한");
+{
+  const now = Date.now();
+  const tickers: UpbitTicker[] = [];
+  for (let i = 1; i <= 20; i++) {
+    tickers.push(makeTicker({ market: `KRW-ALT${i}`, signed_change_rate: 0.01 * i }));
+  }
+
+  const momRes = selectMomentumTopM(tickers, {
+    is429Excluded: () => false,
+    lookbackMin: 3,
+    topM: 20,
+    useVolumeWeight: true,
+    snapshot: new Map(),
+    prevRankByMarket: new Map(),
+  });
+
+  // dynamicCandleTarget을 10으로 요청해도 시스템 최대값 5개로 클램핑되어야 함
+  const targets = selectCandleTargets({
+    heldTickers: [],
+    momentumScored: momRes.scoredCandidates,
+    dynamicCandleTarget: 10,
+    candleEvalHistoryMap: new Map(),
+    nowMs: now,
+  });
+
+  assert(targets.length <= 5, `TC11: 선택된 캔들 타겟 수(${targets.length}) <= 5 (절대 초과 금지)`);
+}
+
+// ─── TC12: 신규 거래대금 유입 시 쿨다운 즉시 해제 (FRESH_SURGE) ────────
+section("TC12: 신규 거래대금 유입 시 쿨다운 즉시 해제 및 FRESH_SURGE 배정");
+{
+  const now = Date.now();
+  // KRW-B3는 직전에 제외되었지만, 이번 tick에 거래대금 100억 증가 (volD > 0)
+  const snap = new Map<string, { ts: number; trade_price: number; acc24: number }>([
+    ["KRW-B3", { ts: now - 60_000, trade_price: 2500, acc24: 20_000_000_000 }],
+  ]);
+
+  const tickers = [
+    makeTicker({ market: "KRW-B3", signed_change_rate: 0.3886, trade_price: 2500, acc_trade_price_24h: 30_000_000_000 }), // +100억
+    makeTicker({ market: "KRW-OTHER", signed_change_rate: 0.10, trade_price: 1000, acc_trade_price_24h: 1_000_000_000 }),
+  ];
+
+  const momRes = selectMomentumTopM(tickers, {
+    is429Excluded: () => false,
+    lookbackMin: 3,
+    topM: 2,
+    useVolumeWeight: true,
+    snapshot: snap,
+    prevRankByMarket: new Map(),
+  });
+
+  const candleEvalHistoryMap = new Map<string, CandleEvalHistory>([
+    ["KRW-B3", {
+      lastEvaluatedAtMs: now - 10_000, // 10초 전 제외
+      lastStatus: "제외",
+      lastScore: 0,
+      lastMomentumScore: 35.0,
+      lastPrice: 2500,
+      consecutiveFatalLowCount: 1,
+    }],
+  ]);
+
+  const targets = selectCandleTargets({
+    heldTickers: [],
+    momentumScored: momRes.scoredCandidates,
+    dynamicCandleTarget: 2,
+    candleEvalHistoryMap,
+    nowMs: now,
+  });
+
+  const b3Target = targets.find((t) => t.ticker.market === "KRW-B3");
+  assert(b3Target !== undefined, "TC12: 거래대금 급증한 B3는 쿨다운 해제되어 candleTargets에 재선정");
+  assert(b3Target?.reason === "CORE" || b3Target?.reason === "FRESH_SURGE", `TC12: B3 선택 이유: ${b3Target?.reason}`);
+}
+
+// ─── TC13: ROTATION/CORE/FRESH 대상 범위 MOMENTUM_TOP_M (40개) 정합성 검증 ─
+section("TC13: ROTATION/CORE/FRESH 대상 범위 MOMENTUM_TOP_M (40개) 정합성 검증");
+{
+  const now = Date.now();
+  const tickers: UpbitTicker[] = [];
+  // 100개 종목 생성: Rank 1 ~ 100
+  for (let i = 1; i <= 100; i++) {
+    tickers.push(
+      makeTicker({
+        market: `KRW-TOKEN${i}`,
+        signed_change_rate: 0.001 * (101 - i), // TOKEN1이 1위, TOKEN100이 100위
+        trade_price: 1000,
+        acc_trade_price_24h: 1_000_000_000 + (101 - i) * 10_000_000,
+      }),
+    );
+  }
+
+  const momRes = selectMomentumTopM(tickers, {
+    is429Excluded: () => false,
+    lookbackMin: 3,
+    topM: 40,
+    useVolumeWeight: true,
+    snapshot: new Map(),
+    prevRankByMarket: new Map(),
+  });
+
+  // HELD 종목: Rank 50인 TOKEN50을 보유 중으로 설정
+  const heldTicker50 = tickers.find((t) => t.market === "KRW-TOKEN50")!;
+
+  const targets = selectCandleTargets({
+    heldTickers: [heldTicker50],
+    momentumScored: momRes.scoredCandidates,
+    dynamicCandleTarget: 5,
+    candleEvalHistoryMap: new Map(),
+    nowMs: now,
+    topM: 40,
+  });
+
+  const targetMarkets = targets.map((t) => t.ticker.market);
+  assert(targetMarkets.includes("KRW-TOKEN50"), "TC13: HELD 종목은 rank 50이어도 정상 선정됨 (HELD 우선)");
+  
+  // 비보유 선정 종목들은 모두 rank 1~40 이내여야 함
+  const nonHeldTargets = targets.filter((t) => t.reason !== "HELD");
+  for (const nht of nonHeldTargets) {
+    const rankNum = parseInt(nht.ticker.market.replace("KRW-TOKEN", ""), 10);
+    assert(rankNum <= 40, `TC13: 비보유 종목 ${nht.ticker.market}은 rank 1~40 이내 (${rankNum})`);
+  }
+}
+
+// ─── TC14: Cooling-down fresh evidence (단기 가격 반등 vs 음수/미변동) 검증 ──
+section("TC14: Cooling-down fresh evidence (단기 가격 반등 vs 음수/미변동) 검증");
+{
+  const now = Date.now();
+
+  // CASE 1: 단기 가격 반등 (+0.5% 상승: 1000 -> 1005)
+  const bounceTicker = makeTicker({ market: "KRW-BOUNCE", signed_change_rate: 0.10, trade_price: 1005 });
+  const otherTicker = makeTicker({ market: "KRW-OTHER", signed_change_rate: 0.05, trade_price: 500 });
+  const momBounce = selectMomentumTopM([bounceTicker, otherTicker], {
+    is429Excluded: () => false,
+    lookbackMin: 3,
+    topM: 2,
+    useVolumeWeight: true,
+    snapshot: new Map(),
+    prevRankByMarket: new Map(),
+  });
+
+  const histBounce = new Map<string, CandleEvalHistory>([
+    ["KRW-BOUNCE", {
+      lastEvaluatedAtMs: now - 30_000,
+      lastStatus: "제외",
+      lastScore: 0,
+      lastMomentumScore: 30.0,
+      lastPrice: 1000, // 직전 평가 가격: 1000 -> 현재 1005 (+0.5%)
+      consecutiveFatalLowCount: 1,
+    }],
+  ]);
+
+  const targetsBounce = selectCandleTargets({
+    heldTickers: [],
+    momentumScored: momBounce.scoredCandidates,
+    dynamicCandleTarget: 2,
+    candleEvalHistoryMap: histBounce,
+    nowMs: now,
+  });
+  const bounceSelected = targetsBounce.find((t) => t.ticker.market === "KRW-BOUNCE");
+  assert(bounceSelected !== undefined, "TC14: 단기 가격 반등한 KRW-BOUNCE는 쿨다운 해제되어 candleTargets 선정");
+
+  // CASE 2: 단기 가격 하락 (1000 -> 995) 또는 제자리 -> 쿨다운 유지되어야 함
+  const dropTicker = makeTicker({ market: "KRW-DROP", signed_change_rate: 0.10, trade_price: 995 });
+  const momDrop = selectMomentumTopM([dropTicker, otherTicker], {
+    is429Excluded: () => false,
+    lookbackMin: 3,
+    topM: 2,
+    useVolumeWeight: true,
+    snapshot: new Map(),
+    prevRankByMarket: new Map(),
+  });
+
+  const histDrop = new Map<string, CandleEvalHistory>([
+    ["KRW-DROP", {
+      lastEvaluatedAtMs: now - 30_000,
+      lastStatus: "제외",
+      lastScore: 0,
+      lastMomentumScore: 30.0,
+      lastPrice: 1000, // 직전 평가 가격: 1000 -> 현재 995 (-0.5%)
+      consecutiveFatalLowCount: 1,
+    }],
+  ]);
+
+  const targetsDrop = selectCandleTargets({
+    heldTickers: [],
+    momentumScored: momDrop.scoredCandidates,
+    dynamicCandleTarget: 1,
+    candleEvalHistoryMap: histDrop,
+    nowMs: now,
+  });
+  const dropSelected = targetsDrop.find((t) => t.ticker.market === "KRW-DROP");
+  assert(dropSelected === undefined, "TC14: 단기 가격 하락한 KRW-DROP은 쿨다운 유지 (슬롯 양보)");
+}
+
+// ─── TC15: ACTIVE_TRACKING exploration 슬롯 독점 방지 검증 ─────────────
+section("TC15: ACTIVE_TRACKING exploration 슬롯 독점 방지 및 탐색 보장");
+{
+  const now = Date.now();
+  // 3개 후보:
+  // 1위 TRK1 (모니터링 상태)
+  // 2위 TRK2 (진입직전 상태)
+  // 3위 FRESH_NEW (새로 등장한 신규 상승 후보)
+  const tickers: UpbitTicker[] = [
+    makeTicker({ market: "KRW-TRK1", signed_change_rate: 0.20 }),
+    makeTicker({ market: "KRW-TRK2", signed_change_rate: 0.18 }),
+    makeTicker({ market: "KRW-FRESH_NEW", signed_change_rate: 0.15 }),
+  ];
+
+  const momRes = selectMomentumTopM(tickers, {
+    is429Excluded: () => false,
+    lookbackMin: 3,
+    topM: 3,
+    useVolumeWeight: true,
+    snapshot: new Map(),
+    prevRankByMarket: new Map(),
+  });
+
+  const histMap = new Map<string, CandleEvalHistory>([
+    ["KRW-TRK1", {
+      lastEvaluatedAtMs: now - 20_000,
+      lastStatus: "모니터링",
+      lastScore: 60.0,
+      lastMomentumScore: 20.0,
+      lastPrice: 1000,
+      consecutiveFatalLowCount: 0,
+    }],
+    ["KRW-TRK2", {
+      lastEvaluatedAtMs: now - 20_000,
+      lastStatus: "진입직전",
+      lastScore: 78.0,
+      lastMomentumScore: 18.0,
+      lastPrice: 500,
+      consecutiveFatalLowCount: 0,
+    }],
+  ]);
+
+  // dynamicCandleTarget = 2 에서 ACTIVE_TRACKING이 2개 있어도,
+  // 1개 슬롯만 ACTIVE_TRACKING에 할당되고 나머지 1개 슬롯은 신규 FRESH_NEW 탐색에 보장되어야 함!
+  const targets = selectCandleTargets({
+    heldTickers: [],
+    momentumScored: momRes.scoredCandidates,
+    dynamicCandleTarget: 2,
+    candleEvalHistoryMap: histMap,
+    nowMs: now,
+  });
+
+  assert(targets.length === 2, "TC15: 2개 candleTargets 선택");
+  const targetMarkets = targets.map((t) => t.ticker.market);
+  assert(targetMarkets.includes("KRW-FRESH_NEW"), "TC15: 신규 후보 KRW-FRESH_NEW가 최소 1개 탐색 슬롯을 배정받음 (독점 차단)");
+  const activeCount = targets.filter((t) => t.reason === "ACTIVE_TRACKING").length;
+  assert(activeCount === 1, `TC15: ACTIVE_TRACKING 슬롯은 최대 1개로 제한되어 2개 슬롯 전부를 독점하지 않음 (실제: ${activeCount})`);
+}
+
+// ─── TC16: ACTIVE_TRACKING 후보 간 starvation 방지 및 공정 순환 검증 ──────
+section("TC16: ACTIVE_TRACKING 후보 간 starvation 방지 및 공정 순환 검증");
+{
+  const baseTime = Date.now();
+  // 3개의 ACTIVE_TRACKING 후보 (A, B, C) 및 1개의 신규 exploration 후보 (EXP)
+  // A는 momentum 1위, B는 2위, C는 3위, EXP는 4위
+  const tickers = [
+    makeTicker({ market: "KRW-A", signed_change_rate: 0.30, trade_price: 1000 }),
+    makeTicker({ market: "KRW-B", signed_change_rate: 0.25, trade_price: 2000 }),
+    makeTicker({ market: "KRW-C", signed_change_rate: 0.20, trade_price: 3000 }),
+    makeTicker({ market: "KRW-EXP", signed_change_rate: 0.15, trade_price: 4000 }),
+  ];
+
+  const momRes = selectMomentumTopM(tickers, {
+    is429Excluded: () => false,
+    lookbackMin: 3,
+    topM: 4,
+    useVolumeWeight: true,
+    snapshot: new Map(),
+    prevRankByMarket: new Map(),
+  });
+
+  // 초기 상태: A는 30초 전, B는 20초 전, C는 10초 전 평가됨 (모두 "진입직전" 또는 "모니터링")
+  const historyMap = new Map<string, CandleEvalHistory>([
+    ["KRW-A", {
+      lastEvaluatedAtMs: baseTime - 30_000,
+      lastStatus: "진입직전",
+      lastScore: 75.0,
+      lastMomentumScore: 30.0,
+      lastPrice: 1000,
+      consecutiveFatalLowCount: 0,
+    }],
+    ["KRW-B", {
+      lastEvaluatedAtMs: baseTime - 20_000,
+      lastStatus: "모니터링",
+      lastScore: 65.0,
+      lastMomentumScore: 25.0,
+      lastPrice: 2000,
+      consecutiveFatalLowCount: 0,
+    }],
+    ["KRW-C", {
+      lastEvaluatedAtMs: baseTime - 10_000,
+      lastStatus: "진입직전",
+      lastScore: 80.0,
+      lastMomentumScore: 20.0,
+      lastPrice: 3000,
+      consecutiveFatalLowCount: 0,
+    }],
+  ]);
+
+  const activeSelectedOrder: string[] = [];
+
+  // 4번의 연속 tick 시뮬레이션 (각 tick마다 1초 경과 및 선택된 ACTIVE 후보의 평가 완료 시뮬레이션)
+  for (let tick = 0; tick < 4; tick++) {
+    const currentTickTime = baseTime + tick * 1000;
+
+    const targets = selectCandleTargets({
+      heldTickers: [],
+      momentumScored: momRes.scoredCandidates,
+      dynamicCandleTarget: 2,
+      candleEvalHistoryMap: historyMap,
+      nowMs: currentTickTime,
+      topM: 4,
+    });
+
+    assert(targets.length === 2, `TC16 [Tick ${tick + 1}]: 슬롯 2개 배정`);
+    const activeTargets = targets.filter((t) => t.reason === "ACTIVE_TRACKING");
+    const explorationTargets = targets.filter((t) => t.reason !== "ACTIVE_TRACKING");
+
+    assert(activeTargets.length === 1, `TC16 [Tick ${tick + 1}]: ACTIVE_TRACKING 슬롯은 정확히 1개`);
+    assert(explorationTargets.length === 1, `TC16 [Tick ${tick + 1}]: 탐색 슬롯 최소 1개 보장 (KRW-EXP 선정)`);
+    assert(explorationTargets[0]!.ticker.market === "KRW-EXP", `TC16 [Tick ${tick + 1}]: 탐색 슬롯은 신규 후보 KRW-EXP`);
+
+    const selectedActive = activeTargets[0]!.ticker.market;
+    activeSelectedOrder.push(selectedActive);
+
+    // 캔들 평가 완료 시뮬레이션: 선택된 ACTIVE 종목의 lastEvaluatedAtMs를 현재 tick 시간으로 갱신
+    const hist = historyMap.get(selectedActive)!;
+    hist.lastEvaluatedAtMs = currentTickTime;
+  }
+
+  // 검증: A -> B -> C -> A 순환 확인
+  assert(activeSelectedOrder[0] === "KRW-A", `TC16: Tick 1에서 가장 오래 평가 안 된 KRW-A 선정 (실제: ${activeSelectedOrder[0]})`);
+  assert(activeSelectedOrder[1] === "KRW-B", `TC16: Tick 2에서 가장 오래 평가 안 된 KRW-B 선정 (실제: ${activeSelectedOrder[1]})`);
+  assert(activeSelectedOrder[2] === "KRW-C", `TC16: Tick 3에서 가장 오래 평가 안 된 KRW-C 선정 (실제: ${activeSelectedOrder[2]})`);
+  assert(activeSelectedOrder[3] === "KRW-A", `TC16: Tick 4에서 다시 가장 오래 평가 안 된 KRW-A 순환 선정 (실제: ${activeSelectedOrder[3]})`);
+
+  // A가 전체를 독점하지 않고 A, B, C가 모두 평가 기회를 얻었는지 최종 확인
+  const uniqueSelected = new Set(activeSelectedOrder);
+  assert(uniqueSelected.size === 3, "TC16: A, B, C 3개 후보가 모두 평가 기회를 획득함 (독점 없음)");
+}
+
+// ─── TC17: CandleEvalHistory 런타임 필드 갱신 및 10분 Stale Pruning 검증 ─
+section("TC17: CandleEvalHistory 런타임 필드 갱신 및 10분 Stale Pruning 검증");
+{
+  const now = Date.now();
+  const historyMap = new Map<string, CandleEvalHistory>();
+
+  // 1) 런타임 갱신 6개 필수 필드 검증 시뮬레이션
+  const ticker = makeTicker({ market: "KRW-TEST", trade_price: 1500 });
+  const fakeCandles1m: UpbitCandle[] = Array.from({ length: 25 }, (_, i) => ({
+    market: "KRW-TEST",
+    candle_date_time_utc: new Date(now - (25 - i) * 60_000).toISOString(),
+    candle_date_time_kst: new Date(now - (25 - i) * 60_000).toISOString(),
+    opening_price: 1400,
+    high_price: 1510,
+    low_price: 1390,
+    trade_price: 1500,
+    timestamp: now - (25 - i) * 60_000,
+    candle_acc_trade_price: 100_000_000,
+    candle_acc_trade_volume: 70_000,
+    unit: 1,
+  }));
+  const fakeCandles5m = fakeCandles1m;
+
+  const scoreRes = scoreOne(fakeCandles1m, fakeCandles5m, ticker, 0);
+  assert(scoreRes !== null, "TC17: scoreOne 평가 성공");
+
+  if (scoreRes) {
+    // 런타임 기록
+    const prevHist = historyMap.get(ticker.market);
+    historyMap.set(ticker.market, {
+      lastEvaluatedAtMs: now,
+      lastStatus: scoreRes.status,
+      lastScore: scoreRes.score,
+      lastExcludeReasons: scoreRes.exclude_reasons,
+      lastMomentumScore: 42.5,
+      lastPrice: ticker.trade_price,
+      consecutiveFatalLowCount: scoreRes.status === "제외" ? ((prevHist?.consecutiveFatalLowCount ?? 0) + 1) : 0,
+    });
+
+    const recorded = historyMap.get("KRW-TEST")!;
+    assert(recorded.lastEvaluatedAtMs === now, "TC17: lastEvaluatedAtMs 정상 기록");
+    assert(recorded.lastStatus === scoreRes.status, "TC17: lastStatus 정상 기록");
+    assert(recorded.lastScore === scoreRes.score, "TC17: lastScore 정상 기록");
+    assert(recorded.lastMomentumScore === 42.5, "TC17: lastMomentumScore 정상 기록");
+    assert(recorded.lastPrice === 1500, "TC17: lastPrice 정상 기록");
+    assert(recorded.lastExcludeReasons === scoreRes.exclude_reasons, "TC17: lastExcludeReasons 정상 기록");
+  }
+
+  // 2) 10분 Stale Pruning 검증 (Map 무한 증가 방지)
+  // 3개 entry 생성: 15분 전(stale), 11분 전(stale), 5분 전(fresh)
+  historyMap.set("KRW-OLD15M", {
+    lastEvaluatedAtMs: now - 15 * 60_000,
+    lastStatus: "모니터링",
+    lastScore: 60,
+    lastMomentumScore: 20,
+    lastPrice: 100,
+    consecutiveFatalLowCount: 0,
+  });
+  historyMap.set("KRW-OLD11M", {
+    lastEvaluatedAtMs: now - 11 * 60_000,
+    lastStatus: "진입직전",
+    lastScore: 75,
+    lastMomentumScore: 30,
+    lastPrice: 200,
+    consecutiveFatalLowCount: 0,
+  });
+  historyMap.set("KRW-FRESH5M", {
+    lastEvaluatedAtMs: now - 5 * 60_000,
+    lastStatus: "모니터링",
+    lastScore: 68,
+    lastMomentumScore: 25,
+    lastPrice: 300,
+    consecutiveFatalLowCount: 0,
+  });
+
+  assert(historyMap.size === 4, "TC17: 정리 전 historyMap 크기 4");
+
+  const deletedCount = pruneCandleEvalHistory(historyMap, now, 600_000);
+
+  assert(deletedCount === 2, `TC17: 10분 이상 지난 2개 항목 정리됨 (실제 삭제: ${deletedCount})`);
+  assert(historyMap.size === 2, `TC17: 정리 후 10분 이내 2개 항목만 유지됨 (실제 크기: ${historyMap.size})`);
+  assert(!historyMap.has("KRW-OLD15M"), "TC17: 15분 전 항목 삭제됨");
+  assert(!historyMap.has("KRW-OLD11M"), "TC17: 11분 전 항목 삭제됨");
+  assert(historyMap.has("KRW-FRESH5M"), "TC17: 5분 전 항목 보존됨");
+  assert(historyMap.has("KRW-TEST"), "TC17: 방금 평가된 항목 보존됨");
+}
+
 // ─── 요약 ─────────────────────────────────────────────────────────────
 console.log(`\n============================`);
 console.log(`결과: ${passed} 통과 / ${passed + failed} 전체`);
 if (failed === 0) {
-  console.log("PASS: 모든 momentum ranking 회귀 테스트 성공");
+  console.log("PASS: 모든 momentum ranking 및 anti-starvation 회귀 테스트 성공");
 } else {
   console.error("FAIL: 테스트 실패 발생");
   process.exit(1);
 }
+
+
+
