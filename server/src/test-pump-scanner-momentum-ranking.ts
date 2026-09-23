@@ -274,18 +274,26 @@ section("TC7: 기존 scoreOne / FATAL / 윗꼬리 / 429 회귀 불변 검증");
     low_price: 995,
     trade_price: 1005,
     candle_acc_trade_volume: 100,
-    candle_date_time_kst: new Date().toISOString(),
+    candle_date_time_kst: new Date(Date.now() - 120_000).toISOString(),
   };
-  const prev20: UpbitCandle[] = Array.from({ length: 21 }, () => ({ ...dummyCandle }));
-  const lastCandle: UpbitCandle = {
+  const prev20: UpbitCandle[] = Array.from({ length: 20 }, () => ({ ...dummyCandle }));
+  const completedCandle: UpbitCandle = {
     opening_price: 1000,
     high_price: 1030,
     low_price: 1000,
     trade_price: 1025,
     candle_acc_trade_volume: 500,
-    candle_date_time_kst: new Date().toISOString(),
+    candle_date_time_kst: new Date(Date.now() - 60_000).toISOString(),
   };
-  const candles = [...prev20, lastCandle];
+  const lastCandle: UpbitCandle = {
+    opening_price: 1000,
+    high_price: 1030,
+    low_price: 1000,
+    trade_price: 1025,
+    candle_acc_trade_volume: 125, // 15초치 (500 * 15/60)
+    candle_date_time_kst: new Date(Date.now() - 15_000).toISOString(),
+  };
+  const candles = [...prev20, completedCandle, lastCandle];
   const ticker = makeTicker({ market: "KRW-TEST", trade_price: 1025, acc_trade_price_24h: 5_000_000_000 });
 
   const scoreRes = scoreOne(candles, [], ticker, 0);
@@ -914,11 +922,126 @@ section("TC17: CandleEvalHistory 런타임 필드 갱신 및 10분 Stale Pruning
   assert(historyMap.has("KRW-TEST"), "TC17: 방금 평가된 항목 보존됨");
 }
 
+// ─── TC18: 1분봉 시간 정합성 및 volumeMultiple 계산 검증 (Completed vs Projected Authority) ─
+section("TC18: 1분봉 시간 정합성 및 volumeMultiple 계산 검증 (Authority 분리)");
+{
+  const baseTime = Date.now();
+  const ticker = makeTicker({ market: "KRW-VOLTEST", trade_price: 1000, acc_trade_price_24h: 10_000_000_000 });
+
+  // 20개 기준 완성봉 (평균 거래대금: 100주 * 1000원 = 100,000원)
+  const prev20: UpbitCandle[] = Array.from({ length: 20 }, (_, i) => ({
+    opening_price: 1000,
+    high_price: 1005,
+    low_price: 995,
+    trade_price: 1000,
+    candle_acc_trade_volume: 100,
+    candle_date_time_kst: new Date(baseTime - (22 - i) * 60_000).toISOString(),
+  }));
+
+  // Helper to build candle list
+  function buildCandles(completedVolume: number, currentPartialVolume: number, elapsedSec: number, invalidTimestamp = false): UpbitCandle[] {
+    const lastCompleted: UpbitCandle = {
+      opening_price: 1000,
+      high_price: 1010,
+      low_price: 995,
+      trade_price: 1000,
+      candle_acc_trade_volume: completedVolume,
+      candle_date_time_kst: new Date(baseTime - 60_000).toISOString(),
+    };
+    const lastCurrent: UpbitCandle = {
+      opening_price: 1000,
+      high_price: 1010,
+      low_price: 995,
+      trade_price: 1000,
+      candle_acc_trade_volume: currentPartialVolume,
+      candle_date_time_kst: invalidTimestamp ? "INVALID_DATE" : new Date(baseTime - elapsedSec * 1000).toISOString(),
+    };
+    return [...prev20, lastCompleted, lastCurrent];
+  }
+
+  // A) Case A: elapsed=3초, partial raw 0.10, completed 1.20 (120주), projected 2.0 (10주 in 3s -> 200주/60s)
+  //   -> elapsed < 10초 구간: projected 미사용, effective = 1.20, source = completed_only_early
+  const cCaseA = buildCandles(120, 10, 3);
+  const resCaseA = scoreOne(cCaseA, [], ticker, 0, undefined, baseTime);
+  assert(resCaseA !== null, "TC18-A: Case A scoreOne 성공");
+  assert(resCaseA?.volume_ratio_effective === 1.20, `TC18-A: 3초 구간에서는 completedVolumeRatio(1.20) 채택 (실제: ${resCaseA?.volume_ratio_effective})`);
+  assert(resCaseA?.volume_ratio_source === "completed_only_early", "TC18-A: source는 completed_only_early");
+
+  // B) Case B: elapsed=15초, partial raw 0.40 (40주), completed 0.80 (80주), projected 1.60 (40주 in 15s -> 160주/60s)
+  //   -> elapsed >= 10초: projected authority 단독 적용, effective = 1.60, source = projected_current
+  const cCaseB = buildCandles(80, 40, 15);
+  const resCaseB = scoreOne(cCaseB, [], ticker, 0, undefined, baseTime);
+  assert(resCaseB !== null, "TC18-B: Case B scoreOne 성공");
+  assert(resCaseB?.volume_ratio_effective === 1.60, `TC18-B: 15초 구간에서 projected(1.60) 반영되어 effective 1.60 (실제: ${resCaseB?.volume_ratio_effective})`);
+  assert(resCaseB?.volume_ratio_source === "projected_current", "TC18-B: source는 projected_current");
+
+  // C) Case C: elapsed=30초, completed 1.40 (140주), projected 0.70 (35주 in 30s -> 70주/60s)
+  //   -> elapsed >= 10초: projected authority 단독 적용, effective = 0.70 (직전 completed 1.40에 가려지지 않음)
+  const cCaseC = buildCandles(140, 35, 30);
+  const resCaseC = scoreOne(cCaseC, [], ticker, 0, undefined, baseTime);
+  assert(resCaseC !== null, "TC18-C: Case C scoreOne 성공");
+  assert(resCaseC?.volume_ratio_effective === 0.70, `TC18-C: 30초 구간에서 projected(0.70) 단독 적용되어 effective 0.70 (실제: ${resCaseC?.volume_ratio_effective})`);
+  assert(resCaseC?.volume_ratio_source === "projected_current", "TC18-C: source는 projected_current");
+
+  // D) Case D: completed=5.0 (500주), projected=0.40 (20주 in 30s -> 40주/60s), elapsed=30초
+  //   -> 직전 완성봉이 5.0으로 아무리 강했어도 현재 거래량이 0.40으로 죽으면 VOLUME_FADE 정상 감지!
+  const cCaseD = buildCandles(500, 20, 30);
+  const fakeoutStateD: FakeoutState = {
+    peakVolumeMultiple: 2.0,
+    peakPrice: 1000,
+    detectedAtMs: baseTime - 60_000,
+    rejectedUntilMs: 0,
+  };
+  const resCaseD = scoreOne(cCaseD, [], ticker, 0, fakeoutStateD, baseTime);
+  assert(resCaseD !== null, "TC18-D: Case D scoreOne 성공");
+  assert(resCaseD?.volume_ratio_effective === 0.40, `TC18-D: 현재 volume fade가 effective(0.40)로 정상 반영됨 (실제: ${resCaseD?.volume_ratio_effective})`);
+  assert(resCaseD?.status === "제외", "TC18-D: volume fade 및 거래대금 부족으로 status='제외'");
+  assert(resCaseD?.freshFakeoutReasons.includes("VOLUME_FADE_REJECTED") === true, "TC18-D: 직전 completed 5.0에 가려지지 않고 VOLUME_FADE_REJECTED 정상 감지!");
+
+  // E) Case E: completed=0.50 (50주), projected=2.00 (100주 in 30s -> 200주/60s), elapsed=30초
+  //   -> 직전 완성봉이 0.50으로 약했더라도 현재 진행봉에서 거래량이 폭발하면 새 급등 정상 포착!
+  const cCaseE = buildCandles(50, 100, 30);
+  const resCaseE = scoreOne(cCaseE, [], ticker, 0, undefined, baseTime);
+  assert(resCaseE !== null, "TC18-E: Case E scoreOne 성공");
+  assert(resCaseE?.volume_ratio_effective === 2.00, `TC18-E: 새 급등 거래량(2.00)이 정상 포착되어 effective 2.00 (실제: ${resCaseE?.volume_ratio_effective})`);
+  assert(resCaseE?.volume_ratio_source === "projected_current", "TC18-E: source는 projected_current");
+
+  // F) Case F: timestamp는 정상 형식이지만 candleAge >= 60초인 Stale Candle (예: 75초 전)
+  //   -> projected authority 금지, 직전 completedVolumeRatio로 안전 fallback!
+  const cCaseF = buildCandles(150, 100, 75);
+  const resCaseF = scoreOne(cCaseF, [], ticker, 0, undefined, baseTime);
+  assert(resCaseF !== null, "TC18-F: Case F scoreOne 성공");
+  assert(resCaseF?.volume_ratio_effective === 1.50, `TC18-F: 60초 이상 지난 stale candle은 completedVolumeRatio(1.50)로 안전 fallback (실제: ${resCaseF?.volume_ratio_effective})`);
+  assert(resCaseF?.volume_ratio_source === "completed_fallback_invalid_or_stale", "TC18-F: source는 completed_fallback_invalid_or_stale");
+
+  // G) Case G: B3 / BLAST / BSV 실측 재현 검증
+  //   1) KRW-B3: completed=0.47, 34초 누적=20.4주 (projected 0.36) -> effective 0.36 < 0.95 (FATAL 제외)
+  const cB3 = buildCandles(47, 20.4, 34);
+  const resB3 = scoreOne(cB3, [], ticker, 0, undefined, baseTime);
+  assert(resB3 !== null, "TC18-G1: B3 재현 scoreOne 성공");
+  assert(resB3?.volume_ratio_effective === 0.36, `TC18-G1: B3 effective = 0.36`);
+  assert(resB3?.exclude_reasons?.includes("거래대금 부족") === true, "TC18-G1: B3 정상 거래대금 부족 FATAL 제외");
+
+  //   2) KRW-BLAST: completed=2.65, 34초 누적=98.6주 (projected 1.74) -> effective 1.74 >= 0.95 (통과!)
+  const cBlast = buildCandles(265, 98.6, 34);
+  const resBlast = scoreOne(cBlast, [], ticker, 0, undefined, baseTime);
+  assert(resBlast !== null, "TC18-G2: BLAST 재현 scoreOne 성공");
+  assert(resBlast?.volume_ratio_effective === 1.74, `TC18-G2: BLAST effective = 1.74 >= 0.95`);
+  assert(resBlast?.exclude_reasons?.includes("거래대금 부족") !== true, "TC18-G2: BLAST는 거래대금 부족 누명 탈출 (통과)");
+
+  //   3) KRW-BSV: completed=0.82, 34초 누적=51.6주 (projected 0.91) -> effective 0.91 < 0.95 (정상 제외)
+  const cBsv = buildCandles(82, 51.6, 34);
+  const resBsv = scoreOne(cBsv, [], ticker, 0, undefined, baseTime);
+  assert(resBsv !== null, "TC18-G3: BSV 재현 scoreOne 성공");
+  assert(resBsv?.volume_ratio_effective === 0.91, `TC18-G3: BSV effective = 0.91 < 0.95`);
+  assert(resBsv?.exclude_reasons?.includes("거래대금 부족") === true, "TC18-G3: BSV 정상 제외");
+}
+
 // ─── 요약 ─────────────────────────────────────────────────────────────
 console.log(`\n============================`);
 console.log(`결과: ${passed} 통과 / ${passed + failed} 전체`);
 if (failed === 0) {
-  console.log("PASS: 모든 momentum ranking 및 anti-starvation 회귀 테스트 성공");
+  console.log("PASS: 모든 momentum ranking 및 anti-starvation, volumeMultiple 시간 정합성 회귀 테스트 성공");
 } else {
   console.error("FAIL: 테스트 실패 발생");
   process.exit(1);

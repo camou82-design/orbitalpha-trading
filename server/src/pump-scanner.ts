@@ -19,6 +19,12 @@ type ScannerRow = {
   /** 제외 | 모니터링(약한 진입 직전) | 진입직전(강한 진입 직전·선진입 구간) */
   status: "진입직전" | "모니터링" | "제외";
   volume_multiple: number;
+  candle_age_sec?: number;
+  volume_ratio_raw_partial?: number;
+  volume_ratio_completed?: number;
+  volume_ratio_projected?: number;
+  volume_ratio_effective?: number;
+  volume_ratio_source?: "completed_only_early" | "projected_current" | "completed_fallback_invalid_or_stale";
   breakout: boolean;
   close_upper_hold: boolean;
   rise_3m_pct: number;
@@ -162,14 +168,93 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTicker, btcDropPenalty: number, fState?: FakeoutState) {
-  const last = c1[c1.length - 1];
-  if (!last) return null;
-  const prev20 = c1.slice(-21, -1);
+export interface ScannerScoreResult {
+  score: number;
+  status: ScannerRow["status"];
+  volumeMultiple: number;
+  breakout: boolean;
+  closeUpperHold: boolean;
+  rise3mPct: number;
+  earlyEntryEligible: boolean;
+  addEntryEligible: boolean;
+  boxTop: number;
+  boxTopBreakout: boolean;
+  price: number;
+  exclude_reasons?: string[];
+  freshFakeoutReasons: string[];
+  fakeoutCooldownActive: boolean;
+  candle_age_sec: number;
+  volume_ratio_raw_partial: number;
+  volume_ratio_completed: number;
+  volume_ratio_projected: number;
+  volume_ratio_effective: number;
+  volume_ratio_source: "completed_only_early" | "projected_current" | "completed_fallback_invalid_or_stale";
+}
+
+export function scoreOne(
+  c1: UpbitCandle[],
+  c5: UpbitCandle[] = [],
+  ticker: UpbitTicker,
+  btcDropPenalty: number = 0,
+  fState?: FakeoutState,
+  nowMs: number = Date.now(),
+): ScannerScoreResult | null {
+  if (c1.length < 22) return null;
+
+  const last = c1[c1.length - 1]!;
+  const lastCompleted = c1[c1.length - 2]!;
+  const prev20 = c1.slice(-22, -2);
   if (prev20.length < 20) return null;
-  const vNow = last.candle_acc_trade_volume * last.trade_price;
+
+  // 1. 기준 평균 거래대금: 직전 20개 완성봉(60초 완주)의 평균 거래대금
   const vAvg = avg(prev20.map((c) => c.candle_acc_trade_volume * c.trade_price));
-  const volumeMultiple = vAvg > 0 ? vNow / vAvg : 0;
+  const vCompleted = lastCompleted.candle_acc_trade_volume * lastCompleted.trade_price;
+  const completedVolumeRatio = vAvg > 0 ? vCompleted / vAvg : 0;
+
+  // 2. 현재 진행봉 거래대금 및 경과 시간 분석 (UpbitCandle의 candle_date_time_kst 기준)
+  const vNow = last.candle_acc_trade_volume * last.trade_price;
+  const rawPartialRatio = vAvg > 0 ? vNow / vAvg : 0;
+
+  let candleStartMs = NaN;
+  if (last.candle_date_time_kst) {
+    const s = last.candle_date_time_kst;
+    candleStartMs = s.endsWith("Z") || /[+-]\d{2}:\d{2}$/.test(s)
+      ? new Date(s).getTime()
+      : new Date(s + "+09:00").getTime();
+  }
+  const isValidTimestamp = Number.isFinite(candleStartMs) && !Number.isNaN(candleStartMs);
+  const candleAgeSec = isValidTimestamp ? Math.floor((nowMs - candleStartMs) / 1000) : -1;
+
+  let projectedVolumeRatio = 0;
+  let effectiveVolumeRatio = completedVolumeRatio;
+  let volumeRatioSource: "completed_only_early" | "projected_current" | "completed_fallback_invalid_or_stale" = "completed_fallback_invalid_or_stale";
+
+  // [시간 구간별 단일 Authority 분리 및 유효성 검증]:
+  // 1) candleAgeSec 10~59초 (실제 현재 minute에 속하는 유효 진행봉):
+  //    - 현재 실시간 모멘텀의 authority는 projectedVolumeRatio가 단독 담당 (직전 completed와 max를 취하지 않음)
+  //    - 직전 완성봉이 강했더라도 현재 30초 거래량이 식은 경우(volume fade) 정상 감지
+  if (isValidTimestamp && candleAgeSec >= 10 && candleAgeSec < 60) {
+    const effElapsedSec = Math.min(60, Math.max(10, candleAgeSec));
+    const projectedVolume = (vNow / effElapsedSec) * 60;
+    projectedVolumeRatio = vAvg > 0 ? projectedVolume / vAvg : 0;
+    effectiveVolumeRatio = projectedVolumeRatio;
+    volumeRatioSource = "projected_current";
+  } else if (isValidTimestamp && candleAgeSec >= 0 && candleAgeSec < 10) {
+    // 2) candleAgeSec 0~9초: 초반 표본 부족 및 순간 노이즈 방지를 위해 completedVolumeRatio 사용
+    const effElapsedSec = Math.max(1, candleAgeSec);
+    projectedVolumeRatio = vAvg > 0 ? ((vNow / effElapsedSec) * 60) / vAvg : 0;
+    effectiveVolumeRatio = completedVolumeRatio;
+    volumeRatioSource = "completed_only_early";
+  } else {
+    // 3) timestamp 비정상 또는 candleAgeSec >= 60 (stale candle) 또는 < 0:
+    //    - projected authority 금지, 직전 completedVolumeRatio로 안전 fallback
+    projectedVolumeRatio = rawPartialRatio;
+    effectiveVolumeRatio = completedVolumeRatio;
+    volumeRatioSource = "completed_fallback_invalid_or_stale";
+  }
+
+  // 최종 판정용 volumeMultiple 통일 (FATAL, Scoring, EarlyEntry, Fakeout 등 모든 경로가 동일 ratio 참조)
+  const volumeMultiple = effectiveVolumeRatio;
 
   const high20 = Math.max(...prev20.map((c) => c.high_price));
   const breakout = last.trade_price >= high20;
@@ -193,7 +278,7 @@ export function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTick
   if (liquidityBad) exclude_reasons.push("유동성 부족");
   if (upperWickRatio > 0.55) exclude_reasons.push("윗꼬리 과다");
   if (oneMinPump > 4.5) exclude_reasons.push("과열 (추격주의)");
-  // "거래대금 부족" = volumeMultiple < 0.95 (직전 20봉 대비 현재 봉 거래대금 비율 미달)
+  // "거래대금 부족" = volumeMultiple < 0.95 (동일 60초 기준 유효 거래대금 비율 미달)
   if (volumeMultiple < 0.95) exclude_reasons.push("거래대금 부족");
 
   // --- FAKEOUT PATTERN REJECTION ---
@@ -202,7 +287,7 @@ export function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTick
   const freshFakeoutReasons: string[] = [];
   let fakeoutCooldownActive = false;
   if (fState) {
-    const now = Date.now();
+    const now = nowMs;
     // 1) VOLUME_FADE: 50% drop from peak multiple
     if (volumeMultiple < fState.peakVolumeMultiple * 0.5) {
       freshFakeoutReasons.push("VOLUME_FADE_REJECTED");
@@ -244,7 +329,7 @@ export function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTick
   let score = clamp(scoreRaw, 0, 100);
 
   // --- ELIGIBILITY (Only for non-fatal) ---
-  const completedBeforeLast = c1.slice(-(PUMP_BOX_LOOKBACK_BARS + 1), -1);
+  const completedBeforeLast = c1.slice(-(PUMP_BOX_LOOKBACK_BARS + 2), -1);
   const boxTop = completedBeforeLast.length >= 5 ? Math.max(...completedBeforeLast.map((c) => c.high_price)) : high20;
   const boxTopBreakout = completedBeforeLast.length >= 5 && last.trade_price > boxTop;
   const initialRiseSignal = rise3mPct >= PUMP_EARLY_RISE_3M_MIN_PCT || (recent3.length >= 2 && recent3[recent3.length - 1]!.trade_price > recent3[0]!.trade_price * 1.0015);
@@ -263,10 +348,10 @@ export function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTick
   return {
     score: Number(score.toFixed(1)),
     status,
-    volumeMultiple,
+    volumeMultiple: Number(volumeMultiple.toFixed(2)),
     breakout,
     closeUpperHold,
-    rise3mPct,
+    rise3mPct: Number(rise3mPct.toFixed(2)),
     earlyEntryEligible,
     addEntryEligible,
     boxTop,
@@ -277,6 +362,12 @@ export function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTick
     freshFakeoutReasons,
     /** true = 이미 cooldown 타이머가 활성화 중 — 재연장 방지 플래그 */
     fakeoutCooldownActive,
+    candle_age_sec: Math.max(0, candleAgeSec),
+    volume_ratio_raw_partial: Number(rawPartialRatio.toFixed(2)),
+    volume_ratio_completed: Number(completedVolumeRatio.toFixed(2)),
+    volume_ratio_projected: Number(projectedVolumeRatio.toFixed(2)),
+    volume_ratio_effective: Number(effectiveVolumeRatio.toFixed(2)),
+    volume_ratio_source: volumeRatioSource,
   };
 }
 
@@ -1164,6 +1255,12 @@ export function createPumpScanner(
             score: Number(s.score.toFixed(1)),
             status: s.status,
             volume_multiple: Number(s.volumeMultiple.toFixed(2)),
+            candle_age_sec: s.candle_age_sec,
+            volume_ratio_raw_partial: s.volume_ratio_raw_partial,
+            volume_ratio_completed: s.volume_ratio_completed,
+            volume_ratio_projected: s.volume_ratio_projected,
+            volume_ratio_effective: s.volume_ratio_effective,
+            volume_ratio_source: s.volume_ratio_source,
             breakout: s.breakout,
             close_upper_hold: s.closeUpperHold,
             rise_3m_pct: Number(s.rise3mPct.toFixed(2)),
@@ -1182,6 +1279,12 @@ export function createPumpScanner(
             score: row.score,
             status: row.status,
             volume_multiple: row.volume_multiple,
+            candle_age_sec: s.candle_age_sec,
+            volume_ratio_raw_partial: s.volume_ratio_raw_partial,
+            volume_ratio_completed: s.volume_ratio_completed,
+            volume_ratio_projected: s.volume_ratio_projected,
+            volume_ratio_effective: s.volume_ratio_effective,
+            volume_ratio_source: s.volume_ratio_source,
             exclude_reasons: row.exclude_reasons ?? [],
             btc_drop_penalty: btcDropPenalty,
           }));

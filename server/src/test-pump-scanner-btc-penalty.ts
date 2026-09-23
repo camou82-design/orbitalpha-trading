@@ -53,30 +53,40 @@ function makeCandles(opts: {
   const lastVolume = opts.lastVolume ?? 500;
 
   const candles: UpbitCandle[] = [];
+  const now = Date.now();
 
-  // 직전 21개 봉 생성 (20개 기준봉 + 이전봉)
-  for (let i = 0; i < 21; i++) {
-    const isRecent3 = i >= 18;
-    // 최근 3봉은 점진적 상승 구조 (1000 -> 1007 -> 1014 -> 1021)
-    const p = opts.stepUp && isRecent3 ? prevPrice + (i - 17) * 7 : prevPrice;
+  // 직전 20개 기준 완성봉 (i=0~19)
+  for (let i = 0; i < 20; i++) {
+    const isRecent3 = i >= 17;
+    const p = opts.stepUp && isRecent3 ? prevPrice + (i - 16) * 7 : prevPrice;
     candles.push({
       opening_price: p,
       high_price: p * 1.005,
       low_price: p * 0.995,
       trade_price: p,
       candle_acc_trade_volume: prevVolume,
-      candle_date_time_kst: new Date(Date.now() - (22 - i) * 60_000).toISOString(),
+      candle_date_time_kst: new Date(now - (22 - i) * 60_000).toISOString(),
     });
   }
 
-  // 현재 완료/진행 중 마지막 봉
+  // 직전 완성봉 (c1[c1.length - 2]): 급등 거래량 완주
   candles.push({
     opening_price: lastOpen,
     high_price: lastHigh,
     low_price: lastLow,
     trade_price: lastClose,
     candle_acc_trade_volume: lastVolume,
-    candle_date_time_kst: new Date().toISOString(),
+    candle_date_time_kst: new Date(now - 60_000).toISOString(),
+  });
+
+  // 현재 진행봉 (c1[c1.length - 1]): 15초 동안 비례 누적된 거래량 (lastVolume * 15 / 60)
+  candles.push({
+    opening_price: lastOpen,
+    high_price: lastHigh,
+    low_price: lastLow,
+    trade_price: lastClose,
+    candle_acc_trade_volume: lastVolume * (15 / 60),
+    candle_date_time_kst: new Date(now - 15_000).toISOString(), // 15초 경과 (projected 활성화)
   });
 
   return candles;
