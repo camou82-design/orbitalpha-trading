@@ -280,7 +280,18 @@ export function scoreOne(c1: UpbitCandle[], c5: UpbitCandle[], ticker: UpbitTick
   };
 }
 
-function selectMomentumTopM(
+export interface MomentumScoredCandidate {
+  t: UpbitTicker;
+  momentum: number;
+  priceComp: number;
+  volD: number;
+  rankDelta: number;
+  np: number;
+  nv: number;
+  nrd: number;
+}
+
+export function selectMomentumTopM(
   tickers: UpbitTicker[],
   opts: {
     is429Excluded: (m: string) => boolean;
@@ -293,6 +304,7 @@ function selectMomentumTopM(
 ): {
   momentumTop: UpbitTicker[];
   momentumScoreByMarket: Map<string, number>;
+  scoredCandidates: MomentumScoredCandidate[];
   nextSnapshot: Map<string, { ts: number; trade_price: number; acc24: number }>;
   nextRankByMarket: Map<string, number>;
   totalConsidered: number;
@@ -312,7 +324,8 @@ function selectMomentumTopM(
   const rankDeltas: number[] = [];
 
   for (const t of sortedBySr) {
-    const sr = Math.abs(Number(t.signed_change_rate ?? 0));
+    // 상승 방향 momentum만 점수화: 음수 하락률은 price component 0 처리
+    const sr = Math.max(0, Number(t.signed_change_rate ?? 0));
     const prev = opts.snapshot.get(t.market);
     let volD = 0;
     let priceComp = sr;
@@ -320,7 +333,8 @@ function selectMomentumTopM(
     if (prev && now - prev.ts <= lookbackMs * 2) {
       volD = Math.max(0, Number(t.acc_trade_price_24h ?? 0) - prev.acc24);
       if (prev.trade_price > 0) {
-        const shortPct = Math.abs((t.trade_price - prev.trade_price) / prev.trade_price);
+        // 단기 가격 변동도 상승분만 인정 (하락분의 절댓값 사용 금지)
+        const shortPct = Math.max(0, (t.trade_price - prev.trade_price) / prev.trade_price);
         priceComp = Math.max(sr, shortPct);
       }
     }
@@ -341,12 +355,21 @@ function selectMomentumTopM(
   const wR = opts.useVolumeWeight ? 0.3 : 0.5;
   const wSum = wP + wV + wR;
 
-  const scored = sortedBySr.map((t, i) => {
+  const scored: MomentumScoredCandidate[] = sortedBySr.map((t, i) => {
     const np = priceShorts[i]! / maxP;
     const nv = volDeltas[i]! / maxV;
     const nrd = rankDeltas[i]! / maxRD;
     const momentum = ((wP * np + wV * nv + wR * nrd) / wSum) * 100;
-    return { t, momentum };
+    return {
+      t,
+      momentum,
+      priceComp: priceShorts[i]!,
+      volD: volDeltas[i]!,
+      rankDelta: rankDeltas[i]!,
+      np,
+      nv,
+      nrd,
+    };
   });
 
   scored.sort((a, b) => b.momentum - a.momentum);
@@ -365,6 +388,7 @@ function selectMomentumTopM(
   return {
     momentumTop,
     momentumScoreByMarket,
+    scoredCandidates: scored,
     nextSnapshot,
     nextRankByMarket: currRankByMarket,
     totalConsidered: sortedBySr.length,
@@ -807,6 +831,29 @@ export function createPumpScanner(
         return (momentumScoreByMarket.get(b.market) ?? 0) - (momentumScoreByMarket.get(a.market) ?? 0);
       });
       const candleTargets = marketsRanked.slice(0, dynamicCandleTarget);
+      const candleTargetSet = new Set(candleTargets.map((t) => t.market));
+      const momentumAuditTop = momSel.scoredCandidates.slice(0, 15).map((x, idx) => ({
+        rank: idx + 1,
+        market: x.t.market,
+        momentum_score: Number(x.momentum.toFixed(2)),
+        price_comp: Number(x.priceComp.toFixed(4)),
+        vol_comp: Number(x.volD.toFixed(0)),
+        rank_delta: x.rankDelta,
+        in_candle_targets: candleTargetSet.has(x.t.market),
+        cut_from_candle_targets: !candleTargetSet.has(x.t.market),
+      }));
+
+      console.info(
+        JSON.stringify({
+          tag: "PUMP_SCANNER_MOMENTUM_AUDIT",
+          ts: new Date().toISOString(),
+          dynamic_candle_target: dynamicCandleTarget,
+          candle_target_max: CANDLE_MAX_MARKETS_PER_TICK,
+          candle_targets: candleTargets.map((t) => t.market),
+          top_momentum_audit: momentumAuditTop,
+        }),
+      );
+
       const tBeforeCandles = Date.now();
       const batches = chunk(candleTargets, CANDLE_BATCH_SIZE);
 
