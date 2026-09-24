@@ -640,26 +640,11 @@ export function selectCandleTargets(opts: {
     (c) => !selectedMap.has(c.t.market) && !isActiveTrackingEligible(c),
   );
 
-  // 3-A: CORE 슬롯 (탐색 풀 중 쿨다운이 아닌 최상위 momentum 후보)
   const nonCooling = explorationPool.filter((c) => !isCoolingDown(c));
-  if (nonCooling.length > 0) {
-    const coreCandidate = nonCooling[0]!;
-    add(coreCandidate.t, "CORE", coreCandidate.momentum);
-    if (selectedMap.size >= budget) return Array.from(selectedMap.values());
-  }
-
-  // 3-B: FRESH_SURGE 슬롯 (탐색 풀 중 단기 거래대금 급증 또는 순위 개선 신규 후보)
   const freshCandidates = explorationPool
     .filter((c) => !selectedMap.has(c.t.market) && (c.volD > 0 || c.rankDelta >= 2))
     .sort((a, b) => (b.nv + b.nrd) - (a.nv + a.nrd));
 
-  if (freshCandidates.length > 0) {
-    const freshCand = freshCandidates[0]!;
-    add(freshCand.t, "FRESH_SURGE", freshCand.momentum);
-    if (selectedMap.size >= budget) return Array.from(selectedMap.values());
-  }
-
-  // 3-C: ROTATION 슬롯 (탐색 풀 중 가장 오랫동안 또는 한 번도 평가받지 못한 종목 순환)
   const unscannedOrOldest = [...explorationPool]
     .filter((c) => !selectedMap.has(c.t.market))
     .sort((a, b) => {
@@ -671,13 +656,44 @@ export function selectCandleTargets(opts: {
       return b.momentum - a.momentum;
     });
 
+  const remainingForNew = budget - selectedMap.size;
+
+  // Reservation for exploration (ROTATION) and fresh surge to ensure proper authority balance:
+  // - If at least 2 slots remain for new candidates and unscanned/oldest candidates exist, reserve 1 slot for ROTATION exploration.
+  // - If fresh surge candidates exist, reserve 1 slot for FRESH_SURGE.
+  const reservedForRotation = unscannedOrOldest.length > 0 && remainingForNew >= 2 ? 1 : 0;
+  const reservedForFresh = freshCandidates.length > 0 && (remainingForNew - reservedForRotation >= 2) ? 1 : 0;
+
+  // 3-A: CORE 슬롯 (탐색 풀 중 쿨다운이 아닌 최상위 momentum 후보 다중 선발)
+  const maxCoreSlots = Math.max(1, remainingForNew - reservedForRotation - reservedForFresh);
+  let coreAdded = 0;
+  for (const coreCand of nonCooling) {
+    if (coreAdded >= maxCoreSlots) break;
+    if (add(coreCand.t, "CORE", coreCand.momentum)) {
+      coreAdded++;
+      if (selectedMap.size >= budget) return Array.from(selectedMap.values());
+    }
+  }
+
+  // 3-B: FRESH_SURGE 슬롯 (단기 급증 신규 후보 선발)
+  for (const freshCand of freshCandidates) {
+    if (selectedMap.has(freshCand.t.market)) continue;
+    if (add(freshCand.t, "FRESH_SURGE", freshCand.momentum)) {
+      if (selectedMap.size >= budget) return Array.from(selectedMap.values());
+      break;
+    }
+  }
+
+  // 3-C: ROTATION 슬롯 (탐색 풀 중 가장 오랫동안 또는 한 번도 평가받지 못한 종목 순환)
   for (const cand of unscannedOrOldest) {
+    if (selectedMap.has(cand.t.market)) continue;
     add(cand.t, "ROTATION", cand.momentum);
     if (selectedMap.size >= budget) return Array.from(selectedMap.values());
   }
 
   // 4. Fallback: 남은 슬롯을 topCandidates momentum 상위 순서로 채움
   for (const cand of topCandidates) {
+    if (selectedMap.has(cand.t.market)) continue;
     add(cand.t, "CORE", cand.momentum);
     if (selectedMap.size >= budget) break;
   }
