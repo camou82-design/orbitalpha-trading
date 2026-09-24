@@ -5,10 +5,15 @@ import { tradingDataRoot } from "./paths.js";
 import {
   fetchMinuteCandles,
   fetchTickers,
+  fetchTickersWithMeta,
+  isFreshForMomentum,
   partitionKrwMarketsByUpbitValidity,
+  tickerSourceMap,
+  tickerAgeMap,
   type FetchTickersOptions,
   type UpbitCandle,
   type UpbitTicker,
+  type FetchTickersWithMetaResult,
 } from "./upbit-public.js";
 import { surgeCandidatesRuntimePath } from "./runtime-paths.js";
 
@@ -961,9 +966,10 @@ export function createPumpScanner(
         }
         altMarkets = altValidity.accepted;
       }
+      let altTickerRes: FetchTickersWithMetaResult | null = null;
       let tickers: UpbitTicker[] = [];
       try {
-        tickers = await fetchTickers(altMarkets, {
+        altTickerRes = await fetchTickersWithMeta(altMarkets, {
           ...pumpAltTickerOptsBase,
           maxMarkets: altMarkets.length,
           debugCaller: "pump-scanner:ticker_alt",
@@ -971,6 +977,7 @@ export function createPumpScanner(
           batchTimeoutMs: Math.max(800, Number(process.env.PUMP_SCANNER_TICKER_BATCH_TIMEOUT_MS ?? 3500)),
           totalTimeoutMs: Math.max(1000, Number(process.env.PUMP_SCANNER_TICKER_ALT_TOTAL_TIMEOUT_MS ?? 12_000)),
         });
+        tickers = altTickerRes.tickers;
       } catch (e) {
         console.warn(JSON.stringify({
           tag: "PUMP_SCANNER_ALT_TICKER_FETCH_FAILED",
@@ -1060,8 +1067,23 @@ export function createPumpScanner(
       }
       const tAfterHeldExtraTickers = Date.now();
 
+      // Ticker Freshness & Source Statistics (Caller-local snapshot: side-channel race free)
+      const fetchedLiveCount = altTickerRes?.fetchedLiveCount ?? 0;
+      const freshCacheCount = altTickerRes?.freshCacheCount ?? 0;
+      const staleFallbackCount = altTickerRes?.staleFallbackCount ?? 0;
+      const missingCount = altTickerRes?.missingCount ?? 0;
+      const maxTickerAgeMs = altTickerRes?.maxTickerAgeMs ?? 0;
+
+      const MAX_MOMENTUM_TICKER_AGE_MS = Math.max(10_000, Number(process.env.PUMP_SCANNER_MAX_MOMENTUM_TICKER_AGE_MS ?? 60_000));
+      
+      // Strict Allowlist check against caller-local metaByMarket snapshot
+      const isAllowedForMomentum = (market: string): boolean => {
+        const meta = altTickerRes?.metaByMarket.get(market);
+        return isFreshForMomentum(meta, MAX_MOMENTUM_TICKER_AGE_MS);
+      };
+
       const momSel = selectMomentumTopM(tickers, {
-        is429Excluded,
+        is429Excluded: (m) => is429Excluded(m) || !isAllowedForMomentum(m),
         lookbackMin: MOMENTUM_LOOKBACK_MIN,
         topM: MOMENTUM_TOP_M,
         useVolumeWeight: USE_VOLUME_WEIGHT,
@@ -1393,15 +1415,18 @@ export function createPumpScanner(
       }
 
       if (PUMP_TIMING_LOG) {
-        const tickerBatchesAlt = Math.ceil(altMarkets.length / PUMP_TICKER_BATCH_SIZE);
+        const tickerBatchesAlt = Math.ceil(altMarkets.length / (PUMP_TICKER_BATCH_SIZE * PUMP_TICKER_PARALLEL));
         const tickTotalMs = Date.now() - tickT0;
         const candleMs = tAfterCandles - tBeforeCandles;
+        const altElapsedMs = tAfterAltTickers - tAfterBaseTickers;
+        const tickerAltBudgetExpired = altTickerRes?.budgetExpired ?? false;
+        const tickBudgetExpired = tickTotalMs >= TICK_BUDGET_SECONDS * 1000;
         console.info(
           JSON.stringify({
             tag: "DEBUG_PUMP_SCANNER_TICK_TIMING",
             tick_total_ms: tickTotalMs,
             ticker_base_ms: tAfterBaseTickers - tickT0,
-            ticker_alt_ms: tAfterAltTickers - tAfterBaseTickers,
+            ticker_alt_ms: altElapsedMs,
             ticker_held_extra_ms: tAfterHeldExtraTickers - tAfterAltTickers,
             ticker_phase_ms: tAfterHeldExtraTickers - tickT0,
             momentum_ms: tAfterMomentum - tAfterHeldExtraTickers,
@@ -1411,8 +1436,19 @@ export function createPumpScanner(
             ticker_returned: tickers.length,
             ticker_batches_alt: tickerBatchesAlt,
             ticker_batch_size: PUMP_TICKER_BATCH_SIZE,
+            configured_parallel: altTickerRes?.configuredParallel ?? PUMP_TICKER_PARALLEL,
             ticker_parallel: PUMP_TICKER_PARALLEL,
+            actual_parallel: altTickerRes?.actualParallel ?? PUMP_TICKER_PARALLEL,
             ticker_batch_delay_ms: PUMP_TICKER_BATCH_DELAY_MS,
+            fetched_live_count: fetchedLiveCount,
+            fresh_cache_count: freshCacheCount,
+            stale_fallback_count: staleFallbackCount,
+            missing_count: missingCount,
+            oldest_ticker_age_ms: maxTickerAgeMs,
+            max_ticker_age_ms: maxTickerAgeMs,
+            lock_wait_ms: altTickerRes?.lockWaitMs ?? 0,
+            ticker_alt_budget_expired: tickerAltBudgetExpired,
+            tick_budget_expired: tickBudgetExpired,
             momentum_considered: momSel.totalConsidered,
             momentum_top_m: MOMENTUM_TOP_M,
             markets_to_score: momSel.momentumTop.length + heldTickers.length,
@@ -1425,7 +1461,6 @@ export function createPumpScanner(
             tradable_confirmed_count: tradableCandidates.length,
           }),
         );
-
         console.info(
           JSON.stringify({
             tag: "LIVE_SURGE_SOURCE_REPAIR_PROOF",
