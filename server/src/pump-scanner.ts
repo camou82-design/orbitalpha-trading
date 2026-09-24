@@ -420,18 +420,18 @@ export function selectMomentumTopM(
   const rankDeltas: number[] = [];
 
   for (const t of sortedBySr) {
-    // 상승 방향 momentum만 점수화: 음수 하락률은 price component 0 처리
+    // 상승 방향 momentum만 점수화: 음수 하락률은 price component 0 처리 (sr은 audit/context 참조용 유지)
     const sr = Math.max(0, Number(t.signed_change_rate ?? 0));
     const prev = opts.snapshot.get(t.market);
     let volD = 0;
-    let priceComp = sr;
+    let priceComp = 0;
 
     if (prev && now - prev.ts <= lookbackMs * 2) {
       volD = Math.max(0, Number(t.acc_trade_price_24h ?? 0) - prev.acc24);
       if (prev.trade_price > 0) {
         // 단기 가격 변동도 상승분만 인정 (하락분의 절댓값 사용 금지)
         const shortPct = Math.max(0, (t.trade_price - prev.trade_price) / prev.trade_price);
-        priceComp = Math.max(sr, shortPct);
+        priceComp = shortPct;
       }
     }
 

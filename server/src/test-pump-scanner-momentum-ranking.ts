@@ -59,12 +59,18 @@ section("TC1: +10% vs -10% signed_change_rate 방향성 점수화 검증");
     makeTicker({ market: "KRW-DUMP", signed_change_rate: -0.10, trade_price: 900, acc_trade_price_24h: 10_000_000_000 }),
   ];
 
+  const now = Date.now();
+  const snapshot = new Map<string, { ts: number; trade_price: number; acc24: number }>([
+    ["KRW-B3", { ts: now - 60_000, trade_price: 1000, acc24: 10_000_000_000 }],
+    ["KRW-DUMP", { ts: now - 60_000, trade_price: 1000, acc24: 10_000_000_000 }],
+  ]);
+
   const res = selectMomentumTopM(tickers, {
     is429Excluded: () => false,
     lookbackMin: 3,
     topM: 2,
     useVolumeWeight: true,
-    snapshot: new Map(),
+    snapshot,
     prevRankByMarket: new Map(),
   });
 
