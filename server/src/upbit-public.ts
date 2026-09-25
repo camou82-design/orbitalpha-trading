@@ -57,6 +57,8 @@ export type FetchTickersOptions = {
   isPriority?: boolean;
   /** 캐시를 무시하고 최신 REST API로 강제 조회할지 여부 */
   forceRefresh?: boolean;
+  /** /v1/ticker/all?quote_currencies=KRW 단일 snapshot 엔드포인트 우선 사용 여부 */
+  preferAllEndpoint?: boolean;
 };
 
 function sleep(ms: number): Promise<void> {
@@ -162,6 +164,32 @@ function maybeLog429(nowMs: number, key: string, meta: { market: string; unit: 1
   );
 }
 
+export type UpbitRateLimitInfo = {
+  group?: string;
+  minRemaining?: number;
+  secRemaining?: number;
+  raw?: string;
+};
+
+export function parseRemainingReqHeader(header: string | null): UpbitRateLimitInfo | null {
+  if (!header) return null;
+  const parts = header.split(";").map((s) => s.trim());
+  let group: string | undefined;
+  let minRemaining: number | undefined;
+  let secRemaining: number | undefined;
+  for (const part of parts) {
+    const [k, v] = part.split("=").map((s) => s.trim());
+    if (k === "group") group = v;
+    else if (k === "min") minRemaining = Number(v);
+    else if (k === "sec") secRemaining = Number(v);
+  }
+  return { group, minRemaining, secRemaining, raw: header };
+}
+
+let lastTickerRateLimitInfo: UpbitRateLimitInfo | null = null;
+let global429Count = 0;
+let globalRetryCount = 0;
+
 async function fetchJson<T>(path: string, signal?: AbortSignal, timeoutMs = 8000): Promise<T> {
   const t0 = Date.now();
   const url = `${UPBIT}${path}`;
@@ -175,6 +203,10 @@ async function fetchJson<T>(path: string, signal?: AbortSignal, timeoutMs = 8000
       headers: { Accept: "application/json" },
       signal: ctrl.signal,
     });
+    const remainingReq = r.headers.get("remaining-req") ?? r.headers.get("Remaining-Req");
+    if (remainingReq) {
+      lastTickerRateLimitInfo = parseRemainingReqHeader(remainingReq);
+    }
     if (!r.ok) {
       const text = await r.text();
       throw new UpbitHttpError(`Upbit ${path} → ${r.status}: ${text.slice(0, 200)}`, r.status, path);
@@ -582,8 +614,8 @@ function numTradePrice(v: unknown): number {
 const TICKER_MAX_MARKETS_PER_TICK = Number(process.env.UPBIT_TICKER_MAX_MARKETS_PER_TICK ?? 25);
 const TICKER_BATCH_SIZE = Number(process.env.UPBIT_TICKER_BATCH_SIZE ?? 10);
 const TICKER_BATCH_DELAY_MS = Number(process.env.UPBIT_TICKER_BATCH_DELAY_MS ?? 400); // 배치 간 간격 대폭 축소
-const TICKER_429_MAX_ATTEMPTS = Number(process.env.UPBIT_TICKER_429_MAX_ATTEMPTS ?? 1); // 기본: 재시도 없음(429 과호출 방지)
-const TICKER_429_RETRY_DELAY_MS = Number(process.env.UPBIT_TICKER_429_RETRY_DELAY_MS ?? 3_000); // 재시도 시 최소 대기
+const TICKER_429_MAX_ATTEMPTS = Math.max(1, Number(process.env.UPBIT_TICKER_429_MAX_ATTEMPTS ?? 2)); // 기본 2회 (1회 재시도)
+const TICKER_429_RETRY_DELAY_MS = Math.max(200, Number(process.env.UPBIT_TICKER_429_RETRY_DELAY_MS ?? 1_000)); // 재시도 시 최소 대기
 
 // ticker REST 과호출/429 완화를 위한 공용 캐시/쿨다운 (프로세스 내).
 const TICKER_CACHE_TTL_MS = Number(process.env.UPBIT_TICKER_CACHE_TTL_MS ?? 60_000); // 캐시 TTL 60초
@@ -616,6 +648,7 @@ export type FetchTickersWithMetaResult = {
   freshCacheCount: number;
   staleFallbackCount: number;
   missingCount: number;
+  momentumEligibleCount: number;
   maxTickerAgeMs: number;
   oldestTickerAgeMs: number;
   lockWaitMs: number;
@@ -646,6 +679,33 @@ const ticker429LastLogAtMs = new Map<string, number>();
 const tickerFailureCountByMarket = new Map<string, number>();
 const tickerCircuitOpenUntilByMarket = new Map<string, number>();
 const tickerFailureLastLogAtMs = new Map<string, number>();
+
+export function getTickerTransportStats() {
+  const now = Date.now();
+  let circuitOpenCount = 0;
+  for (const [m, until] of tickerCircuitOpenUntilByMarket.entries()) {
+    if (until > now) circuitOpenCount++;
+  }
+  return {
+    globalCooldownActive: now < tickerGlobalCooldownUntilMs,
+    globalCooldownUntilMs: tickerGlobalCooldownUntilMs,
+    global429Count,
+    globalRetryCount,
+    circuitOpenCount,
+    rateLimitInfo: lastTickerRateLimitInfo,
+  };
+}
+
+export function resetTickerTransportStatsForTest() {
+  tickerGlobalCooldownUntilMs = 0;
+  global429Count = 0;
+  globalRetryCount = 0;
+  lastTickerRateLimitInfo = null;
+  tickerCooldownUntilMs.clear();
+  tickerFailureCountByMarket.clear();
+  tickerCircuitOpenUntilByMarket.clear();
+  ticker429LastLogAtMs.clear();
+}
 
 // 동시성 제어를 위한 우선순위 락 큐
 export interface TickerLockOptions {
@@ -953,7 +1013,8 @@ async function fetchTickerBatchGroup(args: {
   const onAbort = () => batchCtrl.abort();
   if (signal) signal.addEventListener("abort", onAbort, { once: true });
   const tid = setTimeout(() => batchCtrl.abort(), Math.max(200, batchTimeoutMs ?? 8000));
-  for (let attempt = 1; attempt <= Math.max(1, TICKER_429_MAX_ATTEMPTS); attempt++) {
+  const maxAttempts = Math.max(1, TICKER_429_MAX_ATTEMPTS);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       if (batchCtrl.signal.aborted) throw new DOMException("Aborted", "AbortError");
       const rows: UpbitTicker[] = [];
@@ -980,10 +1041,12 @@ async function fetchTickerBatchGroup(args: {
         ...r,
         trade_price: numTradePrice((r as { trade_price?: unknown }).trade_price),
       }));
+      tickerGlobalCooldownUntilMs = 0; // 429 복구 시 전역 쿨다운 즉시 해제
       for (const t of mapped) {
         ticker24hVolumeHintByMarket.set(t.market, Number(t.acc_trade_price_24h ?? 0));
         tickerFailureCountByMarket.delete(t.market);
         tickerCircuitOpenUntilByMarket.delete(t.market);
+        tickerCooldownUntilMs.delete(t.market);
       }
       out.push(...mapped);
       break;
@@ -1007,6 +1070,7 @@ async function fetchTickerBatchGroup(args: {
       const status = e instanceof UpbitHttpError ? e.status : undefined;
       const is429 = status === 429 || (e instanceof Error && e.message.includes("429"));
       if (is429) {
+        global429Count++;
         const now = Date.now();
         for (const m of group) tickerCooldownUntilMs.set(m, now + TICKER_429_COOLDOWN_MS);
         tickerGlobalCooldownUntilMs = now + TICKER_429_COOLDOWN_MS; // 전역 429 쿨다운 세팅
@@ -1017,6 +1081,7 @@ async function fetchTickerBatchGroup(args: {
             status: status ?? 429,
             retry_count: attempt,
             cooldown_ms: TICKER_429_COOLDOWN_MS,
+            caller: debugCaller,
             cache_fallback_used: group.some((m) => {
               const c = tickerCache.get(m);
               return Boolean(c && now <= c.staleUntilMs);
@@ -1024,12 +1089,15 @@ async function fetchTickerBatchGroup(args: {
           });
         }
       }
-      if (!is429 || attempt >= Math.max(1, TICKER_429_MAX_ATTEMPTS)) {
-        for (const market of group) {
-          const failCount = (tickerFailureCountByMarket.get(market) ?? 0) + 1;
-          tickerFailureCountByMarket.set(market, failCount);
-          if (failCount >= UPBIT_FETCH_CIRCUIT_BREAKER_FAIL_THRESHOLD) {
-            tickerCircuitOpenUntilByMarket.set(market, Date.now() + UPBIT_FETCH_CIRCUIT_BREAKER_COOLDOWN_MS);
+      if (!is429 || attempt >= maxAttempts) {
+        // 429는 전역 transport 문제이므로 개별 마켓 서킷 브레이커(tickerFailureCountByMarket)를 오염시키지 않음.
+        if (!is429) {
+          for (const market of group) {
+            const failCount = (tickerFailureCountByMarket.get(market) ?? 0) + 1;
+            tickerFailureCountByMarket.set(market, failCount);
+            if (failCount >= UPBIT_FETCH_CIRCUIT_BREAKER_FAIL_THRESHOLD) {
+              tickerCircuitOpenUntilByMarket.set(market, Date.now() + UPBIT_FETCH_CIRCUIT_BREAKER_COOLDOWN_MS);
+            }
           }
         }
         maybeLogRateLimitedFailure(
@@ -1039,13 +1107,94 @@ async function fetchTickerBatchGroup(args: {
         );
         break;
       }
-      const retryDelay = TICKER_429_RETRY_DELAY_MS * attempt;
+      globalRetryCount++;
+      const retryDelay = Math.max(300, TICKER_429_RETRY_DELAY_MS * attempt);
       await sleepAbortable(retryDelay, batchCtrl.signal);
     }
   }
   clearTimeout(tid);
   if (signal) signal.removeEventListener("abort", onAbort);
   return out;
+}
+
+export async function fetchTickersAllKrw(opts?: {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  debugCaller?: string;
+}): Promise<UpbitTicker[]> {
+  const timeoutMs = Math.max(500, opts?.timeoutMs ?? 8000);
+  const debugCaller = opts?.debugCaller ?? "fetchTickersAllKrw";
+  const fetchT0 = Date.now();
+  const maxAttempts = Math.max(1, TICKER_429_MAX_ATTEMPTS);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (opts?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    // Global cooldown check before attempt
+    const now = Date.now();
+    if (now < tickerGlobalCooldownUntilMs) {
+      const remainingCd = tickerGlobalCooldownUntilMs - now;
+      if (attempt > 1 && remainingCd <= 5000) {
+        await sleepAbortable(remainingCd, opts?.signal);
+      } else {
+        throw new UpbitHttpError(`Ticker in global 429 cooldown (${remainingCd}ms remaining)`, 429, "/v1/ticker/all?quote_currencies=KRW");
+      }
+    }
+
+    try {
+      const rows = await fetchJson<UpbitTicker[]>("/v1/ticker/all?quote_currencies=KRW", opts?.signal, timeoutMs);
+      const mapped = rows.map((r) => ({
+        ...r,
+        trade_price: numTradePrice((r as { trade_price?: unknown }).trade_price),
+      }));
+
+      const nowAfter = Date.now();
+      tickerGlobalCooldownUntilMs = 0; // 429 복구 시 전역 쿨다운 즉시 해제
+      for (const t of mapped) {
+        ticker24hVolumeHintByMarket.set(t.market, Number(t.acc_trade_price_24h ?? 0));
+        tickerCache.set(t.market, {
+          value: t,
+          fetchedAtMs: nowAfter,
+          expiresAtMs: nowAfter + TICKER_CACHE_TTL_MS,
+          staleUntilMs: nowAfter + TICKER_CACHE_TTL_MS + TICKER_CACHE_STALE_GRACE_MS,
+        });
+        lastGoodTickerCache.set(t.market, t);
+        lastGoodTickerFetchedAtMap.set(t.market, nowAfter);
+        tickerSourceMap.set(t.market, "live");
+        tickerAgeMap.set(t.market, 0);
+        tickerFailureCountByMarket.delete(t.market);
+        tickerCircuitOpenUntilByMarket.delete(t.market);
+        tickerCooldownUntilMs.delete(t.market);
+      }
+      return mapped;
+    } catch (e) {
+      if (opts?.signal?.aborted || (e instanceof DOMException && e.name === "AbortError")) {
+        throw e;
+      }
+      const status = e instanceof UpbitHttpError ? e.status : undefined;
+      const is429 = status === 429 || (e instanceof Error && e.message.includes("429"));
+      if (is429) {
+        global429Count++;
+        const nowCd = Date.now();
+        tickerGlobalCooldownUntilMs = nowCd + TICKER_429_COOLDOWN_MS;
+        if (tickerDebugEnabled()) {
+          maybeLogTicker429(nowCd, {
+            cooldown_key: "ticker_all_krw",
+            status: status ?? 429,
+            retry_count: attempt,
+            cooldown_ms: TICKER_429_COOLDOWN_MS,
+            caller: debugCaller,
+          });
+        }
+      }
+      if (!is429 || attempt >= maxAttempts) {
+        throw e;
+      }
+      globalRetryCount++;
+      const retryDelay = Math.max(300, TICKER_429_RETRY_DELAY_MS * attempt);
+      await sleepAbortable(retryDelay, opts?.signal);
+    }
+  }
+  throw new Error("fetchTickersAllKrw exhausted attempts without result");
 }
 
 export async function fetchTickersWithMeta(
@@ -1063,6 +1212,7 @@ export async function fetchTickersWithMeta(
       freshCacheCount: 0,
       staleFallbackCount: 0,
       missingCount: 0,
+      momentumEligibleCount: 0,
       maxTickerAgeMs: 0,
       oldestTickerAgeMs: 0,
       lockWaitMs: 0,
@@ -1081,6 +1231,7 @@ export async function fetchTickersWithMeta(
       freshCacheCount: 0,
       staleFallbackCount: 0,
       missingCount: 0,
+      momentumEligibleCount: 0,
       maxTickerAgeMs: 0,
       oldestTickerAgeMs: 0,
       lockWaitMs: 0,
@@ -1096,9 +1247,6 @@ export async function fetchTickersWithMeta(
   let budgetExpired = false;
   let totalLockWaitMs = 0;
 
-  // 글로벌 429 쿨다운 확인
-  const isGlobalCooldown = now0 < tickerGlobalCooldownUntilMs;
-
   const maxCap = opts?.maxMarkets ?? TICKER_MAX_MARKETS_PER_TICK;
   const ordered =
     opts?.sortByCached24hVolume === false
@@ -1106,13 +1254,127 @@ export async function fetchTickersWithMeta(
       : [...sanitized].sort((a, b) => (ticker24hVolumeHintByMarket.get(b) ?? 0) - (ticker24hVolumeHintByMarket.get(a) ?? 0));
   const limited = maxCap >= ordered.length ? ordered : ordered.slice(0, Math.max(1, maxCap));
 
-  // 1) 캐시 먼저 반영
+  const shouldTryAllEndpoint =
+    opts?.preferAllEndpoint === true ||
+    (opts?.preferAllEndpoint !== false && limited.length >= 20 && limited.every((m) => m.startsWith("KRW-")));
+
+  // 1) Primary Full-Universe Snapshot: /v1/ticker/all?quote_currencies=KRW
+  if (shouldTryAllEndpoint) {
+    const isGlobalCooldown = Date.now() < tickerGlobalCooldownUntilMs;
+    if (!isGlobalCooldown || isPriority) {
+      let releaseLock: (() => void) | null = null;
+      let allSuccess = false;
+      try {
+        const tLock0 = Date.now();
+        const sliceLockTimeoutMs = opts?.totalTimeoutMs ?? (opts?.batchTimeoutMs ? Math.max(2000, opts.batchTimeoutMs * 2) : 10_000);
+        releaseLock = await acquireTickerLock({
+          priority: isPriority,
+          signal: opts?.signal,
+          timeoutMs: sliceLockTimeoutMs,
+          caller: opts?.debugCaller ?? "fetchTickersWithMeta:all",
+        });
+        totalLockWaitMs += Math.max(0, Date.now() - tLock0);
+
+        const allRows = await fetchTickersAllKrw({
+          signal: opts?.signal,
+          timeoutMs: opts?.batchTimeoutMs ?? 8000,
+          debugCaller: opts?.debugCaller,
+        });
+        allSuccess = true;
+
+        const allMap = new Map(allRows.map((t) => [t.market, t]));
+        const out: UpbitTicker[] = [];
+        const nowFetched = Date.now();
+
+        for (const m of limited) {
+          const t = allMap.get(m);
+          if (t) {
+            out.push(t);
+            localMetaMap.set(m, { source: "live", ageMs: 0, fetchedAtMs: nowFetched });
+          }
+        }
+
+        // Fallback for any missing in requested limited
+        for (const m of limited) {
+          if (out.some((t) => t.market === m)) continue;
+          const lastGood = lastGoodTickerCache.get(m);
+          if (lastGood) {
+            out.push(lastGood);
+            const c = tickerCache.get(m);
+            const fetchedAt = lastGoodTickerFetchedAtMap.get(m) ?? (c ? c.fetchedAtMs : 0);
+            const age = fetchedAt > 0 ? Math.max(0, now0 - fetchedAt) : (c ? Math.max(0, now0 - c.fetchedAtMs) : 0);
+            tickerSourceMap.set(m, "last_good_cache");
+            tickerAgeMap.set(m, age);
+            localMetaMap.set(m, { source: "last_good_cache", ageMs: age, fetchedAtMs: fetchedAt });
+            continue;
+          }
+          tickerSourceMap.set(m, "missing");
+          tickerAgeMap.set(m, 0);
+          localMetaMap.set(m, { source: "missing", ageMs: 0, fetchedAtMs: 0 });
+        }
+
+        let fetchedLiveCount = 0;
+        let freshCacheCount = 0;
+        let staleFallbackCount = 0;
+        let missingCount = 0;
+        let momentumEligibleCount = 0;
+        let maxTickerAgeMs = 0;
+
+        for (const t of out) {
+          const meta = localMetaMap.get(t.market);
+          if (!meta) {
+            missingCount++;
+            continue;
+          }
+          if (meta.source === "live") fetchedLiveCount++;
+          else if (meta.source === "fresh_cache" || meta.source === "cache") freshCacheCount++;
+          else if (meta.source === "last_good_cache" || meta.source === "candle_fallback") staleFallbackCount++;
+          else missingCount++;
+
+          if (isFreshForMomentum(meta, 60_000)) {
+            momentumEligibleCount++;
+          }
+          if (meta.ageMs > maxTickerAgeMs) maxTickerAgeMs = meta.ageMs;
+        }
+
+        return {
+          tickers: out,
+          metaByMarket: localMetaMap,
+          fetchedLiveCount,
+          freshCacheCount,
+          staleFallbackCount,
+          missingCount,
+          momentumEligibleCount,
+          maxTickerAgeMs,
+          oldestTickerAgeMs: maxTickerAgeMs,
+          lockWaitMs: totalLockWaitMs,
+          actualParallel: 1,
+          configuredParallel: parallelTickerBatches,
+          budgetExpired: false,
+        };
+      } catch (err) {
+        if (dbgOn) {
+          console.warn(
+            `[upbit-ticker] fetchTickers /v1/ticker/all failed or cooldown active (caller=${opts?.debugCaller}): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      } finally {
+        if (releaseLock) {
+          releaseLock();
+          releaseLock = null;
+        }
+      }
+    }
+  }
+
+  // 2) Cache & Fallback check before batch fetch
   const needFetch: string[] = [];
   const cachedOut: UpbitTicker[] = [];
 
   for (const m of limited) {
     const c = tickerCache.get(m);
     const circuitOpenUntil = tickerCircuitOpenUntilByMarket.get(m) ?? 0;
+    const isGlobalCooldown = Date.now() < tickerGlobalCooldownUntilMs;
 
     if (circuitOpenUntil > now0) {
       if (c) {
@@ -1139,9 +1401,9 @@ export async function fetchTickersWithMeta(
       continue;
     }
 
-    // 개별 마켓 쿨다운 중이거나 전역 쿨다운 중인 경우
+    // 개별 마켓 쿨다운 중이거나 전역 쿨다운 중인 경우 (priority 또는 forceRefresh 시 우회)
     const cd = tickerCooldownUntilMs.get(m) ?? 0;
-    if (cd > now0 || (isGlobalCooldown && !isPriority)) {
+    if ((cd > now0 || isGlobalCooldown) && !isPriority && opts?.forceRefresh !== true) {
       if (c && now0 <= c.staleUntilMs) {
         cachedOut.push(c.value);
         const age = now0 - c.fetchedAtMs;
@@ -1169,13 +1431,12 @@ export async function fetchTickersWithMeta(
     needFetch.push(m);
   }
 
-  // 2) REST 호출 진행
+  // 3) REST Batch 호출 진행 (Fallback/Pair Ticker Batch)
   const out: UpbitTicker[] = [...cachedOut];
 
   if (needFetch.length > 0) {
     const batchSize = Math.max(1, Math.min(10, opts?.batchSize ?? TICKER_BATCH_SIZE));
     const batchDelayMs = opts?.batchDelayMs ?? TICKER_BATCH_DELAY_MS;
-    const parallelTickerBatches = Math.max(1, Math.min(4, opts?.parallelTickerBatches ?? 1));
     const batches = chunk(needFetch, batchSize);
     const tickSignal = opts?.signal;
     const totalTimeoutMs = opts?.totalTimeoutMs ?? null;
@@ -1183,6 +1444,14 @@ export async function fetchTickersWithMeta(
 
     for (let i = 0; i < batches.length; i += parallelTickerBatches) {
       if (tickSignal?.aborted) break;
+      // 실시간 전역 429 쿨다운 체크: 진행 중 429가 발생했으면 남은 배치들 즉시 중단
+      if (Date.now() < tickerGlobalCooldownUntilMs && !isPriority) {
+        if (dbgOn) {
+          console.warn(`[upbit-ticker] fetchTickers batch aborted due to real-time global 429 cooldown (caller=${opts?.debugCaller})`);
+        }
+        break;
+      }
+
       const elapsedSoFar = Date.now() - now0;
       if (totalTimeoutMs !== null && elapsedSoFar >= totalTimeoutMs) {
         budgetExpired = true;
@@ -1254,7 +1523,7 @@ export async function fetchTickersWithMeta(
     }
   }
 
-  // 3) Fallback 보강
+  // 4) Fallback 보강
   for (const m of limited) {
     if (out.some((t) => t.market === m)) continue;
 
@@ -1295,6 +1564,7 @@ export async function fetchTickersWithMeta(
   let freshCacheCount = 0;
   let staleFallbackCount = 0;
   let missingCount = 0;
+  let momentumEligibleCount = 0;
   let maxTickerAgeMs = 0;
 
   for (const t of out) {
@@ -1308,6 +1578,9 @@ export async function fetchTickersWithMeta(
     else if (meta.source === "last_good_cache" || meta.source === "candle_fallback") staleFallbackCount++;
     else missingCount++;
 
+    if (isFreshForMomentum(meta, 60_000)) {
+      momentumEligibleCount++;
+    }
     if (meta.ageMs > maxTickerAgeMs) maxTickerAgeMs = meta.ageMs;
   }
 
@@ -1335,6 +1608,7 @@ export async function fetchTickersWithMeta(
     freshCacheCount,
     staleFallbackCount,
     missingCount,
+    momentumEligibleCount,
     maxTickerAgeMs,
     oldestTickerAgeMs: maxTickerAgeMs,
     lockWaitMs: totalLockWaitMs,

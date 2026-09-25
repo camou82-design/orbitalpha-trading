@@ -6,6 +6,7 @@ import {
   fetchMinuteCandles,
   fetchTickers,
   fetchTickersWithMeta,
+  getTickerTransportStats,
   isFreshForMomentum,
   partitionKrwMarketsByUpbitValidity,
   tickerSourceMap,
@@ -140,8 +141,12 @@ const PUMP_EARLY_RISE_3M_MIN_PCT = Number(process.env.PUMP_SCANNER_EARLY_RISE_3M
 /** 박스 상단: 직전 N개 완료 봉(현재 봉 제외) 고가 최대 */
 const PUMP_BOX_LOOKBACK_BARS = Math.max(5, Math.min(30, Number(process.env.PUMP_SCANNER_BOX_LOOKBACK_BARS ?? 10)));
 
+const PUMP_SCANNER_BLIND_TICKS_THRESHOLD = Math.max(1, Number(process.env.PUMP_SCANNER_BLIND_TICKS_THRESHOLD ?? 3));
+let consecutiveBlindTicks = 0;
+
 const pumpAltTickerOptsBase: FetchTickersOptions = {
   sortByCached24hVolume: false,
+  preferAllEndpoint: true,
   batchSize: PUMP_TICKER_BATCH_SIZE,
   batchDelayMs: PUMP_TICKER_BATCH_DELAY_MS,
   parallelTickerBatches: PUMP_TICKER_PARALLEL,
@@ -1091,6 +1096,9 @@ export function createPumpScanner(
       const maxTickerAgeMs = altTickerRes?.maxTickerAgeMs ?? 0;
 
       const MAX_MOMENTUM_TICKER_AGE_MS = Math.max(10_000, Number(process.env.PUMP_SCANNER_MAX_MOMENTUM_TICKER_AGE_MS ?? 60_000));
+      const momentumEligibleCount =
+        altTickerRes?.momentumEligibleCount ??
+        Array.from(altTickerRes?.metaByMarket.values() ?? []).filter((m) => isFreshForMomentum(m, MAX_MOMENTUM_TICKER_AGE_MS)).length;
       
       // Strict Allowlist check against caller-local metaByMarket snapshot
       const isAllowedForMomentum = (market: string): boolean => {
@@ -1111,6 +1119,40 @@ export function createPumpScanner(
       const momentumCandidates = momSel.momentumTop;
       const momentumScoreByMarket = momSel.momentumScoreByMarket;
       const tAfterMomentum = Date.now();
+
+      // Scanner health invariant: alt_market_count > 0 인데 fresh live ticker 부재 또는 momentum eligible/considered 0 상태 지속 감시
+      if (altMarkets.length > 0 && (fetchedLiveCount + freshCacheCount === 0 || momentumEligibleCount === 0 || momSel.totalConsidered === 0)) {
+        consecutiveBlindTicks++;
+      } else {
+        consecutiveBlindTicks = 0;
+      }
+
+      const transportStats = getTickerTransportStats();
+      if (consecutiveBlindTicks >= PUMP_SCANNER_BLIND_TICKS_THRESHOLD) {
+        console.error(
+          JSON.stringify({
+            tag: "PUMP_SCANNER_MARKET_DATA_BLIND_PROOF",
+            ts: new Date().toISOString(),
+            consecutive_blind_ticks: consecutiveBlindTicks,
+            alt_market_count: altMarkets.length,
+            ticker_returned: tickers.length,
+            fetched_live_count: fetchedLiveCount,
+            fresh_cache_count: freshCacheCount,
+            stale_fallback_count: staleFallbackCount,
+            missing_count: missingCount,
+            momentum_eligible_count: momentumEligibleCount,
+            momentum_considered: momSel.totalConsidered,
+            oldest_ticker_age_ms: maxTickerAgeMs,
+            max_ticker_age_ms: maxTickerAgeMs,
+            ticker_rate_limit_remaining: transportStats.rateLimitInfo,
+            ticker_429_count: transportStats.global429Count,
+            ticker_retry_count: transportStats.globalRetryCount,
+            global_cooldown_active: transportStats.globalCooldownActive,
+            global_cooldown_ms: Math.max(0, transportStats.globalCooldownUntilMs - Date.now()),
+            circuit_open_count: transportStats.circuitOpenCount,
+          }),
+        );
+      }
 
       if (universeDebugLog) {
         console.info(
@@ -1460,9 +1502,16 @@ export function createPumpScanner(
             fresh_cache_count: freshCacheCount,
             stale_fallback_count: staleFallbackCount,
             missing_count: missingCount,
+            momentum_eligible_count: momentumEligibleCount,
             oldest_ticker_age_ms: maxTickerAgeMs,
             max_ticker_age_ms: maxTickerAgeMs,
             lock_wait_ms: altTickerRes?.lockWaitMs ?? 0,
+            ticker_rate_limit_remaining: transportStats.rateLimitInfo,
+            ticker_429_count: transportStats.global429Count,
+            ticker_retry_count: transportStats.globalRetryCount,
+            global_cooldown_active: transportStats.globalCooldownActive,
+            global_cooldown_ms: Math.max(0, transportStats.globalCooldownUntilMs - Date.now()),
+            circuit_open_count: transportStats.circuitOpenCount,
             ticker_alt_budget_expired: tickerAltBudgetExpired,
             tick_budget_expired: tickBudgetExpired,
             momentum_considered: momSel.totalConsidered,
