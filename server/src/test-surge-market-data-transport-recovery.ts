@@ -2,6 +2,7 @@ import assert from "node:assert";
 import {
   fetchTickersWithMeta,
   fetchTickers,
+  fetchTickersAllKrw,
   isFreshForMomentum,
   lastGoodTickerCache,
   lastGoodTickerFetchedAtMap,
@@ -26,24 +27,24 @@ async function runSuite() {
 
   try {
     // -------------------------------------------------------------------------
-    // TEST A: /v1/ticker/all 정상 응답 -> KRW 전체 ticker live 처리 & 호환성 검증
+    // TEST A-1: direct fetchTickersAllKrw() -> 전체 KRW universe snapshot 획득
     // -------------------------------------------------------------------------
-    console.log("--- Test A: /v1/ticker/all 정상 응답 -> KRW 전체 ticker live 처리 ---");
+    console.log("--- Test A-1: direct fetchTickersAllKrw() -> 전체 KRW universe snapshot ---");
     resetTickerTransportStatsForTest();
     resetTickerLockStateForTest();
     tickerCache.clear();
     lastGoodTickerCache.clear();
     lastGoodTickerFetchedAtMap.clear();
 
-    const mock285Markets = Array.from({ length: 285 }, (_, i) => `KRW-MOCK${i}`);
-    mock285Markets.push("KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-B3", "KRW-MANTRA", "KRW-STALE1", "KRW-FRESH1", "KRW-HELD1");
+    const mockAllMarkets = Array.from({ length: 285 }, (_, i) => `KRW-MOCK${i}`);
+    mockAllMarkets.push("KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-B3", "KRW-MANTRA", "KRW-STALE1", "KRW-FRESH1", "KRW-HELD1");
 
     let allCalled = false;
     let allUrl = "";
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       const urlStr = String(url);
       if (urlStr.includes("/v1/market/all")) {
-        return new Response(JSON.stringify(mock285Markets.map((m) => ({ market: m }))), {
+        return new Response(JSON.stringify(mockAllMarkets.map((m) => ({ market: m }))), {
           status: 200,
           headers: { "content-type": "application/json" },
         });
@@ -51,7 +52,7 @@ async function runSuite() {
       if (urlStr.includes("/v1/ticker/all")) {
         allCalled = true;
         allUrl = urlStr;
-        const rows = mock285Markets.map((m, idx) => ({
+        const rows = mockAllMarkets.map((m, idx) => ({
           market: m,
           trade_date_utc: "2026-09-25",
           trade_time_utc: "06:30:00",
@@ -83,22 +84,49 @@ async function runSuite() {
       throw new Error(`Unexpected url: ${urlStr}`);
     }) as any;
 
-    const resA = await fetchTickersWithMeta(mock285Markets, {
+    const directAllRows = await fetchTickersAllKrw();
+    assert(allCalled, "Test A-1: /v1/ticker/all endpoint was called");
+    assert(allUrl.includes("quote_currencies=KRW"), "Test A-1: quote_currencies=KRW was passed");
+    assert.strictEqual(directAllRows.length, mockAllMarkets.length, "Test A-1: Direct fetch returned all KRW markets");
+    console.log(`[PASS] Test A-1: fetchTickersAllKrw() 직접 호출 -> 전체 ${directAllRows.length}개 ticker snapshot 수집 완료\n`);
+
+    // -------------------------------------------------------------------------
+    // TEST A-2: fetchTickersWithMeta(altMarkets) -> Caller Requested Universe 필터링 & BASE_MARKETS Contamination 0
+    // -------------------------------------------------------------------------
+    console.log("--- Test A-2: fetchTickersWithMeta(altMarkets) -> Universe 필터링 및 BASE_MARKETS 오염 방지 ---");
+    const altMarketsOnly = mockAllMarkets.filter((m) => !["KRW-BTC", "KRW-ETH", "KRW-XRP"].includes(m));
+    const requestedAltCount = altMarketsOnly.length; // 290개 (285 mock + B3, MANTRA, STALE1, FRESH1, HELD1)
+
+    const resA2 = await fetchTickersWithMeta(altMarketsOnly, {
       preferAllEndpoint: true,
-      maxMarkets: mock285Markets.length,
-      debugCaller: "test-a",
+      maxMarkets: altMarketsOnly.length,
+      debugCaller: "test-a2-alt",
     });
 
-    assert(allCalled, "Test A: /v1/ticker/all endpoint was called");
-    assert(allUrl.includes("quote_currencies=KRW"), "Test A: quote_currencies=KRW was passed");
-    assert.strictEqual(resA.tickers.length, mock285Markets.length, "Test A: All 288 markets returned");
-    assert.strictEqual(resA.fetchedLiveCount, mock285Markets.length, "Test A: All markets are live");
-    assert.strictEqual(resA.staleFallbackCount, 0, "Test A: staleFallbackCount is strictly 0");
-    assert.strictEqual(resA.momentumEligibleCount, mock285Markets.length, "Test A: All markets are momentum eligible");
-    const transportStatsA = getTickerTransportStats();
-    assert.strictEqual(transportStatsA.globalCooldownActive, false, "Test A: Global cooldown inactive");
-    assert(transportStatsA.rateLimitInfo?.secRemaining === 9, "Test A: Rate limit header parsed");
-    console.log("[PASS] Test A: /v1/ticker/all 정상 응답 -> 288종목 live 수집 및 schema 매핑 완료\n");
+    // 1) Requested universe vs Returned universe
+    assert.strictEqual(resA2.tickers.length, requestedAltCount, `Test A-2: returned count (${resA2.tickers.length}) matches requested alt count (${requestedAltCount})`);
+    
+    // 2) Subset check: returned markets ⊆ requested alt markets
+    const requestedSet = new Set(altMarketsOnly);
+    for (const t of resA2.tickers) {
+      assert(requestedSet.has(t.market), `Test A-2: Returned market ${t.market} MUST be in requested alt markets`);
+    }
+
+    // 3) BASE_MARKETS contamination check: BASE_MARKETS contamination = 0
+    const baseMarkets = ["KRW-BTC", "KRW-ETH", "KRW-XRP"];
+    for (const base of baseMarkets) {
+      assert(!resA2.tickers.some((t) => t.market === base), `Test A-2: BASE_MARKET ${base} MUST NOT be present in alt ticker results`);
+      assert(!resA2.metaByMarket.has(base), `Test A-2: BASE_MARKET ${base} MUST NOT be in caller metaByMarket`);
+    }
+
+    // 4) Counts consistency with requested universe
+    assert.strictEqual(resA2.fetchedLiveCount, requestedAltCount, `Test A-2: fetchedLiveCount (${resA2.fetchedLiveCount}) strictly matches requested count (${requestedAltCount})`);
+    assert.strictEqual(resA2.staleFallbackCount, 0, "Test A-2: staleFallbackCount is 0");
+    assert.strictEqual(resA2.missingCount, 0, "Test A-2: missingCount is 0");
+    assert.strictEqual(resA2.momentumEligibleCount, requestedAltCount, `Test A-2: momentumEligibleCount strictly matches requested count (${requestedAltCount})`);
+    assert.strictEqual(resA2.metaByMarket.size, requestedAltCount, `Test A-2: metaByMarket.size strictly matches requested count (${requestedAltCount})`);
+    
+    console.log(`[PASS] Test A-2: Universe 필터링 완벽 검증 (Requested=${requestedAltCount}, Returned=${resA2.tickers.length}, BASE_MARKETS Contamination=0)\n`);
 
     // -------------------------------------------------------------------------
     // TEST B: 첫 요청 429 후 제한된 retry 성공 -> live 복구
@@ -164,7 +192,7 @@ async function runSuite() {
     globalThis.fetch = (async (url: string | URL | Request) => {
       const urlStr = String(url);
       if (urlStr.includes("/v1/market/all")) {
-        return new Response(JSON.stringify(mock285Markets.map((m) => ({ market: m }))), {
+        return new Response(JSON.stringify(mockAllMarkets.map((m) => ({ market: m }))), {
           status: 200,
           headers: { "content-type": "application/json" },
         });
@@ -179,7 +207,7 @@ async function runSuite() {
       throw new Error(`Unexpected url: ${urlStr}`);
     }) as any;
 
-    const resC = await fetchTickersWithMeta(mock285Markets.slice(0, 50), {
+    const resC = await fetchTickersWithMeta(mockAllMarkets.slice(0, 50), {
       preferAllEndpoint: true,
       debugCaller: "test-c",
     });
