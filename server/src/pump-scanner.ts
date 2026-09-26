@@ -973,7 +973,7 @@ export function createPumpScanner(
           krwMarkets = cachedKrwMarkets ?? [...BASE_MARKETS];
         }
       }
-      let altMarkets = krwMarkets.filter((m) => !BASE_MARKET_SET.has(m));
+      let altMarkets = krwMarkets;
       const altValidity = await partitionKrwMarketsByUpbitValidity(altMarkets);
       if (!altValidity.skippedBecauseUnknown) {
         if (altValidity.rejected.length > 0) {
@@ -1017,7 +1017,7 @@ export function createPumpScanner(
             action: "attempt_held_only_ticker_recovery",
           }),
         );
-        const heldAltOnly = heldMarkets.filter((m) => !BASE_MARKET_SET.has(m));
+        const heldAltOnly = heldMarkets;
         if (heldAltOnly.length > 0) {
           try {
             tickers = await fetchTickers(heldAltOnly, {
@@ -1067,7 +1067,7 @@ export function createPumpScanner(
       }
       const tAfterAltTickers = Date.now();
       const fetchedAltSet = new Set(tickers.map((t) => t.market));
-      const heldMissingFromTicker = heldMarkets.filter((m) => !BASE_MARKET_SET.has(m) && !fetchedAltSet.has(m) && !is429Excluded(m));
+      const heldMissingFromTicker = heldMarkets.filter((m) => !fetchedAltSet.has(m) && !is429Excluded(m));
       
       let heldExtraTickers: UpbitTicker[] = [];
       try {

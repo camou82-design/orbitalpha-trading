@@ -70,10 +70,10 @@ export function computeLiveCapitalPolicyV4(params: {
     const val = qty * px;
     if (currency === "USDT") {
       usdtValueKrw += val;
-    } else if (coreMarketSet.has(mk)) {
-      coreHoldingsEval += val;
     } else if (managedSurgeSet ? managedSurgeSet.has(mk) : false) {
       surgeHoldingsEval += val;
+    } else if (coreMarketSet.has(mk)) {
+      coreHoldingsEval += val;
     } else {
       passiveHoldingsEval += val;
     }
@@ -81,12 +81,16 @@ export function computeLiveCapitalPolicyV4(params: {
 
   const reservedRaw = Math.max(0, Number(params.reservedKrw ?? 0));
   const inflightMk = typeof params.inFlightMarket === "string" ? params.inFlightMarket.trim() : "";
+  const isInflightSurge =
+    Boolean(params.inFlight) &&
+    inflightMk.length > 0 &&
+    (managedSurgeSet ? managedSurgeSet.has(inflightMk) : !coreMarketSet.has(inflightMk));
   const coreInflightPending =
-    Boolean(params.inFlight) && inflightMk.length > 0 && coreMarketSet.has(inflightMk) ? reservedRaw : 0;
-  const surgeInflightPending =
-    Boolean(params.inFlight) && inflightMk.length > 0 && !coreMarketSet.has(inflightMk)
+    Boolean(params.inFlight) && inflightMk.length > 0 && !isInflightSurge && coreMarketSet.has(inflightMk)
       ? reservedRaw
-      : Math.max(0, Number(params.surgePendingReservedKrw ?? 0));
+      : 0;
+  const surgeInflightPending =
+    isInflightSurge ? reservedRaw : Math.max(0, Number(params.surgePendingReservedKrw ?? 0));
 
   const coreUsedCapitalKrwRaw = coreHoldingsEval + coreInflightPending;
   const surgeUsedCapitalKrwRaw = surgeHoldingsEval + surgeInflightPending;
@@ -103,8 +107,8 @@ export function computeLiveCapitalPolicyV4(params: {
   const okxTransferReserveKrw = excludedUsdtValueKrw;
   const spotTradingEquityKrw = Math.max(0, totalAssetEquityKrw - excludedUsdtValueKrw);
 
-  const coreCapAmount = Math.floor(spotTradingEquityKrw * 0.70);
-  const surgeCapAmount = Math.floor(spotTradingEquityKrw * 0.30);
+  const coreCapAmount = 0;
+  const surgeCapAmount = spotTradingEquityKrw;
 
   const coreUsedCapitalAll = Math.floor(coreUsedCapitalKrwRaw);
   const surgeUsedCapitalAll = Math.floor(surgeUsedCapitalKrwRaw);
@@ -123,7 +127,7 @@ export function computeLiveCapitalPolicyV4(params: {
     passiveHoldingsEvaluationKrw: Math.floor(passiveHoldingsEval),
     corePendingBuyReservedKrw: Math.floor(coreInflightPending),
     surgePendingBuyReservedKrw: Math.floor(surgeInflightPending),
-    coreRemainingKrw: Math.max(0, coreCapAmount - coreUsedCapitalAll),
-    surgeRemainingKrw: Math.max(0, surgeCapAmount - surgeUsedCapitalAll),
+    coreRemainingKrw: 0,
+    surgeRemainingKrw: Math.max(0, surgeCapAmount - (coreUsedCapitalAll + surgeUsedCapitalAll)),
   };
 }

@@ -11714,6 +11714,12 @@ export function createLiveDataStrategy(opts: {
       JSON.stringify({
         tag: "DEBUG_LIVE_CAPITAL_POLICY_V4",
         ts: new Date().toISOString(),
+        capital_mode: "PUMP_100",
+        core_capital_pct: 0,
+        pump_capital_pct: 100,
+        pump_strategy_capital_krw: surgeCapAmount,
+        pump_used_capital_krw: Math.floor(surgeUsedCapitalKrw),
+        pump_remaining_capital_krw: surgeRemainingForTickKrw,
         totalAssetEquity: totalAssetEquityKrw,
         spotTradingEquityKrw,
         excludedUsdtValueKrw,
@@ -11736,6 +11742,9 @@ export function createLiveDataStrategy(opts: {
 
     const baseCoreCapitalLogFields = (): Record<string, unknown> => ({
       source_kind: "CORE_TRADE" as const,
+      capital_mode: "PUMP_100",
+      core_capital_pct: 0,
+      pump_capital_pct: 100,
       spotTradingEquityKrw,
       excludedUsdtValueKrw,
       okxTransferReserveKrw,
@@ -11784,16 +11793,23 @@ export function createLiveDataStrategy(opts: {
     };
     const surgeOpenCount = getEffectiveSurgeOpenCount();
     let sameTickAcceptedSurgeKrw = 0;
-    const tickStartRemainingSurgeCapKrw = Math.max(0, surgeCapAmount - Math.max(0, surgeUsedCapitalKrw));
+    const tickStartRemainingSurgeCapKrw = Math.max(0, surgeCapAmount - (Math.max(0, surgeUsedCapitalKrw) + Math.max(0, coreUsedCapitalKrw)));
 
     console.info(
       JSON.stringify({
         tag: "SURGE_CAPITAL_AUTHORITY_PROOF",
         ts: new Date().toISOString(),
+        capital_mode: "PUMP_100",
+        core_capital_pct: 0,
+        pump_capital_pct: 100,
+        pump_strategy_capital_krw: surgeCapAmount,
+        pump_used_capital_krw: Math.floor(surgeUsedCapitalKrw + coreUsedCapitalKrw),
+        pump_remaining_capital_krw: surgeRemainingForTickKrw,
         spot_trading_equity_krw: spotTradingEquityKrw,
-        surge_cap_ratio: 0.30,
+        surge_cap_ratio: 1.0,
         surge_cap_krw: surgeCapAmount,
         managed_surge_exposure_krw: capTick.surgeHoldingsEvaluationKrw,
+        managed_core_exposure_krw: capTick.coreHoldingsEvaluationKrw,
         surge_pending_reserved_krw: capTick.surgePendingBuyReservedKrw,
         same_tick_accepted_surge_krw: sameTickAcceptedSurgeKrw,
         passive_holdings_excluded_krw: capTick.passiveHoldingsEvaluationKrw,
@@ -13186,7 +13202,13 @@ export function createLiveDataStrategy(opts: {
           continue;
         }
 
-        const isCoreMarket = coreMarketSet.has(market);
+        const isSurgeCandidate = Boolean(
+          (meta as any)?.isSurgeSource === true ||
+          (signalPayload as any)?.isSurgeSource === true ||
+          SURGE_V2_SOURCE_KINDS.has(entrySourceKindByMarket.get(market) ?? "") ||
+          SURGE_V2_SOURCE_KINDS.has(sourceMetaByMarket.get(market)?.source_kind ?? "")
+        );
+        const isCoreMarket = coreMarketSet.has(market) && !isSurgeCandidate;
         const capLimit = isCoreMarket ? coreCapAmount : surgeCapAmount;
         const usedCap = isCoreMarket ? coreUsedCapitalKrw : surgeUsedCapitalKrw;
         const remainingInTick = isCoreMarket ? coreRemainingInTick : surgeRemainingInTick;
@@ -13206,7 +13228,7 @@ export function createLiveDataStrategy(opts: {
         } else {
           // [SURGE SLOT-AWARE SIZING]
           // canonical getEffectiveSurgeOpenCount 및 sameTickAcceptedSurgeKrw 반영 기준 동적 배분
-          const currentSurgeInvestedKrw = Math.max(0, surgeUsedCapitalKrw) + sameTickAcceptedSurgeKrw;
+          const currentSurgeInvestedKrw = Math.max(0, surgeUsedCapitalKrw) + Math.max(0, coreUsedCapitalKrw) + sameTickAcceptedSurgeKrw;
           const remainingSurgeCapital = Math.max(0, surgeCapAmount - currentSurgeInvestedKrw);
           const openSurgePositionsCount = getEffectiveSurgeOpenCount();
           const remainingSurgeSlots = Math.max(0, SURGE_MAX_OPEN_POSITIONS - openSurgePositionsCount);
@@ -15677,7 +15699,7 @@ export function createLiveDataStrategy(opts: {
         );
 
         if (earlyAllowed) {
-          const isCoreMarket = coreMarketSet.has(market);
+          const isCoreMarket = coreMarketSet.has(market) && !isSurgeSource;
           const capLimit = isCoreMarket ? coreCapAmount : surgeCapAmount;
           const usedCap = isCoreMarket ? coreUsedCapitalKrw : surgeUsedCapitalKrw;
           const remainingInTick = isCoreMarket ? coreRemainingInTick : surgeRemainingInTick;
@@ -16918,7 +16940,7 @@ export function createLiveDataStrategy(opts: {
           }),
         );
       };
-      const isCoreMarket = coreMarketSet.has(market);
+      const isCoreMarket = coreMarketSet.has(market) && !isSurgeSource;
       const capLimit = isCoreMarket ? coreCapAmount : surgeCapAmount;
       const usedCap = isCoreMarket ? coreUsedCapitalKrw : surgeUsedCapitalKrw;
       const remainingInTick = isCoreMarket ? coreRemainingInTick : surgeRemainingInTick;
