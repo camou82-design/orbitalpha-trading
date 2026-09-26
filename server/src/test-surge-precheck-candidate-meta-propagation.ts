@@ -64,9 +64,9 @@ console.log("\n--- Case A: Genuine Surge in Neutral with BTC RSI=55 -> neutral_m
 }
 
 // =========================================================================
-// Case B: Genuine Surge in Neutral with BTC RSI=40.75 (< 50)
+// Case B: Genuine Surge in Neutral with BTC RSI=40.75 (Soft Context 0.65 Multiplier)
 // =========================================================================
-console.log("\n--- Case B: Genuine Surge in Neutral with BTC RSI=40.75 -> btc_rsi_low_surge_blocked MUST OCCUR (NOT neutral block) ---");
+console.log("\n--- Case B: Genuine Surge in Neutral with BTC RSI=40.75 -> soft context 0.65 allowed (scale 0.468) ---");
 {
   const snap = createSnap("neutral", 40.75);
   const payload = makeValidPayload("KRW-SOL");
@@ -83,17 +83,38 @@ console.log("\n--- Case B: Genuine Surge in Neutral with BTC RSI=40.75 -> btc_rs
     candidateMeta: candidateMeta,
   });
 
-  assert.strictEqual(res.ok, false, "Must be blocked due to BTC RSI < 50");
+  assert.strictEqual(res.ok, true, "Must be allowed under soft context");
+  assert.strictEqual(res.size_scale, 0.468, "size_scale must be 0.72 * 0.65 = 0.468");
+  console.log(`[PASS] Case B: Correctly allowed with soft context size_scale=${res.size_scale}`);
+}
+
+// =========================================================================
+// Case B2: Genuine Surge with Low RSI (<35) + Severe BTC Risk (btc_drop_penalty >= 25)
+// =========================================================================
+console.log("\n--- Case B2: Genuine Surge with RSI 34 + btc_drop_penalty 30 -> btc_rsi_low_surge_blocked MUST OCCUR ---");
+{
+  const snap = createSnap("risk_off", 34.0);
+  const payload = makeValidPayload("KRW-SOL");
+  const candidateMeta = {
+    engine_bucket: "surge",
+    setup: { ok: true, reason: "surge_setup_passed" },
+    btc_drop_penalty: 30,
+  };
+
+  const res = assertOrderBuyAllowed(snap, {
+    kind: "new_entry",
+    signalPayload: payload,
+    strategyType: "momentum",
+    market: "KRW-SOL",
+    candidateMeta: candidateMeta,
+  });
+
+  assert.strictEqual(res.ok, false, "Must be blocked due to severe BTC risk + low RSI");
   assert.ok(
     res.blocked_reason.includes("btc_rsi_low_surge_blocked"),
     `Expected btc_rsi_low_surge_blocked but got: ${res.blocked_reason}`
   );
-  assert.strictEqual(
-    res.blocked_reason.includes("neutral_market_surge_blocked"),
-    false,
-    "Must NOT be blocked by neutral_market_surge_blocked"
-  );
-  console.log(`[PASS] Case B: Correctly blocked by ${res.blocked_reason}`);
+  console.log(`[PASS] Case B2: Correctly blocked by ${res.blocked_reason}`);
 }
 
 // =========================================================================

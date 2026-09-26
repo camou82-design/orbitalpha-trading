@@ -25,6 +25,8 @@ export type MarketStateSnapshot = {
   exception_entry_allowed: boolean;
   /** BTC RSI 14일 연산값 */
   btc_rsi?: number;
+  /** BTC 단기 급락 감점 */
+  btc_drop_penalty?: number;
 };
 
 /** 주문 직전 게이트용 — UI `market-state` 와 동일 스냅샷 기준. */
@@ -37,6 +39,9 @@ export type OrderBuyGateResult =
       add_entry_blocked: false;
       blocked_reason: null;
       size_scale: number;
+      btc_rsi?: number;
+      btc_rsi_risk_multiplier?: number;
+      btc_rsi_authority?: "soft_context" | "hard_combined_risk";
     }
   | {
       ok: false;
@@ -46,6 +51,9 @@ export type OrderBuyGateResult =
       add_entry_blocked: boolean;
       blocked_reason: string;
       size_scale: number;
+      btc_rsi?: number;
+      btc_rsi_risk_multiplier?: number;
+      btc_rsi_authority?: "soft_context" | "hard_combined_risk";
     };
 
 function ema(values: number[], period: number): number {
@@ -415,6 +423,9 @@ export function assertOrderBuyAllowed(
       }
     }
 
+    let btcRsiRiskMultiplier = 1.0;
+    let btcRsiAuthority: "soft_context" | "hard_combined_risk" = "soft_context";
+
     if (isMajorImpulseStrategy) {
       // 1. Major Impulse Fast-Track: KRW-BTC / KRW-ETH Only
       if (args.candidateMeta?.is_panic === true) {
@@ -534,12 +545,34 @@ export function assertOrderBuyAllowed(
       }
 
     } else {
-      // 4. 일반 Aggressive Surge 정책 (불변 유지)
+      // 4. 일반 Aggressive Surge 정책 (PUMP_100 소프트 컨텍스트 적용)
       if (isAggressiveSurgeStrategy) {
-        // [SURGE V2 권한 위임] neutral/risk_off 장세에서 generic hard block 금지 -> SURGE V2 평가로 위임
-        // [불변] BTC RSI < 50 기존 기준 100% 유지
-        if (snap.btc_rsi !== undefined && snap.btc_rsi < 50) {
-          return deny(`btc_rsi_low_surge_blocked: BTC RSI가 50 미만이라 진입 차단 (${snap.btc_rsi.toFixed(1)})`, true, false);
+        // [PUMP/SURGE BTC RSI SOFT CONTEXT AUTHORITY]
+        // BTC RSI < 50 단독 조건으로 하드 블록하지 않고 시장 위험 context로 size_scale 연동.
+        if (snap.btc_rsi !== undefined) {
+          const rsi = snap.btc_rsi;
+          if (rsi >= 50) {
+            btcRsiRiskMultiplier = 1.0;
+          } else if (rsi >= 45) {
+            btcRsiRiskMultiplier = 0.85;
+          } else if (rsi >= 40) {
+            btcRsiRiskMultiplier = 0.65;
+          } else if (rsi >= 35) {
+            btcRsiRiskMultiplier = 0.45;
+          } else {
+            // RSI < 35: BTC 급락(btc_drop_penalty >= 25) 또는 패닉(is_panic/panic phase) 증거와 동시 충족될 때만 hard block
+            const isSevereBtcRisk = Boolean(
+              args.candidateMeta?.is_panic === true ||
+              args.candidateMeta?.btc_phase === "panic" ||
+              (args.candidateMeta?.btc_drop_penalty !== undefined && args.candidateMeta.btc_drop_penalty >= 25) ||
+              (snap.btc_drop_penalty !== undefined && snap.btc_drop_penalty >= 25)
+            );
+            if (isSevereBtcRisk) {
+              btcRsiAuthority = "hard_combined_risk";
+              return deny(`btc_rsi_low_surge_blocked: BTC RSI < 35 with severe BTC risk (${rsi.toFixed(1)})`, true, false);
+            }
+            btcRsiRiskMultiplier = 0.35;
+          }
         }
       }
 
@@ -553,6 +586,7 @@ export function assertOrderBuyAllowed(
       }
     }
 
+    const finalSizeScale = Number((size_scale * btcRsiRiskMultiplier).toFixed(4));
     return {
       ok: true,
       market_state,
@@ -560,7 +594,10 @@ export function assertOrderBuyAllowed(
       new_entry_blocked: false,
       add_entry_blocked: false,
       blocked_reason: null,
-      size_scale,
+      size_scale: finalSizeScale,
+      btc_rsi: snap.btc_rsi,
+      btc_rsi_risk_multiplier: btcRsiRiskMultiplier,
+      btc_rsi_authority: btcRsiAuthority,
     };
   }
 

@@ -167,7 +167,7 @@ async function runSurgeMarketStateAuthorityTests() {
   assert.strictEqual(tt1.size_scale, 0.72, "TT1 size_scale must be 0.72");
   console.log("[PASS] Truth Table 1: neutral + RSI 55 + SURGE -> 정상 허용 (scale 0.72)");
 
-  console.log("\n--- Truth Table 2: neutral + SURGE + RSI 49 -> RSI gate 차단 ---");
+  console.log("\n--- Truth Table 2: neutral + SURGE + RSI 49 -> soft context 0.85 sizing (scale 0.612) 허용 ---");
   const tt2 = assertOrderBuyAllowed(snapNeutralRsi49, {
     kind: "new_entry",
     market: "KRW-ZK",
@@ -175,9 +175,9 @@ async function runSurgeMarketStateAuthorityTests() {
     signalPayload: zkValidPayload,
     candidateMeta: surgePassingMeta,
   });
-  assert.strictEqual(tt2.ok, false, "TT2 must be blocked");
-  assert.ok(tt2.blocked_reason?.includes("btc_rsi_low_surge_blocked"), "TT2 blocked by btc_rsi_low_surge_blocked");
-  console.log("[PASS] Truth Table 2: neutral + RSI 49 -> btc_rsi_low_surge_blocked 정상 차단");
+  assert.strictEqual(tt2.ok, true, "TT2 must be allowed under soft context");
+  assert.strictEqual(tt2.size_scale, 0.612, "TT2 size_scale must be 0.72 * 0.85 = 0.612");
+  console.log("[PASS] Truth Table 2: neutral + RSI 49 -> soft context 0.85 multiplier (scale 0.612) 정상 허용");
 
   console.log("\n--- Truth Table 3: risk_off + SURGE + RSI 55 -> reduced-size (0.45) 허용 ---");
   const tt3 = assertOrderBuyAllowed(snapRiskOffRsi55, {
@@ -191,7 +191,7 @@ async function runSurgeMarketStateAuthorityTests() {
   assert.strictEqual(tt3.size_scale, 0.45, "TT3 size_scale must be canonical reduced-size 0.45");
   console.log("[PASS] Truth Table 3: risk_off + RSI 55 + SURGE -> canonical reduced-size (0.45) 정상 허용");
 
-  console.log("\n--- Truth Table 4: risk_off + SURGE + RSI 49 -> RSI gate 차단 ---");
+  console.log("\n--- Truth Table 4: risk_off + SURGE + RSI 49 -> soft context 0.85 (scale 0.3825) 허용 ---");
   const tt4 = assertOrderBuyAllowed(snapRiskOffRsi49, {
     kind: "new_entry",
     market: "KRW-ZK",
@@ -199,9 +199,9 @@ async function runSurgeMarketStateAuthorityTests() {
     signalPayload: zkValidPayload,
     candidateMeta: surgePassingMeta,
   });
-  assert.strictEqual(tt4.ok, false, "TT4 must be blocked");
-  assert.ok(tt4.blocked_reason?.includes("btc_rsi_low_surge_blocked"), "TT4 blocked by btc_rsi_low_surge_blocked");
-  console.log("[PASS] Truth Table 4: risk_off + RSI 49 -> btc_rsi_low_surge_blocked 정상 차단");
+  assert.strictEqual(tt4.ok, true, "TT4 must be allowed under soft context");
+  assert.strictEqual(tt4.size_scale, 0.3825, "TT4 size_scale must be 0.45 * 0.85 = 0.3825");
+  console.log("[PASS] Truth Table 4: risk_off + RSI 49 -> soft context 0.85 multiplier (scale 0.3825) 정상 허용");
 
   console.log("\n--- Truth Table 5: neutral + SURGE (delegates to SURGE V2) -> 허용 (scale 0.72) ---");
   const tt5 = assertOrderBuyAllowed(snapNeutralRsi55, {
@@ -252,7 +252,7 @@ async function runSurgeMarketStateAuthorityTests() {
   assert.ok(tt8.blocked_reason?.includes("panic_hard_risk_blocked"), "TT8 blocked by panic_hard_risk_blocked");
   console.log("[PASS] Truth Table 8: panic_hard_risk_blocked 절대 진입 차단 유지");
 
-  console.log("\n--- Truth Table 9: 실서버 KRW-ZK 런타임 재현 (RSI 41.65 < 50) -> 차단 ---");
+  console.log("\n--- Truth Table 9: 실서버 KRW-ZK 런타임 (risk_off, RSI 41.65) -> soft context 0.65 (scale 0.2925) 허용 ---");
   const tt9 = assertOrderBuyAllowed(snapZkRuntime, {
     kind: "new_entry",
     market: "KRW-ZK",
@@ -260,11 +260,11 @@ async function runSurgeMarketStateAuthorityTests() {
     signalPayload: zkValidPayload,
     candidateMeta: surgePassingMeta,
   });
-  assert.strictEqual(tt9.ok, false, "TT9: ZK with RSI 41.65 must be blocked by BTC RSI gate");
-  assert.ok(tt9.blocked_reason?.includes("btc_rsi_low_surge_blocked"), "TT9: blocked by btc_rsi_low_surge_blocked");
-  console.log("[PASS] Truth Table 9: 실서버 ZK (RSI 41.65) -> btc_rsi_low_surge_blocked 안전 차단");
+  assert.strictEqual(tt9.ok, true, "TT9: ZK with RSI 41.65 is allowed under soft context");
+  assert.strictEqual(tt9.size_scale, 0.2925, "TT9 size_scale must be 0.45 * 0.65 = 0.2925");
+  console.log("[PASS] Truth Table 9: 실서버 ZK (risk_off, RSI 41.65) -> soft context 0.65 multiplier (scale 0.2925) 정상 허용");
 
-  console.log("\n--- Truth Table 10: 실서버 KRW-BREV 런타임 재현 (RSI 39.07 < 50) -> 차단 ---");
+  console.log("\n--- Truth Table 10: 실서버 KRW-BREV 런타임 (risk_off, RSI 39.07) -> soft context 0.45 (scale 0.2025) 허용 ---");
   const tt10 = assertOrderBuyAllowed(snapBrevRuntime, {
     kind: "new_entry",
     market: "KRW-BREV",
@@ -272,9 +272,22 @@ async function runSurgeMarketStateAuthorityTests() {
     signalPayload: brevValidPayload,
     candidateMeta: surgePassingMeta,
   });
-  assert.strictEqual(tt10.ok, false, "TT10: BREV with RSI 39.07 must be blocked by BTC RSI gate");
-  assert.ok(tt10.blocked_reason?.includes("btc_rsi_low_surge_blocked"), "TT10: blocked by btc_rsi_low_surge_blocked");
-  console.log("[PASS] Truth Table 10: 실서버 BREV (RSI 39.07) -> btc_rsi_low_surge_blocked 안전 차단");
+  assert.strictEqual(tt10.ok, true, "TT10: BREV with RSI 39.07 is allowed under soft context");
+  assert.strictEqual(tt10.size_scale, 0.2025, "TT10 size_scale must be 0.45 * 0.45 = 0.2025");
+  console.log("[PASS] Truth Table 10: 실서버 BREV (risk_off, RSI 39.07) -> soft context 0.45 multiplier (scale 0.2025) 정상 허용");
+
+  console.log("\n--- Truth Table 10B: Severe Risk combined with low RSI (RSI 34 + btc_drop_penalty 30) -> hard block ---");
+  const snapRsi34 = { ...snapNeutralRsi49, btc_rsi: 34.0, market_state: "risk_off" as const };
+  const tt10b = assertOrderBuyAllowed(snapRsi34, {
+    kind: "new_entry",
+    market: "KRW-BREV",
+    strategyType: "momentum",
+    signalPayload: brevValidPayload,
+    candidateMeta: { ...surgePassingMeta, btc_drop_penalty: 30 },
+  });
+  assert.strictEqual(tt10b.ok, false, "TT10B: RSI 34 + severe drop penalty must be hard blocked");
+  assert.ok(tt10b.blocked_reason?.includes("btc_rsi_low_surge_blocked"), "TT10B blocked by btc_rsi_low_surge_blocked");
+  console.log("[PASS] Truth Table 10B: RSI 34 + severe risk -> btc_rsi_low_surge_blocked 정상 안전 차단");
 
   console.log("\n--- Truth Table 11: 낮은 Entry Score in neutral -> score gate 차단 ---");
   const tt11 = assertOrderBuyAllowed(snapNeutralRsi55, {

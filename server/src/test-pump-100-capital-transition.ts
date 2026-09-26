@@ -2,6 +2,7 @@ import assert from "node:assert";
 import { computeLiveCapitalPolicyV4, LIVE_CORE_TRADE_MARKETS_POLICY } from "./live-capital-policy-v4.js";
 import { scoreOne, selectMomentumTopM } from "./pump-scanner.js";
 import type { UpbitTicker, UpbitCandle } from "./upbit-public.js";
+import { assertOrderBuyAllowed } from "./market-state-filter.js";
 
 async function runRegressionTests() {
   console.log("===============================================================================");
@@ -296,8 +297,183 @@ async function runRegressionTests() {
     console.log("  ✓ Risk guards (SL -3%, TP1/TP2, BE, Trailing Stop) 100% preserved\n");
   }
 
+  // -----------------------------------------------------------------------------------------
+  // Test 5: PUMP_100 BTC RSI Soft Context & Multiplier Authority (A-H)
+  // -----------------------------------------------------------------------------------------
+  console.log("[TEST 5] Verifying BTC RSI Soft Context Authority (A through H)");
+  {
+    const basePayload = {
+      action: "buy",
+      order_type: "limit",
+      price: 250_000,
+      vol_multiplier_1m: 3.5,
+      filter_pass: true,
+      strategy_type: "surge_breakout",
+    };
+
+    const baseSurgeMeta = {
+      engine_bucket: "surge",
+      setup: { ok: true, reason: "surge_setup_passed" },
+      score: 90,
+    };
+
+    const makeSnap = (state: "risk_on" | "neutral" | "risk_off", rsi?: number) => ({
+      timestamp: new Date().toISOString(),
+      market_state: state,
+      entry_policy: (state === "risk_on" ? "적극 진입" : state === "neutral" ? "선별 진입" : "축소 진입") as any,
+      market_bonus: 0,
+      min_entry_score: 72,
+      regime_allows_new_and_additional_buys: state !== "risk_off",
+      order_limits: {} as any,
+      btc_5m_trend: "flat" as const,
+      btc_15m_trend: "flat" as const,
+      breadth_ratio: 0.5,
+      recent_close_bias: "flat" as const,
+      conservative_mode: false,
+      exception_entry_allowed: true,
+      btc_rsi: rsi,
+    });
+
+    // A. PUMP score 강함 + BTC RSI 48 → hard block 금지, 0.85 sizing (neutral: 0.72 * 0.85 = 0.612)
+    {
+      const snap = makeSnap("neutral", 48.0);
+      const res = assertOrderBuyAllowed(snap, {
+        kind: "new_entry",
+        market: "KRW-SOL",
+        strategyType: "momentum",
+        signalPayload: basePayload,
+        candidateMeta: baseSurgeMeta,
+      });
+      assert.strictEqual(res.ok, true, "A: RSI 48 must not be hard blocked");
+      assert.strictEqual(res.size_scale, 0.612, "A: size_scale must be 0.72 * 0.85 = 0.612");
+      assert.strictEqual(res.btc_rsi_risk_multiplier, 0.85);
+      assert.strictEqual(res.btc_rsi_authority, "soft_context");
+      console.log("  ✓ [A] RSI 48: Hard block prohibited, 0.85 multiplier applied (scale: 0.612)");
+    }
+
+    // B. BTC RSI 43 → hard block 금지, 0.65 sizing (neutral: 0.72 * 0.65 = 0.468)
+    {
+      const snap = makeSnap("neutral", 43.0);
+      const res = assertOrderBuyAllowed(snap, {
+        kind: "new_entry",
+        market: "KRW-SOL",
+        strategyType: "momentum",
+        signalPayload: basePayload,
+        candidateMeta: baseSurgeMeta,
+      });
+      assert.strictEqual(res.ok, true, "B: RSI 43 must not be hard blocked");
+      assert.strictEqual(res.size_scale, 0.468, "B: size_scale must be 0.72 * 0.65 = 0.468");
+      assert.strictEqual(res.btc_rsi_risk_multiplier, 0.65);
+      console.log("  ✓ [B] RSI 43: Hard block prohibited, 0.65 multiplier applied (scale: 0.468)");
+    }
+
+    // C. BTC RSI 37 → hard block 금지, 0.45 sizing (neutral: 0.72 * 0.45 = 0.324)
+    {
+      const snap = makeSnap("neutral", 37.0);
+      const res = assertOrderBuyAllowed(snap, {
+        kind: "new_entry",
+        market: "KRW-SOL",
+        strategyType: "momentum",
+        signalPayload: basePayload,
+        candidateMeta: baseSurgeMeta,
+      });
+      assert.strictEqual(res.ok, true, "C: RSI 37 must not be hard blocked");
+      assert.strictEqual(res.size_scale, 0.324, "C: size_scale must be 0.72 * 0.45 = 0.324");
+      assert.strictEqual(res.btc_rsi_risk_multiplier, 0.45);
+      console.log("  ✓ [C] RSI 37: Hard block prohibited, 0.45 multiplier applied (scale: 0.324)");
+    }
+
+    // D. RSI34 + risk_off + weak btc_drop_penalty(<25), panic=false → hard block 금지 (scale: 0.45 * 0.35 = 0.1575)
+    {
+      const snap = makeSnap("risk_off", 34.0);
+      const res = assertOrderBuyAllowed(snap, {
+        kind: "new_entry",
+        market: "KRW-SOL",
+        strategyType: "momentum",
+        signalPayload: basePayload,
+        candidateMeta: { ...baseSurgeMeta, btc_drop_penalty: 10, is_panic: false },
+      });
+      assert.strictEqual(res.ok, true, "D: RSI 34 + weak drop penalty in risk_off must not be hard blocked");
+      assert.strictEqual(res.size_scale, 0.1575, "D: size_scale must be 0.45 * 0.35 = 0.1575");
+      assert.strictEqual(res.btc_rsi_risk_multiplier, 0.35);
+      console.log("  ✓ [D] RSI 34 + Risk_Off + Weak Drop Penalty (10): Hard block prohibited, 0.35 multiplier applied (scale: 0.1575)");
+    }
+
+    // E. RSI34 + btc_drop_penalty >= 25 → hard block
+    {
+      const snap = makeSnap("risk_off", 34.0);
+      const res = assertOrderBuyAllowed(snap, {
+        kind: "new_entry",
+        market: "KRW-SOL",
+        strategyType: "momentum",
+        signalPayload: basePayload,
+        candidateMeta: { ...baseSurgeMeta, btc_drop_penalty: 25 },
+      });
+      assert.strictEqual(res.ok, false, "E: RSI 34 + severe drop penalty (25) must be hard blocked");
+      assert.ok(res.blocked_reason?.includes("btc_rsi_low_surge_blocked"), "E: blocked by btc_rsi_low_surge_blocked");
+      console.log("  ✓ [E] RSI 34 + Severe Drop Penalty (>=25): Hard blocked by btc_rsi_low_surge_blocked");
+    }
+
+    // F. RSI34 + panic=true → hard block
+    {
+      const snap = makeSnap("neutral", 34.0);
+      const res = assertOrderBuyAllowed(snap, {
+        kind: "new_entry",
+        market: "KRW-SOL",
+        strategyType: "momentum",
+        signalPayload: basePayload,
+        candidateMeta: { ...baseSurgeMeta, is_panic: true },
+      });
+      assert.strictEqual(res.ok, false, "F: RSI 34 + is_panic=true must be hard blocked");
+      assert.ok(
+        res.blocked_reason?.includes("panic_hard_risk_blocked") || res.blocked_reason?.includes("btc_rsi_low_surge_blocked"),
+        "F: blocked by panic guard",
+      );
+      console.log("  ✓ [F] RSI 34 + Panic (is_panic=true): Hard blocked immediately by panic guard");
+    }
+
+    // G. CORE capital=0 / PUMP capital=100% invariant 유지
+    {
+      const balances = [
+        { currency: "KRW", balance: 500_000, locked: 0, avg_buy_price: 1 },
+        { currency: "BTC", balance: 0.005, locked: 0, avg_buy_price: 100_000_000 },
+      ];
+      const policy = computeLiveCapitalPolicyV4({
+        balances,
+        markPriceOrAvgByMarket: (m, avg) => (m === "KRW-BTC" ? 100_000_000 : avg),
+        accountPortfolioTotalEvaluatedKrw: 1_000_000,
+        totalKrwFallback: 500_000,
+        reservedKrw: 0,
+        inFlightMarket: null,
+        inFlight: false,
+      });
+      assert.strictEqual(policy.coreCapAmount, 0);
+      assert.strictEqual(policy.surgeRemainingKrw, 500_000);
+      assert.strictEqual(policy.coreUsedCapitalKrw + policy.surgeUsedCapitalKrw + policy.surgeRemainingKrw, 1_000_000);
+      console.log("  ✓ [G] Capital Conservation Invariant: core_used + pump_used + pump_remaining = 1,000,000 <= 1,000,000");
+    }
+
+    // H. BTC/ETH/SOL/XRP/DOGE/TRX가 PUMP candidate provenance를 가지면 동일 정책 적용
+    {
+      const symbols = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-DOGE", "KRW-TRX"];
+      for (const sym of symbols) {
+        const snap = makeSnap("neutral", 45.0);
+        const res = assertOrderBuyAllowed(snap, {
+          kind: "new_entry",
+          market: sym,
+          strategyType: "momentum",
+          signalPayload: basePayload,
+          candidateMeta: { ...baseSurgeMeta, market: sym },
+        });
+        assert.strictEqual(res.ok, true, `H: ${sym} with PUMP provenance is allowed with soft multiplier`);
+        assert.strictEqual(res.size_scale, 0.612, `H: ${sym} size_scale is 0.612`);
+      }
+      console.log("  ✓ [H] Representative BASE Symbols (BTC/ETH/SOL/XRP/DOGE/TRX) under PUMP provenance: Uniform Soft Authority\n");
+    }
+  }
+
   console.log("===============================================================================");
-  console.log(" ALL AUDIT CHECKS & REGRESSION TESTS PASSED (4/4)");
+  console.log(" ALL AUDIT CHECKS & REGRESSION TESTS PASSED (5/5)");
   console.log("===============================================================================\n");
 }
 

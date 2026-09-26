@@ -13244,7 +13244,19 @@ export function createLiveDataStrategy(opts: {
             : 0;
           bucketHighConfidenceOrderKrw = Math.min(capLimit, Math.floor(slotBaseOrderKrw * 1.15));
 
+          const btcRsiNow = Number((marketState as any)?.btc_rsi ?? opts.marketState?.status()?.btc_rsi ?? 50);
+          let btcRsiRiskMult = 1.0;
+          let btcRsiAuth = "soft_context";
+          if (Number.isFinite(btcRsiNow)) {
+            if (btcRsiNow >= 50) btcRsiRiskMult = 1.0;
+            else if (btcRsiNow >= 45) btcRsiRiskMult = 0.85;
+            else if (btcRsiNow >= 40) btcRsiRiskMult = 0.65;
+            else if (btcRsiNow >= 35) btcRsiRiskMult = 0.45;
+            else btcRsiRiskMult = 0.35;
+          }
+
           const currentMarketScale = marketState.market_state === "risk_on" ? 1 : marketState.market_state === "neutral" ? 0.72 : 0.45;
+          const combinedMarketContextMultiplier = Number((currentMarketScale * btcRsiRiskMult).toFixed(4));
 
           console.info(JSON.stringify({
             tag: "SURGE_SLOT_AWARE_SIZING_PROOF",
@@ -13260,6 +13272,9 @@ export function createLiveDataStrategy(opts: {
             pre_scale_slot_budget_krw: slotBaseOrderKrw,
             remaining_cap_before_order_krw: remainingSurgeCapital,
             market_state_scale: currentMarketScale,
+            btc_rsi: btcRsiNow,
+            btc_rsi_risk_multiplier: btcRsiRiskMult,
+            combined_gate_size_scale: combinedMarketContextMultiplier,
             hard_cap_applied: Math.min(LIVE_MAX_ENTRY_KRW, ORDER_LIMITS.MAX_STRATEGY_INVESTED_KRW_PER_MARKET),
             available_krw: remainingInTick,
           }));
@@ -13274,6 +13289,20 @@ export function createLiveDataStrategy(opts: {
         const baseBudgetKrw = perPositionBudgetBySymbol.get(market) ?? 0;
         const rawRequestedOrderKrw = isCoreMarket ? baseBudgetKrw : bucketNormalOrderKrw;
 
+        const btcRsiNow = Number((marketState as any)?.btc_rsi ?? opts.marketState?.status()?.btc_rsi ?? 50);
+        let btcRsiRiskMult = 1.0;
+        let btcRsiAuth = "soft_context";
+        if (Number.isFinite(btcRsiNow)) {
+          if (btcRsiNow >= 50) btcRsiRiskMult = 1.0;
+          else if (btcRsiNow >= 45) btcRsiRiskMult = 0.85;
+          else if (btcRsiNow >= 40) btcRsiRiskMult = 0.65;
+          else if (btcRsiNow >= 35) btcRsiRiskMult = 0.45;
+          else btcRsiRiskMult = 0.35;
+        }
+
+        const currentMarketScale = marketState.market_state === "risk_on" ? 1 : marketState.market_state === "neutral" ? 0.72 : 0.45;
+        const combinedMarketContextMultiplier = Number((currentMarketScale * btcRsiRiskMult).toFixed(4));
+
         // Performance kill multiplier: STRONG CORE probe under PERFORMANCE_KILL is strictly capped at 25%
         let performanceKillMultiplier = 1.0;
         if (meta?.is_recovery_probe || meta?.is_performance_probe) {
@@ -13283,10 +13312,10 @@ export function createLiveDataStrategy(opts: {
         // Apply performance multiplier & strategy multipliers
         let orderAfterPerfMultiplier = Math.floor(rawRequestedOrderKrw * performanceKillMultiplier);
         if (!isCoreMarket) {
-          orderAfterPerfMultiplier = Math.floor(orderAfterPerfMultiplier * finalMultiplier);
+          orderAfterPerfMultiplier = Math.floor(orderAfterPerfMultiplier * finalMultiplier * combinedMarketContextMultiplier);
           const highConfidenceSurgeSetup = paperConfidence === "high" && (stats?.win_rate ?? 0) >= 0.55;
           if (highConfidenceSurgeSetup) {
-            orderAfterPerfMultiplier = Math.max(orderAfterPerfMultiplier, bucketHighConfidenceOrderKrw);
+            orderAfterPerfMultiplier = Math.max(orderAfterPerfMultiplier, Math.floor(bucketHighConfidenceOrderKrw * combinedMarketContextMultiplier));
           }
         }
 
@@ -13344,10 +13373,22 @@ export function createLiveDataStrategy(opts: {
             strategyCapitalCapKrw,
             currentStrategyUsedKrw: Math.floor(currentStrategyUsedKrw),
             remainingStrategyCapitalKrw: Math.floor(remainingStrategyCapitalKrw),
+            raw_slot_order_krw: rawRequestedOrderKrw,
             rawRequestedOrderKrw,
+            market_state_scale: currentMarketScale,
+            btc_rsi: btcRsiNow,
+            btc_rsi_risk_multiplier: btcRsiRiskMult,
+            btc_rsi_authority: btcRsiAuth,
+            combined_gate_size_scale: combinedMarketContextMultiplier,
+            order_before_market_context_krw: rawRequestedOrderKrw,
+            order_after_market_context_krw: orderAfterPerfMultiplier,
+            capital_cap_applied_krw: capitalCapAppliedKrw,
+            available_cap_applied_krw: availableKrwCapAppliedKrw,
             capitalCapAppliedKrw,
             availableKrwCapAppliedKrw,
             finalExecutableOrderKrw,
+            pre_btc_context_order_krw: Math.floor(rawRequestedOrderKrw * currentMarketScale),
+            post_btc_context_order_krw: finalExecutableOrderKrw,
           }),
         );
 
@@ -16979,9 +17020,6 @@ export function createLiveDataStrategy(opts: {
       if (!isSurgeSource && lateEntrySizingMultiplier < 1 - 1e-9) {
         orderKrw = Math.max(minOrderKrw, Math.floor(orderKrw * lateEntrySizingMultiplier));
       }
-      if (isSurgeSource && surgeMarketSizeMultiplier < 1 - 1e-9) {
-        orderKrw = Math.max(UPBIT_MIN_ORDER_KRW, Math.floor(orderKrw * surgeMarketSizeMultiplier));
-      }
 
       // Core Relaxed Probe Sizing: Fixed multipliers based on softening
       if (metaForGuard?.is_relaxed_probe || metaForGuard?.softened_reasons?.length) {
@@ -17576,6 +17614,17 @@ export function createLiveDataStrategy(opts: {
             } : {})
           })
         );
+        const btcRsiPre = Number(opts.marketState?.status()?.btc_rsi ?? 50);
+        let btcRsiMultPre = 1.0;
+        let btcRsiAuthPre = "soft_context";
+        if (Number.isFinite(btcRsiPre)) {
+          if (btcRsiPre >= 50) btcRsiMultPre = 1.0;
+          else if (btcRsiPre >= 45) btcRsiMultPre = 0.85;
+          else if (btcRsiPre >= 40) btcRsiMultPre = 0.65;
+          else if (btcRsiPre >= 35) btcRsiMultPre = 0.45;
+          else btcRsiMultPre = 0.35;
+        }
+
         console.info(
           JSON.stringify({
             tag: "SURGE_ORDER_PRE_EXECUTION_SIZING_PROOF",
@@ -17590,11 +17639,16 @@ export function createLiveDataStrategy(opts: {
             remaining_surge_capital_before: remainingInTick,
             projected_surge_capital_after: Math.max(0, remainingInTick - orderKrw),
             surge_cap_krw: capLimit,
-            surge_cap_ratio: 0.30,
+            surge_cap_ratio: 1.0,
             per_market_remaining_krw: remainingPerMarket,
             tick_start_remaining_cap_krw: tickStartRemainingSurgeCapKrw,
             same_tick_accepted_krw: sameTickAcceptedSurgeKrw,
             projected_total_after_order: Math.floor(usedCap + sameTickAcceptedSurgeKrw + orderKrw),
+            btc_rsi: btcRsiPre,
+            btc_rsi_risk_multiplier: btcRsiMultPre,
+            btc_rsi_authority: btcRsiAuthPre,
+            pre_btc_context_order_krw: baseBudget,
+            post_btc_context_order_krw: orderKrw,
           })
         );
       }
