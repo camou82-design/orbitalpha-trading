@@ -14,6 +14,7 @@ import { normalizeBalanceCurrency } from "./account-portfolio.js";
 import {
   fetchMinuteCandles,
   fetchTickers,
+  fetchTickersWithMeta,
   fetchLiveTickersDirect,
   partitionKrwMarketsByUpbitValidity,
   peekMinuteCandleCache,
@@ -21,6 +22,8 @@ import {
   tickerAgeMap,
   tickerCache,
   type UpbitCandle,
+  type FetchTickersWithMetaResult,
+  type TickerMeta,
 } from "./upbit-public.js";
 import { LogDeduper } from "./log-deduper.js";
 import { fetchOrderDetails } from "./upbit-private.js";
@@ -1323,6 +1326,7 @@ async function hydrateLiveTickerPriceMaps(
   symbolsNeeded: readonly string[],
   signal: AbortSignal,
   markPrices: Record<string, number> | undefined,
+  metaByMarket?: Map<string, TickerMeta>,
 ): Promise<{
   sourceByMarket: Record<string, LiveTickerPriceSourceTag>;
   ageByMarket: Record<string, number | null>;
@@ -1347,12 +1351,26 @@ async function hydrateLiveTickerPriceMaps(
 
   for (const m of uniq) {
     const px0 = Number(priceBy.get(m) ?? 0);
+    const meta = metaByMarket?.get(m);
+
     if (Number.isFinite(px0) && px0 > 0) {
-      sourceByMarket[m] = "ticker_batch";
-      fetchedAtByMarket[m] = now0;
-      ageByMarket[m] = 0;
-      continue;
+      if (meta && (meta.source === "last_good_cache" || meta.source === "candle_fallback")) {
+        sourceByMarket[m] = "last_good_cache";
+        fetchedAtByMarket[m] = meta.fetchedAtMs > 0 ? meta.fetchedAtMs : null;
+        ageByMarket[m] = meta.ageMs;
+        fromLastGood.push(m);
+        continue;
+      }
+      if (meta && meta.source === "missing") {
+        priceBy.delete(m);
+      } else {
+        sourceByMarket[m] = "ticker_batch";
+        fetchedAtByMarket[m] = meta?.fetchedAtMs ?? now0;
+        ageByMarket[m] = meta?.ageMs ?? 0;
+        continue;
+      }
     }
+
     const maxAge = coreSet.has(m) ? LIVE_CORE_TICKER_LAST_GOOD_MAX_AGE_MS : LIVE_TICKER_LAST_GOOD_MAX_AGE_MS;
     const cached = lastGoodTickerCache.get(m);
     const row = cached?.row;
@@ -1394,6 +1412,7 @@ async function hydrateLiveTickerPriceMaps(
       const rows = await fetchTickers([m], {
         debugCaller: "live-strategy:hydrate_per_symbol",
         signal,
+        isPriority: false,
         batchSize: 1,
         parallelTickerBatches: 1,
         batchDelayMs: 0,
@@ -7120,21 +7139,24 @@ export function createLiveDataStrategy(opts: {
         requested_symbols: tickerRequestedSymbols.slice(0, 20),
       }),
     );
+    let tickerRes: FetchTickersWithMetaResult | null = null;
     let tickerRows: any[] = [];
     try {
-      tickerRows = await racePhase("fetch_tickers", PHASE_MS.fetch_tickers, (phaseSignal) =>
-        fetchTickers(tickerRequestedSymbols, {
+      tickerRes = await racePhase("fetch_tickers", PHASE_MS.fetch_tickers, (phaseSignal) =>
+        fetchTickersWithMeta(tickerRequestedSymbols, {
           debugCaller: "live-strategy",
           signal: phaseSignal || tickSignal,
-          isPriority: true,
+          isPriority: false,
           totalTimeoutMs: Math.max(2000, PHASE_MS.fetch_tickers - 500),
           batchTimeoutMs: Math.max(1500, Math.min(4000, Math.floor(PHASE_MS.fetch_tickers / 3))),
         }),
       );
+      tickerRows = tickerRes.tickers;
       for (const r of tickerRows) {
         const tp = Number(r?.trade_price ?? 0);
-        if (r?.market && Number.isFinite(tp) && tp > 0) {
-          lastGoodTickerCache.set(r.market, { ts_ms: Date.now(), row: r });
+        const meta = tickerRes.metaByMarket.get(r.market);
+        if (r?.market && Number.isFinite(tp) && tp > 0 && (meta?.source === "live" || meta?.source === "fresh_cache")) {
+          lastGoodTickerCache.set(r.market, { ts_ms: meta.fetchedAtMs || Date.now(), row: r });
         }
       }
     } catch (e) {
@@ -7160,7 +7182,6 @@ export function createLiveDataStrategy(opts: {
       tickerRows = fallbackRows;
     }
 
-    
     console.info(
       JSON.stringify({
         tag: "DEBUG_TICKER_FETCH_DONE",
@@ -7168,6 +7189,17 @@ export function createLiveDataStrategy(opts: {
         stage: "after_scanner_after_tickers",
         requested_count: tickerRequestedSymbols.length,
         ticker_rows_count: tickerRows.length,
+        fetched_live_count: tickerRes?.fetchedLiveCount ?? 0,
+        fresh_cache_count: tickerRes?.freshCacheCount ?? 0,
+        stale_fallback_count: tickerRes?.staleFallbackCount ?? 0,
+        missing_count: tickerRes?.missingCount ?? 0,
+        lock_wait_ms: tickerRes?.lockWaitMs ?? 0,
+        source_summary: {
+          live: tickerRes?.fetchedLiveCount ?? 0,
+          fresh_cache: tickerRes?.freshCacheCount ?? 0,
+          stale_fallback: tickerRes?.staleFallbackCount ?? 0,
+          missing: tickerRes?.missingCount ?? 0,
+        },
         ticker_symbols: tickerRows.map((r) => r.market).slice(0, 20),
       }),
     );
@@ -7193,6 +7225,7 @@ export function createLiveDataStrategy(opts: {
       tickerRequestedSymbols,
       tickSignal,
       markPricesForTicker,
+      tickerRes?.metaByMarket,
     );
     console.info(
       JSON.stringify({
@@ -12219,6 +12252,7 @@ export function createLiveDataStrategy(opts: {
                   debugCaller: "live-strategy:major_impulse_ticker_force_refresh",
                   signal: tickSignal,
                   timeoutMs: 3000,
+                  priority: false,
                 });
                 const r0 = directRes.rows?.[0];
                 const tp = Number(r0?.trade_price ?? 0);

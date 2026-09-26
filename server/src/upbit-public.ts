@@ -203,7 +203,7 @@ async function fetchJson<T>(path: string, signal?: AbortSignal, timeoutMs = 8000
       headers: { Accept: "application/json" },
       signal: ctrl.signal,
     });
-    const remainingReq = r.headers.get("remaining-req") ?? r.headers.get("Remaining-Req");
+    const remainingReq = r.headers?.get?.("remaining-req") ?? r.headers?.get?.("Remaining-Req") ?? null;
     if (remainingReq) {
       lastTickerRateLimitInfo = parseRemainingReqHeader(remainingReq);
     }
@@ -733,6 +733,9 @@ const tickerQueue: TickerRequestTask[] = [];
 let tickerActiveRequests = 0;
 let tickerTaskIdSeq = 0;
 const UPBIT_TICKER_MAX_CONCURRENCY = Number(process.env.UPBIT_TICKER_MAX_CONCURRENCY ?? 1);
+let consecutivePriorityGrants = 0;
+const MAX_CONSECUTIVE_PRIORITY_GRANTS = Number(process.env.UPBIT_TICKER_MAX_CONSECUTIVE_PRIORITY_GRANTS ?? 2);
+const NORMAL_STARVATION_THRESHOLD_MS = Number(process.env.UPBIT_TICKER_NORMAL_STARVATION_THRESHOLD_MS ?? 1500);
 
 function createIdempotentRelease(caller: string, acquiredAt: number): () => void {
   let released = false;
@@ -784,6 +787,11 @@ export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<(
   // 2. 동시성 슬롯이 남아있으면 즉시 획득
   if (tickerActiveRequests < UPBIT_TICKER_MAX_CONCURRENCY) {
     tickerActiveRequests++;
+    if (priority) {
+      consecutivePriorityGrants++;
+    } else {
+      consecutivePriorityGrants = 0;
+    }
     if (tickerDebugEnabled()) {
       console.info(
         JSON.stringify({
@@ -791,6 +799,8 @@ export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<(
           ts: new Date().toISOString(),
           caller,
           status: "immediate",
+          priority,
+          consecutive_priority: consecutivePriorityGrants,
           wait_ms: 0,
           active_requests: tickerActiveRequests,
           queue_len: tickerQueue.length,
@@ -863,8 +873,8 @@ export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<(
         task.aborted = true;
         cleanup();
         removeTaskFromQueue();
-        if (tickerDebugEnabled()) {
-          console.info(
+        if (caller.includes("pump") || tickerDebugEnabled()) {
+          console.warn(
             JSON.stringify({
               tag: "DEBUG_TICKER_LOCK_TIMEOUT",
               ts: new Date().toISOString(),
@@ -872,6 +882,7 @@ export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<(
               task_id: taskId,
               wait_ms: Date.now() - now0,
               timeout_ms: timeoutMs,
+              priority: task.priority,
               active_requests: tickerActiveRequests,
               queue_len: tickerQueue.length,
             }),
@@ -886,16 +897,8 @@ export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<(
       return;
     }
 
-    if (priority) {
-      const firstNonPriorityIndex = tickerQueue.findIndex((t) => !t.priority);
-      if (firstNonPriorityIndex !== -1) {
-        tickerQueue.splice(firstNonPriorityIndex, 0, task);
-      } else {
-        tickerQueue.push(task);
-      }
-    } else {
-      tickerQueue.push(task);
-    }
+    // Queue in FIFO order; processNextTickerRequest performs bounded fairness selection
+    tickerQueue.push(task);
 
     if (tickerDebugEnabled()) {
       console.info(
@@ -915,9 +918,37 @@ export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<(
 
 function processNextTickerRequest() {
   while (tickerQueue.length > 0 && tickerActiveRequests < UPBIT_TICKER_MAX_CONCURRENCY) {
-    const next = tickerQueue.shift();
-    if (!next) break;
-    if (next.aborted) continue;
+    const hasPriority = tickerQueue.some((t) => t.priority && !t.aborted);
+    const hasNormal = tickerQueue.some((t) => !t.priority && !t.aborted);
+
+    let nextIndex = -1;
+    if (hasPriority && hasNormal) {
+      const oldestNormalIndex = tickerQueue.findIndex((t) => !t.priority && !t.aborted);
+      const oldestNormal = oldestNormalIndex !== -1 ? tickerQueue[oldestNormalIndex] : null;
+      const normalWaitMs = oldestNormal ? Date.now() - oldestNormal.createdAt : 0;
+
+      // 만약 연속 priority grant 상한에 도달했거나, normal waiter가 기아 한계 시간 이상 대기했으면 normal 우선 서비스
+      if (
+        consecutivePriorityGrants >= MAX_CONSECUTIVE_PRIORITY_GRANTS ||
+        normalWaitMs >= NORMAL_STARVATION_THRESHOLD_MS
+      ) {
+        nextIndex = oldestNormalIndex;
+      } else {
+        nextIndex = tickerQueue.findIndex((t) => t.priority && !t.aborted);
+      }
+    } else if (hasPriority) {
+      nextIndex = tickerQueue.findIndex((t) => t.priority && !t.aborted);
+    } else {
+      nextIndex = tickerQueue.findIndex((t) => !t.aborted);
+    }
+
+    if (nextIndex === -1) {
+      tickerQueue.length = 0;
+      break;
+    }
+
+    const [next] = tickerQueue.splice(nextIndex, 1);
+    if (!next || next.aborted) continue;
 
     if (next.timerId) {
       clearTimeout(next.timerId);
@@ -926,6 +957,12 @@ function processNextTickerRequest() {
     if (next.signal && next.abortHandler) {
       next.signal.removeEventListener("abort", next.abortHandler);
       next.abortHandler = undefined;
+    }
+
+    if (next.priority) {
+      consecutivePriorityGrants++;
+    } else {
+      consecutivePriorityGrants = 0;
     }
 
     tickerActiveRequests++;
@@ -938,6 +975,8 @@ function processNextTickerRequest() {
           ts: new Date().toISOString(),
           caller: next.caller,
           task_id: next.id,
+          priority: next.priority,
+          consecutive_priority: consecutivePriorityGrants,
           status: "queued",
           wait_ms: waitMs,
           active_requests: tickerActiveRequests,
@@ -956,12 +995,14 @@ export function getTickerLockStats() {
     activeRequests: tickerActiveRequests,
     queueLength: tickerQueue.length,
     maxConcurrency: UPBIT_TICKER_MAX_CONCURRENCY,
+    consecutivePriorityGrants,
   };
 }
 
 export function resetTickerLockStateForTest() {
   tickerActiveRequests = 0;
   tickerQueue.length = 0;
+  consecutivePriorityGrants = 0;
 }
 
 function tickerDebugEnabled(): boolean {
@@ -1264,16 +1305,19 @@ export async function fetchTickersWithMeta(
     if (!isGlobalCooldown || isPriority) {
       let releaseLock: (() => void) | null = null;
       let allSuccess = false;
+      const tLock0 = Date.now();
       try {
-        const tLock0 = Date.now();
         const sliceLockTimeoutMs = opts?.totalTimeoutMs ?? (opts?.batchTimeoutMs ? Math.max(2000, opts.batchTimeoutMs * 2) : 10_000);
-        releaseLock = await acquireTickerLock({
-          priority: isPriority,
-          signal: opts?.signal,
-          timeoutMs: sliceLockTimeoutMs,
-          caller: opts?.debugCaller ?? "fetchTickersWithMeta:all",
-        });
-        totalLockWaitMs += Math.max(0, Date.now() - tLock0);
+        try {
+          releaseLock = await acquireTickerLock({
+            priority: isPriority,
+            signal: opts?.signal,
+            timeoutMs: sliceLockTimeoutMs,
+            caller: opts?.debugCaller ?? "fetchTickersWithMeta:all",
+          });
+        } finally {
+          totalLockWaitMs += Math.max(0, Date.now() - tLock0);
+        }
 
         const allRows = await fetchTickersAllKrw({
           signal: opts?.signal,
@@ -1472,13 +1516,16 @@ export async function fetchTickersWithMeta(
           break;
         }
         const tLock0 = Date.now();
-        releaseLock = await acquireTickerLock({
-          priority: isPriority,
-          signal: tickSignal,
-          timeoutMs: sliceLockTimeoutMs,
-          caller: opts?.debugCaller ?? "fetchTickers",
-        });
-        totalLockWaitMs += Math.max(0, Date.now() - tLock0);
+        try {
+          releaseLock = await acquireTickerLock({
+            priority: isPriority,
+            signal: tickSignal,
+            timeoutMs: sliceLockTimeoutMs,
+            caller: opts?.debugCaller ?? "fetchTickers",
+          });
+        } finally {
+          totalLockWaitMs += Math.max(0, Date.now() - tLock0);
+        }
 
         const slice = batches.slice(i, i + parallelTickerBatches);
         const results = await Promise.all(
@@ -1625,7 +1672,7 @@ export async function fetchTickers(markets: string[], opts?: FetchTickersOptions
 
 export async function fetchLiveTickersDirect(
   markets: string[],
-  opts?: { signal?: AbortSignal; timeoutMs?: number; debugCaller?: string }
+  opts?: { signal?: AbortSignal; timeoutMs?: number; debugCaller?: string; priority?: boolean }
 ): Promise<{ ok: boolean; source: "live" | "fallback" | "failed"; rows: UpbitTicker[]; fetchedAtMs: number | null }> {
   if (markets.length === 0) return { ok: false, source: "failed", rows: [], fetchedAtMs: null };
   const sanitized = await sanitizeKrwMarkets(markets);
@@ -1634,7 +1681,7 @@ export async function fetchLiveTickersDirect(
   let releaseLock: (() => void) | null = null;
   try {
     releaseLock = await acquireTickerLock({
-      priority: true,
+      priority: opts?.priority ?? true,
       signal: opts?.signal,
       timeoutMs: opts?.timeoutMs ?? 3000,
       caller: opts?.debugCaller ?? "fetchLiveTickersDirect",
