@@ -198,7 +198,7 @@ async function fetchJson<T>(path: string, signal?: AbortSignal, timeoutMs = 8000
   const onAbort = () => ctrl.abort();
   if (signal) signal.addEventListener("abort", onAbort, { once: true });
 
-  try {
+  const run = async (): Promise<T> => {
     const r = await fetch(url, {
       headers: { Accept: "application/json" },
       signal: ctrl.signal,
@@ -211,14 +211,26 @@ async function fetchJson<T>(path: string, signal?: AbortSignal, timeoutMs = 8000
       const text = await r.text();
       throw new UpbitHttpError(`Upbit ${path} → ${r.status}: ${text.slice(0, 200)}`, r.status, path);
     }
-    return (await r.json()) as Promise<T>;
+    return (await r.json()) as T;
+  };
+
+  let hardTimeoutId: ReturnType<typeof setTimeout> | undefined;
+  const hardTimeoutP = new Promise<never>((_, reject) => {
+    hardTimeoutId = setTimeout(() => {
+      ctrl.abort();
+      reject(new Error(`Upbit fetch hard timeout ${path} (${timeoutMs}ms)`));
+    }, timeoutMs + 50);
+  });
+
+  try {
+    return await Promise.race([run(), hardTimeoutP]);
   } catch (e) {
     if (ctrl.signal.aborted && !signal?.aborted && Date.now() - t0 >= timeoutMs) {
-      // Local timeout
-      (e as any).isUpbitHttpTimeout = true;
+      (e as { isUpbitHttpTimeout?: boolean }).isUpbitHttpTimeout = true;
     }
     throw e;
   } finally {
+    if (hardTimeoutId) clearTimeout(hardTimeoutId);
     clearTimeout(tid);
     if (signal) signal.removeEventListener("abort", onAbort);
   }
@@ -736,12 +748,108 @@ const UPBIT_TICKER_MAX_CONCURRENCY = Number(process.env.UPBIT_TICKER_MAX_CONCURR
 let consecutivePriorityGrants = 0;
 const MAX_CONSECUTIVE_PRIORITY_GRANTS = Number(process.env.UPBIT_TICKER_MAX_CONSECUTIVE_PRIORITY_GRANTS ?? 2);
 const NORMAL_STARVATION_THRESHOLD_MS = Number(process.env.UPBIT_TICKER_NORMAL_STARVATION_THRESHOLD_MS ?? 1500);
+/** Legitimate ticker HTTP + batch work upper bound; exceeded => orphaned holder recovery (not waiter timeout inflation). */
+const TICKER_LOCK_MAX_HOLD_MS = Math.max(
+  8_000,
+  Number(process.env.UPBIT_TICKER_LOCK_MAX_HOLD_MS ?? 45_000),
+);
 
-function createIdempotentRelease(caller: string, acquiredAt: number): () => void {
+type TickerLockHolderState = {
+  caller: string;
+  acquiredAt: number;
+  taskId?: number;
+  priority: boolean;
+  release: () => void;
+};
+
+let tickerLockHolder: TickerLockHolderState | null = null;
+
+function logTickerLockHolderSnapshot(extra: Record<string, unknown> = {}) {
+  const now = Date.now();
+  const holder = tickerLockHolder;
+  return {
+    holder_caller: holder?.caller ?? null,
+    holder_held_ms: holder ? now - holder.acquiredAt : null,
+    holder_task_id: holder?.taskId ?? null,
+    holder_priority: holder?.priority ?? null,
+    active_requests: tickerActiveRequests,
+    queue_len: tickerQueue.length,
+    ...extra,
+  };
+}
+
+function registerTickerLockHolder(
+  caller: string,
+  acquiredAt: number,
+  priority: boolean,
+  release: () => void,
+  taskId?: number,
+) {
+  tickerLockHolder = { caller, acquiredAt, taskId, priority, release };
+}
+
+function clearTickerLockHolderIfMatches(release: () => void) {
+  if (tickerLockHolder?.release === release) {
+    tickerLockHolder = null;
+  }
+}
+
+/** Recover active_requests=1 with no progress (orphaned holder / desync). Does not extend waiter timeouts. */
+export function forceRecoverStaleOrDesyncedTickerLock(reason: string): boolean {
+  const now = Date.now();
+  if (tickerActiveRequests <= 0 && !tickerLockHolder) {
+    tickerActiveRequests = 0;
+    return false;
+  }
+
+  if (tickerLockHolder) {
+    const heldMs = now - tickerLockHolder.acquiredAt;
+    if (heldMs >= TICKER_LOCK_MAX_HOLD_MS) {
+      console.warn(
+        JSON.stringify({
+          tag: "DEBUG_TICKER_LOCK_FORCE_RELEASE",
+          ts: new Date().toISOString(),
+          reason,
+          held_ms: heldMs,
+          max_hold_ms: TICKER_LOCK_MAX_HOLD_MS,
+          ...logTickerLockHolderSnapshot(),
+        }),
+      );
+      try {
+        tickerLockHolder.release();
+      } catch {
+        tickerActiveRequests = 0;
+        tickerLockHolder = null;
+        processNextTickerRequest();
+      }
+      return true;
+    }
+  }
+
+  if (tickerActiveRequests > 0 && !tickerLockHolder) {
+    console.warn(
+      JSON.stringify({
+        tag: "DEBUG_TICKER_LOCK_DESYNC_RECOVER",
+        ts: new Date().toISOString(),
+        reason,
+        ...logTickerLockHolderSnapshot(),
+      }),
+    );
+    tickerActiveRequests = 0;
+    consecutivePriorityGrants = 0;
+    processNextTickerRequest();
+    return true;
+  }
+
+  return false;
+}
+
+function createIdempotentRelease(caller: string, acquiredAt: number, priority: boolean, taskId?: number): () => void {
   let released = false;
-  return () => {
+  const release = () => {
     if (released) return;
     released = true;
+    clearTickerLockHolderIfMatches(release);
     tickerActiveRequests = Math.max(0, tickerActiveRequests - 1);
     if (tickerDebugEnabled()) {
       console.info(
@@ -757,6 +865,29 @@ function createIdempotentRelease(caller: string, acquiredAt: number): () => void
     }
     processNextTickerRequest();
   };
+  registerTickerLockHolder(caller, acquiredAt, priority, release, taskId);
+  return release;
+}
+
+export async function withTickerLock<T>(opts: TickerLockOptions | undefined, fn: () => Promise<T>): Promise<T> {
+  const release = await acquireTickerLock(opts);
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+async function acquireTickerLockMeasured(
+  opts: TickerLockOptions,
+  onLockWaitMs: (waitMs: number) => void,
+): Promise<() => void> {
+  const t0 = Date.now();
+  try {
+    return await acquireTickerLock(opts);
+  } finally {
+    onLockWaitMs(Math.max(0, Date.now() - t0));
+  }
 }
 
 export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<() => void> {
@@ -766,6 +897,8 @@ export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<(
   const timeoutMs = options.timeoutMs;
   const caller = options.caller ?? "unknown";
   const now0 = Date.now();
+
+  forceRecoverStaleOrDesyncedTickerLock("pre_acquire_sweep");
 
   // 1. 이미 취소된 signal인 경우 즉시 거부 (큐 진입 안 함)
   if (signal?.aborted) {
@@ -807,7 +940,7 @@ export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<(
         }),
       );
     }
-    return Promise.resolve(createIdempotentRelease(caller, now0));
+    return Promise.resolve(createIdempotentRelease(caller, now0, priority));
   }
 
   // 3. 대기 큐 진입
@@ -883,11 +1016,11 @@ export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<(
               wait_ms: Date.now() - now0,
               timeout_ms: timeoutMs,
               priority: task.priority,
-              active_requests: tickerActiveRequests,
-              queue_len: tickerQueue.length,
+              ...logTickerLockHolderSnapshot(),
             }),
           );
         }
+        forceRecoverStaleOrDesyncedTickerLock(`waiter_timeout:${caller}`);
         reject(new Error(`Ticker lock acquisition timed out after ${timeoutMs}ms (caller=${caller})`));
       }, timeoutMs);
     } else if (timeoutMs !== undefined && timeoutMs !== null && timeoutMs <= 0) {
@@ -943,7 +1076,11 @@ function processNextTickerRequest() {
     }
 
     if (nextIndex === -1) {
-      tickerQueue.length = 0;
+      for (let i = tickerQueue.length - 1; i >= 0; i--) {
+        if (tickerQueue[i]?.aborted) {
+          tickerQueue.splice(i, 1);
+        }
+      }
       break;
     }
 
@@ -984,7 +1121,7 @@ function processNextTickerRequest() {
         }),
       );
     }
-    const release = createIdempotentRelease(next.caller, now);
+    const release = createIdempotentRelease(next.caller, now, next.priority, next.id);
     next.resolve(release);
     break;
   }
@@ -996,6 +1133,8 @@ export function getTickerLockStats() {
     queueLength: tickerQueue.length,
     maxConcurrency: UPBIT_TICKER_MAX_CONCURRENCY,
     consecutivePriorityGrants,
+    holderCaller: tickerLockHolder?.caller ?? null,
+    holderHeldMs: tickerLockHolder ? Date.now() - tickerLockHolder.acquiredAt : null,
   };
 }
 
@@ -1003,6 +1142,13 @@ export function resetTickerLockStateForTest() {
   tickerActiveRequests = 0;
   tickerQueue.length = 0;
   consecutivePriorityGrants = 0;
+  tickerLockHolder = null;
+}
+
+/** Test-only: simulate orphaned active_requests counter without holder metadata. */
+export function injectTickerLockDesyncForTest(activeRequests = 1) {
+  tickerActiveRequests = Math.max(0, activeRequests);
+  tickerLockHolder = null;
 }
 
 function tickerDebugEnabled(): boolean {
@@ -1305,19 +1451,19 @@ export async function fetchTickersWithMeta(
     if (!isGlobalCooldown || isPriority) {
       let releaseLock: (() => void) | null = null;
       let allSuccess = false;
-      const tLock0 = Date.now();
       try {
         const sliceLockTimeoutMs = opts?.totalTimeoutMs ?? (opts?.batchTimeoutMs ? Math.max(2000, opts.batchTimeoutMs * 2) : 10_000);
-        try {
-          releaseLock = await acquireTickerLock({
+        releaseLock = await acquireTickerLockMeasured(
+          {
             priority: isPriority,
             signal: opts?.signal,
             timeoutMs: sliceLockTimeoutMs,
             caller: opts?.debugCaller ?? "fetchTickersWithMeta:all",
-          });
-        } finally {
-          totalLockWaitMs += Math.max(0, Date.now() - tLock0);
-        }
+          },
+          (waitMs) => {
+            totalLockWaitMs += waitMs;
+          },
+        );
 
         const allRows = await fetchTickersAllKrw({
           signal: opts?.signal,
@@ -1515,22 +1661,27 @@ export async function fetchTickersWithMeta(
           budgetExpired = true;
           break;
         }
-        const tLock0 = Date.now();
-        try {
-          releaseLock = await acquireTickerLock({
+        releaseLock = await acquireTickerLockMeasured(
+          {
             priority: isPriority,
             signal: tickSignal,
             timeoutMs: sliceLockTimeoutMs,
             caller: opts?.debugCaller ?? "fetchTickers",
-          });
-        } finally {
-          totalLockWaitMs += Math.max(0, Date.now() - tLock0);
-        }
+          },
+          (waitMs) => {
+            totalLockWaitMs += waitMs;
+          },
+        );
 
         const slice = batches.slice(i, i + parallelTickerBatches);
         const results = await Promise.all(
           slice.map((g) =>
-            fetchTickerBatchGroup({ group: g, signal: tickSignal, batchTimeoutMs: batchTimeoutMs ?? undefined, debugCaller: opts?.debugCaller }),
+            fetchTickerBatchGroup({
+              group: g,
+              signal: tickSignal,
+              batchTimeoutMs: batchTimeoutMs ?? undefined,
+              debugCaller: opts?.debugCaller,
+            }),
           ),
         );
         for (const r of results) {
@@ -1678,21 +1829,22 @@ export async function fetchLiveTickersDirect(
   const sanitized = await sanitizeKrwMarkets(markets);
   if (sanitized.length === 0) return { ok: false, source: "failed", rows: [], fetchedAtMs: null };
 
-  let releaseLock: (() => void) | null = null;
   try {
-    releaseLock = await acquireTickerLock({
-      priority: opts?.priority ?? true,
-      signal: opts?.signal,
-      timeoutMs: opts?.timeoutMs ?? 3000,
-      caller: opts?.debugCaller ?? "fetchLiveTickersDirect",
-    });
-
-    const rows = await fetchTickerBatchGroup({
-      group: sanitized,
-      signal: opts?.signal,
-      batchTimeoutMs: opts?.timeoutMs ? Math.floor(opts.timeoutMs * 0.8) : 2500,
-      debugCaller: opts?.debugCaller ?? "fetchLiveTickersDirect",
-    });
+    const rows = await withTickerLock(
+      {
+        priority: opts?.priority ?? true,
+        signal: opts?.signal,
+        timeoutMs: opts?.timeoutMs ?? 3000,
+        caller: opts?.debugCaller ?? "fetchLiveTickersDirect",
+      },
+      () =>
+        fetchTickerBatchGroup({
+          group: sanitized,
+          signal: opts?.signal,
+          batchTimeoutMs: opts?.timeoutMs ? Math.floor(opts.timeoutMs * 0.8) : 2500,
+          debugCaller: opts?.debugCaller ?? "fetchLiveTickersDirect",
+        }),
+    );
 
     const now = Date.now();
     for (const t of rows) {
@@ -1715,7 +1867,5 @@ export async function fetchLiveTickersDirect(
     return { ok: false, source: "failed", rows: [], fetchedAtMs: null };
   } catch {
     return { ok: false, source: "failed", rows: [], fetchedAtMs: null };
-  } finally {
-    if (releaseLock) releaseLock();
   }
 }

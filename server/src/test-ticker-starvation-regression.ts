@@ -1,7 +1,9 @@
 import assert from "node:assert";
 import {
   acquireTickerLock,
+  forceRecoverStaleOrDesyncedTickerLock,
   getTickerLockStats,
+  injectTickerLockDesyncForTest,
   resetTickerLockStateForTest,
   fetchTickersWithMeta,
 } from "./upbit-public.js";
@@ -181,6 +183,21 @@ async function runStarvationRegressionSuite() {
   console.log(`Fetch returned with budgetExpired=${res.budgetExpired}, lockWaitMs=${res.lockWaitMs}, elapsed=${elapsed}ms`);
   assert(res.lockWaitMs >= 70, `lockWaitMs (${res.lockWaitMs}ms) must reflect actual wait time (>= 70ms), not 0ms`);
   console.log("[PASS] Test 3: Lock wait telemetry accurately captures wait_ms even on acquisition timeout\n");
+
+  // -------------------------------------------------------------------------
+  // SCENARIO 4: Desynced active_requests without holder metadata is recovered
+  // -------------------------------------------------------------------------
+  console.log("--- Test 4: Desync active_requests orphan recovery ---");
+  resetTickerLockStateForTest();
+  injectTickerLockDesyncForTest(1);
+  assert.strictEqual(getTickerLockStats().activeRequests, 1);
+  assert.strictEqual(forceRecoverStaleOrDesyncedTickerLock("test_desync"), true);
+  assert.strictEqual(getTickerLockStats().activeRequests, 0, "desync counter cleared");
+  const rel = await acquireTickerLock({ caller: "post_desync_acquire", priority: false, timeoutMs: 500 });
+  rel();
+  assert.strictEqual(getTickerLockStats().activeRequests, 0);
+  assert.strictEqual(forceRecoverStaleOrDesyncedTickerLock("test_clean"), false);
+  console.log("[PASS] Test 4: Desync recovery clears orphaned active_requests and allows acquire\n");
 
   console.log("================================================================================");
   console.log("  ALL STARVATION & FAIRNESS REGRESSION TESTS PASSED!");
