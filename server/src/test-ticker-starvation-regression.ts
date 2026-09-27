@@ -2,6 +2,7 @@ import assert from "node:assert";
 import {
   acquireTickerLock,
   forceRecoverStaleOrDesyncedTickerLock,
+  getTickerLockLifecycleAuditSnapshot,
   getTickerLockStats,
   injectTickerLockDesyncForTest,
   resetTickerLockStateForTest,
@@ -198,6 +199,22 @@ async function runStarvationRegressionSuite() {
   assert.strictEqual(getTickerLockStats().activeRequests, 0);
   assert.strictEqual(forceRecoverStaleOrDesyncedTickerLock("test_clean"), false);
   console.log("[PASS] Test 4: Desync recovery clears orphaned active_requests and allows acquire\n");
+
+  // -------------------------------------------------------------------------
+  // SCENARIO 5: lock_id lifecycle audit fields present on acquire/release
+  // -------------------------------------------------------------------------
+  console.log("--- Test 5: lock_id lifecycle audit on acquire/release ---");
+  resetTickerLockStateForTest();
+  const rel5 = await acquireTickerLock({ caller: "pump-scanner:ticker_alt", priority: false, timeoutMs: 500 });
+  assert(typeof rel5.lockId === "string" && rel5.lockId.startsWith("tl-"), `lockId must be issued (got ${rel5.lockId})`);
+  const snapBefore = getTickerLockLifecycleAuditSnapshot();
+  assert.strictEqual(snapBefore.unreleased_locks.length, 1, "one unreleased lock tracked");
+  assert.strictEqual(snapBefore.unreleased_locks[0]?.lock_id, rel5.lockId);
+  rel5();
+  const snapAfter = getTickerLockLifecycleAuditSnapshot();
+  assert.strictEqual(snapAfter.unreleased_locks.length, 0, "no unreleased locks after release");
+  assert.strictEqual(getTickerLockStats().activeRequests, 0);
+  console.log("[PASS] Test 5: lock_id issued and lifecycle marked released\n");
 
   console.log("================================================================================");
   console.log("  ALL STARVATION & FAIRNESS REGRESSION TESTS PASSED!");

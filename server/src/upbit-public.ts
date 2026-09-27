@@ -727,12 +727,14 @@ export interface TickerLockOptions {
   caller?: string;
 }
 
+export type TickerLockRelease = (() => void) & { lockId: string };
+
 interface TickerRequestTask {
   id: number;
   priority: boolean;
   caller: string;
   createdAt: number;
-  resolve: (release: () => void) => void;
+  resolve: (release: TickerLockRelease) => void;
   reject: (err: Error) => void;
   signal?: AbortSignal;
   timeoutMs?: number;
@@ -744,6 +746,9 @@ interface TickerRequestTask {
 const tickerQueue: TickerRequestTask[] = [];
 let tickerActiveRequests = 0;
 let tickerTaskIdSeq = 0;
+let tickerLockIdSeq = 0;
+/** Distinguishes in-process runtime recurrence vs post-restart clean slate (in-memory lock state resets on exit). */
+const TICKER_LOCK_RUNTIME_ID = `${process.pid}-${Date.now()}`;
 const UPBIT_TICKER_MAX_CONCURRENCY = Number(process.env.UPBIT_TICKER_MAX_CONCURRENCY ?? 1);
 let consecutivePriorityGrants = 0;
 const MAX_CONSECUTIVE_PRIORITY_GRANTS = Number(process.env.UPBIT_TICKER_MAX_CONSECUTIVE_PRIORITY_GRANTS ?? 2);
@@ -753,45 +758,257 @@ const TICKER_LOCK_MAX_HOLD_MS = Math.max(
   8_000,
   Number(process.env.UPBIT_TICKER_LOCK_MAX_HOLD_MS ?? 45_000),
 );
+const TICKER_LOCK_LONG_HOLD_THRESHOLDS_MS = [10_000, 20_000, 30_000] as const;
+const TICKER_LOCK_LIFECYCLE_MAX = Math.max(50, Number(process.env.UPBIT_TICKER_LOCK_LIFECYCLE_MAX ?? 200));
+
+type TickerLockReleasePath = "normal" | "force" | "desync" | "pending";
 
 type TickerLockHolderState = {
+  lock_id: string;
   caller: string;
-  acquiredAt: number;
-  taskId?: number;
+  acquired_at: number;
+  release_at: number | null;
+  hold_ms: number | null;
   priority: boolean;
-  release: () => void;
+  waiter_task_id?: number;
+  source_hint: string;
+  release: TickerLockRelease;
+  long_hold_timer_ids: ReturnType<typeof setTimeout>[];
+  long_hold_logged: Set<number>;
+};
+
+export type TickerLockLifecycleEntry = {
+  lock_id: string;
+  runtime_id: string;
+  caller: string;
+  priority: boolean;
+  acquired_at: number;
+  release_at: number | null;
+  hold_ms: number | null;
+  released: boolean;
+  release_path: TickerLockReleasePath;
+  source_hint: string;
+  force_recovered: boolean;
 };
 
 let tickerLockHolder: TickerLockHolderState | null = null;
+const tickerLockLifecycleById = new Map<string, TickerLockLifecycleEntry>();
+const tickerLockLifecycleOrder: string[] = [];
+let tickerLockForceRecoveryTotal = 0;
+const tickerLockForceRecoveryByCaller = new Map<string, number>();
+const tickerLockLongHoldCountByCaller = new Map<string, { t10: number; t20: number; t30: number }>();
+let tickerLockReleasePathOverride: TickerLockReleasePath | null = null;
+
+function nextTickerLockId(): string {
+  tickerLockIdSeq += 1;
+  return `tl-${TICKER_LOCK_RUNTIME_ID}-${tickerLockIdSeq}`;
+}
+
+function captureTickerLockSourceHint(): string {
+  try {
+    const stack = new Error().stack ?? "";
+    const lines = stack
+      .split("\n")
+      .slice(2, 8)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    return lines.join(" | ").slice(0, 512);
+  } catch {
+    return "";
+  }
+}
+
+function tickerLockAuditEnabled(): boolean {
+  return (
+    process.env.UPBIT_TICKER_LOCK_AUDIT === "1" ||
+    tickerDebugEnabled() ||
+    (process.env.ORBITALPHA_TRADING_DEBUG_LOG_ENABLED ?? "").toLowerCase() === "true"
+  );
+}
+
+function shouldEmitTickerLockLifecycleLog(caller: string): boolean {
+  return (
+    tickerLockAuditEnabled() ||
+    caller.includes("pump") ||
+    caller.includes("exit") ||
+    caller.includes("sell") ||
+    caller.includes("live-strategy")
+  );
+}
+
+function emitTickerLockLifecycleLog(tag: string, payload: Record<string, unknown>, caller?: string) {
+  const c = String(caller ?? payload["caller"] ?? payload["waiter_caller"] ?? "");
+  if (!shouldEmitTickerLockLifecycleLog(c) && !tag.includes("FORCE") && !tag.includes("DESYNC") && !tag.includes("LONG_HOLD")) {
+    return;
+  }
+  console.info(
+    JSON.stringify({
+      tag,
+      ts: new Date().toISOString(),
+      runtime_id: TICKER_LOCK_RUNTIME_ID,
+      ...payload,
+    }),
+  );
+}
+
+function adjustActiveRequests(delta: number, event: string, meta: Record<string, unknown>) {
+  const counter_before = tickerActiveRequests;
+  tickerActiveRequests = Math.max(0, counter_before + delta);
+  emitTickerLockLifecycleLog("DEBUG_TICKER_LOCK_COUNTER", {
+    event,
+    counter_before,
+    counter_after: tickerActiveRequests,
+    queue_len: tickerQueue.length,
+    ...meta,
+  }, String(meta["caller"] ?? ""));
+}
+
+function trimTickerLockLifecycleHistory() {
+  while (tickerLockLifecycleOrder.length > TICKER_LOCK_LIFECYCLE_MAX) {
+    const dropId = tickerLockLifecycleOrder.shift();
+    if (dropId) tickerLockLifecycleById.delete(dropId);
+  }
+}
+
+function registerTickerLockLifecyclePending(entry: Omit<TickerLockLifecycleEntry, "released" | "release_path" | "force_recovered">) {
+  tickerLockLifecycleById.set(entry.lock_id, {
+    ...entry,
+    released: false,
+    release_path: "pending",
+    force_recovered: false,
+  });
+  tickerLockLifecycleOrder.push(entry.lock_id);
+  trimTickerLockLifecycleHistory();
+  emitTickerLockLifecycleLog(
+    "DEBUG_TICKER_LOCK_LIFECYCLE",
+    { phase: "acquire_registered", lock_id: entry.lock_id, caller: entry.caller, priority: entry.priority, source_hint: entry.source_hint },
+    entry.caller,
+  );
+}
+
+function finalizeTickerLockLifecycle(
+  lockId: string,
+  releasePath: TickerLockReleasePath,
+  releaseAt: number,
+  holdMs: number,
+  forceRecovered = false,
+) {
+  const row = tickerLockLifecycleById.get(lockId);
+  if (!row) return;
+  row.release_at = releaseAt;
+  row.hold_ms = holdMs;
+  row.released = releasePath !== "pending";
+  row.release_path = releasePath;
+  row.force_recovered = forceRecovered;
+  emitTickerLockLifecycleLog(
+    "DEBUG_TICKER_LOCK_LIFECYCLE",
+    {
+      phase: "release_finalized",
+      lock_id: lockId,
+      caller: row.caller,
+      release_path: releasePath,
+      hold_ms: holdMs,
+      force_recovered: forceRecovered,
+    },
+    row.caller,
+  );
+}
 
 function logTickerLockHolderSnapshot(extra: Record<string, unknown> = {}) {
   const now = Date.now();
   const holder = tickerLockHolder;
   return {
+    lock_id: holder?.lock_id ?? null,
     holder_caller: holder?.caller ?? null,
-    holder_held_ms: holder ? now - holder.acquiredAt : null,
-    holder_task_id: holder?.taskId ?? null,
+    holder_held_ms: holder ? now - holder.acquired_at : null,
+    holder_task_id: holder?.waiter_task_id ?? null,
     holder_priority: holder?.priority ?? null,
+    holder_source_hint: holder?.source_hint ?? null,
+    holder_acquired_at: holder?.acquired_at ?? null,
     active_requests: tickerActiveRequests,
     queue_len: tickerQueue.length,
+    runtime_id: TICKER_LOCK_RUNTIME_ID,
+    force_recovery_total: tickerLockForceRecoveryTotal,
     ...extra,
   };
 }
 
-function registerTickerLockHolder(
-  caller: string,
-  acquiredAt: number,
-  priority: boolean,
-  release: () => void,
-  taskId?: number,
-) {
-  tickerLockHolder = { caller, acquiredAt, taskId, priority, release };
+function clearLongHoldTimers(holder: TickerLockHolderState) {
+  for (const tid of holder.long_hold_timer_ids) {
+    clearTimeout(tid);
+  }
+  holder.long_hold_timer_ids.length = 0;
 }
 
-function clearTickerLockHolderIfMatches(release: () => void) {
+function scheduleLongHoldWatchdog(holder: TickerLockHolderState) {
+  for (const thresholdMs of TICKER_LOCK_LONG_HOLD_THRESHOLDS_MS) {
+    const tid = setTimeout(() => {
+      if (tickerLockHolder?.lock_id !== holder.lock_id) return;
+      if (holder.long_hold_logged.has(thresholdMs)) return;
+      holder.long_hold_logged.add(thresholdMs);
+      const heldMs = Date.now() - holder.acquired_at;
+      const bucketKey = thresholdMs === 10_000 ? "t10" : thresholdMs === 20_000 ? "t20" : "t30";
+      const agg = tickerLockLongHoldCountByCaller.get(holder.caller) ?? { t10: 0, t20: 0, t30: 0 };
+      agg[bucketKey] += 1;
+      tickerLockLongHoldCountByCaller.set(holder.caller, agg);
+      console.warn(
+        JSON.stringify({
+          ...logTickerLockHolderSnapshot(),
+          tag: "DEBUG_TICKER_LOCK_LONG_HOLD",
+          ts: new Date().toISOString(),
+          lock_id: holder.lock_id,
+          caller: holder.caller,
+          priority: holder.priority,
+          threshold_ms: thresholdMs,
+          held_ms: heldMs,
+          long_hold_count_by_caller: agg,
+        }),
+      );
+    }, thresholdMs);
+    holder.long_hold_timer_ids.push(tid);
+  }
+}
+
+function registerTickerLockHolder(state: Omit<TickerLockHolderState, "long_hold_timer_ids" | "long_hold_logged">) {
+  const holder: TickerLockHolderState = {
+    ...state,
+    long_hold_timer_ids: [],
+    long_hold_logged: new Set<number>(),
+  };
+  tickerLockHolder = holder;
+  scheduleLongHoldWatchdog(holder);
+}
+
+function clearTickerLockHolderIfMatches(release: TickerLockRelease) {
   if (tickerLockHolder?.release === release) {
+    clearLongHoldTimers(tickerLockHolder);
     tickerLockHolder = null;
   }
+}
+
+function logTickerLockQueueMutation(op: "push" | "pop" | "remove", meta: Record<string, unknown>) {
+  emitTickerLockLifecycleLog(`DEBUG_TICKER_LOCK_QUEUE_${op.toUpperCase()}`, meta, String(meta["caller"] ?? ""));
+}
+
+function snapshotPriorHolderForForceRecovery() {
+  if (!tickerLockHolder) return null;
+  const now = Date.now();
+  return {
+    lock_id: tickerLockHolder.lock_id,
+    caller: tickerLockHolder.caller,
+    priority: tickerLockHolder.priority,
+    acquired_at: tickerLockHolder.acquired_at,
+    held_ms: now - tickerLockHolder.acquired_at,
+    source_hint: tickerLockHolder.source_hint,
+    waiter_task_id: tickerLockHolder.waiter_task_id ?? null,
+    lifecycle: tickerLockLifecycleById.get(tickerLockHolder.lock_id) ?? null,
+  };
+}
+
+function recordForceRecovery(caller: string, priorHolder: ReturnType<typeof snapshotPriorHolderForForceRecovery>) {
+  tickerLockForceRecoveryTotal += 1;
+  const key = priorHolder?.caller ?? caller;
+  tickerLockForceRecoveryByCaller.set(key, (tickerLockForceRecoveryByCaller.get(key) ?? 0) + 1);
 }
 
 /** Recover active_requests=1 with no progress (orphaned holder / desync). Does not extend waiter timeouts. */
@@ -803,39 +1020,60 @@ export function forceRecoverStaleOrDesyncedTickerLock(reason: string): boolean {
   }
 
   if (tickerLockHolder) {
-    const heldMs = now - tickerLockHolder.acquiredAt;
+    const heldMs = now - tickerLockHolder.acquired_at;
     if (heldMs >= TICKER_LOCK_MAX_HOLD_MS) {
+      const prior_holder = snapshotPriorHolderForForceRecovery();
+      recordForceRecovery(tickerLockHolder.caller, prior_holder);
       console.warn(
         JSON.stringify({
+          ...logTickerLockHolderSnapshot(),
           tag: "DEBUG_TICKER_LOCK_FORCE_RELEASE",
           ts: new Date().toISOString(),
           reason,
           held_ms: heldMs,
           max_hold_ms: TICKER_LOCK_MAX_HOLD_MS,
-          ...logTickerLockHolderSnapshot(),
+          prior_holder,
+          force_recovery_by_caller: Object.fromEntries(tickerLockForceRecoveryByCaller.entries()),
+          unreleased_lock_ids: [...tickerLockLifecycleById.values()].filter((e) => !e.released).map((e) => e.lock_id),
         }),
       );
       try {
+        tickerLockReleasePathOverride = "force";
         tickerLockHolder.release();
       } catch {
+        const before = tickerActiveRequests;
         tickerActiveRequests = 0;
+        emitTickerLockLifecycleLog("DEBUG_TICKER_LOCK_COUNTER", {
+          event: "force_release_exception_reset",
+          counter_before: before,
+          counter_after: 0,
+          caller: prior_holder?.caller ?? "unknown",
+          lock_id: prior_holder?.lock_id ?? null,
+        });
         tickerLockHolder = null;
         processNextTickerRequest();
+      } finally {
+        tickerLockReleasePathOverride = null;
       }
       return true;
     }
   }
 
   if (tickerActiveRequests > 0 && !tickerLockHolder) {
+    const unreleased = [...tickerLockLifecycleById.values()].filter((e) => !e.released);
+    recordForceRecovery("desync", null);
     console.warn(
       JSON.stringify({
+        ...logTickerLockHolderSnapshot(),
         tag: "DEBUG_TICKER_LOCK_DESYNC_RECOVER",
         ts: new Date().toISOString(),
         reason,
-        ...logTickerLockHolderSnapshot(),
+        unreleased_lock_ids: unreleased.map((e) => e.lock_id),
+        unreleased_callers: unreleased.map((e) => e.caller),
+        force_recovery_by_caller: Object.fromEntries(tickerLockForceRecoveryByCaller.entries()),
       }),
     );
-    tickerActiveRequests = 0;
+    adjustActiveRequests(-tickerActiveRequests, "desync_recover_reset", { caller: "desync", lock_id: null });
     consecutivePriorityGrants = 0;
     processNextTickerRequest();
     return true;
@@ -844,29 +1082,80 @@ export function forceRecoverStaleOrDesyncedTickerLock(reason: string): boolean {
   return false;
 }
 
-function createIdempotentRelease(caller: string, acquiredAt: number, priority: boolean, taskId?: number): () => void {
+function createIdempotentRelease(
+  lockId: string,
+  caller: string,
+  acquiredAt: number,
+  priority: boolean,
+  sourceHint: string,
+  taskId?: number,
+): TickerLockRelease {
   let released = false;
-  const release = () => {
+  const release = (() => {
     if (released) return;
     released = true;
+    const releaseAt = Date.now();
+    const holdMs = releaseAt - acquiredAt;
     clearTickerLockHolderIfMatches(release);
-    tickerActiveRequests = Math.max(0, tickerActiveRequests - 1);
-    if (tickerDebugEnabled()) {
-      console.info(
-        JSON.stringify({
-          tag: "DEBUG_TICKER_LOCK_RELEASE",
-          ts: new Date().toISOString(),
-          caller,
-          held_ms: Date.now() - acquiredAt,
-          active_requests: tickerActiveRequests,
-          queue_len: tickerQueue.length,
-        }),
-      );
-    }
+    adjustActiveRequests(-1, "release", { caller, lock_id: lockId, hold_ms: holdMs });
+    emitTickerLockLifecycleLog(
+      "DEBUG_TICKER_LOCK_RELEASE",
+      {
+        lock_id: lockId,
+        caller,
+        priority,
+        acquired_at: acquiredAt,
+        release_at: releaseAt,
+        hold_ms: holdMs,
+        waiter_task_id: taskId ?? null,
+        source_hint: sourceHint,
+        queue_len: tickerQueue.length,
+      },
+      caller,
+    );
+    const releasePath = tickerLockReleasePathOverride ?? "normal";
+    const forceRecovered = releasePath === "force" || releasePath === "desync";
+    finalizeTickerLockLifecycle(lockId, releasePath, releaseAt, holdMs, forceRecovered);
     processNextTickerRequest();
-  };
-  registerTickerLockHolder(caller, acquiredAt, priority, release, taskId);
+  }) as TickerLockRelease;
+  release.lockId = lockId;
+  registerTickerLockHolder({
+    lock_id: lockId,
+    caller,
+    acquired_at: acquiredAt,
+    release_at: null,
+    hold_ms: null,
+    priority,
+    waiter_task_id: taskId,
+    source_hint: sourceHint,
+    release,
+  });
   return release;
+}
+
+export function getTickerLockLifecycleAuditSnapshot() {
+  const now = Date.now();
+  const unreleased = [...tickerLockLifecycleById.values()].filter((e) => !e.released);
+  return {
+    runtime_id: TICKER_LOCK_RUNTIME_ID,
+    active_requests: tickerActiveRequests,
+    queue_len: tickerQueue.length,
+    current_holder: tickerLockHolder
+      ? {
+          lock_id: tickerLockHolder.lock_id,
+          caller: tickerLockHolder.caller,
+          priority: tickerLockHolder.priority,
+          acquired_at: tickerLockHolder.acquired_at,
+          held_ms: now - tickerLockHolder.acquired_at,
+          source_hint: tickerLockHolder.source_hint,
+        }
+      : null,
+    unreleased_locks: unreleased,
+    force_recovery_total: tickerLockForceRecoveryTotal,
+    force_recovery_by_caller: Object.fromEntries(tickerLockForceRecoveryByCaller.entries()),
+    long_hold_count_by_caller: Object.fromEntries(tickerLockLongHoldCountByCaller.entries()),
+    recent_lifecycle: tickerLockLifecycleOrder.slice(-20).map((id) => tickerLockLifecycleById.get(id)).filter(Boolean),
+  };
 }
 
 export async function withTickerLock<T>(opts: TickerLockOptions | undefined, fn: () => Promise<T>): Promise<T> {
@@ -881,7 +1170,7 @@ export async function withTickerLock<T>(opts: TickerLockOptions | undefined, fn:
 async function acquireTickerLockMeasured(
   opts: TickerLockOptions,
   onLockWaitMs: (waitMs: number) => void,
-): Promise<() => void> {
+): Promise<TickerLockRelease> {
   const t0 = Date.now();
   try {
     return await acquireTickerLock(opts);
@@ -890,7 +1179,7 @@ async function acquireTickerLockMeasured(
   }
 }
 
-export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<() => void> {
+export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<TickerLockRelease> {
   const options: TickerLockOptions = typeof opts === "boolean" ? { priority: opts } : (opts ?? {});
   const priority = options.priority === true;
   const signal = options.signal;
@@ -902,45 +1191,56 @@ export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<(
 
   // 1. 이미 취소된 signal인 경우 즉시 거부 (큐 진입 안 함)
   if (signal?.aborted) {
-    if (tickerDebugEnabled()) {
-      console.info(
-        JSON.stringify({
-          tag: "DEBUG_TICKER_LOCK_ABORT",
-          ts: new Date().toISOString(),
-          caller,
-          reason: "already_aborted",
-          active_requests: tickerActiveRequests,
-          queue_len: tickerQueue.length,
-        }),
-      );
-    }
+    emitTickerLockLifecycleLog(
+      "DEBUG_TICKER_LOCK_ABORT",
+      {
+        lock_id: null,
+        caller,
+        reason: "already_aborted",
+        active_requests: tickerActiveRequests,
+        queue_len: tickerQueue.length,
+      },
+      caller,
+    );
     return Promise.reject(new DOMException("Aborted", "AbortError"));
   }
 
   // 2. 동시성 슬롯이 남아있으면 즉시 획득
   if (tickerActiveRequests < UPBIT_TICKER_MAX_CONCURRENCY) {
-    tickerActiveRequests++;
+    const lockId = nextTickerLockId();
+    const sourceHint = captureTickerLockSourceHint();
     if (priority) {
       consecutivePriorityGrants++;
     } else {
       consecutivePriorityGrants = 0;
     }
-    if (tickerDebugEnabled()) {
-      console.info(
-        JSON.stringify({
-          tag: "DEBUG_TICKER_LOCK_ACQUIRE",
-          ts: new Date().toISOString(),
-          caller,
-          status: "immediate",
-          priority,
-          consecutive_priority: consecutivePriorityGrants,
-          wait_ms: 0,
-          active_requests: tickerActiveRequests,
-          queue_len: tickerQueue.length,
-        }),
-      );
-    }
-    return Promise.resolve(createIdempotentRelease(caller, now0, priority));
+    adjustActiveRequests(1, "acquire_immediate", { caller, lock_id: lockId, priority });
+    registerTickerLockLifecyclePending({
+      lock_id: lockId,
+      runtime_id: TICKER_LOCK_RUNTIME_ID,
+      caller,
+      priority,
+      acquired_at: now0,
+      release_at: null,
+      hold_ms: null,
+      source_hint: sourceHint,
+    });
+    emitTickerLockLifecycleLog(
+      "DEBUG_TICKER_LOCK_ACQUIRE",
+      {
+        lock_id: lockId,
+        caller,
+        status: "immediate",
+        priority,
+        consecutive_priority: consecutivePriorityGrants,
+        wait_ms: 0,
+        acquired_at: now0,
+        source_hint: sourceHint,
+        queue_len: tickerQueue.length,
+      },
+      caller,
+    );
+    return Promise.resolve(createIdempotentRelease(lockId, caller, now0, priority, sourceHint));
   }
 
   // 3. 대기 큐 진입
@@ -972,7 +1272,14 @@ export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<(
     const removeTaskFromQueue = () => {
       const idx = tickerQueue.findIndex((t) => t.id === taskId);
       if (idx !== -1) {
+        const queue_len_before = tickerQueue.length;
         tickerQueue.splice(idx, 1);
+        logTickerLockQueueMutation("remove", {
+          caller,
+          waiter_task_id: taskId,
+          queue_len_before,
+          queue_len_after: tickerQueue.length,
+        });
       }
     };
 
@@ -982,19 +1289,18 @@ export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<(
         task.aborted = true;
         cleanup();
         removeTaskFromQueue();
-        if (tickerDebugEnabled()) {
-          console.info(
-            JSON.stringify({
-              tag: "DEBUG_TICKER_LOCK_ABORT",
-              ts: new Date().toISOString(),
-              caller,
-              task_id: taskId,
-              wait_ms: Date.now() - now0,
-              active_requests: tickerActiveRequests,
-              queue_len: tickerQueue.length,
-            }),
-          );
-        }
+        emitTickerLockLifecycleLog(
+          "DEBUG_TICKER_LOCK_ABORT",
+          {
+            ...logTickerLockHolderSnapshot(),
+            lock_id: null,
+            caller,
+            waiter_task_id: taskId,
+            wait_ms: Date.now() - now0,
+            reason: "signal_abort_while_waiting",
+          },
+          caller,
+        );
         reject(new DOMException("Aborted", "AbortError"));
       };
       signal.addEventListener("abort", task.abortHandler, { once: true });
@@ -1006,20 +1312,20 @@ export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<(
         task.aborted = true;
         cleanup();
         removeTaskFromQueue();
-        if (caller.includes("pump") || tickerDebugEnabled()) {
-          console.warn(
-            JSON.stringify({
-              tag: "DEBUG_TICKER_LOCK_TIMEOUT",
-              ts: new Date().toISOString(),
-              caller,
-              task_id: taskId,
-              wait_ms: Date.now() - now0,
-              timeout_ms: timeoutMs,
-              priority: task.priority,
-              ...logTickerLockHolderSnapshot(),
-            }),
-          );
-        }
+        console.warn(
+          JSON.stringify({
+            ...logTickerLockHolderSnapshot(),
+            tag: "DEBUG_TICKER_LOCK_TIMEOUT",
+            ts: new Date().toISOString(),
+            lock_id: null,
+            caller,
+            waiter_task_id: taskId,
+            wait_ms: Date.now() - now0,
+            timeout_ms: timeoutMs,
+            priority: task.priority,
+            prior_holder: snapshotPriorHolderForForceRecovery(),
+          }),
+        );
         forceRecoverStaleOrDesyncedTickerLock(`waiter_timeout:${caller}`);
         reject(new Error(`Ticker lock acquisition timed out after ${timeoutMs}ms (caller=${caller})`));
       }, timeoutMs);
@@ -1031,21 +1337,27 @@ export function acquireTickerLock(opts?: boolean | TickerLockOptions): Promise<(
     }
 
     // Queue in FIFO order; processNextTickerRequest performs bounded fairness selection
+    const queue_len_before = tickerQueue.length;
     tickerQueue.push(task);
-
-    if (tickerDebugEnabled()) {
-      console.info(
-        JSON.stringify({
-          tag: "DEBUG_TICKER_LOCK_WAIT",
-          ts: new Date().toISOString(),
-          caller,
-          task_id: taskId,
-          priority,
-          active_requests: tickerActiveRequests,
-          queue_len: tickerQueue.length,
-        }),
-      );
-    }
+    logTickerLockQueueMutation("push", {
+      caller,
+      waiter_task_id: taskId,
+      priority,
+      queue_len_before,
+      queue_len_after: tickerQueue.length,
+    });
+    emitTickerLockLifecycleLog(
+      "DEBUG_TICKER_LOCK_WAIT",
+      {
+        lock_id: null,
+        caller,
+        waiter_task_id: taskId,
+        priority,
+        active_requests: tickerActiveRequests,
+        queue_len: tickerQueue.length,
+      },
+      caller,
+    );
   });
 }
 
@@ -1084,7 +1396,17 @@ function processNextTickerRequest() {
       break;
     }
 
+    const queue_len_before = tickerQueue.length;
     const [next] = tickerQueue.splice(nextIndex, 1);
+    if (next) {
+      logTickerLockQueueMutation("pop", {
+        caller: next.caller,
+        waiter_task_id: next.id,
+        queue_len_before,
+        queue_len_after: tickerQueue.length,
+        selected_index: nextIndex,
+      });
+    }
     if (!next || next.aborted) continue;
 
     if (next.timerId) {
@@ -1102,26 +1424,43 @@ function processNextTickerRequest() {
       consecutivePriorityGrants = 0;
     }
 
-    tickerActiveRequests++;
+    const lockId = nextTickerLockId();
+    const sourceHint = captureTickerLockSourceHint();
+    adjustActiveRequests(1, "acquire_from_queue", {
+      caller: next.caller,
+      lock_id: lockId,
+      priority: next.priority,
+      waiter_task_id: next.id,
+    });
     const now = Date.now();
     const waitMs = now - next.createdAt;
-    if (tickerDebugEnabled()) {
-      console.info(
-        JSON.stringify({
-          tag: "DEBUG_TICKER_LOCK_ACQUIRE",
-          ts: new Date().toISOString(),
-          caller: next.caller,
-          task_id: next.id,
-          priority: next.priority,
-          consecutive_priority: consecutivePriorityGrants,
-          status: "queued",
-          wait_ms: waitMs,
-          active_requests: tickerActiveRequests,
-          queue_len: tickerQueue.length,
-        }),
-      );
-    }
-    const release = createIdempotentRelease(next.caller, now, next.priority, next.id);
+    registerTickerLockLifecyclePending({
+      lock_id: lockId,
+      runtime_id: TICKER_LOCK_RUNTIME_ID,
+      caller: next.caller,
+      priority: next.priority,
+      acquired_at: now,
+      release_at: null,
+      hold_ms: null,
+      source_hint: sourceHint,
+    });
+    emitTickerLockLifecycleLog(
+      "DEBUG_TICKER_LOCK_ACQUIRE",
+      {
+        lock_id: lockId,
+        caller: next.caller,
+        waiter_task_id: next.id,
+        priority: next.priority,
+        consecutive_priority: consecutivePriorityGrants,
+        status: "queued",
+        wait_ms: waitMs,
+        acquired_at: now,
+        source_hint: sourceHint,
+        queue_len: tickerQueue.length,
+      },
+      next.caller,
+    );
+    const release = createIdempotentRelease(lockId, next.caller, now, next.priority, sourceHint, next.id);
     next.resolve(release);
     break;
   }
@@ -1134,15 +1473,25 @@ export function getTickerLockStats() {
     maxConcurrency: UPBIT_TICKER_MAX_CONCURRENCY,
     consecutivePriorityGrants,
     holderCaller: tickerLockHolder?.caller ?? null,
-    holderHeldMs: tickerLockHolder ? Date.now() - tickerLockHolder.acquiredAt : null,
+    holderLockId: tickerLockHolder?.lock_id ?? null,
+    holderHeldMs: tickerLockHolder ? Date.now() - tickerLockHolder.acquired_at : null,
+    runtimeId: TICKER_LOCK_RUNTIME_ID,
   };
 }
 
 export function resetTickerLockStateForTest() {
+  if (tickerLockHolder) {
+    clearLongHoldTimers(tickerLockHolder);
+  }
   tickerActiveRequests = 0;
   tickerQueue.length = 0;
   consecutivePriorityGrants = 0;
   tickerLockHolder = null;
+  tickerLockLifecycleById.clear();
+  tickerLockLifecycleOrder.length = 0;
+  tickerLockForceRecoveryTotal = 0;
+  tickerLockForceRecoveryByCaller.clear();
+  tickerLockLongHoldCountByCaller.clear();
 }
 
 /** Test-only: simulate orphaned active_requests counter without holder metadata. */
