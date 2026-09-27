@@ -33,6 +33,11 @@ import {
   processSurgeCaptureQueue,
   saveCaptureQueue,
 } from "./surge-v2/surge-capture-layer.js";
+import {
+  classifySurgeImpulseMemory,
+  postSpikeExtraEntryRequirements,
+  type SurgeImpulseMemoryResult,
+} from "./surge-v2/surge-impulse-memory.js";
 import { assertOrderBuyAllowed } from "./market-state-filter.js";
 import {
   LIVE_ENTRY_SIGNAL_GATES,
@@ -684,6 +689,9 @@ type SurgeEntrySetupResult = {
   wickOk?: boolean;
   rrOk?: boolean;
   probe_allowed?: boolean;
+  impulse_phase?: string;
+  impulse_memory?: SurgeImpulseMemoryResult;
+  early_surge_authority?: boolean;
 };
 
 type PaperSurgePatternStats = {
@@ -4368,10 +4376,20 @@ function evaluateSurgeEntrySetup(
   const isFresh = payload?.is_fresh_signal !== false && payload?.age_seconds !== null && (payload?.age_seconds ?? 0) <= 240;
   const earlyContract = isScannerEarlyContractApproved(payload, isFresh);
 
-  const setupVolRequired = earlyContract.approved ? 1.2 : 1.4;
-  const setupMomentumRequired = earlyContract.approved ? 0.25 : 0.7;
-  const volAuthority = earlyContract.approved ? "scanner_early_contract" : "independent_surge_setup";
-  const momentumAuthority = earlyContract.approved ? "scanner_early_contract" : "independent_surge_setup";
+  const volRatioEarly = Number(payload.volume_ratio ?? payload.volume_multiple ?? 0);
+  const impulseMemory = classifySurgeImpulseMemory({
+    completedCandles: completed,
+    currentPx,
+    payloadVolumeRatio: volRatioEarly,
+  });
+  const postSpikeGate = postSpikeExtraEntryRequirements(impulseMemory);
+  const earlySurgeAuthority =
+    earlyContract.approved && impulseMemory.earlySurgeAuthorityPreserved;
+
+  const setupVolRequired = earlySurgeAuthority ? 1.2 : 1.4;
+  const setupMomentumRequired = earlySurgeAuthority ? 0.25 : 0.7;
+  const volAuthority = earlySurgeAuthority ? "scanner_early_contract" : "independent_surge_setup";
+  const momentumAuthority = earlySurgeAuthority ? "scanner_early_contract" : "independent_surge_setup";
   
   // 1. Volume Expansion (payload's volume_ratio)
   const volRatio = Number(payload.volume_ratio ?? payload.volume_multiple ?? 0);
@@ -4414,6 +4432,9 @@ function evaluateSurgeEntrySetup(
   if (overextended) failed.push("overextended");
   if (!wickOk) failed.push("upper_wick_rejection");
   if (!rrOk) failed.push("risk_reward_invalid");
+  if (postSpikeGate.required && !postSpikeGate.ok) {
+    failed.push(...postSpikeGate.failed);
+  }
 
   const pass = failed.length === 0;
   
@@ -4444,6 +4465,19 @@ function evaluateSurgeEntrySetup(
       market,
       source_kind: payload?.source_kind ?? "none",
       scanner_authority: earlyContract.approved,
+      early_surge_authority: earlySurgeAuthority,
+      impulse_phase: impulseMemory.phase,
+      impulse_prior_spike: impulseMemory.priorSpike,
+      impulse_spike_high: impulseMemory.spikeHigh,
+      impulse_spike_amplitude_pct: Number(impulseMemory.spikeAmplitudePct.toFixed(3)),
+      impulse_spike_duration_bars: impulseMemory.spikeDurationBars,
+      impulse_drawdown_from_spike_high_pct: Number(impulseMemory.drawdownFromSpikeHighPct.toFixed(3)),
+      impulse_volume_acceleration: Number(impulseMemory.volumeAcceleration.toFixed(3)),
+      impulse_post_spike_volume_decay: Number(impulseMemory.postSpikeVolumeDecay.toFixed(3)),
+      impulse_high_reclaim: impulseMemory.highReclaim,
+      impulse_higher_low: impulseMemory.higherLow,
+      impulse_follow_through: impulseMemory.followThrough,
+      impulse_post_spike_recovery_ok: impulseMemory.postSpikeRecoveryOk,
       scanner_filter_pass: Boolean(payload?.filter_pass),
       scanner_bridge_pass: payload?.filter_pass === true && payload?.source_kind !== "scanner_bridge_score_fail",
       volume_multiple: volRatio,
@@ -4491,7 +4525,10 @@ function evaluateSurgeEntrySetup(
     overextended,
     wickOk,
     rrOk,
-    probe_allowed: probeAllowed
+    probe_allowed: probeAllowed,
+    impulse_phase: impulseMemory.phase,
+    impulse_memory: impulseMemory,
+    early_surge_authority: earlySurgeAuthority,
   };
 }
 

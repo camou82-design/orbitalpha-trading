@@ -2,6 +2,12 @@ export * from "./surge-types.js";
 export { isSurgePosition } from "./surge-position-classifier.js";
 export { evaluateSurgeEntryPipeline } from "./surge-entry-engine.js";
 export { evaluateSurgeExit } from "./surge-exit-engine.js";
+export {
+  classifySurgeImpulseMemory,
+  postSpikeExtraEntryRequirements,
+  type SurgeImpulseMemoryResult,
+  type SurgeImpulsePhase,
+} from "./surge-impulse-memory.js";
 
 // Shadow Judgment Logic (Preserved for paper-trading and workers)
 import { detectEarlySurge } from "./surge-early-detector.js";
