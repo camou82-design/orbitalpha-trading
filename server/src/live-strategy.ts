@@ -11479,7 +11479,7 @@ export function createLiveDataStrategy(opts: {
     /** discovery_universe: 신규 급등주 탐색/진입용. 현재 보유(holdings) 종목은 제외한다. */
     const universeDroppedReasons: Record<string, string> = {};
     let entryUniverse = baseEntryUniverse.filter((m) => {
-      if (m === "KRW-USDT") {
+      if (m === "KRW-USDT" || m === "KRW-USDC") {
         universeDroppedReasons[m] = "excluded_as_transfer_reserve";
         return false;
       }
@@ -11496,7 +11496,7 @@ export function createLiveDataStrategy(opts: {
     const coreMarketSet = new Set<string>(CORE_TRADE_MARKETS as unknown as string[]);
     const surgeDiscoveryEntryOnly = entryUniverse.filter((m) => !coreMarketSet.has(m));
     const coreTradeEntryEligibleSymbols: string[] = (CORE_TRADE_MARKETS as readonly string[]).filter((sym) => {
-      if (sym === "KRW-USDT") return false;
+      if (sym === "KRW-USDT" || sym === "KRW-USDC") return false;
       if (heldSymbolSet.has(sym)) return false;
       if (heldMeaningfulMarkets.has(sym)) return false;
       return true;

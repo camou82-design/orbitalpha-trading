@@ -58,7 +58,7 @@ export function evaluateSurgeExit(pos: any, currentPx: number, rise3mPct?: numbe
   let tp2Ratio = 0.5;
   let trailingStartPct = pos.surge_trailing_start_pct || (surgeEntryMode === "FAST_SURGE_PROBE" ? 2.0 : 3.0);
   let trailingGapPct = pos.surge_trailing_gap_pct || (surgeEntryMode === "FAST_SURGE_PROBE" ? 1.5 : 2.0);
-  let breakevenProtectTrigger = surgeEntryMode === "FAST_SURGE_PROBE" ? 0.2 : 0.5;
+  let breakevenProtectTrigger = surgeEntryMode === "FAST_SURGE_PROBE" ? 0.2 : 0.35;
 
   // 3/4. 복구 Surge 정책 강제 적용 및 stale 상태값 덮어쓰기
   if (isRecoveredSurgePolicy) {
@@ -122,8 +122,8 @@ export function evaluateSurgeExit(pos: any, currentPx: number, rise3mPct?: numbe
       decision = { action: "sell", reason: "SURGE_RUNNER_TRAILING_EXIT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
     }
   }
-  // 6. Breakeven Protect
-  if (!decision && maxPnlPct >= trailingStartPct && pnlPct <= breakevenProtectTrigger) {
+  // 6. Breakeven Protect (armed when maxPnlPct >= trailingStartPct OR tp1Done OR peak >= 1.35%)
+  if (!decision && (maxPnlPct >= trailingStartPct || tp1Done || maxPnlPct >= 1.35) && pnlPct <= breakevenProtectTrigger) {
     decision = { action: "sell", reason: "SURGE_BREAKEVEN_PROTECT", ratio: 1, runnerTrailActive, authoritySource: "surge-v2" };
   }
   // 7. Timeout Exits (Tiered 30m Weak Exit & 60m Extended Timeout Exit)
