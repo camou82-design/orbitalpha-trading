@@ -2067,7 +2067,11 @@ export function evaluateGlobalKillSwitch(
   reason: string | null;
   meta?: Record<string, unknown>;
 } {
-  const completed = trades.filter((t) => t.action === "sell" && ((t as any).filled_qty > 0 || (t as any).order_krw > 0));
+  const completed = trades.filter((t) => {
+    const isSell = t.action === "sell" || (t as any).side === "sell" || (t as any).type === "position_closed" || (t as any).type === "partial_take_profit" || (t as any).final_close === true || (t as any).partial_exit === true;
+    const hasVolume = Number((t as any).filled_qty ?? 0) > 0 || Number((t as any).order_krw ?? 0) > 0 || Number((t as any).filled_entry_krw ?? 0) > 0;
+    return isSell && hasVolume;
+  });
   if (completed.length === 0) {
     return {
       active: false,
@@ -2099,15 +2103,36 @@ export function evaluateGlobalKillSwitch(
   let validTimestampCount = 0;
   let invalidTimestampCount = 0;
 
-  const validCompleted: Array<{
+  // 포지션 단위 집계 (position_id / entry_ts 기준 그룹화 및 단일 레코드 지원)
+  interface PositionSummary {
+    positionId: string;
     market: string;
-    pnl_pct: number;
     tradeTimeMs: number;
+    totalPnlKrw: number;
+    totalPnlPct: number;
+    hasKrw: boolean;
     note?: string;
-  }> = [];
+    isSurgeStopLoss: boolean;
+  }
+
+  interface RawTradeLeg {
+    market: string;
+    tradeTimeMs: number;
+    pnlKrw?: number;
+    rawPnlPct: number;
+    partialProfit: number;
+    entryKrw: number;
+    isPartial: boolean;
+    isFinal: boolean;
+    note?: string;
+    isSurgeStopLoss: boolean;
+  }
+
+  const posLegsMap = new Map<string, RawTradeLeg[]>();
+  const independentPositions: PositionSummary[] = [];
 
   for (const t of completed) {
-    const raw = t.timestamp;
+    const raw = (t as any).timestamp || (t as any).ts;
     if (!raw || typeof raw !== "string" || raw.trim() === "") {
       invalidTimestampCount++;
       continue;
@@ -2117,14 +2142,142 @@ export function evaluateGlobalKillSwitch(
       invalidTimestampCount++;
       continue;
     }
+
+    // 단순 가격 업데이트 더미 레코드는 집계에서 제외
+    const isPriceUpdateDummy =
+      ((t as any).filled_qty === 0 || (t as any).filled_qty === "0") &&
+      ((t as any).order_krw === 0 || (t as any).order_krw === "0") &&
+      ((t as any).reason_exit === "highest_price_update" || (t as any).liquidation_reason === "highest_price_update");
+    if (isPriceUpdateDummy) {
+      continue;
+    }
+
     validTimestampCount++;
-    validCompleted.push({
-      market: t.market,
-      pnl_pct: (t.pnl_pct !== undefined && t.pnl_pct !== null && Number.isFinite(Number(t.pnl_pct))) ? Number(t.pnl_pct) : NaN,
-      tradeTimeMs: parsed,
-      note: t.note,
-    });
+
+    const rawPnlPct = (t.pnl_pct !== undefined && t.pnl_pct !== null && Number.isFinite(Number(t.pnl_pct)))
+      ? Number(t.pnl_pct)
+      : NaN;
+
+    const pnlKrw = ((t as any).pnl_krw !== undefined && (t as any).pnl_krw !== null && Number.isFinite(Number((t as any).pnl_krw)))
+      ? Number((t as any).pnl_krw)
+      : (((t as any).pnl_net !== undefined && (t as any).pnl_net !== null && Number.isFinite(Number((t as any).pnl_net))) ? Number((t as any).pnl_net) : undefined);
+
+    const partialProfit = Number((t as any).realized_partial_profit ?? (t as any).realizedPartialProfit ?? 0);
+    const entryKrw = Number((t as any).filled_entry_krw ?? (t as any).target_budget_krw ?? (t as any).order_krw ?? 0);
+
+    const noteText = String(t.note || (t as any).reason_exit || (t as any).exit_reason || "");
+    const isSurgeStopLoss = /surge_stop_loss/i.test(noteText);
+
+    const isPartial = (t as any).partial_exit === true || (t as any).event_type === "partial_take_profit" || /partial/i.test(noteText);
+    const isFinal = (t as any).final_close === true || (t as any).event_type === "position_closed";
+
+    // 포지션 식별 키
+    const posId = (t as any).position_id ||
+      ((t as any).entry_ts && t.market ? `${t.market}|${(t as any).entry_ts}` : null);
+
+    if (posId) {
+      const list = posLegsMap.get(posId) ?? [];
+      list.push({
+        market: t.market,
+        tradeTimeMs: parsed,
+        pnlKrw,
+        rawPnlPct,
+        partialProfit,
+        entryKrw,
+        isPartial,
+        isFinal,
+        note: t.note ?? undefined,
+        isSurgeStopLoss,
+      });
+      posLegsMap.set(posId, list);
+    } else {
+      const initialKrw = (pnlKrw ?? 0) + partialProfit;
+      let effPct = rawPnlPct;
+      if (entryKrw > 0 && initialKrw !== 0) {
+        effPct = (initialKrw / entryKrw) * 100;
+      } else if (initialKrw > 0 && effPct <= 0) {
+        effPct = Math.abs(effPct) || 0.01;
+      } else if (initialKrw < 0 && effPct >= 0) {
+        effPct = -Math.abs(effPct) || -0.01;
+      }
+      independentPositions.push({
+        positionId: `indep_${t.market}_${parsed}_${validTimestampCount}`,
+        market: t.market,
+        tradeTimeMs: parsed,
+        totalPnlKrw: initialKrw,
+        totalPnlPct: effPct,
+        hasKrw: pnlKrw !== undefined || partialProfit !== 0,
+        note: t.note ?? undefined,
+        isSurgeStopLoss,
+      });
+    }
   }
+
+  const positionMap = new Map<string, PositionSummary>();
+  for (const [posId, legs] of posLegsMap.entries()) {
+    if (legs.length === 1) {
+      const leg = legs[0];
+      const initialKrw = (leg.pnlKrw ?? 0) + leg.partialProfit;
+      let effPct = leg.rawPnlPct;
+      if (leg.entryKrw > 0 && initialKrw !== 0) {
+        effPct = (initialKrw / leg.entryKrw) * 100;
+      } else if (initialKrw > 0 && effPct <= 0) {
+        effPct = Math.abs(effPct) || 0.01;
+      } else if (initialKrw < 0 && effPct >= 0) {
+        effPct = -Math.abs(effPct) || -0.01;
+      }
+      positionMap.set(posId, {
+        positionId: posId,
+        market: leg.market,
+        tradeTimeMs: leg.tradeTimeMs,
+        totalPnlKrw: initialKrw,
+        totalPnlPct: effPct,
+        hasKrw: leg.pnlKrw !== undefined || leg.partialProfit !== 0,
+        note: leg.note,
+        isSurgeStopLoss: leg.isSurgeStopLoss,
+      });
+    } else {
+      const latestTimeMs = Math.max(...legs.map((l) => l.tradeTimeMs));
+      const hasAnyKrw = legs.some((l) => l.pnlKrw !== undefined || l.partialProfit !== 0);
+      const anySurgeStopLoss = legs.some((l) => l.isSurgeStopLoss);
+      const maxReportedPartial = Math.max(0, ...legs.map((l) => l.partialProfit));
+      const entryKrw = Math.max(0, ...legs.map((l) => l.entryKrw));
+
+      // Case A, B, C 정밀 방어:
+      // 1. 각 leg에 pnl_krw가 분할 기록되어 있는 경우 leg 합산이 우선
+      const sumPnlKrw = legs.reduce((acc, l) => acc + (l.pnlKrw ?? 0), 0);
+      const hasRealizedProfitLeg = legs.some((l) => (l.pnlKrw ?? 0) > 0);
+
+      let totalPnlKrw = sumPnlKrw;
+      // partial 이익이 개별 leg의 pnl_krw로 잡히지 않고 final record의 partialProfit에만 기록된 경우에만 가산
+      // 이미 partial leg(pnlKrw > 0)가 있다면 final record의 partialProfit은 중복 계상이므로 더하지 않음 (Case B 방어)
+      if (!hasRealizedProfitLeg && maxReportedPartial > 0) {
+        totalPnlKrw += maxReportedPartial;
+      }
+
+      let totalPnlPct = legs.reduce((acc, l) => acc + (Number.isFinite(l.rawPnlPct) ? l.rawPnlPct : 0), 0);
+      if (entryKrw > 0 && totalPnlKrw !== 0) {
+        totalPnlPct = (totalPnlKrw / entryKrw) * 100;
+      } else if (totalPnlKrw > 0 && totalPnlPct <= 0) {
+        totalPnlPct = Math.abs(totalPnlPct) || 0.01;
+      } else if (totalPnlKrw < 0 && totalPnlPct >= 0) {
+        totalPnlPct = -Math.abs(totalPnlPct) || -0.01;
+      }
+
+      positionMap.set(posId, {
+        positionId: posId,
+        market: legs[0].market,
+        tradeTimeMs: latestTimeMs,
+        totalPnlKrw,
+        totalPnlPct,
+        hasKrw: hasAnyKrw,
+        note: legs[legs.length - 1].note,
+        isSurgeStopLoss: anySurgeStopLoss,
+      });
+    }
+  }
+
+  const allPositions = [...positionMap.values(), ...independentPositions];
 
   const RECENT_WINDOW_HOURS = 48;
   const recentWindowMs = RECENT_WINDOW_HOURS * 3600 * 1000;
@@ -2132,54 +2285,51 @@ export function evaluateGlobalKillSwitch(
   const oneDayAgoMs = nowMs - 24 * 3600 * 1000;
 
   // windowStartMs <= tradeTimeMs <= maxValidFutureMs (최근 48시간 유효 표본)
-  const recentWindowTrades = validCompleted.filter(
-    (t) => t.tradeTimeMs >= windowStartMs && t.tradeTimeMs <= maxValidFutureMs,
+  const recentWindowPositions = allPositions.filter(
+    (p) => p.tradeTimeMs >= windowStartMs && p.tradeTimeMs <= maxValidFutureMs,
   );
 
   // oneDayAgoMs <= tradeTimeMs <= maxValidFutureMs (최근 24시간 유효 표본)
-  const recent24hTrades = validCompleted.filter(
-    (t) => t.tradeTimeMs >= oneDayAgoMs && t.tradeTimeMs <= maxValidFutureMs,
+  const recent24hPositions = allPositions.filter(
+    (p) => p.tradeTimeMs >= oneDayAgoMs && p.tradeTimeMs <= maxValidFutureMs,
   );
 
   // 가장 최신 완료 거래의 경과 시간 (hours)
-  const latestTradeTimeMs = validCompleted.reduce((max, t) => Math.max(max, t.tradeTimeMs), 0);
+  const latestTradeTimeMs = allPositions.reduce((max, p) => Math.max(max, p.tradeTimeMs), 0);
   const latestTradeAgeHours = latestTradeTimeMs > 0 ? (nowMs - latestTradeTimeMs) / (3600 * 1000) : null;
 
-  const totalPnlPct = recentWindowTrades.reduce((acc, t) => acc + t.pnl_pct, 0);
-  const wins = recentWindowTrades.filter((t) => t.pnl_pct > 0).length;
-  const winRate = recentWindowTrades.length > 0 ? wins / recentWindowTrades.length : null;
-  const losses24h = recent24hTrades.filter((t) => t.pnl_pct < 0).length;
+  const totalPnlPct = recentWindowPositions.reduce((acc, p) => acc + (Number.isFinite(p.totalPnlPct) ? p.totalPnlPct : 0), 0);
+  const wins = recentWindowPositions.filter((p) => p.hasKrw ? p.totalPnlKrw > 0 : p.totalPnlPct > 0).length;
+  const winRate = recentWindowPositions.length > 0 ? wins / recentWindowPositions.length : null;
+  const losses24h = recent24hPositions.filter((p) => p.hasKrw ? p.totalPnlKrw < 0 : p.totalPnlPct < 0).length;
 
   let hardRiskActive = false;
   let performanceKillActive = false;
   const hardRiskReasons: string[] = [];
   const performanceReasons: string[] = [];
 
-  // 1. 누적 심각한 손실 가드 (HARD_RISK): 최근 48시간 내 3건 이상 거래가 있고 누적 PnL <= -5.0%일 때 발동
-  if (recentWindowTrades.length >= 3 && Number.isFinite(totalPnlPct) && totalPnlPct <= -5.0) {
+  // 1. 누적 심각한 손실 가드 (HARD_RISK): 최근 48시간 내 3건 이상 거래가 있고 누적 PnL <= -5.0%일 때 발동 (임계값 절대 변경 금지)
+  if (recentWindowPositions.length >= 3 && Number.isFinite(totalPnlPct) && totalPnlPct <= -5.0) {
     hardRiskActive = true;
-    hardRiskReasons.push(`Cumulative PnL under -5% in recent 48h (${recentWindowTrades.length} trades, ${totalPnlPct.toFixed(2)}%)`);
+    hardRiskReasons.push(`Cumulative PnL under -5% in recent 48h (${recentWindowPositions.length} trades, ${totalPnlPct.toFixed(2)}%)`);
   }
 
-  // 2. 승률 가드 (PERFORMANCE): 최근 48시간 내 5건 이상 거래가 있고 승률 < 20%일 때 발동
-  if (recentWindowTrades.length >= 5 && winRate !== null && winRate < 0.20) {
+  // 2. 승률 가드 (PERFORMANCE): 최근 48시간 내 5건 이상 거래가 있고 승률 < 20%일 때 발동 (임계값 절대 변경 금지)
+  if (recentWindowPositions.length >= 5 && winRate !== null && winRate < 0.20) {
     performanceKillActive = true;
-    performanceReasons.push(`Win rate under 20% in recent 48h (${recentWindowTrades.length} trades, ${(winRate * 100).toFixed(1)}%)`);
+    performanceReasons.push(`Win rate under 20% in recent 48h (${recentWindowPositions.length} trades, ${(winRate * 100).toFixed(1)}%)`);
   }
-  // 3. 24시간 손실 횟수 가드 (PERFORMANCE): 최근 24시간 내 손실 5건 이상 시 발동
+  // 3. 24시간 손실 횟수 가드 (PERFORMANCE): 최근 24시간 내 손실 5건 이상 시 발동 (임계값 절대 변경 금지)
   if (losses24h >= 5) {
     performanceKillActive = true;
     performanceReasons.push(`5 or more loss trades in the last 24 hours (${losses24h} losses)`);
   }
   // 4. surge_stop_loss 집중 가드 (PERFORMANCE): 최근 48시간 내 5건 이상 거래 중 surge_stop_loss 비율 >= 50% & 누적 PnL 음수
-  if (recentWindowTrades.length >= 5) {
-    const surgeStopLosses = recentWindowTrades.filter((t) => {
-      const note = (t.note || "").toLowerCase();
-      return note.includes("surge_stop_loss");
-    }).length;
-    if (surgeStopLosses / recentWindowTrades.length >= 0.5 && Number.isFinite(totalPnlPct) && totalPnlPct < 0) {
+  if (recentWindowPositions.length >= 5) {
+    const surgeStopLosses = recentWindowPositions.filter((p) => p.isSurgeStopLoss).length;
+    if (surgeStopLosses / recentWindowPositions.length >= 0.5 && Number.isFinite(totalPnlPct) && totalPnlPct < 0) {
       performanceKillActive = true;
-      performanceReasons.push(`surge_stop_loss ratio >= 50% in recent 48h (${((surgeStopLosses / recentWindowTrades.length) * 100).toFixed(1)}%) and negative cumulative PnL (${totalPnlPct.toFixed(2)}%)`);
+      performanceReasons.push(`surge_stop_loss ratio >= 50% in recent 48h (${((surgeStopLosses / recentWindowPositions.length) * 100).toFixed(1)}%) and negative cumulative PnL (${totalPnlPct.toFixed(2)}%)`);
     }
   }
 
@@ -2196,8 +2346,8 @@ export function evaluateGlobalKillSwitch(
       valid_timestamp_count: validTimestampCount,
       invalid_timestamp_count: invalidTimestampCount,
       recent_window_hours: RECENT_WINDOW_HOURS,
-      recent_window_count: recentWindowTrades.length,
-      recent_24h_count: recent24hTrades.length,
+      recent_window_count: recentWindowPositions.length,
+      recent_24h_count: recent24hPositions.length,
       wins,
       win_rate: winRate !== null ? Number(winRate.toFixed(4)) : null,
       total_pnl_pct: Number.isFinite(totalPnlPct) ? Number(totalPnlPct.toFixed(4)) : totalPnlPct,
@@ -2226,8 +2376,8 @@ export function evaluateGlobalKillSwitch(
       valid_timestamp_count: validTimestampCount,
       invalid_timestamp_count: invalidTimestampCount,
       recent_window_hours: RECENT_WINDOW_HOURS,
-      recent_window_count: recentWindowTrades.length,
-      recent_24h_count: recent24hTrades.length,
+      recent_window_count: recentWindowPositions.length,
+      recent_24h_count: recent24hPositions.length,
       wins,
       win_rate: winRate,
       total_pnl_pct: totalPnlPct,
@@ -4900,6 +5050,120 @@ export function evaluateExitAuthority(params: {
     }
   }
   return { reasonExit: null, ratio: 1, stopTriggerKind: null, authorityClass: "none", reasonDetail: "no_exit", runnerTrailActive: p.partial_tp_done };
+}
+
+export interface EffectiveHighWatermarkResult {
+  effectiveHigh: number;
+  maxPnlPct: number;
+  source: "current_px" | "previous_highest" | "intrabar_candle_high";
+  candleUsed: {
+    high: number;
+    candleTimeMs: number;
+    ageMs: number;
+  } | null;
+  armOptionD: boolean;
+  tp1Eligible: boolean;
+}
+
+export function parseCandleTimeMs(c: UpbitCandle): number {
+  if ((c as any).timestamp && Number.isFinite(Number((c as any).timestamp))) {
+    return Number((c as any).timestamp);
+  }
+  const utcStr = (c as any).candle_date_time_utc;
+  if (utcStr && typeof utcStr === "string") {
+    const s = utcStr.endsWith("Z") || utcStr.includes("+") ? utcStr : `${utcStr}Z`;
+    const ms = Date.parse(s);
+    if (Number.isFinite(ms)) return ms;
+  }
+  const kstStr = c.candle_date_time_kst;
+  if (kstStr && typeof kstStr === "string") {
+    if (kstStr.endsWith("Z") || kstStr.includes("+") || kstStr.includes("-", 10)) {
+      const ms = Date.parse(kstStr);
+      if (Number.isFinite(ms)) return ms;
+    }
+    const ms = Date.parse(`${kstStr}+09:00`);
+    if (Number.isFinite(ms)) return ms;
+    const fallback = Date.parse(kstStr);
+    if (Number.isFinite(fallback)) return fallback;
+  }
+  return NaN;
+}
+
+export function computeEffectiveHighWatermark(params: {
+  entryPrice: number;
+  entryTs: string | number;
+  currentPx: number;
+  previousHighest?: number;
+  previousMaxPnlPct?: number;
+  candles?: UpbitCandle[];
+  nowMs?: number;
+  maxCandleAgeMs?: number;
+}): EffectiveHighWatermarkResult {
+  const { entryPrice, currentPx } = params;
+  const nowMs = params.nowMs ?? Date.now();
+  const entryMs = typeof params.entryTs === "number" ? params.entryTs : Date.parse(params.entryTs);
+  const previousHighest = Math.max(entryPrice, params.previousHighest ?? 0);
+  const maxCandleAgeMs = params.maxCandleAgeMs ?? 120_000;
+
+  let bestCandleHigh = 0;
+  let bestCandleMeta: { high: number; candleTimeMs: number; ageMs: number } | null = null;
+
+  if (Number.isFinite(entryMs) && entryMs > 0 && Array.isArray(params.candles) && params.candles.length > 0) {
+    for (const c of params.candles) {
+      const high = Number(c.high_price);
+      if (!Number.isFinite(high) || high <= 0) continue;
+
+      const candleTimeMs = parseCandleTimeMs(c);
+      if (!Number.isFinite(candleTimeMs) || candleTimeMs <= 0) continue;
+
+      // 1. Freshness 검증: 캔들이 stale한지 확인 (기본 120초 이내)
+      const ageMs = nowMs - candleTimeMs;
+      if (ageMs < -60_000 || ageMs > maxCandleAgeMs) {
+        continue;
+      }
+
+      // 2. Entry 시점 무결성 검증 (Same-minute pre-entry contamination 차단):
+      // Upbit 1분봉 데이터는 캔들 내 high 발생 초(second) 정보를 제공하지 않음.
+      // 따라서 진입 시점 이전에 열린 캔들(candleTimeMs < entryMs, 동일 분봉의 선행 구간 포함)은
+      // high가 진입 전에 찍혔을 위험이 있으므로 배제.
+      // 오직 진입 시점과 동시에 또는 이후에 새로 열린 캔들(candleTimeMs >= entryMs)의 high만 post-entry MFE로 인정.
+      // (진입 동일 분봉 내 가격은 실시간 currentPx / polling snapshot으로 안전하게 추적됨)
+      if (candleTimeMs < entryMs) {
+        continue;
+      }
+
+      // 진입 시점 이후의 high 후보
+      if (high > bestCandleHigh) {
+        bestCandleHigh = high;
+        bestCandleMeta = {
+          high,
+          candleTimeMs,
+          ageMs,
+        };
+      }
+    }
+  }
+
+  let effectiveHigh = Math.max(previousHighest, currentPx);
+  let source: "current_px" | "previous_highest" | "intrabar_candle_high" =
+    currentPx >= previousHighest ? "current_px" : "previous_highest";
+
+  if (bestCandleHigh > effectiveHigh) {
+    effectiveHigh = bestCandleHigh;
+    source = "intrabar_candle_high";
+  }
+
+  const pnlFromEffectiveHigh = entryPrice > 0 ? ((effectiveHigh - entryPrice) / entryPrice) * 100 : 0;
+  const maxPnlPct = Math.max(params.previousMaxPnlPct ?? 0, pnlFromEffectiveHigh);
+
+  return {
+    effectiveHigh,
+    maxPnlPct,
+    source,
+    candleUsed: source === "intrabar_candle_high" ? bestCandleMeta : null,
+    armOptionD: maxPnlPct >= 1.35,
+    tp1Eligible: effectiveHigh >= entryPrice * 1.015,
+  };
 }
 
 export function createLiveDataStrategy(opts: {
@@ -9397,7 +9661,50 @@ export function createLiveDataStrategy(opts: {
       const withinGracePeriod = heldMs < LIVE_EXIT_GRACE_SECONDS * 1000;
       const feeRoundTripPct = UPBIT_FEE_RATE * 2 * 100;
       const netPnlPctEst = pnlGross - feeRoundTripPct - LIVE_EXIT_FEE_BUFFER_PCT;
-      p.max_pnl_pct = Math.max(p.max_pnl_pct, pnlGross);
+
+      // ── [INTRABAR HIGH-WATERMARK MERGE (DRV Defect Fix)] ─────────────────────
+      // 30초 polling snapshot 사이의 1분봉 intrabar high를 검증 후 병합하여
+      // Option D BE ARM (1.35%) 및 TP1 (1.50%) 기회를 놓치지 않도록 방어.
+      let effectiveHighWatermark = now;
+      let effectiveMaxPnlPct = pnlGross;
+      try {
+        let candleRows = peekMinuteCandleCache(market, 1, 3)?.rows;
+        if (!candleRows || candleRows.length === 0) {
+          candleRows = await fetchMinuteCandlesCached(market, 1, 3);
+        }
+        if (candleRows && candleRows.length > 0) {
+          const hwRes = computeEffectiveHighWatermark({
+            entryPrice: p.entry_price,
+            entryTs: p.entry_ts,
+            currentPx: now,
+            previousHighest: p.highest_price_after_entry,
+            previousMaxPnlPct: p.max_pnl_pct,
+            candles: candleRows,
+            nowMs: Date.now(),
+          });
+          effectiveHighWatermark = hwRes.effectiveHigh;
+          effectiveMaxPnlPct = hwRes.maxPnlPct;
+          if (hwRes.source === "intrabar_candle_high") {
+            console.info(JSON.stringify({
+              tag: "INTRABAR_HIGH_WATERMARK_UPDATED",
+              ts: new Date().toISOString(),
+              market,
+              entryPrice: p.entry_price,
+              currentPx: now,
+              previousHighest: p.highest_price_after_entry,
+              effectiveHigh: hwRes.effectiveHigh,
+              effectiveMaxPnlPct: Number(hwRes.maxPnlPct.toFixed(4)),
+              candleUsed: hwRes.candleUsed,
+              armOptionD: hwRes.armOptionD,
+              tp1Eligible: hwRes.tp1Eligible,
+            }));
+          }
+        }
+      } catch (err) {
+        // Safe fallback - keep existing now/pnlGross behavior
+      }
+
+      p.max_pnl_pct = Math.max(p.max_pnl_pct, pnlGross, effectiveMaxPnlPct);
       p.min_pnl_pct = Math.min(Number(p.min_pnl_pct ?? 0), pnlGross);
       p.current_net_pnl_pct = pnlGross;
 
@@ -9552,8 +9859,8 @@ export function createLiveDataStrategy(opts: {
         stopTriggerKind = "price_stop";
       }
 
-      if (now > p.highest_price_after_entry) {
-        p.highest_price_after_entry = now;
+      if (effectiveHighWatermark > p.highest_price_after_entry) {
+        p.highest_price_after_entry = effectiveHighWatermark;
         state.trades.push({
           timestamp: new Date().toISOString(),
           entry_ts: p.entry_ts,
@@ -9562,9 +9869,9 @@ export function createLiveDataStrategy(opts: {
           order_krw: 0,
           filled_qty: 0,
           avg_buy_price: p.entry_price,
-          exit_price: now,
+          exit_price: effectiveHighWatermark,
           pnl_krw: 0,
-          pnl_pct: pnlGross,
+          pnl_pct: p.max_pnl_pct,
           reason_enter: p.reason_enter,
           reason_exit: "highest_price_update",
           holding_minutes: minutesSince(p.entry_ts),
@@ -16269,10 +16576,15 @@ export function createLiveDataStrategy(opts: {
       const entry_profile_key = makeEntryProfileKey(entryProfileFeatures);
       const profileInfo = evaluateEntryProfileDecision(state.entry_profile_stats?.[entry_profile_key]);
       emitEval("DEBUG_LIVE_PROFILE_GATE", {
+        market,
+        source_kind: sourceKindForJudgment,
+        isSurgeSource,
         entry_profile_key,
         profile_decision: profileInfo.decision,
         profile_reason: profileInfo.reason,
         profile_stats: state.entry_profile_stats?.[entry_profile_key] ?? null,
+        final_entry_allowed: profileInfo.decision !== "block",
+        final_block_reason: profileInfo.decision === "block" ? profileInfo.reason : null,
       });
       if (profileInfo.decision === "block") {
         bumpSkip("profile_block");
@@ -16282,15 +16594,23 @@ export function createLiveDataStrategy(opts: {
           ts: new Date().toISOString(),
           kind: "system",
           message: profileInfo.reason,
-          payload: { symbol: market, entry_profile_key, profile_decision: "block" },
+          payload: {
+            symbol: market,
+            market,
+            source_kind: sourceKindForJudgment,
+            isSurgeSource,
+            entry_profile_key,
+            profile_decision: "block",
+            profile_reason: profileInfo.reason,
+            final_entry_allowed: false,
+            final_block_reason: profileInfo.reason,
+          },
         });
-        if (!isSurgeSource) {
-          if (evaluationDiagnostics[market]) {
-            evaluationDiagnostics[market].buyGate = { checked: true, allowed: false, reason: "profile_block" };
-            evaluationDiagnostics[market].final = { action: "blocked", reason: profileInfo.reason };
-          }
-          continue;
+        if (evaluationDiagnostics[market]) {
+          evaluationDiagnostics[market].buyGate = { checked: true, allowed: false, reason: "profile_block" };
+          evaluationDiagnostics[market].final = { action: "blocked", reason: profileInfo.reason };
         }
+        continue;
       }
       const openForGate = Object.keys(state.positions).length;
       const minBaseScore = openForGate >= 1 ? 88 : 83;
