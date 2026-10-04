@@ -15300,8 +15300,49 @@ export function createLiveDataStrategy(opts: {
               continue;
             }
 
-            if (guard.killSwitchType === "PERFORMANCE" || reclaimCandidateMeta.relaxed_multiplier === 0.25) {
-              orderKrw = Math.max(5000, Math.floor(baseOrderAmount * 0.25));
+            const isPerformanceKill =
+              guard.killSwitchType === "PERFORMANCE" || reclaimCandidateMeta.relaxed_multiplier === 0.25;
+            const reclaimBaseCap = 0.50;
+            const performanceCap = isPerformanceKill ? 0.25 : 1.0;
+
+            let btcRsiSoftCap = 1.0;
+            const rsiValForSizing = guard.btcRsi ?? (opts.marketState?.status?.()?.btc_rsi ?? null);
+            if (rsiValForSizing !== null && rsiValForSizing !== undefined) {
+              if (rsiValForSizing >= 50) {
+                btcRsiSoftCap = 1.0;
+              } else if (rsiValForSizing >= 45) {
+                btcRsiSoftCap = 0.85;
+              } else if (rsiValForSizing >= 40) {
+                btcRsiSoftCap = 0.65;
+              } else if (rsiValForSizing >= 35) {
+                btcRsiSoftCap = 0.45;
+              } else {
+                btcRsiSoftCap = 0.35;
+              }
+            }
+
+            const finalMultiplier = Math.min(reclaimBaseCap, btcRsiSoftCap, performanceCap);
+            orderKrw = Math.max(5000, Math.floor(baseOrderAmount * finalMultiplier));
+
+            console.info(
+              JSON.stringify({
+                tag: "SURGE_RECLAIM_BTC_RSI_SOFT_CONTEXT_PROOF",
+                ts: new Date().toISOString(),
+                market,
+                btc_rsi: rsiValForSizing,
+                reclaim_base_cap: reclaimBaseCap,
+                btc_rsi_soft_cap: btcRsiSoftCap,
+                performance_cap: performanceCap,
+                final_multiplier: finalMultiplier,
+                multiplier_policy: "MIN_CAP_NOT_PRODUCT",
+                performance_kill: isPerformanceKill,
+                panic_detected: reclaimCandidateMeta.is_panic === true,
+                risk_off: guard.marketStateStr === "risk_off",
+                decision: "RECLAIM_SIZING_DETERMINED",
+              }),
+            );
+
+            if (isPerformanceKill) {
               console.info(
                 JSON.stringify({
                   tag: "SURGE_RECLAIM_PERFORMANCE_PROBE_ALLOWED_25PCT",

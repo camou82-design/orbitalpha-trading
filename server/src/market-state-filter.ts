@@ -518,23 +518,30 @@ export function assertOrderBuyAllowed(
         return deny("reclaim_score_missing: Reclaim score is missing or invalid", true, false);
       }
 
-      // 2. Reclaim 전용 BTC RSI 정책 분리
+      // 2. Reclaim BTC RSI 소프트 컨텍스트 적용 (기존 SURGE 정책과 동일한 soft context authority 재사용)
       if (snap.btc_rsi !== undefined) {
-        if (snap.btc_rsi < 40) {
-          return deny(`btc_rsi_low_reclaim_blocked: Reclaim requires BTC RSI >= 40 (${snap.btc_rsi.toFixed(1)})`, true, false);
-        } else if (snap.btc_rsi < 50) {
-          // 40 <= btc_rsi < 50: 추가 강화 조건 적용
-          const volAccel = args.volumeAccel ?? 0;
-          const aboveEma = args.aboveEma20 ?? false;
-          if (rScore < 65) {
-            return deny(`btc_rsi_low_reclaim_penalty_blocked: RSI < 50 requires reclaim_score >= 65 (actual: ${rScore})`, true, false);
+        const rsi = snap.btc_rsi;
+        if (rsi >= 50) {
+          btcRsiRiskMultiplier = 1.0;
+        } else if (rsi >= 45) {
+          btcRsiRiskMultiplier = 0.85;
+        } else if (rsi >= 40) {
+          btcRsiRiskMultiplier = 0.65;
+        } else if (rsi >= 35) {
+          btcRsiRiskMultiplier = 0.45;
+        } else {
+          // RSI < 35: BTC 급락(btc_drop_penalty >= 25) 또는 패닉(is_panic/panic phase) 증거와 동시 충족될 때만 hard block
+          const isSevereBtcRisk = Boolean(
+            args.candidateMeta?.is_panic === true ||
+            args.candidateMeta?.btc_phase === "panic" ||
+            (args.candidateMeta?.btc_drop_penalty !== undefined && args.candidateMeta.btc_drop_penalty >= 25) ||
+            (snap.btc_drop_penalty !== undefined && snap.btc_drop_penalty >= 25)
+          );
+          if (isSevereBtcRisk) {
+            btcRsiAuthority = "hard_combined_risk";
+            return deny(`btc_rsi_low_surge_blocked: BTC RSI < 35 with severe BTC risk (${rsi.toFixed(1)})`, true, false);
           }
-          if (volAccel < 1.1) {
-            return deny(`btc_rsi_low_reclaim_penalty_blocked: RSI < 50 requires volume acceleration >= 1.1 (actual: ${volAccel.toFixed(2)})`, true, false);
-          }
-          if (!aboveEma) {
-            return deny("btc_rsi_low_reclaim_penalty_blocked: RSI < 50 requires price > EMA20", true, false);
-          }
+          btcRsiRiskMultiplier = 0.35;
         }
       }
 

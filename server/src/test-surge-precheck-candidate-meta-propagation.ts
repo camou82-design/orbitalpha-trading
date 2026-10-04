@@ -191,7 +191,7 @@ console.log("\n--- Case E: Reclaim Dedicated RSI & Score Policy Unaffected ---")
   });
   assert.strictEqual(resReclaim.ok, true, "Reclaim with RSI=45 and reinforced conditions must PASS");
 
-  // Reclaim with BTC RSI=38 (< 40) -> btc_rsi_low_reclaim_blocked
+  // Reclaim with BTC RSI=38 -> PASS with soft context multiplier 0.45 (0.72 * 0.45 = 0.324)
   const snapRsi38 = createSnap("neutral", 38);
   const resRsi38 = assertOrderBuyAllowed(snapRsi38, {
     kind: "new_entry",
@@ -202,12 +202,30 @@ console.log("\n--- Case E: Reclaim Dedicated RSI & Score Policy Unaffected ---")
     volumeAccel: 1.2,
     aboveEma20: true,
   });
-  assert.strictEqual(resRsi38.ok, false);
-  assert.ok(resRsi38.blocked_reason.includes("btc_rsi_low_reclaim_blocked"));
+  assert.strictEqual(resRsi38.ok, true, "Reclaim with RSI=38 must PASS under soft-context");
+  assert.strictEqual(resRsi38.btc_rsi_risk_multiplier, 0.45);
+  assert.strictEqual(resRsi38.size_scale, 0.324);
 
-  console.log("[PASS] Case E: Reclaim dedicated RSI/score policy 100% verified");
+  // Reclaim with BTC RSI=32 (< 35) + severe drop penalty (btc_drop_penalty >= 25) -> btc_rsi_low_surge_blocked
+  const snapRsi32Drop = createSnap("neutral", 32);
+  const resRsi32Drop = assertOrderBuyAllowed(snapRsi32Drop, {
+    kind: "new_entry",
+    signalPayload: payload,
+    strategyType: "reclaim",
+    market: "KRW-ETH",
+    reclaimScore: 70,
+    volumeAccel: 1.2,
+    aboveEma20: true,
+    candidateMeta: { btc_drop_penalty: 30 },
+  });
+  assert.strictEqual(resRsi32Drop.ok, false);
+  assert.ok(resRsi32Drop.blocked_reason.includes("btc_rsi_low_surge_blocked"));
+
+  console.log("[PASS] Case E: Reclaim BTC RSI soft-context policy 100% verified");
 }
 
 console.log("\n=========================================================================");
 console.log("  ALL REGRESSION TEST CASES (A through E) PASSED SUCCESSFULLY!          ");
 console.log("=========================================================================\n");
+
+process.exit(0);
