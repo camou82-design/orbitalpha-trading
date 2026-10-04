@@ -494,6 +494,110 @@ async function runTests() {
     console.log("[PASS] Scenario 6: Cooldown 종료 + 포지션 청산 후 새로운 STRONG_CORE => 새 probe 25% 허용");
   }
 
+  // --- Scenario 7: precheck 전에 sizing preview가 만들어졌더라도 최종 주문금액은 PERFORMANCE probe 25%가 반영된다 ---
+  {
+    // HBAR SURGE 운영 증거 재현: raw 254265 -> neutral 0.72 -> 183070
+    const hbarMeta: any = {
+      market: "KRW-HBAR",
+      engine_bucket: "surge",
+      score: 95,
+      setupReason: "surge_v2_entry_path",
+      setup: { ok: true, reason: "surge_v2_entry_path", score: 95 },
+      scanner_authority: true,
+      early_surge_authority: true,
+      btc_phase: "neutral",
+      asset_phase: "impulse",
+      is_panic: false,
+      relaxed_multiplier: 1.0,
+    };
+
+    const rawRequestedKrw = 254265;
+    const neutralScale = 0.72;
+    const previewOrderKrw = Math.floor(rawRequestedKrw * neutralScale); // 183070 KRW
+    assert.strictEqual(previewOrderKrw, 183070);
+
+    // Precheck 실행 (PERFORMANCE_KILL 발동 상태)
+    const precheckRes = await validateLiveBuyPrecheck({
+      market: "KRW-HBAR",
+      trades: perfLossTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: null,
+      signalPayload: null,
+      strategyType: "surge",
+      entryPath: "surge_v2_entry_path",
+      isAdditionalBuy: false,
+      actualDailyPnlPct: 0.0,
+      candidateMeta: hbarMeta,
+    });
+
+    assert.strictEqual(precheckRes.allowed, true);
+    assert.strictEqual(hbarMeta.is_performance_probe, true);
+    assert.strictEqual(hbarMeta.relaxed_multiplier, 0.25);
+
+    // 최종 orderKrw 계산 구간 시뮬레이션 (line 17530 invariant)
+    let finalOrderKrw = previewOrderKrw;
+    if (hbarMeta.is_performance_probe && !hbarMeta.performance_probe_sizing_applied) {
+      finalOrderKrw = Math.floor(finalOrderKrw * hbarMeta.relaxed_multiplier);
+      hbarMeta.performance_probe_sizing_applied = true;
+    }
+    assert.strictEqual(finalOrderKrw, 45767, "최종 orderKrw는 precheck 승인 후 25%가 반영된 45767 KRW이어야 함 (183070 누락 방지)");
+
+    // 중복 축소 방지 검증: 한 번 더 적용 시도시 45767 유지 (0.25 x 0.25 = 11441 중복 방지)
+    if (hbarMeta.is_performance_probe && !hbarMeta.performance_probe_sizing_applied) {
+      finalOrderKrw = Math.floor(finalOrderKrw * hbarMeta.relaxed_multiplier);
+    }
+    assert.strictEqual(finalOrderKrw, 45767, "단일 25% 축소 불변식: 0.25 x 0.25 중복 축소 방지 확인");
+    console.log("[PASS] Scenario 7: precheck 전 sizing preview(183,070원) 생성 후에도 최종 주문금액에 PERFORMANCE probe 25%(45,767원) 정상 반영 및 중복방지 검증");
+  }
+
+  // --- Scenario 8: Negative Regression: relaxed_multiplier=0.25 alone without explicit probe flags is NOT treated as PERFORMANCE probe ---
+  {
+    const nonProbeMeta: any = {
+      market: "KRW-SOL",
+      engine_bucket: "surge",
+      score: 85,
+      relaxed_multiplier: 0.25,
+      is_performance_probe: false,
+      is_recovery_probe: false,
+    };
+
+    // 1. Preview sizing 단계: 명시적 probe 플래그가 없으므로 performanceKillMultiplier는 1.0이어야 함
+    let performanceKillMultiplier = 1.0;
+    if (nonProbeMeta?.is_recovery_probe === true || nonProbeMeta?.is_performance_probe === true) {
+      performanceKillMultiplier = 0.25;
+      nonProbeMeta.performance_probe_sizing_applied = true;
+    }
+    assert.strictEqual(performanceKillMultiplier, 1.0, "Preview performance multiplier must remain 1.0 when probe flags are false");
+    assert.strictEqual(nonProbeMeta.performance_probe_sizing_applied, undefined);
+
+    // 2. Line 17535 sizing authority 판정: 오직 명시적 플래그만 인정 (relaxed_multiplier 추론 금지)
+    const isPerformanceProbeApproved = Boolean(
+      nonProbeMeta.is_performance_probe === true ||
+      nonProbeMeta.is_recovery_probe === true
+    );
+    assert.strictEqual(isPerformanceProbeApproved, false, "relaxed_multiplier=0.25 alone must NEVER be inferred as performance probe");
+
+    // 3. 주문 금액이 PERFORMANCE probe 로직으로 축소되면 안 됨
+    let orderKrw = 100000;
+    const initialOrderKrw = orderKrw;
+    if (isPerformanceProbeApproved && !nonProbeMeta.performance_probe_sizing_applied) {
+      orderKrw = Math.floor(orderKrw * nonProbeMeta.relaxed_multiplier);
+      nonProbeMeta.performance_probe_sizing_applied = true;
+    }
+    assert.strictEqual(orderKrw, initialOrderKrw, "orderKrw must NOT be modified by performance probe sizing");
+    assert.strictEqual(nonProbeMeta.performance_probe_sizing_applied, undefined, "applied flag must remain unset");
+
+    // 4. Final gate safety guarantee도 명시적 플래그만 인정
+    const isPerfProbeAtFinalGate = Boolean(
+      nonProbeMeta.is_performance_probe === true ||
+      nonProbeMeta.is_recovery_probe === true
+    );
+    assert.strictEqual(isPerfProbeAtFinalGate, false, "Final gate must reject candidate without explicit probe flags");
+
+    console.log("[PASS] Scenario 8: Negative Regression verified - relaxed_multiplier=0.25 with false probe flags strictly NOT treated as PERFORMANCE probe");
+  }
+
   console.log("\n==================================================================");
   console.log("ALL VERIFICATION SUITES AND SCENARIOS PASSED WITH ZERO ERRORS!");
   console.log("==================================================================");

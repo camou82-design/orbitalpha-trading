@@ -671,6 +671,7 @@ type CandidateMeta = {
   scanner_authority?: boolean;
   early_surge_authority?: boolean;
   validated_surge_authority?: boolean;
+  performance_probe_sizing_applied?: boolean;
 };
 
 type SurgeEntrySetupResult = {
@@ -13762,8 +13763,11 @@ export function createLiveDataStrategy(opts: {
 
         // Performance kill multiplier: STRONG CORE probe under PERFORMANCE_KILL is strictly capped at 25%
         let performanceKillMultiplier = 1.0;
-        if (meta?.is_recovery_probe || meta?.is_performance_probe) {
+        if (meta?.is_recovery_probe === true || meta?.is_performance_probe === true) {
           performanceKillMultiplier = 0.25;
+          if (meta) meta.performance_probe_sizing_applied = true;
+          const mapMeta = candidateMetaMap.get(market);
+          if (mapMeta) mapMeta.performance_probe_sizing_applied = true;
         }
 
         // Apply performance multiplier & strategy multipliers
@@ -17526,6 +17530,54 @@ export function createLiveDataStrategy(opts: {
         }));
       }
 
+      // PERFORMANCE RECOVERY PROBE SIZING (CORE & SURGE)
+      // validateLiveBuyPrecheck에서 승인된 is_performance_probe / is_recovery_probe의 25% sizing을 실제 주문금액에 반드시 반영
+      // PERFORMANCE probe 판정 authority는 오직 명시적 플래그만 사용: is_performance_probe === true || is_recovery_probe === true
+      const isPerformanceProbeApproved = Boolean(
+        candidateMetaFromSetup?.is_performance_probe === true ||
+        candidateMetaFromSetup?.is_recovery_probe === true ||
+        metaForGuard?.is_performance_probe === true ||
+        metaForGuard?.is_recovery_probe === true
+      );
+
+      const probeSizingAlreadyApplied = Boolean(
+        candidateMetaFromSetup?.performance_probe_sizing_applied ||
+        metaForGuard?.performance_probe_sizing_applied
+      );
+
+      if (isPerformanceProbeApproved && !probeSizingAlreadyApplied) {
+        // 이미 core relaxed probe에서 0.25 이하로 축소된 경우 0.25 x 0.25 중복 축소 방지
+        const alreadySoftenedToProbe = Boolean(
+          metaForGuard?.is_relaxed_probe &&
+          (metaForGuard?.relaxed_multiplier ?? 1.0) <= 0.25 &&
+          (metaForGuard?.softened_reasons?.length ?? 0) > 0
+        );
+
+        if (!alreadySoftenedToProbe) {
+          const probeMult = candidateMetaFromSetup?.relaxed_multiplier ?? metaForGuard?.relaxed_multiplier ?? 0.25;
+          const prePerfOrderKrw = orderKrw;
+          orderKrw = Math.floor(orderKrw * probeMult);
+          if (candidateMetaFromSetup) candidateMetaFromSetup.performance_probe_sizing_applied = true;
+          if (metaForGuard) metaForGuard.performance_probe_sizing_applied = true;
+
+          console.info(
+            JSON.stringify({
+              tag: "PERFORMANCE_PROBE_SIZING_APPLIED_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              engine_bucket: candidateMetaFromSetup?.engine_bucket ?? (isCoreMarket ? "core" : "surge"),
+              probe_multiplier: probeMult,
+              pre_probe_order_krw: prePerfOrderKrw,
+              final_order_krw: orderKrw,
+              reason: "applied_precheck_approved_performance_probe_multiplier",
+            }),
+          );
+        } else {
+          if (candidateMetaFromSetup) candidateMetaFromSetup.performance_probe_sizing_applied = true;
+          if (metaForGuard) metaForGuard.performance_probe_sizing_applied = true;
+        }
+      }
+
       const stPos = st.strategy_positions?.[market];
       const investedSoFar = Math.max(0, Number(stPos?.invested_krw_total ?? 0));
       const remainingPerMarket = Math.max(0, ORDER_LIMITS.MAX_STRATEGY_INVESTED_KRW_PER_MARKET - investedSoFar);
@@ -18219,6 +18271,30 @@ export function createLiveDataStrategy(opts: {
             btcRsi: guard.btcRsi,
           });
           throw new Error(`precheck_safety_guard_blocked:${guard.blockReason}`);
+        }
+
+        // Final gate safety guarantee: Precheck 직후 probe 승인 메타의 25% sizing 미반영 시 즉시 반영
+        // Explicit probe flag만 인정
+        const isPerfProbeAtFinalGate = Boolean(
+          candidateMetaFromSetup?.is_performance_probe === true ||
+          candidateMetaFromSetup?.is_recovery_probe === true
+        );
+        if (isPerfProbeAtFinalGate && !(candidateMetaFromSetup as any)?.performance_probe_sizing_applied) {
+          const probeMult = candidateMetaFromSetup?.relaxed_multiplier ?? 0.25;
+          const preKrw = orderKrw;
+          orderKrw = Math.floor(orderKrw * probeMult);
+          finalOrderKrwValue = orderKrw;
+          if (candidateMetaFromSetup) (candidateMetaFromSetup as any).performance_probe_sizing_applied = true;
+          console.info(
+            JSON.stringify({
+              tag: "PERFORMANCE_PROBE_FINAL_GATE_SIZING_APPLIED_PROOF",
+              ts: new Date().toISOString(),
+              market,
+              pre_probe_order_krw: preKrw,
+              final_order_krw: orderKrw,
+              probe_multiplier: probeMult,
+            }),
+          );
         }
 
         if (!leaseOk()) {
