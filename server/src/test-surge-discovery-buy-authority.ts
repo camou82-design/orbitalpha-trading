@@ -2405,6 +2405,153 @@ async function runPerformanceKillRegressionSuite() {
     console.log("  -> PASS: TEST H (TRUE_EARLY / CONFIRMED_SURGE soft-context regression verified 100%)");
   }
 
+  // ===========================================================================
+  // RECLAIM RETURNS_OK 1M/3M EPSILON BOUNDARY SUITE (TESTS 1 ~ 8)
+  // ===========================================================================
+  console.log("\n--- RECLAIM RETURNS_OK 1M/3M EPSILON BOUNDARY SUITE (TESTS 1 ~ 8) ---");
+
+  const baseEvalParams = {
+    currentPrice: 1000,
+    localHigh: 1000,
+    pullbackLowPrice: 985,
+    closes1: Array(30).fill(990), // EMA20 = 990 <= 1000 (isAboveEma = true)
+  };
+
+  console.log("\n[TEST RET-1] 1m > 0, 3m > 0 -> PASS");
+  {
+    const res = evaluateReclaimConditions({
+      ...baseEvalParams,
+      recent1mRet: 0.5,
+      recent3mRet: 1.2,
+    });
+    assert.strictEqual(res.valid, true);
+    assert.strictEqual(res.returnsOk, true);
+    assert.deepStrictEqual(res.failedConditions, []);
+    console.log("  -> PASS: TEST RET-1");
+  }
+
+  console.log("\n[TEST RET-2] 1m = 0, 3m > 0 -> PASS");
+  {
+    const res = evaluateReclaimConditions({
+      ...baseEvalParams,
+      recent1mRet: 0.0,
+      recent3mRet: 1.0,
+    });
+    assert.strictEqual(res.valid, true);
+    assert.strictEqual(res.returnsOk, true);
+    assert.deepStrictEqual(res.failedConditions, []);
+    console.log("  -> PASS: TEST RET-2");
+  }
+
+  console.log("\n[TEST RET-3] 1m = 0, 3m = 0 -> BLOCK (failedConditions includes returns_ok)");
+  {
+    const res = evaluateReclaimConditions({
+      ...baseEvalParams,
+      recent1mRet: 0.0,
+      recent3mRet: 0.0,
+    });
+    assert.strictEqual(res.valid, false);
+    assert.strictEqual(res.returnsOk, false);
+    assert.ok(res.failedConditions.includes("returns_ok"));
+    console.log("  -> PASS: TEST RET-3");
+  }
+
+  console.log("\n[TEST RET-4] 1m < 0 -> BLOCK (failedConditions includes returns_ok)");
+  {
+    const res = evaluateReclaimConditions({
+      ...baseEvalParams,
+      recent1mRet: -0.2,
+      recent3mRet: 1.0,
+    });
+    assert.strictEqual(res.valid, false);
+    assert.strictEqual(res.returnsOk, false);
+    assert.ok(res.failedConditions.includes("returns_ok"));
+    console.log("  -> PASS: TEST RET-4");
+  }
+
+  console.log("\n[TEST RET-5] 1m = -1e-9 (FP 오차, 사실상 0) + 3m > 0 -> PASS");
+  {
+    const res = evaluateReclaimConditions({
+      ...baseEvalParams,
+      recent1mRet: -1e-9,
+      recent3mRet: 1.1,
+    });
+    assert.strictEqual(res.valid, true);
+    assert.strictEqual(res.returnsOk, true);
+    assert.deepStrictEqual(res.failedConditions, []);
+    console.log("  -> PASS: TEST RET-5");
+  }
+
+  console.log("\n[TEST RET-6] 3m > 2.5 (3.0) -> BLOCK");
+  {
+    const res = evaluateReclaimConditions({
+      ...baseEvalParams,
+      recent1mRet: 0.5,
+      recent3mRet: 3.0,
+    });
+    assert.strictEqual(res.valid, false);
+    assert.strictEqual(res.returnsOk, false);
+    assert.ok(res.failedConditions.includes("returns_ok"));
+    console.log("  -> PASS: TEST RET-6");
+  }
+
+  console.log("\n[TEST RET-7] MOVE 실운영 fixture 재현 (1m=0.00%, 3m=1.2%, pullback=1.4%, nearHigh=true) -> returns_ok PASS");
+  {
+    // KRW-MOVE: localHigh 250, pullbackLow 246, currentPrice 249.5 (nearHigh=true), EMA20=248, 1m=0.0, 3m=1.2
+    const resMove = evaluateReclaimConditions({
+      currentPrice: 249.5,
+      localHigh: 250,
+      pullbackLowPrice: 246,
+      recent1mRet: 0.0,
+      recent3mRet: 1.2,
+      closes1: Array(30).fill(248),
+    });
+    assert.strictEqual(resMove.valid, true);
+    assert.strictEqual(resMove.returnsOk, true);
+    assert.deepStrictEqual(resMove.failedConditions, []);
+    console.log("  -> PASS: TEST RET-7 (MOVE live fixture passed without returns_ok block)");
+  }
+
+  console.log("\n[TEST RET-8] MIRA / SAND / BEAM 기존 정상 통과 회귀 유지");
+  {
+    // MIRA: 1m +0.4%, 3m +1.5%
+    const resMira = evaluateReclaimConditions({
+      currentPrice: 1000,
+      localHigh: 1002,
+      pullbackLowPrice: 980,
+      recent1mRet: 0.4,
+      recent3mRet: 1.5,
+      closes1: Array(30).fill(990),
+    });
+    assert.strictEqual(resMira.valid, true);
+    assert.strictEqual(resMira.returnsOk, true);
+
+    // SAND: 1m +0.1%, 3m +0.8%
+    const resSand = evaluateReclaimConditions({
+      currentPrice: 500,
+      localHigh: 501,
+      pullbackLowPrice: 492,
+      recent1mRet: 0.1,
+      recent3mRet: 0.8,
+      closes1: Array(30).fill(495),
+    });
+    assert.strictEqual(resSand.valid, true);
+    assert.strictEqual(resSand.returnsOk, true);
+
+    // BEAM: 1m 0.0%, 3m +1.0% (저가 틱 동가 반등)
+    const resBeam = evaluateReclaimConditions({
+      currentPrice: 35.0,
+      localHigh: 35.1,
+      pullbackLowPrice: 34.5,
+      recent1mRet: 0.0,
+      recent3mRet: 1.0,
+      closes1: Array(30).fill(34.7),
+    });
+    assert.strictEqual(resBeam.valid, true);
+    assert.strictEqual(resBeam.returnsOk, true);
+    console.log("  -> PASS: TEST RET-8 (MIRA / SAND / BEAM regression preserved 100%)");
+  }
+
   console.log("\n====================================================================");
   console.log(" All PERFORMANCE_KILL & SURGE Authority Regression Tests PASSED!    ");
   console.log("====================================================================");

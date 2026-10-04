@@ -1584,7 +1584,11 @@ export function evaluateReclaimConditions(params: {
   closes1: number[];
 }) {
   const isRebounding = params.pullbackLowPrice !== null && params.currentPrice > params.pullbackLowPrice;
-  const returnsOk = params.recent1mRet > 0 && params.recent3mRet >= 0 && params.recent3mRet <= 2.5;
+  const EPSILON = 1e-7;
+  const is1mRetPositive = params.recent1mRet > EPSILON;
+  const is1mRetZero = Math.abs(params.recent1mRet) <= EPSILON;
+  const is1mOk = is1mRetPositive || (is1mRetZero && params.recent3mRet > EPSILON);
+  const returnsOk = is1mOk && params.recent3mRet >= 0 && params.recent3mRet <= 2.5;
   const nearHigh = params.currentPrice >= params.localHigh * 0.997 && params.currentPrice <= params.localHigh * 1.003;
 
   const ema20 = emaLast(params.closes1, 20);
@@ -14626,7 +14630,11 @@ export function createLiveDataStrategy(opts: {
       closes1: number[];
     }) {
       const isRebounding = params.pullbackLowPrice !== null && params.currentPrice > params.pullbackLowPrice;
-      const returnsOk = params.recent1mRet > 0 && params.recent3mRet >= 0 && params.recent3mRet <= 2.5;
+      const EPSILON = 1e-7;
+      const is1mRetPositive = params.recent1mRet > EPSILON;
+      const is1mRetZero = Math.abs(params.recent1mRet) <= EPSILON;
+      const is1mOk = is1mRetPositive || (is1mRetZero && params.recent3mRet > EPSILON);
+      const returnsOk = is1mOk && params.recent3mRet >= 0 && params.recent3mRet <= 2.5;
       const nearHigh = params.currentPrice >= params.localHigh * 0.997 && params.currentPrice <= params.localHigh * 1.003;
 
       const ema20 = emaLast(params.closes1, 20);
