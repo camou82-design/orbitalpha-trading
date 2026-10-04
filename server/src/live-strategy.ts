@@ -1591,6 +1591,13 @@ export function evaluateReclaimConditions(params: {
   const hasEma = typeof ema20 === "number" && Number.isFinite(ema20);
   const isAboveEma = hasEma && params.currentPrice >= ema20;
 
+  const failedConditions: string[] = [];
+  if (!isRebounding) failedConditions.push("is_rebounding");
+  if (!returnsOk) failedConditions.push("returns_ok");
+  if (!nearHigh) failedConditions.push("near_high");
+  if (!hasEma) failedConditions.push("has_ema");
+  if (hasEma && !isAboveEma) failedConditions.push("is_above_ema");
+
   const valid = isRebounding && returnsOk && nearHigh && hasEma && isAboveEma;
 
   return {
@@ -1601,7 +1608,66 @@ export function evaluateReclaimConditions(params: {
     hasEma,
     isAboveEma,
     ema20,
+    failedConditions,
   };
+}
+
+export const reclaimEvalDebugLastLogTs = new Map<string, number>();
+
+export function logReclaimConditionsEvalDebug(params: {
+  market: string;
+  watchStatus: string;
+  currentPrice: number;
+  localHigh: number;
+  pullbackLowPrice: number | null;
+  pullbackPct: number;
+  recent1mRet: number;
+  recent3mRet: number;
+  ema20: number | null | undefined;
+  distanceFromLocalHighPct: number;
+  isRebounding: boolean;
+  returnsOk: boolean;
+  nearHigh: boolean;
+  hasEma: boolean;
+  isAboveEma: boolean;
+  finalValid: boolean;
+  failedConditions: string[];
+  elapsedSeconds: number;
+  forceImmediate?: boolean;
+}): boolean {
+  const now = Date.now();
+  const lastLog = reclaimEvalDebugLastLogTs.get(params.market) || 0;
+  const isDebounced = !params.forceImmediate && params.finalValid === false && (now - lastLog < 60000);
+  if (isDebounced) {
+    return false;
+  }
+  reclaimEvalDebugLastLogTs.set(params.market, now);
+
+  console.info(
+    JSON.stringify({
+      tag: "SURGE_RECLAIM_CONDITIONS_EVAL_DEBUG",
+      ts: new Date().toISOString(),
+      market: params.market,
+      watch_status: params.watchStatus,
+      current_price: params.currentPrice,
+      local_high: params.localHigh,
+      pullback_low_price: params.pullbackLowPrice,
+      pullback_pct: params.pullbackPct,
+      recent_1m_ret: params.recent1mRet,
+      recent_3m_ret: params.recent3mRet,
+      ema20: params.ema20 ?? null,
+      distance_from_local_high_pct: params.distanceFromLocalHighPct,
+      is_rebounding: params.isRebounding,
+      returns_ok: params.returnsOk,
+      near_high: params.nearHigh,
+      has_ema: params.hasEma,
+      is_above_ema: params.isAboveEma,
+      final_valid: params.finalValid,
+      failed_conditions: params.failedConditions,
+      elapsed_seconds: params.elapsedSeconds,
+    })
+  );
+  return true;
 }
 
 export interface SurgeAuthorityProofParams {
@@ -14567,6 +14633,13 @@ export function createLiveDataStrategy(opts: {
       const hasEma = typeof ema20 === "number" && Number.isFinite(ema20);
       const isAboveEma = hasEma && params.currentPrice >= ema20;
 
+      const failedConditions: string[] = [];
+      if (!isRebounding) failedConditions.push("is_rebounding");
+      if (!returnsOk) failedConditions.push("returns_ok");
+      if (!nearHigh) failedConditions.push("near_high");
+      if (!hasEma) failedConditions.push("has_ema");
+      if (hasEma && !isAboveEma) failedConditions.push("is_above_ema");
+
       const valid = isRebounding && returnsOk && nearHigh && hasEma && isAboveEma;
 
       return {
@@ -14577,6 +14650,7 @@ export function createLiveDataStrategy(opts: {
         hasEma,
         isAboveEma,
         ema20,
+        failedConditions,
       };
     }
 
@@ -14796,12 +14870,35 @@ export function createLiveDataStrategy(opts: {
           closes1,
         });
         const highReclaim = currentPrice >= localHigh * 0.9985;
+        const pullbackPct = ((localHigh - (item.pullback_low_price || currentPrice)) / localHigh) * 100;
+        const elapsedSeconds = Math.floor((nowMs - registerTime) / 1000);
+
+        logReclaimConditionsEvalDebug({
+          market,
+          watchStatus: item.status,
+          currentPrice,
+          localHigh,
+          pullbackLowPrice: item.pullback_low_price,
+          pullbackPct,
+          recent1mRet,
+          recent3mRet,
+          ema20: evalRes.ema20,
+          distanceFromLocalHighPct,
+          isRebounding: evalRes.isRebounding,
+          returnsOk: evalRes.returnsOk,
+          nearHigh: evalRes.nearHigh,
+          hasEma: evalRes.hasEma,
+          isAboveEma: evalRes.isAboveEma,
+          finalValid: evalRes.valid,
+          failedConditions: evalRes.failedConditions,
+          elapsedSeconds,
+          forceImmediate: evalRes.valid === true,
+        });
 
         if (evalRes.valid) {
           const fromState = item.status;
           item.status = "reclaim_ready"; // reclaim_ready 상태로 전이!
           
-          const pullbackPct = ((localHigh - currentPrice) / localHigh) * 100;
           console.info(
             JSON.stringify({
               tag: "SURGE_WATCH_STATE_TRANSITION",

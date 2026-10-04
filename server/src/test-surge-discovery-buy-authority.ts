@@ -48,6 +48,8 @@ import {
   evaluateReclaimConditions,
   emitSurgeAuthorityProof,
   validateLiveBuyPrecheck,
+  reclaimEvalDebugLastLogTs,
+  logReclaimConditionsEvalDebug,
   SurgeCandidateAuthorityInput,
   SurgeAuthorityProofParams,
 } from "./live-strategy.js";
@@ -1945,8 +1947,242 @@ async function runPerformanceKillRegressionSuite() {
     console.log("  -> PASS: TEST R (placeBuy attempt = 0 on panic)");
   }
 
+  console.log("\n[TEST OBS-1] nearHigh만 실패 -> failed_conditions: ['near_high']");
+  {
+    const currentPrice = 990;
+    const localHigh = 1000; // dist = 1.0% > 0.3% (nearHigh = false)
+    const pullbackLowPrice = 985; // 990 > 985 (isRebounding = true)
+    const recent1mRet = 0.5; // > 0
+    const recent3mRet = 1.0; // 0 <= 3m <= 2.5 (returnsOk = true)
+    const closes1 = Array(30).fill(988); // EMA20 = 988, 990 >= 988 (isAboveEma = true)
+    const res = evaluateReclaimConditions({
+      currentPrice,
+      pullbackLowPrice,
+      recent1mRet,
+      recent3mRet,
+      localHigh,
+      closes1,
+    });
+    assert.strictEqual(res.valid, false);
+    assert.strictEqual(res.nearHigh, false);
+    assert.strictEqual(res.isRebounding, true);
+    assert.strictEqual(res.returnsOk, true);
+    assert.strictEqual(res.isAboveEma, true);
+    assert.deepStrictEqual(res.failedConditions, ["near_high"]);
+    console.log("  -> PASS: TEST OBS-1");
+  }
+
+  console.log("\n[TEST OBS-2] returnsOk만 실패 -> failed_conditions: ['returns_ok']");
+  {
+    const currentPrice = 998;
+    const localHigh = 1000; // nearHigh = true (998 >= 997)
+    const pullbackLowPrice = 990; // isRebounding = true (998 > 990)
+    const recent1mRet = -0.2; // <= 0 -> returnsOk = false
+    const recent3mRet = 1.0;
+    const closes1 = Array(30).fill(995); // isAboveEma = true (998 >= 995)
+    const res = evaluateReclaimConditions({
+      currentPrice,
+      pullbackLowPrice,
+      recent1mRet,
+      recent3mRet,
+      localHigh,
+      closes1,
+    });
+    assert.strictEqual(res.valid, false);
+    assert.strictEqual(res.returnsOk, false);
+    assert.strictEqual(res.nearHigh, true);
+    assert.strictEqual(res.isRebounding, true);
+    assert.strictEqual(res.isAboveEma, true);
+    assert.deepStrictEqual(res.failedConditions, ["returns_ok"]);
+    console.log("  -> PASS: TEST OBS-2");
+  }
+
+  console.log("\n[TEST OBS-3] isRebounding만 실패 -> failed_conditions: ['is_rebounding']");
+  {
+    const currentPrice = 998;
+    const localHigh = 1000; // nearHigh = true
+    const pullbackLowPrice = 999; // 998 <= 999 -> isRebounding = false
+    const recent1mRet = 0.4; // returnsOk = true
+    const recent3mRet = 1.0;
+    const closes1 = Array(30).fill(995); // isAboveEma = true
+    const res = evaluateReclaimConditions({
+      currentPrice,
+      pullbackLowPrice,
+      recent1mRet,
+      recent3mRet,
+      localHigh,
+      closes1,
+    });
+    assert.strictEqual(res.valid, false);
+    assert.strictEqual(res.isRebounding, false);
+    assert.strictEqual(res.returnsOk, true);
+    assert.strictEqual(res.nearHigh, true);
+    assert.strictEqual(res.isAboveEma, true);
+    assert.deepStrictEqual(res.failedConditions, ["is_rebounding"]);
+    console.log("  -> PASS: TEST OBS-3");
+  }
+
+  console.log("\n[TEST OBS-4] EMA20만 실패 -> failed_conditions: ['is_above_ema']");
+  {
+    const currentPrice = 998;
+    const localHigh = 1000; // nearHigh = true
+    const pullbackLowPrice = 990; // isRebounding = true
+    const recent1mRet = 0.4; // returnsOk = true
+    const recent3mRet = 1.0;
+    const closes1 = Array(30).fill(999.5); // ema20 = 999.5 > 998 -> isAboveEma = false
+    const res = evaluateReclaimConditions({
+      currentPrice,
+      pullbackLowPrice,
+      recent1mRet,
+      recent3mRet,
+      localHigh,
+      closes1,
+    });
+    assert.strictEqual(res.valid, false);
+    assert.strictEqual(res.isAboveEma, false);
+    assert.strictEqual(res.hasEma, true);
+    assert.strictEqual(res.isRebounding, true);
+    assert.strictEqual(res.returnsOk, true);
+    assert.strictEqual(res.nearHigh, true);
+    assert.deepStrictEqual(res.failedConditions, ["is_above_ema"]);
+    console.log("  -> PASS: TEST OBS-4");
+  }
+
+  console.log("\n[TEST OBS-5] 복수 실패 시 failed_conditions 정확성");
+  {
+    const currentPrice = 990;
+    const localHigh = 1000; // nearHigh = false (990 < 997)
+    const pullbackLowPrice = 992; // isRebounding = false (990 <= 992)
+    const recent1mRet = -0.5; // returnsOk = false
+    const recent3mRet = -1.0;
+    const closes1 = Array(30).fill(995); // isAboveEma = false (990 < 995)
+    const res = evaluateReclaimConditions({
+      currentPrice,
+      pullbackLowPrice,
+      recent1mRet,
+      recent3mRet,
+      localHigh,
+      closes1,
+    });
+    assert.strictEqual(res.valid, false);
+    assert.deepStrictEqual(res.failedConditions, [
+      "is_rebounding",
+      "returns_ok",
+      "near_high",
+      "is_above_ema",
+    ]);
+    console.log("  -> PASS: TEST OBS-5");
+  }
+
+  console.log("\n[TEST OBS-6] 60초 디바운스 동작 검증");
+  {
+    const market = "KRW-DEBOUNCE-TEST";
+    reclaimEvalDebugLastLogTs.delete(market);
+
+    // Call 1: initial false -> must log (return true)
+    const l1 = logReclaimConditionsEvalDebug({
+      market,
+      watchStatus: "pullback_seen",
+      currentPrice: 990,
+      localHigh: 1000,
+      pullbackLowPrice: 985,
+      pullbackPct: 1.5,
+      recent1mRet: -0.2,
+      recent3mRet: 0.5,
+      ema20: 988,
+      distanceFromLocalHighPct: 1.0,
+      isRebounding: true,
+      returnsOk: false,
+      nearHigh: false,
+      hasEma: true,
+      isAboveEma: true,
+      finalValid: false,
+      failedConditions: ["returns_ok", "near_high"],
+      elapsedSeconds: 30,
+    });
+    assert.strictEqual(l1, true, "Call 1 must log");
+
+    // Call 2: 10 seconds later, still false -> must be debounced (return false)
+    const l2 = logReclaimConditionsEvalDebug({
+      market,
+      watchStatus: "pullback_seen",
+      currentPrice: 990,
+      localHigh: 1000,
+      pullbackLowPrice: 985,
+      pullbackPct: 1.5,
+      recent1mRet: -0.2,
+      recent3mRet: 0.5,
+      ema20: 988,
+      distanceFromLocalHighPct: 1.0,
+      isRebounding: true,
+      returnsOk: false,
+      nearHigh: false,
+      hasEma: true,
+      isAboveEma: true,
+      finalValid: false,
+      failedConditions: ["returns_ok", "near_high"],
+      elapsedSeconds: 40,
+    });
+    assert.strictEqual(l2, false, "Call 2 within 60s must be debounced");
+
+    // Call 3: simulate 61 seconds passed -> must log again (return true)
+    reclaimEvalDebugLastLogTs.set(market, Date.now() - 61000);
+    const l3 = logReclaimConditionsEvalDebug({
+      market,
+      watchStatus: "pullback_seen",
+      currentPrice: 990,
+      localHigh: 1000,
+      pullbackLowPrice: 985,
+      pullbackPct: 1.5,
+      recent1mRet: -0.2,
+      recent3mRet: 0.5,
+      ema20: 988,
+      distanceFromLocalHighPct: 1.0,
+      isRebounding: true,
+      returnsOk: false,
+      nearHigh: false,
+      hasEma: true,
+      isAboveEma: true,
+      finalValid: false,
+      failedConditions: ["returns_ok", "near_high"],
+      elapsedSeconds: 91,
+    });
+    assert.strictEqual(l3, true, "Call 3 after 60s must log");
+    console.log("  -> PASS: TEST OBS-6");
+  }
+
+  console.log("\n[TEST OBS-7] valid=true일 때 60초 디바운스 무시하고 즉시 로그 출력");
+  {
+    const market = "KRW-IMMEDIATE-LOG-TEST";
+    reclaimEvalDebugLastLogTs.set(market, Date.now() - 5000); // Only 5s ago (within 60s window)
+
+    const lImmediate = logReclaimConditionsEvalDebug({
+      market,
+      watchStatus: "pullback_seen",
+      currentPrice: 998,
+      localHigh: 1000,
+      pullbackLowPrice: 990,
+      pullbackPct: 1.0,
+      recent1mRet: 0.5,
+      recent3mRet: 1.2,
+      ema20: 995,
+      distanceFromLocalHighPct: 0.2,
+      isRebounding: true,
+      returnsOk: true,
+      nearHigh: true,
+      hasEma: true,
+      isAboveEma: true,
+      finalValid: true,
+      failedConditions: [],
+      elapsedSeconds: 35,
+      forceImmediate: true,
+    });
+    assert.strictEqual(lImmediate, true, "valid=true with forceImmediate must bypass debounce and log immediately");
+    console.log("  -> PASS: TEST OBS-7");
+  }
+
   console.log("\n====================================================================");
-  console.log(" All 32 PERFORMANCE_KILL & SURGE Authority Regression Tests PASSED! ");
+  console.log(" All 39 PERFORMANCE_KILL & SURGE Authority Regression Tests PASSED! ");
   console.log("====================================================================");
 }
 
