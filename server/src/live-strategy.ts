@@ -3095,6 +3095,7 @@ export async function validateLiveBuyPrecheck(params: {
   allowed: boolean;
   blockReason: string | null;
   killSwitchReason: string | null;
+  killSwitchType: "HARD_RISK" | "PERFORMANCE" | "NONE";
   cooldownRemainingSec: number;
   dailyLossCount: number;
   dailyPnlPct: number;
@@ -3181,6 +3182,7 @@ export async function validateLiveBuyPrecheck(params: {
       allowed: false,
       blockReason: "reclaim_score_missing",
       killSwitchReason: null,
+      killSwitchType: "NONE",
       cooldownRemainingSec: 0,
       dailyLossCount: 0,
       dailyPnlPct: 0,
@@ -3196,6 +3198,7 @@ export async function validateLiveBuyPrecheck(params: {
       allowed: false,
       blockReason: "reclaim_score_low",
       killSwitchReason: null,
+      killSwitchType: "NONE",
       cooldownRemainingSec: 0,
       dailyLossCount: 0,
       dailyPnlPct: 0,
@@ -3317,6 +3320,7 @@ async function _validateLiveBuyPrecheckInternal(params: {
   reclaimScore?: number;
   volumeAccel?: number;
   aboveEma20?: boolean;
+  currentPrice?: number;
   candidateMeta?: any;
   candleSource?: string;
   candleAgeMs?: number;
@@ -3329,12 +3333,14 @@ async function _validateLiveBuyPrecheckInternal(params: {
   allowed: boolean;
   blockReason: string | null;
   killSwitchReason: string | null;
+  killSwitchType: "HARD_RISK" | "PERFORMANCE" | "NONE";
   cooldownRemainingSec: number;
   dailyLossCount: number;
   dailyPnlPct: number;
   legacyTradePnlPctSum?: number;
   marketStateStr: string;
   btcRsi: number | null;
+  isPanic?: boolean;
 }> {
   const isReclaimStrategy =
     params.strategyType === "reclaim" ||
@@ -3352,12 +3358,14 @@ async function _validateLiveBuyPrecheckInternal(params: {
     allowed: true,
     blockReason: null as string | null,
     killSwitchReason: null as string | null,
+    killSwitchType: "NONE" as "HARD_RISK" | "PERFORMANCE" | "NONE",
     cooldownRemainingSec: 0,
     dailyLossCount: 0,
     dailyPnlPct: 0,
     legacyTradePnlPctSum: 0,
     marketStateStr: "unknown",
     btcRsi: null as number | null,
+    isPanic: false,
   };
 
   if (snap) {
@@ -3452,11 +3460,13 @@ async function _validateLiveBuyPrecheckInternal(params: {
 
       result.allowed = false;
       result.blockReason = isDailyPnlLimit ? "daily_pnl_limit_reached" : "global_kill_switch_active";
-      result.killSwitchReason = killSwitch.hard_risk_reasons?.[0] ?? (isDailyPnlLimit ? "daily_pnl_limit_reached" : "hard_risk_conditions_active");
+      result.killSwitchReason = killSwitch.hard_risk_reasons?.[0] ?? (isDailyPnlLimit ? "daily_pnl_limit_reached" : (isPanic ? "btc_market_panic_active" : "hard_risk_conditions_active"));
+      result.killSwitchType = "HARD_RISK";
+      result.isPanic = isPanic;
       return result;
     }
 
-    // 2. PERFORMANCE_KILL CHECK (최근 손실/승률 악화 - STRONG CORE 및 STRONG SURGE에 한해 25% probe 허용)
+    // 2. PERFORMANCE_KILL CHECK (최근 손실/승률 악화 - STRONG CORE, STRONG SURGE, VALID RECLAIM에 한해 25% probe 허용)
     const isDailyLossCountLimit = result.dailyLossCount >= 5;
     const isPerformanceKillActive = killSwitch.performance_kill_active || isDailyLossCountLimit;
     if (isPerformanceKillActive) {
@@ -3540,10 +3550,33 @@ async function _validateLiveBuyPrecheckInternal(params: {
         hasEarlySurgeAuthority &&
         !isPanic;
 
+      // 3) Reclaim SURGE 판정 (truthful reclaim candidateMeta 기반: pullback_seen -> reclaim_ready 통과 + 유효 stop/RR)
+      const currentPriceVal = Number(params.currentPrice ?? cMeta?.currentPrice ?? 0);
+      const isReclaimPath = cMeta?.sourceStrategy === "surge_reclaim_entry" || cMeta?.strategyType === "surge_reclaim";
+      const reclaimRiskReward = Number(cMeta?.riskReward ?? 0);
+      const reclaimStopPrice = Number(cMeta?.stopPrice ?? 0);
+      const isReclaimValid =
+        isReclaimPath &&
+        Boolean(cMeta?.reclaim_ready_passed === true) &&
+        reclaimRiskReward >= 1.3 &&
+        reclaimStopPrice > 0 &&
+        (currentPriceVal <= 0 || reclaimStopPrice < currentPriceVal);
+
+      // Reclaim 전용 시장 안전 판정: 합성 phase(btc_phase/asset_phase)를 사용하지 않고
+      // 실제 market_state 스냅샷과 실제 panic 플래그만 사용한다. (HARD_RISK/panic은 위에서 이미 절대 차단)
+      const reclaimMarketStateReal = String(snap?.market_state ?? "");
+      const isReclaimRiskOff = reclaimMarketStateReal === "risk_off";
+      const isReclaimPanicDetected =
+        cMeta?.is_panic === true || snap?.panic === true || snap?.is_panic === true;
+      const isReclaimMarketSafe = !isReclaimRiskOff && !isReclaimPanicDetected;
+
       const isCoreEligible = isStrongCore && isCorePhaseSafe && !isPositionLimitReached;
       const isSurgeEligible = isStrongSurge && isSurgePhaseSafe && !isPositionLimitReached;
-      const finalEligibility = isCoreEligible || isSurgeEligible;
-      const probeKind: "CORE" | "SURGE" | null = isCoreEligible ? "CORE" : (isSurgeEligible ? "SURGE" : null);
+      const isReclaimEligible = isReclaimValid && isReclaimMarketSafe && !isPositionLimitReached;
+      const finalEligibility = isCoreEligible || isSurgeEligible || isReclaimEligible;
+      const probeKind: "CORE" | "SURGE" | "SURGE_RECLAIM" | null = isCoreEligible
+        ? "CORE"
+        : (isReclaimEligible ? "SURGE_RECLAIM" : (isSurgeEligible ? "SURGE" : null));
 
       console.info(
         JSON.stringify({
@@ -3558,6 +3591,9 @@ async function _validateLiveBuyPrecheckInternal(params: {
           original_kill_reason: killSwitch.reason,
           is_strong_core: isStrongCore,
           is_strong_surge: isStrongSurge,
+          is_reclaim_valid: isReclaimValid,
+          is_reclaim_eligible: isReclaimEligible,
+          is_reclaim_market_safe: isReclaimMarketSafe,
           is_core_phase_safe: isCorePhaseSafe,
           is_surge_phase_safe: isSurgePhaseSafe,
           surge_authority_source: surgeReason || "none",
@@ -3582,6 +3618,29 @@ async function _validateLiveBuyPrecheckInternal(params: {
           cMeta.relaxed_multiplier = finalSizeScale;
         }
 
+        if (probeKind === "SURGE_RECLAIM") {
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_RECLAIM_PERFORMANCE_PROBE_PROOF",
+              ts: new Date().toISOString(),
+              market: params.market,
+              score,
+              reclaim_ready_passed: cMeta?.reclaim_ready_passed === true,
+              reclaim_status: cMeta?.reclaim_status ?? null,
+              market_state: reclaimMarketStateReal || "unknown",
+              panic_detected: isReclaimPanicDetected,
+              hard_risk_kill: false,
+              performance_kill: true,
+              risk_reward: reclaimRiskReward,
+              stop_price: reclaimStopPrice,
+              current_price: currentPriceVal,
+              original_kill_reason: killSwitch.reason,
+              final_size_scale: finalSizeScale,
+              decision: "SURGE_RECLAIM_PERFORMANCE_PROBE_ELIGIBLE",
+            }),
+          );
+        }
+
         console.info(
           JSON.stringify({
             tag: "GLOBAL_KILL_SWITCH_PERFORMANCE_PROBE_ALLOWED",
@@ -3600,10 +3659,18 @@ async function _validateLiveBuyPrecheckInternal(params: {
         result.allowed = true;
         result.blockReason = null;
         result.killSwitchReason = killSwitch.reason;
+        result.killSwitchType = "PERFORMANCE";
       } else {
         let blockDetail = "performance_kill_not_eligible";
         if (isPositionLimitReached) {
           blockDetail = "performance_probe_position_limit_reached";
+        } else if (isReclaimPath) {
+          if (!Boolean(cMeta?.reclaim_ready_passed === true)) blockDetail = "reclaim_ready_not_passed";
+          else if (reclaimRiskReward < 1.3) blockDetail = `reclaim_rr_low:${reclaimRiskReward}<1.3`;
+          else if (reclaimStopPrice <= 0 || (currentPriceVal > 0 && reclaimStopPrice >= currentPriceVal)) blockDetail = `reclaim_stop_invalid:${reclaimStopPrice}>=${currentPriceVal}`;
+          else if (isReclaimRiskOff) blockDetail = "reclaim_market_risk_off";
+          else if (isReclaimPanicDetected) blockDetail = "reclaim_panic_detected";
+          else blockDetail = "reclaim_performance_kill_not_eligible";
         } else if (cMeta?.engine_bucket === "surge") {
           if (score < 90) blockDetail = `score_low:${score}<90`;
           else if (!isSurgeSetupOk) blockDetail = "setup_not_ok";
@@ -3639,6 +3706,7 @@ async function _validateLiveBuyPrecheckInternal(params: {
         result.allowed = false;
         result.blockReason = "global_kill_switch_active";
         result.killSwitchReason = killSwitch.reason;
+        result.killSwitchType = "PERFORMANCE";
         return result;
       }
     }
@@ -14983,10 +15051,51 @@ export function createLiveDataStrategy(opts: {
         );
 
         const baseOrderAmount = strategyUsableKrwForAlloc > 0 ? strategyUsableKrwForAlloc * 0.15 : 20000;
-        const orderKrw = Math.floor(baseOrderAmount * 0.5);
+        let orderKrw = Math.floor(baseOrderAmount * 0.5);
 
         if (orderKrw >= 5000) {
           try {
+            let btcCandlesForReclaim = precheckCandleCache.get("KRW-BTC")?.candles ?? [];
+            if (!btcCandlesForReclaim || btcCandlesForReclaim.length < 5) {
+              try {
+                btcCandlesForReclaim = await fetchMinuteCandlesCached("KRW-BTC", 1, 30);
+              } catch {
+                btcCandlesForReclaim = [];
+              }
+            }
+            const btcPxForReclaim = Number(
+              btcCandlesForReclaim[btcCandlesForReclaim.length - 1]?.trade_price ??
+                priceBy.get("KRW-BTC") ??
+                lastGoodTickerCache.get("KRW-BTC")?.row?.trade_price ??
+                0,
+            );
+            const btcPhaseResult = detectBtcMarketPhase(
+              btcCandlesForReclaim,
+              btcPxForReclaim,
+              marketState?.btc_5m_trend,
+              marketState?.btc_15m_trend,
+              marketState?.market_state,
+            );
+
+            const reclaimCandidateMeta: any = {
+              market,
+              engine_bucket: "surge",
+              sourceStrategy: "surge_reclaim_entry",
+              strategyType: "surge_reclaim",
+              reclaim_ready_passed: item.status === "reclaim_ready",
+              reclaim_status: item.status,
+              score: rScore,
+              stopPrice,
+              takeProfitPrice,
+              riskReward,
+              scanner_authority: (item as any).scanner_authority !== undefined ? Boolean((item as any).scanner_authority) : undefined,
+              early_surge_authority: (item as any).early_surge_authority !== undefined ? Boolean((item as any).early_surge_authority) : undefined,
+              validated_surge_authority: (item as any).validated_surge_authority !== undefined ? Boolean((item as any).validated_surge_authority) : undefined,
+              setup: (item as any).setup ?? undefined,
+              setupReason: (item as any).setupReason ?? undefined,
+              is_panic: btcPhaseResult.isPanic === true ? true : undefined,
+            };
+
             const guard = await validateLiveBuyPrecheck({
               market,
               trades: state.trades,
@@ -15002,7 +15111,7 @@ export function createLiveDataStrategy(opts: {
               reclaimScore: rScore,
               volumeAccel: volumeRatio1m5,
               aboveEma20: evalRes.isAboveEma,
-              candidateMeta: undefined,
+              candidateMeta: reclaimCandidateMeta,
               actualDailyPnlPct: state.daily.actual_daily_pnl_pct,
             });
             if (!guard.allowed) {
@@ -15017,6 +15126,63 @@ export function createLiveDataStrategy(opts: {
                 marketState: guard.marketStateStr,
                 btcRsi: guard.btcRsi,
               });
+
+              const isBtcPanicBlock =
+                guard.killSwitchType === "HARD_RISK" &&
+                (btcPhaseResult.isPanic === true ||
+                 (guard as any).isPanic === true ||
+                 reclaimCandidateMeta.is_panic === true);
+
+              if (isBtcPanicBlock) {
+                console.info(
+                  JSON.stringify({
+                    tag: "SURGE_RECLAIM_QUEUE_PRESERVED_ON_BTC_PANIC_PROOF",
+                    ts: new Date().toISOString(),
+                    market,
+                    status: "retry_wait",
+                    previous_status: item.status,
+                    attempt_count: item.attempt_count,
+                    block_reason: guard.blockReason,
+                    kill_switch_reason: guard.killSwitchReason,
+                    kill_switch_type: guard.killSwitchType,
+                    is_panic: true,
+                    last_block_reason: "hard_risk_btc_panic",
+                    decision: "RECLAIM_QUEUE_PRESERVED_BTC_PANIC_RETRY_WAIT",
+                  }),
+                );
+                item.status = "retry_wait";
+                item.last_attempt_at = new Date().toISOString();
+                item.last_block_reason = "hard_risk_btc_panic";
+                item.retry_after = Date.now() + 5000;
+                continue;
+              }
+
+              const isPerformanceKillBlock =
+                guard.killSwitchType === "PERFORMANCE" ||
+                (guard.killSwitchType !== "HARD_RISK" &&
+                  (guard.blockReason === "performance_kill_not_eligible" ||
+                   guard.blockReason === "performance_probe_position_limit_reached"));
+
+              if (isPerformanceKillBlock) {
+                console.info(
+                  JSON.stringify({
+                    tag: "SURGE_RECLAIM_QUEUE_PRESERVED_ON_PERFORMANCE_KILL_PROOF",
+                    ts: new Date().toISOString(),
+                    market,
+                    status: item.status,
+                    attempt_count: item.attempt_count,
+                    block_reason: guard.blockReason,
+                    kill_switch_reason: guard.killSwitchReason,
+                    kill_switch_type: guard.killSwitchType,
+                    decision: "RECLAIM_QUEUE_PRESERVED_NO_DELETION",
+                  }),
+                );
+                item.status = "retry_wait";
+                item.last_attempt_at = new Date().toISOString();
+                item.last_block_reason = guard.blockReason;
+                item.retry_after = Date.now() + 5000;
+                continue;
+              }
 
               const isPermanentBlock = false; // 점수 누락/미달은 일시적 차단으로 간주 (다음 틱에 개선 가능)
 
@@ -15035,6 +15201,28 @@ export function createLiveDataStrategy(opts: {
                 item.retry_after = Date.now() + 5000;
               }
               continue;
+            }
+
+            if (guard.killSwitchType === "PERFORMANCE" || reclaimCandidateMeta.relaxed_multiplier === 0.25) {
+              orderKrw = Math.max(5000, Math.floor(baseOrderAmount * 0.25));
+              console.info(
+                JSON.stringify({
+                  tag: "SURGE_RECLAIM_PERFORMANCE_PROBE_ALLOWED_25PCT",
+                  ts: new Date().toISOString(),
+                  market,
+                  reclaim_ready_passed: reclaimCandidateMeta.reclaim_ready_passed === true,
+                  reclaim_status: item.status,
+                  market_state: guard.marketStateStr,
+                  panic_detected: reclaimCandidateMeta.is_panic === true,
+                  hard_risk_kill: false,
+                  performance_kill: true,
+                  stop_price: stopPrice,
+                  risk_reward: riskReward,
+                  base_budget_krw: baseOrderAmount,
+                  final_order_krw: orderKrw,
+                  effective_multiplier: baseOrderAmount > 0 ? Number((orderKrw / baseOrderAmount).toFixed(4)) : null,
+                }),
+              );
             }
 
             reclaim_precheck_pass_count++;
@@ -15571,50 +15759,74 @@ export function createLiveDataStrategy(opts: {
           final_block_reason: guard.allowed ? null : guard.blockReason,
         }),
       );
+      let isPrecheckPerformanceKillPreserved = false;
       if (!guard.allowed) {
-        if (guard.blockReason === "global_kill_switch_active") {
-          (state as any).global_kill_switch_active = true;
-          (state as any).global_kill_switch_reason = guard.killSwitchReason;
-        }
-        emitEval("DEBUG_LIVE_PRECHECK", { return_reason: guard.blockReason, reason_detail: guard.killSwitchReason });
-        logPlacebuyFinalGateBlocked(guard.blockReason!, {
-          market,
-          path: "precheck",
-          strategyType: loopStrategyType,
-          killSwitchReason: guard.killSwitchReason,
-          cooldownRemaining: guard.cooldownRemainingSec,
-          dailyLossCount: guard.dailyLossCount,
-          dailyPnlPct: guard.dailyPnlPct,
-          marketState: guard.marketStateStr,
-          btcRsi: guard.btcRsi,
-        });
-        bumpSkip(guard.blockReason!);
-        
-        if (evaluationDiagnostics[market]) {
-          evaluationDiagnostics[market].buyGate = {
-            checked: true,
-            allowed: false,
-            reason: guard.blockReason
-          };
-          evaluationDiagnostics[market].final = {
-            action: "blocked",
-            reason: guard.blockReason
-          };
-        }
-        if (guard.blockReason === "cooldown_active") {
-          const cool = state.cooldown_until[market];
+        const isSurgeCandidateForDiscovery = Boolean(
+          isSurgeSourceLocal ||
+          candidateMetaFromSetup?.engine_bucket === "surge" ||
+          (sigPre?.p as any)?.source_kind === "scanner" ||
+          SURGE_V2_SOURCE_KINDS.has(String((sigPre?.p as any)?.source_kind ?? "")) ||
+          isActualPromotedReclaim
+        );
+
+        if (isSurgeCandidateForDiscovery && guard.killSwitchType === "PERFORMANCE") {
+          isPrecheckPerformanceKillPreserved = true;
           console.info(
             JSON.stringify({
-              tag: "DEBUG_LIVE_REENTRY_BLOCKED",
+              tag: "SURGE_PERFORMANCE_KILL_DISCOVERY_PRESERVED_PROOF",
               ts: new Date().toISOString(),
-              symbol: market,
-              cooldown_until: cool,
-              seconds_remaining: guard.cooldownRemainingSec,
-              prior_exit_reason: null,
+              market,
+              kill_switch_type: guard.killSwitchType,
+              kill_switch_reason: guard.killSwitchReason,
+              engine_bucket: candidateMetaFromSetup?.engine_bucket ?? "surge",
+              decision: "PRESERVE_DISCOVERY_PROCEED_TO_SURGE_AUTHORITY",
             }),
           );
+        } else {
+          if (guard.blockReason === "global_kill_switch_active") {
+            (state as any).global_kill_switch_active = true;
+            (state as any).global_kill_switch_reason = guard.killSwitchReason;
+          }
+          emitEval("DEBUG_LIVE_PRECHECK", { return_reason: guard.blockReason, reason_detail: guard.killSwitchReason });
+          logPlacebuyFinalGateBlocked(guard.blockReason!, {
+            market,
+            path: "precheck",
+            strategyType: loopStrategyType,
+            killSwitchReason: guard.killSwitchReason,
+            cooldownRemaining: guard.cooldownRemainingSec,
+            dailyLossCount: guard.dailyLossCount,
+            dailyPnlPct: guard.dailyPnlPct,
+            marketState: guard.marketStateStr,
+            btcRsi: guard.btcRsi,
+          });
+          bumpSkip(guard.blockReason!);
+
+          if (evaluationDiagnostics[market]) {
+            evaluationDiagnostics[market].buyGate = {
+              checked: true,
+              allowed: false,
+              reason: guard.blockReason
+            };
+            evaluationDiagnostics[market].final = {
+              action: "blocked",
+              reason: guard.blockReason
+            };
+          }
+          if (guard.blockReason === "cooldown_active") {
+            const cool = state.cooldown_until[market];
+            console.info(
+              JSON.stringify({
+                tag: "DEBUG_LIVE_REENTRY_BLOCKED",
+                ts: new Date().toISOString(),
+                symbol: market,
+                cooldown_until: cool,
+                seconds_remaining: guard.cooldownRemainingSec,
+                prior_exit_reason: null,
+              }),
+            );
+          }
+          continue;
         }
-        continue;
       } else {
         (state as any).global_kill_switch_active = false;
         (state as any).global_kill_switch_reason = null;
@@ -16371,6 +16583,20 @@ export function createLiveDataStrategy(opts: {
             reason: authority.reason,
           });
 
+          if (isPrecheckPerformanceKillPreserved || guard.killSwitchType === "PERFORMANCE") {
+            console.info(
+              JSON.stringify({
+                tag: "SURGE_PERFORMANCE_KILL_RECLAIM_WATCH_PRESERVED_PROOF",
+                ts: new Date().toISOString(),
+                market,
+                transferred,
+                reason: authority.reason,
+                kill_switch_type: guard.killSwitchType,
+                decision: "RECLAIM_WATCH_REGISTERED_UNDER_PERFORMANCE_KILL",
+              }),
+            );
+          }
+
           emitSurgeAuthorityProof({
             tag: "SURGE_LATE_GOOD_TO_RECLAIM_PROOF",
             market,
@@ -16453,10 +16679,76 @@ export function createLiveDataStrategy(opts: {
             reason: authority.reason,
           });
 
-          lateTimingTier = "reduced_size_allowed";
-          lateEntrySizingMultiplier = 0.5;
-          lateEntryGuardTriggered = false;
-          lateEntryGuardReason = null;
+          const metaToUpdate = candidateMetaFromSetup ?? metaForGuard;
+          if (metaToUpdate) {
+            metaToUpdate.engine_bucket = "surge";
+            metaToUpdate.validated_surge_authority = true;
+            metaToUpdate.early_surge_authority = true;
+            metaToUpdate.scanner_authority = true;
+            if (!metaToUpdate.setup) {
+              metaToUpdate.setup = { ok: true, mode: "safe", reason: "surge_v2_entry_path" };
+            }
+          }
+
+          if (isPrecheckPerformanceKillPreserved) {
+            const earlyBuyGuard = await validateLiveBuyPrecheck({
+              market,
+              trades: state.trades,
+              positions: state.positions,
+              cooldown_until: state.cooldown_until,
+              marketState: opts.marketState,
+              signalPayload: sig?.p,
+              strategyType: loopStrategyType,
+              entrySignalType: loopEntrySignalType,
+              entryPath: "surge_normal",
+              isAdditionalBuy: false,
+              currentPrice,
+              candidateMeta: metaToUpdate,
+              actualDailyPnlPct: state.daily.actual_daily_pnl_pct,
+            });
+
+            if (!earlyBuyGuard.allowed) {
+              console.info(
+                JSON.stringify({
+                  tag: "SURGE_TRUE_EARLY_PERFORMANCE_PROBE_BLOCKED",
+                  ts: new Date().toISOString(),
+                  market,
+                  blockReason: earlyBuyGuard.blockReason,
+                  killSwitchReason: earlyBuyGuard.killSwitchReason,
+                  score,
+                }),
+              );
+              lateEntryGuardTriggered = true;
+              lateTimingTier = "hard_block";
+              lateEntryGuardReason = earlyBuyGuard.blockReason;
+              bumpSkip(earlyBuyGuard.blockReason!);
+              continue;
+            }
+
+            console.info(
+              JSON.stringify({
+                tag: "SURGE_TRUE_EARLY_PERFORMANCE_PROBE_PROOF",
+                ts: new Date().toISOString(),
+                market,
+                score,
+                size_multiplier: 0.25,
+                decision: "PERFORMANCE_PROBE_ALLOWED_25PCT",
+              }),
+            );
+            lateTimingTier = "reduced_size_allowed";
+            lateEntrySizingMultiplier = 0.25;
+            if (metaToUpdate) {
+              metaToUpdate.relaxed_multiplier = 0.25;
+              metaToUpdate.is_performance_probe = true;
+            }
+            lateEntryGuardTriggered = false;
+            lateEntryGuardReason = null;
+          } else {
+            lateTimingTier = "reduced_size_allowed";
+            lateEntrySizingMultiplier = 0.5;
+            lateEntryGuardTriggered = false;
+            lateEntryGuardReason = null;
+          }
         }
       } else {
         if (secondsSinceSignal !== null && secondsSinceSignal > staleLimit) {
@@ -16984,6 +17276,7 @@ export function createLiveDataStrategy(opts: {
             strategyType: "momentum",
             entryPath: "early_entry",
             isAdditionalBuy: false,
+            candidateMeta: candidateMetaFromSetup ?? metaForGuard,
             actualDailyPnlPct: state.daily.actual_daily_pnl_pct,
           });
           if (!guard.allowed) {

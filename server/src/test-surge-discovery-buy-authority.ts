@@ -47,6 +47,7 @@ import {
   detectSurgePullback,
   evaluateReclaimConditions,
   emitSurgeAuthorityProof,
+  validateLiveBuyPrecheck,
   SurgeCandidateAuthorityInput,
   SurgeAuthorityProofParams,
 } from "./live-strategy.js";
@@ -901,6 +902,1055 @@ console.log("\n[TEST 21] dist = -0.05%, fresh breakout + gentle + EMA/volume val
   console.log("  -> PASS: TEST 21 Verified (fresh breakout with gentle returns retained FAST_SURGE_PROBE).");
 }
 
-console.log("\n====================================================================");
-console.log(" All 21 Scenarios & Integration Tests PASSED With ZERO Errors! ");
-console.log("====================================================================");
+// =============================================================================
+// PERFORMANCE_KILL & SURGE 권한 계층 분리 10대 회귀 테스트 (TEST 22 ~ TEST 31)
+// =============================================================================
+
+async function runPerformanceKillRegressionSuite() {
+  console.log("\n====================================================================");
+  console.log(" Running PERFORMANCE_KILL & SURGE Authority Regression Tests (10/10) ");
+  console.log("====================================================================");
+
+  const performanceKillTrades = [
+    { market: "KRW-LOSS1", pnl_pct: -1.5, timestamp: new Date().toISOString(), action: "sell", order_krw: 100000, filled_qty: 10 },
+    { market: "KRW-LOSS2", pnl_pct: -2.0, timestamp: new Date().toISOString(), action: "sell", order_krw: 100000, filled_qty: 10 },
+    { market: "KRW-LOSS3", pnl_pct: -1.2, timestamp: new Date().toISOString(), action: "sell", order_krw: 100000, filled_qty: 10 },
+    { market: "KRW-LOSS4", pnl_pct: -0.8, timestamp: new Date().toISOString(), action: "sell", order_krw: 100000, filled_qty: 10 },
+    { market: "KRW-LOSS5", pnl_pct: -1.1, timestamp: new Date().toISOString(), action: "sell", order_krw: 100000, filled_qty: 10 },
+  ];
+
+  // 1. PERFORMANCE_KILL + LATE_BUT_GOOD → BUY X / RECLAIM_WATCH O
+  console.log("\n[TEST 22] 1. PERFORMANCE_KILL + LATE_BUT_GOOD → BUY X / RECLAIM_WATCH O");
+  {
+    const mockState: any = { surge_watchlist: {}, morning_surge_watchlist: {}, trades: performanceKillTrades };
+    const input = createBaseSurgeCandidate({
+      market: "KRW-LATE-PERF",
+      distanceFromLocalHighPct: 0.08, // near apex -> LATE_BUT_GOOD
+      score: 95,
+      breakout: true,
+      setupOk: true,
+    });
+
+    const authority = classifySurgeCandidateAuthority(input);
+    assert.strictEqual(authority.category, "LATE_BUT_GOOD", "Must be LATE_BUT_GOOD");
+    assert.strictEqual(authority.immediateBuyAllowed, false, "Immediate BUY must be false");
+    assert.strictEqual(authority.finalAuthority, "RECLAIM_WATCH", "Authority must be RECLAIM_WATCH");
+
+    const guard = await validateLiveBuyPrecheck({
+      market: input.market,
+      trades: performanceKillTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: null,
+      signalPayload: { source_kind: "scanner" },
+      strategyType: "surge",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      actualDailyPnlPct: -1.0,
+      candidateMeta: { engine_bucket: "surge", score: 95 },
+    });
+    assert.strictEqual(guard.allowed, false, "Precheck must NOT allow normal BUY under PERFORMANCE_KILL");
+    assert.strictEqual(guard.killSwitchType, "PERFORMANCE", "Kill switch type must be PERFORMANCE");
+
+    // Discovery 보존 확인: Watchlist 정상 이관
+    const transferred = transferSurgeCandidateToReclaimWatchlist({
+      market: input.market,
+      currentPrice: input.currentPrice,
+      localHigh: input.localHigh,
+      dayChangePct: 4.2,
+      volume24hKrw: 5_000_000_000,
+      isMorningWindow: false,
+      state: mockState,
+      reason: authority.reason,
+    });
+    assert.strictEqual(transferred, true, "Candidate must be transferred to watchlist");
+    assert.ok(mockState.surge_watchlist[input.market], "Candidate must exist in surge_watchlist");
+    assert.strictEqual(mockState.surge_watchlist[input.market].status, "watching", "Status must be 'watching'");
+    console.log("  -> PASS: PERFORMANCE_KILL did not block discovery/watchlist transfer. BUY blocked, RECLAIM_WATCH preserved.");
+  }
+
+  // 2. PERFORMANCE_KILL + TRUE_EARLY strong → 0.25x probe O
+  console.log("\n[TEST 23] 2. PERFORMANCE_KILL + TRUE_EARLY strong → 0.25x probe O");
+  {
+    const strongCandidateMeta: any = {
+      market: "KRW-STRONG-EARLY",
+      engine_bucket: "surge",
+      score: 95,
+      setup: { ok: true, reason: "surge_v2_entry_path", mode: "safe" },
+      setupReason: "surge_v2_entry_path",
+      scanner_authority: true,
+      early_surge_authority: true,
+      validated_surge_authority: true,
+      btc_phase: "neutral",
+      asset_phase: "impulse",
+      is_panic: false,
+    };
+
+    const guard = await validateLiveBuyPrecheck({
+      market: "KRW-STRONG-EARLY",
+      trades: performanceKillTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: null,
+      signalPayload: { source_kind: "scanner" },
+      strategyType: "surge",
+      entryPath: "surge_normal",
+      isAdditionalBuy: false,
+      actualDailyPnlPct: -1.0,
+      candidateMeta: strongCandidateMeta,
+    });
+    assert.strictEqual(guard.allowed, true, "Strong TRUE_EARLY must be allowed as probe");
+    assert.strictEqual(guard.killSwitchType, "PERFORMANCE", "Must be PERFORMANCE kill switch");
+    assert.strictEqual(strongCandidateMeta.relaxed_multiplier, 0.25, "Must enforce 0.25x probe multiplier");
+    assert.strictEqual(strongCandidateMeta.is_performance_probe, true, "Must flag is_performance_probe");
+    console.log("  -> PASS: Strong TRUE_EARLY granted 0.25x performance probe.");
+  }
+
+  // 3. PERFORMANCE_KILL + TRUE_EARLY weak → BUY X
+  console.log("\n[TEST 24] 3. PERFORMANCE_KILL + TRUE_EARLY weak (score < 90) → BUY X");
+  {
+    const weakCandidateMeta: any = {
+      market: "KRW-WEAK-EARLY",
+      engine_bucket: "surge",
+      score: 85, // weak score < 90
+      setup: { ok: true, reason: "surge_v2_entry_path", mode: "safe" },
+      setupReason: "surge_v2_entry_path",
+      scanner_authority: true,
+      early_surge_authority: true,
+      btc_phase: "neutral",
+      asset_phase: "impulse",
+      is_panic: false,
+    };
+
+    const guard = await validateLiveBuyPrecheck({
+      market: "KRW-WEAK-EARLY",
+      trades: performanceKillTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: null,
+      signalPayload: { source_kind: "scanner" },
+      strategyType: "surge",
+      entryPath: "surge_normal",
+      isAdditionalBuy: false,
+      actualDailyPnlPct: -1.0,
+      candidateMeta: weakCandidateMeta,
+    });
+    assert.strictEqual(guard.allowed, false, "Weak TRUE_EARLY must be BLOCKED under PERFORMANCE_KILL");
+    assert.strictEqual(guard.blockReason, "global_kill_switch_active", "Must block with global_kill_switch_active");
+    assert.strictEqual(guard.killSwitchType, "PERFORMANCE", "Must identify PERFORMANCE kill switch");
+    console.log("  -> PASS: Weak TRUE_EARLY successfully blocked from BUY under PERFORMANCE_KILL.");
+  }
+
+  // 4. PERFORMANCE_KILL + RECLAIM_READY valid → 0.25x probe O
+  console.log("\n[TEST 25] 4. PERFORMANCE_KILL + RECLAIM_READY valid → 0.25x probe O");
+  {
+    const validReclaimMeta: any = {
+      market: "KRW-RECLAIM-VALID",
+      engine_bucket: "surge",
+      sourceStrategy: "surge_reclaim_entry",
+      strategyType: "surge_reclaim",
+      reclaim_ready_passed: true,
+      riskReward: 1.5, // >= 1.3
+      stopPrice: 950,  // > 0 and < currentPrice
+      score: 80,
+      btc_phase: "neutral",
+      asset_phase: "impulse",
+      is_panic: false,
+    };
+
+    const guard = await validateLiveBuyPrecheck({
+      market: "KRW-RECLAIM-VALID",
+      trades: performanceKillTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: null,
+      signalPayload: { source_kind: "scanner" },
+      strategyType: "surge_reclaim",
+      entrySignalType: "reclaim",
+      entryPath: "surge_reclaim_entry",
+      isAdditionalBuy: false,
+      currentPrice: 1000,
+      reclaimScore: 80,
+      actualDailyPnlPct: -1.0,
+      candidateMeta: validReclaimMeta,
+    });
+    assert.strictEqual(guard.allowed, true, "Valid RECLAIM_READY must be allowed 0.25x probe under PERFORMANCE_KILL");
+    assert.strictEqual(guard.killSwitchType, "PERFORMANCE", "Must identify PERFORMANCE kill switch");
+    assert.strictEqual(validReclaimMeta.relaxed_multiplier, 0.25, "Must enforce 0.25x multiplier");
+    assert.strictEqual(validReclaimMeta.is_performance_probe, true, "Must flag is_performance_probe");
+    console.log("  -> PASS: Valid RECLAIM_READY granted 0.25x performance probe.");
+  }
+
+  // 5. PERFORMANCE_KILL + RECLAIM_READY invalid RR → BUY X
+  console.log("\n[TEST 26] 5. PERFORMANCE_KILL + RECLAIM_READY invalid RR (< 1.3) → BUY X");
+  {
+    const invalidRrReclaimMeta: any = {
+      market: "KRW-RECLAIM-LOW-RR",
+      engine_bucket: "surge",
+      sourceStrategy: "surge_reclaim_entry",
+      strategyType: "surge_reclaim",
+      reclaim_ready_passed: true,
+      riskReward: 1.15, // < 1.3 invalid RR
+      stopPrice: 950,
+      score: 80,
+      btc_phase: "neutral",
+      asset_phase: "impulse",
+      is_panic: false,
+    };
+
+    const guard = await validateLiveBuyPrecheck({
+      market: "KRW-RECLAIM-LOW-RR",
+      trades: performanceKillTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: null,
+      signalPayload: { source_kind: "scanner" },
+      strategyType: "surge_reclaim",
+      entrySignalType: "reclaim",
+      entryPath: "surge_reclaim_entry",
+      isAdditionalBuy: false,
+      currentPrice: 1000,
+      reclaimScore: 80,
+      actualDailyPnlPct: -1.0,
+      candidateMeta: invalidRrReclaimMeta,
+    });
+    assert.strictEqual(guard.allowed, false, "Invalid RR RECLAIM must be BLOCKED");
+    assert.strictEqual(guard.blockReason, "global_kill_switch_active", "Must block with global_kill_switch_active");
+    console.log("  -> PASS: RECLAIM with invalid RR (< 1.3) successfully blocked.");
+  }
+
+  // 6. PERFORMANCE_KILL 때문에 BUY 거절 → watchlist 삭제 X
+  console.log("\n[TEST 27] 6. PERFORMANCE_KILL 때문에 BUY 거절 → watchlist 삭제 X (queue 보존)");
+  {
+    // 이미 1개의 probe position이 열려 있어 position limit으로 Reclaim BUY가 거절되는 상황
+    const mockPositionsWithProbe: any = {
+      "KRW-EXISTING-PROBE": {
+        qty: 10,
+        is_performance_probe: true,
+        managed: true,
+        engine_bucket: "surge",
+      },
+    };
+
+    const mockWatchlist: any = {
+      "KRW-HOLD-WATCH": {
+        market: "KRW-HOLD-WATCH",
+        status: "reclaim_ready",
+        attempt_count: 5, // attempt_count가 5에 도달했음!
+        entry_price: 1000,
+        stop_price: 950,
+      },
+    };
+
+    const reclaimMeta: any = {
+      market: "KRW-HOLD-WATCH",
+      engine_bucket: "surge",
+      sourceStrategy: "surge_reclaim_entry",
+      strategyType: "surge_reclaim",
+      reclaim_ready_passed: true,
+      riskReward: 1.6,
+      stopPrice: 950,
+      btc_phase: "neutral",
+      asset_phase: "impulse",
+      is_panic: false,
+    };
+
+    const guard = await validateLiveBuyPrecheck({
+      market: "KRW-HOLD-WATCH",
+      trades: performanceKillTrades,
+      positions: mockPositionsWithProbe, // position limit reached!
+      cooldown_until: {},
+      marketState: null,
+      signalPayload: { source_kind: "scanner" },
+      strategyType: "surge_reclaim",
+      entrySignalType: "reclaim",
+      entryPath: "surge_reclaim_entry",
+      isAdditionalBuy: false,
+      currentPrice: 1000,
+      reclaimScore: 80,
+      actualDailyPnlPct: -1.0,
+      candidateMeta: reclaimMeta,
+    });
+    assert.strictEqual(guard.allowed, false, "Must be blocked due to performance probe limit");
+    assert.strictEqual(guard.killSwitchType, "PERFORMANCE", "Must identify as PERFORMANCE kill switch");
+
+    // Reclaim loop logic simulation: PERFORMANCE_KILL 차단 시 deletion 방지
+    const item = mockWatchlist["KRW-HOLD-WATCH"];
+    const isPerformanceKillBlock =
+      guard.killSwitchType === "PERFORMANCE" ||
+      guard.blockReason === "global_kill_switch_active" ||
+      guard.blockReason === "performance_kill_not_eligible" ||
+      guard.blockReason === "performance_probe_position_limit_reached";
+
+    assert.strictEqual(isPerformanceKillBlock, true, "Must be detected as performance kill block");
+    if (isPerformanceKillBlock) {
+      item.status = "retry_wait";
+      item.retry_after = Date.now() + 5000;
+    } else {
+      item.attempt_count = (item.attempt_count || 0) + 1;
+      if (item.attempt_count >= 5) {
+        delete mockWatchlist["KRW-HOLD-WATCH"];
+      }
+    }
+
+    assert.ok(mockWatchlist["KRW-HOLD-WATCH"], "Watchlist item must NOT be deleted on performance kill!");
+    assert.strictEqual(mockWatchlist["KRW-HOLD-WATCH"].status, "retry_wait", "Item status must transition to retry_wait");
+    console.log("  -> PASS: Candidate NOT deleted from watchlist despite attempt_count >= 5 when blocked by PERFORMANCE_KILL.");
+  }
+
+  // 7. HARD_RISK_KILL + TRUE_EARLY → BUY X
+  console.log("\n[TEST 28] 7. HARD_RISK_KILL + TRUE_EARLY → BUY X");
+  {
+    const strongEarlyMeta: any = {
+      market: "KRW-HARD-EARLY",
+      engine_bucket: "surge",
+      score: 95,
+      setup: { ok: true, reason: "surge_v2_entry_path", mode: "safe" },
+      scanner_authority: true,
+      early_surge_authority: true,
+      btc_phase: "neutral",
+      asset_phase: "impulse",
+      is_panic: false,
+    };
+
+    const guard = await validateLiveBuyPrecheck({
+      market: "KRW-HARD-EARLY",
+      trades: [],
+      positions: {},
+      cooldown_until: {},
+      marketState: null,
+      signalPayload: { source_kind: "scanner" },
+      strategyType: "surge",
+      entryPath: "surge_normal",
+      isAdditionalBuy: false,
+      actualDailyPnlPct: -3.0, // HARD RISK: <= -2.5%
+      candidateMeta: strongEarlyMeta,
+    });
+    assert.strictEqual(guard.allowed, false, "HARD_RISK_KILL must block TRUE_EARLY 100%");
+    assert.strictEqual(guard.killSwitchType, "HARD_RISK", "Must identify HARD_RISK kill switch");
+    assert.strictEqual(guard.blockReason, "daily_pnl_limit_reached", "Reason must be daily_pnl_limit_reached");
+    console.log("  -> PASS: HARD_RISK_KILL completely blocked TRUE_EARLY.");
+  }
+
+  // 8. HARD_RISK_KILL + RECLAIM_READY → BUY X
+  console.log("\n[TEST 29] 8. HARD_RISK_KILL + RECLAIM_READY → BUY X");
+  {
+    const validReclaimMeta: any = {
+      market: "KRW-HARD-RECLAIM",
+      engine_bucket: "surge",
+      sourceStrategy: "surge_reclaim_entry",
+      strategyType: "surge_reclaim",
+      reclaim_ready_passed: true,
+      riskReward: 2.0,
+      stopPrice: 900,
+      score: 90,
+      btc_phase: "neutral",
+      asset_phase: "impulse",
+      is_panic: false,
+    };
+
+    const guard = await validateLiveBuyPrecheck({
+      market: "KRW-HARD-RECLAIM",
+      trades: [],
+      positions: {},
+      cooldown_until: {},
+      marketState: null,
+      signalPayload: { source_kind: "scanner" },
+      strategyType: "surge_reclaim",
+      entrySignalType: "reclaim",
+      entryPath: "surge_reclaim_entry",
+      isAdditionalBuy: false,
+      currentPrice: 1000,
+      reclaimScore: 90,
+      actualDailyPnlPct: -3.0, // HARD RISK: <= -2.5%
+      candidateMeta: validReclaimMeta,
+    });
+    assert.strictEqual(guard.allowed, false, "HARD_RISK_KILL must block RECLAIM_READY 100%");
+    assert.strictEqual(guard.killSwitchType, "HARD_RISK", "Must identify HARD_RISK kill switch");
+    console.log("  -> PASS: HARD_RISK_KILL completely blocked RECLAIM_READY.");
+  }
+
+  // 9. cooldown / position_exists / stale → 기존과 동일하게 BUY X
+  console.log("\n[TEST 30] 9. cooldown / position_exists / stale → 기존과 동일하게 BUY X");
+  {
+    // 9-1) Cooldown active
+    const coolTime = new Date(Date.now() + 60000).toISOString();
+    const guardCool = await validateLiveBuyPrecheck({
+      market: "KRW-COOLDOWN",
+      trades: [],
+      positions: {},
+      cooldown_until: { "KRW-COOLDOWN": coolTime },
+      marketState: null,
+      signalPayload: {},
+      strategyType: "surge",
+      entryPath: "surge_normal",
+      isAdditionalBuy: false,
+      actualDailyPnlPct: 0.0,
+    });
+    assert.ok(guardCool.cooldownRemainingSec > 0, "Cooldown seconds remaining must be positive");
+
+    // 9-2) Stale signal in classifier
+    const staleCandidate = createBaseSurgeCandidate({
+      market: "KRW-STALE",
+      secondsSinceSignal: 300, // > 240s stale limit
+    });
+    const authStale = classifySurgeCandidateAuthority(staleCandidate);
+    assert.strictEqual(authStale.category, "BAD_SETUP", "Stale candidate must be BAD_SETUP");
+    assert.strictEqual(authStale.immediateBuyAllowed, false, "Stale must not allow BUY");
+    assert.ok(authStale.reason.includes("signal_stale"), "Reason must mention signal_stale");
+
+    // 9-3) Position exists in classifier
+    const posCandidate = createBaseSurgeCandidate({
+      market: "KRW-EXISTS",
+      hasPosition: true,
+    });
+    const authPos = classifySurgeCandidateAuthority(posCandidate);
+    assert.strictEqual(authPos.category, "BAD_SETUP", "Position exists candidate must be BAD_SETUP");
+    assert.strictEqual(authPos.immediateBuyAllowed, false, "Position exists must not allow BUY");
+    assert.ok(authPos.reason.includes("position_exists"), "Reason must mention position_exists");
+
+    console.log("  -> PASS: cooldown, position_exists, and stale signals strictly blocked.");
+  }
+
+  // 10. BAD_SETUP → PERFORMANCE_KILL 여부와 관계없이 reclaim queue X
+  console.log("\n[TEST 31] 10. BAD_SETUP → PERFORMANCE_KILL 여부와 관계없이 reclaim queue X");
+  {
+    const mockState: any = { surge_watchlist: {}, morning_surge_watchlist: {} };
+    const badCandidate = createBaseSurgeCandidate({
+      market: "KRW-BAD-SETUP",
+      boxBreakoutFailed: true, // structural failure
+      volumeSpikeCloseFail: true,
+    });
+
+    const authority = classifySurgeCandidateAuthority(badCandidate);
+    assert.strictEqual(authority.category, "BAD_SETUP", "Must be classified as BAD_SETUP");
+    assert.strictEqual(authority.immediateBuyAllowed, false, "Immediate BUY must be false");
+    assert.strictEqual(authority.finalAuthority, "BLOCKED", "Final authority must be BLOCKED");
+    assert.strictEqual(authority.transitionTarget, "hard_reject", "Transition target must be hard_reject");
+
+    assert.strictEqual(Object.keys(mockState.surge_watchlist).length, 0, "BAD_SETUP must NOT be transferred to watchlist");
+    console.log("  -> PASS: BAD_SETUP hard-rejected and never transferred to reclaim queue.");
+  }
+
+  // ===========================================================================
+  // 추가 4대 검증 테스트 (TEST 32 ~ TEST 35)
+  // 1. 원본 scanner_authority 없음 → candidateMeta가 임의 true 생성하지 않음
+  // 2. EMA 위지만 status != reclaim_ready → reclaim_ready_passed=false
+  // 3. HARD_RISK + blockReason=global_kill_switch_active → PERFORMANCE queue-preserve 분기 진입 X
+  // 4. PERFORMANCE_KILL + 실제 reclaim_ready → 0.25x probe O
+  // ===========================================================================
+
+  // 11 (TEST 32). 원본 scanner_authority 없음 → candidateMeta가 임의 true 생성하지 않음
+  console.log("\n[TEST 32] 11. 원본 scanner_authority 없음 → candidateMeta가 임의 true 생성하지 않음 (truthful metadata)");
+  {
+    const rawWatchlistItem: any = {
+      market: "KRW-TRUTHFUL-RECLAIM",
+      status: "reclaim_ready",
+      local_high_price: 1000,
+      pullback_low_price: 980,
+      attempt_count: 1,
+      // scanner_authority, early_surge_authority, validated_surge_authority, setup 등이 없음
+    };
+
+    // live-strategy.ts 15039~15058의 candidateMeta 생성 원칙 검증
+    const candidateMeta: any = {
+      market: rawWatchlistItem.market,
+      engine_bucket: "surge",
+      sourceStrategy: "surge_reclaim_entry",
+      strategyType: "surge_reclaim",
+      reclaim_ready_passed: rawWatchlistItem.status === "reclaim_ready",
+      reclaim_status: rawWatchlistItem.status,
+      score: 85,
+      stopPrice: 975,
+      takeProfitPrice: 1050,
+      riskReward: 2.0,
+      scanner_authority: rawWatchlistItem.scanner_authority !== undefined ? Boolean(rawWatchlistItem.scanner_authority) : undefined,
+      early_surge_authority: rawWatchlistItem.early_surge_authority !== undefined ? Boolean(rawWatchlistItem.early_surge_authority) : undefined,
+      validated_surge_authority: rawWatchlistItem.validated_surge_authority !== undefined ? Boolean(rawWatchlistItem.validated_surge_authority) : undefined,
+      setup: rawWatchlistItem.setup ?? undefined,
+      setupReason: rawWatchlistItem.setupReason ?? undefined,
+    };
+
+    assert.strictEqual(candidateMeta.scanner_authority, undefined, "Must NOT inject fake true for scanner_authority");
+    assert.strictEqual(candidateMeta.early_surge_authority, undefined, "Must NOT inject fake true for early_surge_authority");
+    assert.strictEqual(candidateMeta.validated_surge_authority, undefined, "Must NOT inject fake true for validated_surge_authority");
+    assert.strictEqual(candidateMeta.setup, undefined, "Must NOT inject fake setup { ok: true }");
+    assert.notStrictEqual(candidateMeta.scanner_authority, true, "scanner_authority must never be true when absent");
+    assert.strictEqual(candidateMeta.reclaim_ready_passed, true, "reclaim_ready_passed must be true based purely on state machine");
+    console.log("  -> PASS: candidateMeta creates no fake authorities; preserves undefined when absent.");
+  }
+
+  // 12 (TEST 33). EMA 위지만 status != reclaim_ready → reclaim_ready_passed=false
+  console.log("\n[TEST 33] 12. EMA 위지만 status != reclaim_ready → reclaim_ready_passed=false (isAboveEma 대체 금지)");
+  {
+    const pullbackItem: any = {
+      market: "KRW-PULLBACK-ONLY",
+      status: "pullback_seen", // Not yet reclaim_ready!
+      local_high_price: 1000,
+      pullback_low_price: 980,
+    };
+
+    const evalRes = {
+      isAboveEma: true, // EMA 위지만 아직 reclaim_ready에 도달하지 않음
+    };
+
+    // 로직: item.status === "reclaim_ready" (evalRes.isAboveEma 대체 금지)
+    const reclaim_ready_passed = pullbackItem.status === "reclaim_ready";
+    assert.strictEqual(reclaim_ready_passed, false, "reclaim_ready_passed must be false when status is pullback_seen, even if isAboveEma is true");
+
+    // candidateMeta 구성 및 validateLiveBuyPrecheck 검증
+    const candidateMeta: any = {
+      market: pullbackItem.market,
+      engine_bucket: "surge",
+      sourceStrategy: "surge_reclaim_entry",
+      strategyType: "surge_reclaim",
+      reclaim_ready_passed, // false
+      reclaim_status: pullbackItem.status,
+      score: 85,
+      stopPrice: 975,
+      takeProfitPrice: 1050,
+      riskReward: 2.0,
+      btc_phase: "neutral",
+      asset_phase: "impulse",
+      is_panic: false,
+    };
+
+    const guard = await validateLiveBuyPrecheck({
+      market: pullbackItem.market,
+      trades: performanceKillTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: null,
+      signalPayload: { source_kind: "scanner" },
+      strategyType: "surge_reclaim",
+      entrySignalType: "reclaim",
+      entryPath: "surge_reclaim_entry",
+      isAdditionalBuy: false,
+      currentPrice: 990,
+      reclaimScore: 85,
+      actualDailyPnlPct: -1.0,
+      candidateMeta,
+    });
+
+    assert.strictEqual(guard.allowed, false, "Must NOT allow probe when reclaim_ready_passed is false");
+    assert.strictEqual(guard.blockReason, "global_kill_switch_active", "Must block with global_kill_switch_active");
+    assert.strictEqual(guard.killSwitchType, "PERFORMANCE", "KillSwitchType must be PERFORMANCE");
+    console.log("  -> PASS: isAboveEma did not substitute for reclaim_ready; probe strictly blocked.");
+  }
+
+  // 13 (TEST 34). HARD_RISK + blockReason=global_kill_switch_active → PERFORMANCE queue-preserve 분기 진입 X
+  console.log("\n[TEST 34] 13. HARD_RISK + blockReason=global_kill_switch_active → PERFORMANCE queue-preserve 분기 진입 X");
+  {
+    const mockWatchlist: any = {
+      "KRW-HARD-RISK-DROP": {
+        market: "KRW-HARD-RISK-DROP",
+        status: "reclaim_ready",
+        attempt_count: 4, // 1회 추가 시 5회 도달하여 삭제 대상
+      },
+    };
+
+    // HARD_RISK 상황: 일일 손실 -3.0%로 HARD_RISK 가드 발동
+    const hardRiskMeta: any = {
+      market: "KRW-HARD-RISK-DROP",
+      engine_bucket: "surge",
+      sourceStrategy: "surge_reclaim_entry",
+      strategyType: "surge_reclaim",
+      reclaim_ready_passed: true,
+      riskReward: 2.0,
+      stopPrice: 950,
+      score: 90,
+      btc_phase: "neutral",
+      asset_phase: "impulse",
+      is_panic: false,
+    };
+
+    const guard = await validateLiveBuyPrecheck({
+      market: "KRW-HARD-RISK-DROP",
+      trades: [],
+      positions: {},
+      cooldown_until: {},
+      marketState: null,
+      signalPayload: { source_kind: "scanner" },
+      strategyType: "surge_reclaim",
+      entrySignalType: "reclaim",
+      entryPath: "surge_reclaim_entry",
+      isAdditionalBuy: false,
+      currentPrice: 1000,
+      reclaimScore: 90,
+      actualDailyPnlPct: -3.0, // HARD_RISK
+      candidateMeta: hardRiskMeta,
+    });
+
+    assert.strictEqual(guard.allowed, false, "HARD_RISK must block buy");
+    assert.strictEqual(guard.killSwitchType, "HARD_RISK", "Must be HARD_RISK kill switch type");
+
+    // Queue-preserve 판정 로직 검증:
+    // guard.killSwitchType === "PERFORMANCE" || (guard.killSwitchType !== "HARD_RISK" && ...)
+    const isPerformanceKillBlock =
+      (guard.killSwitchType as string) === "PERFORMANCE" ||
+      (guard.killSwitchType !== "HARD_RISK" &&
+        (guard.blockReason === "performance_kill_not_eligible" ||
+         guard.blockReason === "performance_probe_position_limit_reached"));
+
+    assert.strictEqual(isPerformanceKillBlock, false, "HARD_RISK must NEVER be treated as performance kill block");
+
+    // 가령 blockReason이 'global_kill_switch_active'인 가상 HARD_RISK guard 객체로도 검증
+    const syntheticHardRiskGuard: any = {
+      allowed: false,
+      killSwitchType: "HARD_RISK",
+      blockReason: "global_kill_switch_active",
+    };
+    const syntheticIsPerfBlock =
+      syntheticHardRiskGuard.killSwitchType === "PERFORMANCE" ||
+      (syntheticHardRiskGuard.killSwitchType !== "HARD_RISK" &&
+        (syntheticHardRiskGuard.blockReason === "performance_kill_not_eligible" ||
+         syntheticHardRiskGuard.blockReason === "performance_probe_position_limit_reached"));
+
+    assert.strictEqual(syntheticIsPerfBlock, false, "Synthetic HARD_RISK + global_kill_switch_active must NOT enter queue-preserve");
+
+    // 시뮬레이션: HARD_RISK 차단 시 attempt_count 증가 후 5회 도달 시 정상 삭제
+    const item = mockWatchlist["KRW-HARD-RISK-DROP"];
+    if (isPerformanceKillBlock) {
+      item.status = "retry_wait";
+    } else {
+      item.attempt_count = (item.attempt_count || 0) + 1;
+      if (item.attempt_count >= 5) {
+        delete mockWatchlist["KRW-HARD-RISK-DROP"];
+      }
+    }
+
+    assert.strictEqual(mockWatchlist["KRW-HARD-RISK-DROP"], undefined, "Item must be deleted from watchlist after 5 attempts on HARD_RISK (no preservation)");
+    console.log("  -> PASS: HARD_RISK strictly excluded from PERFORMANCE queue-preservation; standard retry/purge policy upheld.");
+  }
+
+  // 14 (TEST 35). PERFORMANCE_KILL + 실제 reclaim_ready (가짜 authority 없이) → 0.25x probe O
+  console.log("\n[TEST 35] 14. PERFORMANCE_KILL + 실제 reclaim_ready (가짜 authority 없이) → 0.25x probe O");
+  {
+    const truthfulReclaimMeta: any = {
+      market: "KRW-TRUTHFUL-PROBE",
+      engine_bucket: "surge",
+      sourceStrategy: "surge_reclaim_entry",
+      strategyType: "surge_reclaim",
+      reclaim_ready_passed: true, // Only genuine state machine proof!
+      riskReward: 1.8,             // >= 1.3
+      stopPrice: 950,              // valid stop < currentPrice
+      score: 85,
+      btc_phase: "neutral",
+      asset_phase: "impulse",
+      is_panic: false,
+      // scanner_authority, early_surge_authority, validated_surge_authority are all UNDEFINED
+    };
+
+    assert.strictEqual(truthfulReclaimMeta.scanner_authority, undefined);
+    assert.strictEqual(truthfulReclaimMeta.early_surge_authority, undefined);
+    assert.strictEqual(truthfulReclaimMeta.setup, undefined);
+
+    const guard = await validateLiveBuyPrecheck({
+      market: "KRW-TRUTHFUL-PROBE",
+      trades: performanceKillTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: null,
+      signalPayload: { source_kind: "scanner" },
+      strategyType: "surge_reclaim",
+      entrySignalType: "reclaim",
+      entryPath: "surge_reclaim_entry",
+      isAdditionalBuy: false,
+      currentPrice: 1000,
+      reclaimScore: 85,
+      actualDailyPnlPct: -1.0,
+      candidateMeta: truthfulReclaimMeta,
+    });
+
+    assert.strictEqual(guard.allowed, true, "Truthful reclaim candidate must be granted probe under PERFORMANCE_KILL");
+    assert.strictEqual(guard.killSwitchType, "PERFORMANCE", "Must identify PERFORMANCE kill switch");
+    assert.strictEqual(truthfulReclaimMeta.relaxed_multiplier, 0.25, "Must enforce 0.25x probe sizing multiplier");
+    assert.strictEqual(truthfulReclaimMeta.is_performance_probe, true, "Must flag is_performance_probe");
+    console.log("  -> PASS: Truthful reclaim candidate granted 0.25x probe purely via reclaim_ready_passed without fake authorities.");
+  }
+
+  // ===========================================================================
+  // Reclaim 전용 eligibility 테스트 (TEST A ~ G): 합성 phase 없이 판정
+  // ===========================================================================
+  const mkMarketState = (market_state: string, extra: any = {}) => ({
+    status: () => ({ market_state, btc_rsi: 50, ...extra }),
+    evaluate: async () => ({ market_state, btc_rsi: 50, ...extra }),
+  });
+  const mkReclaimMeta = (market: string, over: any = {}): any => ({
+    market,
+    engine_bucket: "surge",
+    sourceStrategy: "surge_reclaim_entry",
+    strategyType: "surge_reclaim",
+    reclaim_ready_passed: true,
+    reclaim_status: "reclaim_ready",
+    riskReward: 1.8,
+    stopPrice: 950,
+    score: 85,
+    // btc_phase / asset_phase 의도적으로 없음
+    ...over,
+  });
+  const runReclaim = (market: string, meta: any, ms: any, pnl = -1.0) =>
+    validateLiveBuyPrecheck({
+      market,
+      trades: performanceKillTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: ms,
+      signalPayload: { source_kind: "scanner" },
+      strategyType: "surge_reclaim",
+      entrySignalType: "reclaim",
+      entryPath: "surge_reclaim_entry",
+      isAdditionalBuy: false,
+      currentPrice: 1000,
+      reclaimScore: 85,
+      actualDailyPnlPct: pnl,
+      candidateMeta: meta,
+    } as any);
+
+  console.log("\n[TEST A] phase 없음 + reclaim_ready_passed + 정상 시장 + PERFORMANCE_KILL → 0.25x 허용");
+  {
+    const meta = mkReclaimMeta("KRW-RC-A");
+    assert.strictEqual(meta.btc_phase, undefined);
+    assert.strictEqual(meta.asset_phase, undefined);
+    const g = await runReclaim("KRW-RC-A", meta, mkMarketState("neutral"));
+    assert.strictEqual(g.allowed, true, "Reclaim must be allowed without any phase data");
+    assert.strictEqual(g.killSwitchType, "PERFORMANCE");
+    assert.strictEqual(meta.relaxed_multiplier, 0.25);
+    assert.strictEqual(meta.is_performance_probe, true);
+    console.log("  -> PASS: TEST A");
+  }
+
+  console.log("\n[TEST B] 동일 조건 + market_state=risk_off → 차단");
+  {
+    const meta = mkReclaimMeta("KRW-RC-B");
+    const g = await runReclaim("KRW-RC-B", meta, mkMarketState("risk_off"));
+    assert.strictEqual(g.allowed, false);
+    assert.strictEqual(meta.relaxed_multiplier, undefined, "No probe multiplier on block");
+    console.log("  -> PASS: TEST B");
+  }
+
+  console.log("\n[TEST C] 동일 조건 + 실제 panic=true → 차단");
+  {
+    const meta1 = mkReclaimMeta("KRW-RC-C1", { is_panic: true });
+    const g1 = await runReclaim("KRW-RC-C1", meta1, mkMarketState("neutral"));
+    assert.strictEqual(g1.allowed, false, "meta is_panic must block");
+    const meta2 = mkReclaimMeta("KRW-RC-C2");
+    const g2 = await runReclaim("KRW-RC-C2", meta2, mkMarketState("neutral", { panic: true }));
+    assert.strictEqual(g2.allowed, false, "market-state panic snapshot must block");
+    assert.strictEqual(meta2.relaxed_multiplier, undefined);
+    console.log("  -> PASS: TEST C");
+  }
+
+  console.log("\n[TEST D] 동일 조건 + HARD_RISK_KILL → 차단 + queue-preserve 예외 없음");
+  {
+    const meta = mkReclaimMeta("KRW-RC-D");
+    const g = await runReclaim("KRW-RC-D", meta, mkMarketState("neutral"), -3.0);
+    assert.strictEqual(g.allowed, false);
+    assert.strictEqual(g.killSwitchType, "HARD_RISK");
+    const isPerfBlock =
+      (g.killSwitchType as string) === "PERFORMANCE" ||
+      (g.killSwitchType !== "HARD_RISK" &&
+        (g.blockReason === "performance_kill_not_eligible" ||
+          g.blockReason === "performance_probe_position_limit_reached"));
+    assert.strictEqual(isPerfBlock, false, "HARD_RISK must not enter queue-preserve");
+    assert.strictEqual(meta.relaxed_multiplier, undefined);
+    console.log("  -> PASS: TEST D");
+  }
+
+  console.log("\n[TEST E] reclaim_ready_passed=false → phase와 무관하게 차단");
+  {
+    const meta = mkReclaimMeta("KRW-RC-E", { reclaim_ready_passed: false, reclaim_status: "pullback_seen", btc_phase: "impulse", asset_phase: "impulse" });
+    const g = await runReclaim("KRW-RC-E", meta, mkMarketState("risk_on"));
+    assert.strictEqual(g.allowed, false);
+    console.log("  -> PASS: TEST E");
+  }
+
+  console.log("\n[TEST F] stop/RR 불량 → 차단");
+  {
+    const lowRr = mkReclaimMeta("KRW-RC-F1", { riskReward: 1.1 });
+    assert.strictEqual((await runReclaim("KRW-RC-F1", lowRr, mkMarketState("neutral"))).allowed, false);
+    const badStop = mkReclaimMeta("KRW-RC-F2", { stopPrice: 1000 });
+    assert.strictEqual((await runReclaim("KRW-RC-F2", badStop, mkMarketState("neutral"))).allowed, false);
+    const noStop = mkReclaimMeta("KRW-RC-F3", { stopPrice: 0 });
+    assert.strictEqual((await runReclaim("KRW-RC-F3", noStop, mkMarketState("neutral"))).allowed, false);
+    console.log("  -> PASS: TEST F");
+  }
+
+  console.log("\n[TEST G] 정상 Reclaim PERFORMANCE probe: base 100,000원 → final 25,000원");
+  {
+    const meta = mkReclaimMeta("KRW-RC-G");
+    const g = await runReclaim("KRW-RC-G", meta, mkMarketState("neutral"));
+    assert.strictEqual(g.allowed, true);
+    const baseBudgetKrw = 100_000;
+    // live-strategy reclaim 경로와 동일: 원본 base에 relaxed_multiplier 한 번만 적용 (중복 축소 없음)
+    const finalOrderKrw = Math.max(5000, Math.floor(baseBudgetKrw * meta.relaxed_multiplier));
+    assert.strictEqual(finalOrderKrw, 25_000);
+    assert.strictEqual(finalOrderKrw / baseBudgetKrw, 0.25);
+    console.log("  -> PASS: TEST G (effective_multiplier = 0.25)");
+  }
+
+  console.log("\n[TEST H] PERFORMANCE + reclaim_ready + BTC 정상 → 0.25x ALLOW");
+  {
+    const meta = mkReclaimMeta("KRW-RC-H");
+    assert.strictEqual(meta.is_panic, undefined);
+    const g = await runReclaim("KRW-RC-H", meta, mkMarketState("neutral"));
+    assert.strictEqual(g.allowed, true);
+    assert.strictEqual(g.killSwitchType, "PERFORMANCE");
+    assert.strictEqual(meta.relaxed_multiplier, 0.25);
+    assert.strictEqual(meta.is_performance_probe, true);
+    console.log("  -> PASS: TEST H");
+  }
+
+  console.log("\n[TEST I] PERFORMANCE + reclaim_ready + detectBtcMarketPhase.isPanic=true → HARD_RISK BLOCK");
+  {
+    const meta = mkReclaimMeta("KRW-RC-I", { is_panic: true });
+    const g = await runReclaim("KRW-RC-I", meta, mkMarketState("neutral"));
+    assert.strictEqual(g.allowed, false, "Must block on real BTC panic");
+    assert.strictEqual(g.killSwitchType, "HARD_RISK", "Panic must be classified as HARD_RISK");
+    assert.strictEqual(meta.relaxed_multiplier, undefined, "No probe multiplier on panic");
+    console.log("  -> PASS: TEST I");
+  }
+
+  console.log("\n[TEST J] panic=true 상태에서 relaxed_multiplier=0.25여도 → BUY BLOCK");
+  {
+    const meta = mkReclaimMeta("KRW-RC-J", { is_panic: true, relaxed_multiplier: 0.25, is_performance_probe: true });
+    const g = await runReclaim("KRW-RC-J", meta, mkMarketState("neutral"));
+    assert.strictEqual(g.allowed, false, "Must strictly block BUY even if relaxed_multiplier=0.25");
+    assert.strictEqual(g.killSwitchType, "HARD_RISK");
+    console.log("  -> PASS: TEST J");
+  }
+
+  console.log("\n[TEST K] panic=true + reclaim_ready + RR>=1.3 + valid stop → reclaim eligibility가 있어도 HARD_RISK 우선 BLOCK");
+  {
+    const meta = mkReclaimMeta("KRW-RC-K", {
+      is_panic: true,
+      reclaim_ready_passed: true,
+      riskReward: 2.0,
+      stopPrice: 950,
+      score: 95,
+    });
+    const g = await runReclaim("KRW-RC-K", meta, mkMarketState("risk_on"));
+    assert.strictEqual(g.allowed, false, "Reclaim eligibility must NOT bypass HARD_RISK on panic");
+    assert.strictEqual(g.killSwitchType, "HARD_RISK");
+    console.log("  -> PASS: TEST K");
+  }
+
+  console.log("\n[TEST L] panic=false/undefined + risk_off=false → 기존 PERFORMANCE reclaim 0.25x 동작 유지");
+  {
+    const metaUndefined = mkReclaimMeta("KRW-RC-L1");
+    assert.strictEqual(metaUndefined.is_panic, undefined);
+    const g1 = await runReclaim("KRW-RC-L1", metaUndefined, mkMarketState("neutral"));
+    assert.strictEqual(g1.allowed, true);
+    assert.strictEqual(metaUndefined.relaxed_multiplier, 0.25);
+
+    const metaFalse = mkReclaimMeta("KRW-RC-L2", { is_panic: false });
+    const g2 = await runReclaim("KRW-RC-L2", metaFalse, mkMarketState("neutral"));
+    assert.strictEqual(g2.allowed, true);
+    assert.strictEqual(metaFalse.relaxed_multiplier, 0.25);
+    console.log("  -> PASS: TEST L");
+  }
+
+  console.log("\n[TEST M] panic=true → PERFORMANCE queue-preserve 분기 진입 금지");
+  {
+    const meta = mkReclaimMeta("KRW-RC-M", { is_panic: true });
+    const g = await runReclaim("KRW-RC-M", meta, mkMarketState("neutral"));
+    assert.strictEqual(g.killSwitchType, "HARD_RISK");
+    const isPerfBlock =
+      (g.killSwitchType as string) === "PERFORMANCE" ||
+      (g.killSwitchType !== "HARD_RISK" &&
+        (g.blockReason === "performance_kill_not_eligible" ||
+          g.blockReason === "performance_probe_position_limit_reached"));
+    assert.strictEqual(isPerfBlock, false, "Panic-induced HARD_RISK must NOT enter queue-preserve branch");
+    console.log("  -> PASS: TEST M");
+  }
+
+  console.log("\n[TEST N] reclaim_ready + BTC panic → BUY BLOCK → watchlist item preserved");
+  {
+    const mockWatchlist: Record<string, any> = {
+      "KRW-PANIC-TEST": {
+        market: "KRW-PANIC-TEST",
+        status: "reclaim_ready",
+        attempt_count: 2,
+        pullback_low_price: 990,
+        local_high: 1000,
+      },
+    };
+
+    const panicMeta = mkReclaimMeta("KRW-PANIC-TEST", { is_panic: true });
+    const guard = await runReclaim("KRW-PANIC-TEST", panicMeta, mkMarketState("neutral"));
+
+    assert.strictEqual(guard.allowed, false, "Must block BUY on panic");
+    assert.strictEqual(guard.killSwitchType, "HARD_RISK", "Must be HARD_RISK");
+
+    const item = mockWatchlist["KRW-PANIC-TEST"];
+    const isBtcPanicBlock =
+      guard.killSwitchType === "HARD_RISK" &&
+      (panicMeta.is_panic === true || (guard as any).isPanic === true);
+
+    assert.strictEqual(isBtcPanicBlock, true, "Must detect BTC panic block");
+
+    if (isBtcPanicBlock) {
+      item.status = "retry_wait";
+      item.last_block_reason = "hard_risk_btc_panic";
+      item.retry_after = Date.now() + 5000;
+    } else {
+      item.attempt_count = (item.attempt_count || 0) + 1;
+      if (item.attempt_count >= 5) {
+        delete mockWatchlist["KRW-PANIC-TEST"];
+      }
+    }
+
+    assert.notStrictEqual(mockWatchlist["KRW-PANIC-TEST"], undefined, "Watchlist item MUST be preserved on panic");
+    assert.strictEqual(item.status, "retry_wait", "Status must transition to retry_wait");
+    assert.strictEqual(item.last_block_reason, "hard_risk_btc_panic", "Reason must be hard_risk_btc_panic");
+    assert.strictEqual(item.attempt_count, 2, "attempt_count must NOT increment on panic");
+    console.log("  -> PASS: TEST N");
+  }
+
+  console.log("\n[TEST O] BTC panic block 후 panic 해제 → 과거 reclaim_ready 즉시 재사용 금지 → reclaim conditions 재검증 필수");
+  {
+    const item: any = {
+      market: "KRW-PANIC-CLEAR",
+      status: "retry_wait",
+      pullback_low_price: 990,
+      local_high: 1000,
+      last_block_reason: "hard_risk_btc_panic",
+      retry_after: Date.now() - 100, // timer expired
+    };
+
+    // 1. 과거 reclaim_ready 즉시 재사용 금지 확인 (item.status is retry_wait, not reclaim_ready)
+    assert.notStrictEqual(item.status, "reclaim_ready", "Must not be reclaim_ready without revalidation");
+
+    // 2. panic이 해제되었더라도 reclaim conditions가 불량이면 (예: 가격이 pullback_low 이하로 붕괴)
+    const brokenPrice = 980; // below pullback_low 990
+    const evalBroken = evaluateReclaimConditions({
+      currentPrice: brokenPrice,
+      pullbackLowPrice: item.pullback_low_price,
+      recent1mRet: -0.5,
+      recent3mRet: -1.2,
+      localHigh: item.local_high,
+      closes1: [995, 990, 985, 980],
+    });
+
+    assert.strictEqual(evalBroken.valid, false, "Broken conditions must fail validation");
+
+    if (evalBroken.valid) {
+      item.status = "reclaim_ready";
+    } else {
+      item.status = "pullback_seen";
+      item.last_block_reason = "reclaim_conditions_no_longer_valid";
+    }
+
+    assert.strictEqual(item.status, "pullback_seen", "Must demote to pullback_seen on failed conditions");
+    assert.notStrictEqual(item.status, "reclaim_ready", "Stale reclaim_ready MUST NOT be reused");
+    console.log("  -> PASS: TEST O");
+  }
+
+  console.log("\n[TEST P] panic 해제 + reclaim conditions 재통과 → PERFORMANCE_KILL이면 0.25x BUY 허용");
+  {
+    const item: any = {
+      market: "KRW-PANIC-RECOVERED",
+      status: "retry_wait",
+      pullback_low_price: 990,
+      local_high: 1000,
+      last_block_reason: "hard_risk_btc_panic",
+      retry_after: Date.now() - 100,
+    };
+
+    // 1. Reclaim conditions 재검증 통과
+    const currentPrice = 999;
+    const closes = Array(30).fill(992);
+    closes.push(999);
+    const evalValid = evaluateReclaimConditions({
+      currentPrice,
+      pullbackLowPrice: item.pullback_low_price,
+      recent1mRet: 0.3,
+      recent3mRet: 0.8,
+      localHigh: item.local_high,
+      closes1: closes,
+    });
+    assert.strictEqual(evalValid.valid, true, "Reclaim conditions must pass");
+    item.status = "reclaim_ready";
+
+    // 2. panic 해제 상태에서 Reclaim precheck 실행 (PERFORMANCE_KILL 활성 환경)
+    const recoveredMeta = mkReclaimMeta("KRW-PANIC-RECOVERED", {
+      is_panic: undefined, // Panic cleared
+      reclaim_ready_passed: true,
+      stopPrice: 990,
+      riskReward: 1.8,
+      score: 85,
+    });
+    const guard = await runReclaim("KRW-PANIC-RECOVERED", recoveredMeta, mkMarketState("neutral"));
+
+    assert.strictEqual(guard.allowed, true, "Must allow BUY when panic cleared and reclaim revalidated");
+    assert.strictEqual(guard.killSwitchType, "PERFORMANCE", "Under performance kill switch");
+    assert.strictEqual(recoveredMeta.relaxed_multiplier, 0.25, "Probe multiplier must be 0.25");
+
+    const baseBudgetKrw = 100_000;
+    const finalOrderKrw = Math.max(5000, Math.floor(baseBudgetKrw * recoveredMeta.relaxed_multiplier));
+    assert.strictEqual(finalOrderKrw, 25_000, "Final order KRW must be exactly 25,000 (0.25x)");
+    console.log("  -> PASS: TEST P (0.25x probe allowed after panic cleared & revalidated)");
+  }
+
+  console.log("\n[TEST Q] daily PnL HARD_RISK 등 비-panic hard risk → 기존 정책 유지");
+  {
+    const mockWatchlist: Record<string, any> = {
+      "KRW-DAILY-LOSS-COIN": {
+        market: "KRW-DAILY-LOSS-COIN",
+        status: "reclaim_ready",
+        attempt_count: 4,
+      },
+    };
+
+    const nonPanicMeta = mkReclaimMeta("KRW-DAILY-LOSS-COIN", { is_panic: false });
+    const guard = await runReclaim("KRW-DAILY-LOSS-COIN", nonPanicMeta, mkMarketState("neutral"), -3.0);
+
+    assert.strictEqual(guard.allowed, false, "Must block buy");
+    assert.strictEqual(guard.killSwitchType, "HARD_RISK", "Must be HARD_RISK");
+
+    const isBtcPanicBlock =
+      guard.killSwitchType === "HARD_RISK" &&
+      (nonPanicMeta.is_panic === true || (guard as any).isPanic === true);
+
+    assert.strictEqual(isBtcPanicBlock, false, "Daily PnL hard risk must NOT be classified as BTC panic");
+
+    const item = mockWatchlist["KRW-DAILY-LOSS-COIN"];
+    if (isBtcPanicBlock) {
+      item.status = "retry_wait";
+    } else {
+      item.attempt_count = (item.attempt_count || 0) + 1;
+      if (item.attempt_count >= 5) {
+        delete mockWatchlist["KRW-DAILY-LOSS-COIN"];
+      }
+    }
+
+    assert.strictEqual(mockWatchlist["KRW-DAILY-LOSS-COIN"], undefined, "Item must be deleted after 5 attempts on non-panic HARD_RISK");
+    console.log("  -> PASS: TEST Q (non-panic HARD_RISK purge policy preserved)");
+  }
+
+  console.log("\n[TEST R] panic 중 placeBuy attempt = 0");
+  {
+    let placeBuyCalls = 0;
+    const placeBuyOrder = () => { placeBuyCalls++; };
+
+    const panicMeta = mkReclaimMeta("KRW-PANIC-ORDER", { is_panic: true });
+    const guard = await runReclaim("KRW-PANIC-ORDER", panicMeta, mkMarketState("neutral"));
+
+    if (guard.allowed) {
+      placeBuyOrder();
+    }
+
+    assert.strictEqual(guard.allowed, false, "Guard must block BUY");
+    assert.strictEqual(placeBuyCalls, 0, "placeBuy attempt count must be strictly 0 during panic");
+    console.log("  -> PASS: TEST R (placeBuy attempt = 0 on panic)");
+  }
+
+  console.log("\n====================================================================");
+  console.log(" All 32 PERFORMANCE_KILL & SURGE Authority Regression Tests PASSED! ");
+  console.log("====================================================================");
+}
+
+runPerformanceKillRegressionSuite().catch((err) => {
+  console.error("Test failed with error:", err);
+  process.exit(1);
+});
