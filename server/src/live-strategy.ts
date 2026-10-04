@@ -435,6 +435,8 @@ type StrategyPosition = {
   stochD?: number;
   volumeRatio?: number;
   is_relaxed_probe?: boolean;
+  is_performance_probe?: boolean;
+  is_recovery_probe?: boolean;
   softened_reasons?: string[];
   // Rescue Add (Pre-Stop Average Down)
   rescue_add_count?: number;
@@ -666,6 +668,9 @@ type CandidateMeta = {
   is_major_impulse?: boolean;
   is_recovery_probe?: boolean;
   is_performance_probe?: boolean;
+  scanner_authority?: boolean;
+  early_surge_authority?: boolean;
+  validated_surge_authority?: boolean;
 };
 
 type SurgeEntrySetupResult = {
@@ -692,6 +697,7 @@ type SurgeEntrySetupResult = {
   impulse_phase?: string;
   impulse_memory?: SurgeImpulseMemoryResult;
   early_surge_authority?: boolean;
+  scanner_authority?: boolean;
 };
 
 type PaperSurgePatternStats = {
@@ -2298,7 +2304,10 @@ export function evaluateGlobalKillSwitch(
   const latestTradeTimeMs = allPositions.reduce((max, p) => Math.max(max, p.tradeTimeMs), 0);
   const latestTradeAgeHours = latestTradeTimeMs > 0 ? (nowMs - latestTradeTimeMs) / (3600 * 1000) : null;
 
-  const totalPnlPct = recentWindowPositions.reduce((acc, p) => acc + (Number.isFinite(p.totalPnlPct) ? p.totalPnlPct : 0), 0);
+  const hasInvalidPnl = recentWindowPositions.some((p) => !Number.isFinite(p.totalPnlPct));
+  const totalPnlPct = hasInvalidPnl
+    ? NaN
+    : recentWindowPositions.reduce((acc, p) => acc + (Number.isFinite(p.totalPnlPct) ? p.totalPnlPct : 0), 0);
   const wins = recentWindowPositions.filter((p) => p.hasKrw ? p.totalPnlKrw > 0 : p.totalPnlPct > 0).length;
   const winRate = recentWindowPositions.length > 0 ? wins / recentWindowPositions.length : null;
   const losses24h = recent24hPositions.filter((p) => p.hasKrw ? p.totalPnlKrw < 0 : p.totalPnlPct < 0).length;
@@ -2308,10 +2317,10 @@ export function evaluateGlobalKillSwitch(
   const hardRiskReasons: string[] = [];
   const performanceReasons: string[] = [];
 
-  // 1. 누적 심각한 손실 가드 (HARD_RISK): 최근 48시간 내 3건 이상 거래가 있고 누적 PnL <= -5.0%일 때 발동 (임계값 절대 변경 금지)
+  // 1. 누적 심각한 손실 가드 (PERFORMANCE): 최근 48시간 내 3건 이상 거래가 있고 누적 PnL <= -5.0%일 때 발동 (임계값 절대 변경 금지)
   if (recentWindowPositions.length >= 3 && Number.isFinite(totalPnlPct) && totalPnlPct <= -5.0) {
-    hardRiskActive = true;
-    hardRiskReasons.push(`Cumulative PnL under -5% in recent 48h (${recentWindowPositions.length} trades, ${totalPnlPct.toFixed(2)}%)`);
+    performanceKillActive = true;
+    performanceReasons.push(`Cumulative PnL under -5% in recent 48h (${recentWindowPositions.length} trades, ${totalPnlPct.toFixed(2)}%)`);
   }
 
   // 2. 승률 가드 (PERFORMANCE): 최근 48시간 내 5건 이상 거래가 있고 승률 < 20%일 때 발동 (임계값 절대 변경 금지)
@@ -3012,21 +3021,94 @@ async function _validateLiveBuyPrecheckInternal(params: {
       return result;
     }
 
-    // 2. PERFORMANCE_KILL CHECK (최근 손실/승률 악화 - STRONG CORE에 한해 25% probe 허용)
+    // 2. PERFORMANCE_KILL CHECK (최근 손실/승률 악화 - STRONG CORE 및 STRONG SURGE에 한해 25% probe 허용)
     const isDailyLossCountLimit = result.dailyLossCount >= 5;
     const isPerformanceKillActive = killSwitch.performance_kill_active || isDailyLossCountLimit;
     if (isPerformanceKillActive) {
-      // Recovery Probe Position Limit (동시 최대 1개)
+      // Recovery Probe Position Limit (동시 PERFORMANCE recovery probe 최대 1개)
+      // passive holdings는 probe slot으로 계산하지 않도록 managed/probe 메타데이터 확인
+      const isProbePosition = (m: string, pos: any): boolean => {
+        if (!pos) return false;
+        const qty = Number(pos.remaining_qty ?? pos.qty ?? 0);
+        if (qty <= 0) return false;
+        if (pos.managed === false || pos.entry_origin === "passive" || pos.entry_origin === "external") {
+          return false;
+        }
+        if (pos.is_performance_probe === true || pos.is_recovery_probe === true || pos.is_relaxed_probe === true) {
+          return true;
+        }
+        if (m === "KRW-BTC" || m === "KRW-ETH") {
+          return true;
+        }
+        if (pos.engine_bucket === "surge" && (pos.relaxed_multiplier === 0.25 || pos.is_performance_probe === true || pos.is_recovery_probe === true)) {
+          return true;
+        }
+        return false;
+      };
+
       const currentOpenPositions = Object.keys(params.positions || {}).filter((m) => (params.positions[m]?.qty ?? 0) > 0);
-      const openMajorPositionsCount = currentOpenPositions.filter((m) => m === "KRW-BTC" || m === "KRW-ETH").length;
-      const isPositionLimitReached = openMajorPositionsCount >= 1;
+      const openPerformanceProbesCount = currentOpenPositions.filter((m) => isProbePosition(m, params.positions[m])).length;
+      const isPositionLimitReached = openPerformanceProbesCount >= 1;
 
-      // Phase Safety Check (고점 과열/추격 방지: impulse 또는 continuation만 허용, exhaustion/retrace 차단)
-      const isPhaseSafe = (btcPhase === "impulse" || btcPhase === "continuation") &&
-                          assetPhase !== "exhaustion" &&
-                          assetPhase !== "retrace";
+      // CORE Phase Safety Check (고점 과열/추격 방지: impulse 또는 continuation만 허용, exhaustion/retrace 차단 - 기존 로직 100% 보존)
+      const isCorePhaseSafe = (btcPhase === "impulse" || btcPhase === "continuation") &&
+                              assetPhase !== "exhaustion" &&
+                              assetPhase !== "retrace";
 
+      // SURGE Phase Safety Check:
+      // BTC neutral 허용, 단 BTC panic 금지. asset phase는 impulse/expansion 계열 허용, exhaustion/retrace/dead_bounce 금지
+      const isSurgePhaseSafe =
+        !isPanic &&
+        btcPhase !== "panic" &&
+        (assetPhase === "impulse" || assetPhase === "expansion" || assetPhase === "continuation" || assetPhase === "ignition" ||
+         cMeta?.surge_shadow_setup?.impulse_phase === "EXPANSION" || cMeta?.surge_shadow_setup?.impulse_phase === "CONTINUATION" || cMeta?.surge_shadow_setup?.impulse_phase === "IGNITION") &&
+        assetPhase !== "exhaustion" &&
+        assetPhase !== "retrace" &&
+        assetPhase !== "dead_bounce";
+
+      const isPhaseSafe = isCorePhaseSafe; // 기존 하위 호환용
+
+      // 1) Strong CORE 판정 (기존 로직 100% 보존)
       const isStrongCore = (isMajorImpulse || isCoreStrictAuthority) && score >= 90;
+
+      // 2) Strong SURGE 판정 (실제 candidateMeta authority 필드 기반)
+      const isSurgeBucket = cMeta?.engine_bucket === "surge";
+      const isSurgeScoreOk = score >= 90;
+      const isSurgeSetupOk = cMeta?.setup?.ok === true;
+      const surgeReason = String(cMeta?.setup?.reason ?? cMeta?.setupReason ?? cMeta?.surge_shadow_setup?.reason ?? "");
+      const isSurgeV2Authority =
+        surgeReason === "surge_v2_entry_path" ||
+        surgeReason === "surge_setup_passed" ||
+        surgeReason.startsWith("surge_v2") ||
+        cMeta?.surge_shadow_setup?.reason === "surge_setup_passed" ||
+        cMeta?.sourceStrategy === "surge_reclaim_entry";
+
+      const hasScannerAuthority = Boolean(
+        cMeta?.scanner_authority === true ||
+        cMeta?.surge_shadow_setup?.scanner_authority === true ||
+        (cMeta?.surge_shadow_setup as any)?.earlyContract?.approved === true ||
+        (cMeta?.surge_shadow_setup as any)?.early_contract_approved === true
+      );
+
+      const hasEarlySurgeAuthority = Boolean(
+        cMeta?.early_surge_authority === true ||
+        cMeta?.surge_shadow_setup?.early_surge_authority === true ||
+        cMeta?.validated_surge_authority === true
+      );
+
+      const isStrongSurge =
+        isSurgeBucket &&
+        isSurgeScoreOk &&
+        isSurgeSetupOk &&
+        isSurgeV2Authority &&
+        hasScannerAuthority &&
+        hasEarlySurgeAuthority &&
+        !isPanic;
+
+      const isCoreEligible = isStrongCore && isCorePhaseSafe && !isPositionLimitReached;
+      const isSurgeEligible = isStrongSurge && isSurgePhaseSafe && !isPositionLimitReached;
+      const finalEligibility = isCoreEligible || isSurgeEligible;
+      const probeKind: "CORE" | "SURGE" | null = isCoreEligible ? "CORE" : (isSurgeEligible ? "SURGE" : null);
 
       console.info(
         JSON.stringify({
@@ -3040,6 +3122,15 @@ async function _validateLiveBuyPrecheckInternal(params: {
           panic: isPanic,
           original_kill_reason: killSwitch.reason,
           is_strong_core: isStrongCore,
+          is_strong_surge: isStrongSurge,
+          is_core_phase_safe: isCorePhaseSafe,
+          is_surge_phase_safe: isSurgePhaseSafe,
+          surge_authority_source: surgeReason || "none",
+          scanner_authority: hasScannerAuthority,
+          early_surge_authority: hasEarlySurgeAuthority,
+          setup_ok: Boolean(cMeta?.setup?.ok),
+          probe_position_limit: isPositionLimitReached,
+          final_eligibility: finalEligibility,
           is_major_impulse: isMajorImpulse,
           is_core_strict_authority: isCoreStrictAuthority,
           is_position_limit_reached: isPositionLimitReached,
@@ -3047,7 +3138,7 @@ async function _validateLiveBuyPrecheckInternal(params: {
         }),
       );
 
-      if (isStrongCore && isPhaseSafe && !isPositionLimitReached) {
+      if (finalEligibility && probeKind) {
         // [PERFORMANCE_KILL PROBE ALLOWED: 25% Order Size]
         const finalSizeScale = 0.25;
         if (cMeta) {
@@ -3062,7 +3153,8 @@ async function _validateLiveBuyPrecheckInternal(params: {
             ts: new Date().toISOString(),
             market: params.market,
             score,
-            engine_bucket: cMeta?.engine_bucket ?? "core",
+            engine_bucket: cMeta?.engine_bucket ?? (probeKind === "CORE" ? "core" : "surge"),
+            probe_kind: probeKind,
             btc_phase: btcPhase,
             asset_phase: assetPhase,
             original_kill_reason: killSwitch.reason,
@@ -3075,9 +3167,23 @@ async function _validateLiveBuyPrecheckInternal(params: {
         result.killSwitchReason = killSwitch.reason;
       } else {
         let blockDetail = "performance_kill_not_eligible";
-        if (!isStrongCore) blockDetail = score < 90 ? `score_low:${score}<90` : "not_strong_core";
-        else if (!isPhaseSafe) blockDetail = `phase_unsafe:btc=${btcPhase},asset=${assetPhase}`;
-        else if (isPositionLimitReached) blockDetail = "performance_probe_position_limit_reached";
+        if (isPositionLimitReached) {
+          blockDetail = "performance_probe_position_limit_reached";
+        } else if (cMeta?.engine_bucket === "surge") {
+          if (score < 90) blockDetail = `score_low:${score}<90`;
+          else if (!isSurgeSetupOk) blockDetail = "setup_not_ok";
+          else if (!hasScannerAuthority) blockDetail = "scanner_authority_missing";
+          else if (!hasEarlySurgeAuthority || !isSurgeV2Authority) blockDetail = "surge_authority_missing";
+          else if (!isSurgePhaseSafe) blockDetail = `phase_unsafe:btc=${btcPhase},asset=${assetPhase}`;
+          else blockDetail = "not_strong_surge";
+        } else if (cMeta?.engine_bucket === "core" || cMeta?.engine_bucket === "major_impulse") {
+          if (score < 90) blockDetail = `score_low:${score}<90`;
+          else if (!isCorePhaseSafe) blockDetail = `phase_unsafe:btc=${btcPhase},asset=${assetPhase}`;
+          else blockDetail = "not_strong_core";
+        } else {
+          if (score < 90) blockDetail = `score_low:${score}<90`;
+          else blockDetail = "performance_kill_not_eligible";
+        }
 
         console.info(
           JSON.stringify({
@@ -4679,6 +4785,7 @@ function evaluateSurgeEntrySetup(
     impulse_phase: impulseMemory.phase,
     impulse_memory: impulseMemory,
     early_surge_authority: earlySurgeAuthority,
+    scanner_authority: earlyContract.approved,
   };
 }
 
@@ -13285,6 +13392,12 @@ export function createLiveDataStrategy(opts: {
           is_late_follow: isLateFollowAlt,
           btc_phase: btcPhaseInfo.phase,
           asset_phase: assetPhaseInfo.phase,
+          scanner_authority: isSurgeCandidate
+            ? Boolean(surgeShadowSetup?.scanner_authority ?? (effectivePayload?.source_kind === "scanner_tradable_candidate" || effectivePayload?.filter_pass))
+            : undefined,
+          early_surge_authority: isSurgeCandidate
+            ? Boolean(surgeShadowSetup?.early_surge_authority)
+            : undefined,
           source_kind: setup.reason === "MAJOR_IMPULSE_V1" ? "MAJOR_IMPULSE_V1" : effectivePayload.source_kind,
           strategyType: setup.reason === "MAJOR_IMPULSE_V1" ? "major_impulse" : (isCoreMarket ? "stable" : undefined),
         };
@@ -13687,7 +13800,7 @@ export function createLiveDataStrategy(opts: {
         const killReason = currentKillSwitch.reason;
         const probeAllowed = Boolean(meta?.is_performance_probe || meta?.is_recovery_probe);
         const probeReason = meta?.is_performance_probe
-          ? "STRONG_CORE_PERFORMANCE_PROBE_25PCT"
+          ? (meta?.engine_bucket === "surge" ? "STRONG_SURGE_PERFORMANCE_PROBE_25PCT" : "STRONG_CORE_PERFORMANCE_PROBE_25PCT")
           : (meta?.is_recovery_probe ? "RECOVERY_PROBE" : null);
 
         const cooldownUntilStr = state.cooldown_until?.[market];
@@ -18377,6 +18490,8 @@ export function createLiveDataStrategy(opts: {
         btc_tier_at_entry: btcTierNow,
         volatility_pct_at_entry: 0,
         is_relaxed_probe: !isSurgeSource && marketMeta?.is_relaxed_probe === true,
+        is_performance_probe: marketMeta?.is_performance_probe === true,
+        is_recovery_probe: marketMeta?.is_recovery_probe === true,
         entry_ts: new Date().toISOString(),
         entry_price: price,
         qty,

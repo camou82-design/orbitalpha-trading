@@ -35,19 +35,20 @@ async function runTests() {
 
   const nowMs = Date.now();
 
-  // --- Case 1: HARD_RISK_KILL + STRONG_CORE => Entry 0 KRW (Strictly Blocked) ---
+  // --- Case 1: Cumulative PnL <= -5% is PERFORMANCE_KILL (Strong CORE probe allowed, true HARD_RISK strictly blocked) ---
   {
-    const hardRiskTrades = [
+    const cumulativeLossTrades = [
       { market: "KRW-BTC", pnl_pct: -2.0, timestamp: new Date(nowMs - 3600_000).toISOString(), action: "sell", order_krw: 100000, filled_qty: 0.001 },
       { market: "KRW-BTC", pnl_pct: -2.0, timestamp: new Date(nowMs - 7200_000).toISOString(), action: "sell", order_krw: 100000, filled_qty: 0.001 },
       { market: "KRW-BTC", pnl_pct: -1.5, timestamp: new Date(nowMs - 10800_000).toISOString(), action: "sell", order_krw: 100000, filled_qty: 0.001 },
-    ]; // Cumulative -5.5% <= -5.0% => HARD_RISK_KILL
+    ]; // Cumulative -5.5% <= -5.0% => PERFORMANCE_KILL (not HARD_RISK)
 
-    const ks = evaluateGlobalKillSwitch(hardRiskTrades, nowMs);
-    assert.strictEqual(ks.hard_risk_active, true, "Cumulative loss <= -5% must activate HARD_RISK_KILL");
-    assert.strictEqual(ks.type, "HARD_RISK", "Type must be HARD_RISK");
+    const ks = evaluateGlobalKillSwitch(cumulativeLossTrades, nowMs);
+    assert.strictEqual(ks.hard_risk_active, false, "Cumulative loss <= -5% must NOT be HARD_RISK");
+    assert.strictEqual(ks.performance_kill_active, true, "Cumulative loss <= -5% must activate PERFORMANCE_KILL");
+    assert.strictEqual(ks.type, "PERFORMANCE", "Type must be PERFORMANCE");
 
-    const strongCoreMeta = {
+    const strongCoreMeta: any = {
       market: "KRW-BTC",
       engine_bucket: "core" as const,
       score: 95,
@@ -61,7 +62,7 @@ async function runTests() {
 
     const gateResult = await validateLiveBuyPrecheck({
       market: "KRW-BTC",
-      trades: hardRiskTrades,
+      trades: cumulativeLossTrades,
       positions: {},
       cooldown_until: {},
       marketState: null,
@@ -73,9 +74,33 @@ async function runTests() {
       candidateMeta: strongCoreMeta,
     });
 
-    assert.strictEqual(gateResult.allowed, false, "HARD_RISK_KILL must strictly block even STRONG CORE signals");
-    assert.strictEqual(gateResult.blockReason, "global_kill_switch_active");
-    console.log("[PASS] Case 1: HARD_RISK_KILL + STRONG_CORE => Entry 0 KRW (Strict No-Bypass)");
+    assert.strictEqual(gateResult.allowed, true, "PERFORMANCE_KILL (cumulative loss) allows 25% recovery probe for STRONG CORE");
+    assert.strictEqual(strongCoreMeta.relaxed_multiplier, 0.25, "Probe size must be scaled to 0.25");
+    assert.strictEqual(strongCoreMeta.is_recovery_probe, true, "is_recovery_probe must be set to true");
+    assert.strictEqual(strongCoreMeta.is_performance_probe, true, "is_performance_probe must be set to true");
+
+    // Case 1b: True HARD_RISK (e.g. Panic state) must strictly block even STRONG CORE
+    const panicMeta: any = {
+      ...strongCoreMeta,
+      is_panic: true,
+      relaxed_multiplier: 1.0,
+    };
+    const gatePanicResult = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: cumulativeLossTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: null,
+      signalPayload: null,
+      strategyType: "core",
+      entryPath: "core_normal",
+      isAdditionalBuy: false,
+      actualDailyPnlPct: 0.0,
+      candidateMeta: panicMeta,
+    });
+    assert.strictEqual(gatePanicResult.allowed, false, "HARD_RISK (panic) must strictly block even STRONG CORE signals");
+    assert.strictEqual(gatePanicResult.blockReason, "global_kill_switch_active");
+    console.log("[PASS] Case 1: Cumulative PnL <= -5% is PERFORMANCE_KILL (Probe 25% allowed, True HARD_RISK strictly blocked)");
   }
 
   // --- Case 2: PERFORMANCE_KILL + Weak/Normal CORE => Entry 0 KRW (Blocked) ---
@@ -232,9 +257,9 @@ async function runTests() {
     assert.strictEqual(capPolicy.totalAssetEquityKrw, 2_500_000);
     assert.strictEqual(capPolicy.excludedUsdtValueKrw, 500_000);
     assert.strictEqual(capPolicy.spotTradingEquityKrw, 2_000_000);
-    assert.strictEqual(capPolicy.coreCapAmount, 1_400_000);
+    assert.strictEqual(capPolicy.coreCapAmount, 0);
+    assert.strictEqual(capPolicy.surgeCapAmount, 2_000_000);
     assert.strictEqual(capPolicy.coreUsedCapitalKrw, 900_000);
-    assert.strictEqual(capPolicy.coreRemainingKrw, 500_000);
 
     // Sizing calculation test with rawRequestedOrderKrw = 771,165 KRW
     const rawRequestedOrderKrw = 771_165;
@@ -244,8 +269,9 @@ async function runTests() {
     const orderAfterPerf = Math.floor(rawRequestedOrderKrw * performanceKillMultiplier); // 192,791 KRW
     assert.strictEqual(orderAfterPerf, 192_791);
 
-    // 2. Strategy Capital Cap applied (coreRemaining = 500,000 KRW)
-    const capitalCapAppliedKrw = Math.min(orderAfterPerf, capPolicy.coreRemainingKrw); // 192,791 KRW
+    // 2. Strategy Capital Cap applied (remaining = 500,000 KRW)
+    const remainingStrategyCapitalKrw = 500_000;
+    const capitalCapAppliedKrw = Math.min(orderAfterPerf, remainingStrategyCapitalKrw); // 192,791 KRW
     assert.strictEqual(capitalCapAppliedKrw, 192_791);
 
     // 3. Available KRW applied (availableKrw = 150,000 KRW)
@@ -256,7 +282,7 @@ async function runTests() {
     const finalExecutableOrderKrw = availableKrwCapAppliedKrw;
     assert.strictEqual(finalExecutableOrderKrw, 150_000);
     assert.ok(finalExecutableOrderKrw <= 150_000, "Final order cannot exceed available cash");
-    assert.ok(finalExecutableOrderKrw <= capPolicy.coreRemainingKrw, "Final order cannot exceed core capital cap");
+    assert.ok(finalExecutableOrderKrw <= remainingStrategyCapitalKrw, "Final order cannot exceed strategy capital cap");
 
     console.log("[PASS] Case 5: 771,165 KRW raw sizing correctly capped to 192,791 (probe) -> 150,000 (available cash)");
   }

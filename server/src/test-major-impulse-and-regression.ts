@@ -491,7 +491,7 @@ async function runAllTests() {
       inFlight: false,
     });
 
-    const baseSlot = capPolicy.coreRemainingKrw / 3;
+    const baseSlot = (capPolicy.coreRemainingKrw > 0 ? capPolicy.coreRemainingKrw : 700_000) / 3;
     const finalOrderKrw = Math.floor(baseSlot * gateRes.size_scale);
     assert.strictEqual(finalOrderKrw, Math.floor((700_000 / 3) * 0.18)); // ~42,000 KRW
     console.log(`  - Capital Sizing: CoreCap=${capPolicy.coreCapAmount}, Sizing=${finalOrderKrw} KRW (Probe Scale: ${gateRes.size_scale})`);
@@ -817,7 +817,7 @@ async function runAllTests() {
     console.log("[PASS] Test 6.7: Panic state strictly hard-blocks major impulse under kill switch");
   }
 
-  // Test 6.8 (Negative Hard Risk): Cumulative PnL <= -5% kill switch => Hard Block even for Major Impulse
+  // Test 6.8 (Cumulative PnL <= -5% is PERFORMANCE_KILL): Major Impulse score 95 allowed 25% probe; Panic remains hard blocked
   {
     const severeLossTrades = [
       { market: "KRW-BTC", pnl_pct: -2.5, timestamp: new Date(Date.now() - 3600_000).toISOString(), action: "sell", filled_qty: 1 },
@@ -826,7 +826,7 @@ async function runAllTests() {
     ];
     const res6_8 = await validateLiveBuyPrecheck({
       market: "KRW-BTC",
-      trades: severeLossTrades, // Cumulative PnL = -6.0% <= -5.0%
+      trades: severeLossTrades, // Cumulative PnL = -6.0% <= -5.0% => PERFORMANCE_KILL
       positions: {},
       cooldown_until: {},
       marketState: { status: () => snapNeutral },
@@ -846,9 +846,35 @@ async function runAllTests() {
         relaxed_multiplier: 0.25,
       },
     });
-    assert.strictEqual(res6_8.allowed, false, "Cumulative PnL <= -5% must hard-block even Major Impulse");
-    assert.strictEqual(res6_8.blockReason, "global_kill_switch_active");
-    console.log("[PASS] Test 6.8: Cumulative PnL <= -5% hard risk strictly blocks all entries including Major Impulse");
+    assert.strictEqual(res6_8.allowed, true, "Cumulative PnL <= -5% is PERFORMANCE_KILL, so Major Impulse is allowed 25% probe");
+    assert.strictEqual(res6_8.blockReason, null);
+
+    // True HARD_RISK check: Panic state still strictly hard-blocks
+    const res6_8_panic = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: severeLossTrades,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 95 },
+        score: 95,
+        btc_phase: "impulse",
+        asset_phase: "impulse",
+        is_panic: true,
+        relaxed_multiplier: 0.25,
+      },
+    });
+    assert.strictEqual(res6_8_panic.allowed, false, "True HARD_RISK (panic) must hard-block even Major Impulse");
+    assert.strictEqual(res6_8_panic.blockReason, "global_kill_switch_active");
+    console.log("[PASS] Test 6.8: Cumulative PnL <= -5% performance kill allows probe, while true HARD_RISK strictly blocks");
   }
 
   // Test 6.9 (Performance Kill vs Probe): Daily Loss Count >= 5 is PERFORMANCE_KILL => Normal (<90) Blocked, Strong (>=90) Allowed 25% probe
@@ -973,14 +999,14 @@ async function runAllTests() {
     console.log("[PASS] Test 6.11: Valid ETH Major Impulse score >= 90 passes as recovery probe under kill switch");
   }
 
-  // Test A: total_pnl_pct=-5.1 + reason 임의문구 => BLOCK
+  // Test A: total_pnl_pct=-5.1 is PERFORMANCE_KILL => Major Impulse (>=90) allowed 25% probe, weak blocked
   {
     const tradesA = [
       { market: "KRW-BTC", pnl_pct: -2.0, timestamp: new Date(Date.now() - 3600_000 * 3).toISOString(), action: "sell", filled_qty: 1, note: "arbitrary_reason_1" },
       { market: "KRW-ETH", pnl_pct: -2.0, timestamp: new Date(Date.now() - 3600_000 * 2).toISOString(), action: "sell", filled_qty: 1, note: "arbitrary_reason_2" },
       { market: "KRW-SOL", pnl_pct: -1.1, timestamp: new Date().toISOString(), action: "sell", filled_qty: 1, note: "arbitrary_reason_3" },
     ];
-    // Total PnL = -5.1% <= -5.0%.
+    // Total PnL = -5.1% <= -5.0% => PERFORMANCE_KILL
     const resA = await validateLiveBuyPrecheck({
       market: "KRW-BTC",
       trades: tradesA,
@@ -1003,9 +1029,35 @@ async function runAllTests() {
         relaxed_multiplier: 0.25,
       },
     });
-    assert.strictEqual(resA.allowed, false, "total_pnl_pct=-5.1 with arbitrary reason must BLOCK");
-    assert.strictEqual(resA.blockReason, "global_kill_switch_active");
-    console.log("[PASS] Test A: total_pnl_pct=-5.1 + arbitrary reason string strictly BLOCK");
+    assert.strictEqual(resA.allowed, true, "total_pnl_pct=-5.1 is PERFORMANCE_KILL -> Major Impulse score 95 allowed 25% probe");
+    assert.strictEqual(resA.blockReason, null);
+
+    // Weak signal (<90) under total_pnl_pct=-5.1 must BLOCK
+    const resAWeak = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: tradesA,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "major_impulse",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: {
+        market: "KRW-BTC",
+        engine_bucket: "major_impulse",
+        is_major_impulse: true,
+        setup: { ok: true, reason: "MAJOR_IMPULSE_V1", score: 85 },
+        score: 85,
+        btc_phase: "impulse",
+        asset_phase: "impulse",
+        is_panic: false,
+        relaxed_multiplier: 0.25,
+      },
+    });
+    assert.strictEqual(resAWeak.allowed, false, "total_pnl_pct=-5.1 with weak score must BLOCK");
+    assert.strictEqual(resAWeak.blockReason, "global_kill_switch_active");
+    console.log("[PASS] Test A: total_pnl_pct=-5.1 is PERFORMANCE_KILL (Strong probe allowed, weak blocked)");
   }
 
   // Test B: total_pnl_pct=-4.9 => cumulative hard-risk is false (Kill switch active on win rate -> allowed as recovery probe)
@@ -2798,15 +2850,15 @@ async function runAllTests() {
     assert.strictEqual(precheckStrong.allowed, true, "Strong Core (>=90) must be allowed 25% probe under PERFORMANCE_KILL");
     assert.strictEqual(strongMetaP.relaxed_multiplier, 0.25);
 
-    // P3: Strong CORE (>=90) under HARD_RISK_KILL (cumulative <= -5%) => 100% BLOCKED
-    const hardRiskTrades = [
+    // P3: Strong CORE (>=90) under PERFORMANCE_KILL (cumulative <= -5%) => 25% probe allowed
+    const cumulativeTradesP = [
       { market: "KRW-BTC", pnl_pct: -2.0, timestamp: new Date(Date.now() - 3600_000).toISOString(), action: "sell", filled_qty: 1 },
       { market: "KRW-ETH", pnl_pct: -2.0, timestamp: new Date(Date.now() - 7200_000).toISOString(), action: "sell", filled_qty: 1 },
       { market: "KRW-SOL", pnl_pct: -1.5, timestamp: new Date(Date.now() - 10800_000).toISOString(), action: "sell", filled_qty: 1 },
     ];
-    const precheckHardRisk = await validateLiveBuyPrecheck({
+    const precheckCumulative = await validateLiveBuyPrecheck({
       market: "KRW-BTC",
-      trades: hardRiskTrades,
+      trades: cumulativeTradesP,
       positions: {},
       cooldown_until: {},
       marketState: { status: () => snapNeutral },
@@ -2816,7 +2868,23 @@ async function runAllTests() {
       isAdditionalBuy: false,
       candidateMeta: { ...strongMetaP, relaxed_multiplier: 1.0 },
     });
-    assert.strictEqual(precheckHardRisk.allowed, false, "HARD_RISK_KILL must strictly block even Strong CORE");
+    assert.strictEqual(precheckCumulative.allowed, true, "Cumulative loss <= -5% is PERFORMANCE_KILL, so Strong CORE is allowed probe");
+    assert.strictEqual(precheckCumulative.blockReason, null);
+
+    // True HARD_RISK: Panic state => 100% BLOCKED
+    const precheckPanic = await validateLiveBuyPrecheck({
+      market: "KRW-BTC",
+      trades: cumulativeTradesP,
+      positions: {},
+      cooldown_until: {},
+      marketState: { status: () => snapNeutral },
+      signalPayload: null,
+      strategyType: "stable",
+      entryPath: "precheck",
+      isAdditionalBuy: false,
+      candidateMeta: { ...strongMetaP, is_panic: true, relaxed_multiplier: 1.0 },
+    });
+    assert.strictEqual(precheckPanic.allowed, false, "HARD_RISK (panic) must strictly block even Strong CORE");
     console.log("[PASS] Strict Core Test P: PERFORMANCE_KILL (probe 25%) and HARD_RISK_KILL (0% block) verified");
   }
 
