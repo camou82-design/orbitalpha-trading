@@ -1604,6 +1604,440 @@ export function evaluateReclaimConditions(params: {
   };
 }
 
+export interface SurgeAuthorityProofParams {
+  tag:
+    | "SURGE_DISCOVERY_BUY_AUTHORITY_PROOF"
+    | "SURGE_LATE_GOOD_TO_RECLAIM_PROOF"
+    | "SURGE_TRUE_EARLY_PROBE_ALLOWED_PROOF"
+    | "SURGE_IMMEDIATE_BUY_BLOCKED_FOR_PRICE_LOCATION_PROOF"
+    | "SURGE_RECLAIM_BUY_AUTHORITY_PROOF";
+  market: string;
+  currentPrice: number;
+  localHigh: number;
+  distanceFromLocalHighPct: number | null;
+  recent1mRet: number | null;
+  recent3mRet: number | null;
+  recent5mRet: number | null;
+  emaDistancePct: number | null;
+  volumeAccel: number | null;
+  score: number;
+  sourceKind: string;
+  originalDecision: string;
+  finalAuthority: string;
+  transitionTarget: string;
+  reason: string;
+}
+
+export function emitSurgeAuthorityProof(p: SurgeAuthorityProofParams) {
+  console.info(
+    JSON.stringify({
+      tag: p.tag,
+      ts: new Date().toISOString(),
+      market: p.market,
+      currentPrice: p.currentPrice,
+      current_price: p.currentPrice,
+      localHigh: p.localHigh,
+      local_high: p.localHigh,
+      distanceFromLocalHighPct: p.distanceFromLocalHighPct,
+      distance_from_local_high_pct: p.distanceFromLocalHighPct,
+      recent1mRet: p.recent1mRet,
+      recent_1m_ret: p.recent1mRet,
+      recent3mRet: p.recent3mRet,
+      recent_3m_ret: p.recent3mRet,
+      recent5mRet: p.recent5mRet,
+      recent_5m_ret: p.recent5mRet,
+      emaDistancePct: p.emaDistancePct,
+      ema_distance: p.emaDistancePct,
+      volumeAccel: p.volumeAccel,
+      volume_accel: p.volumeAccel,
+      score: p.score,
+      sourceKind: p.sourceKind,
+      source_kind: p.sourceKind,
+      originalDecision: p.originalDecision,
+      original_decision: p.originalDecision,
+      finalAuthority: p.finalAuthority,
+      final_authority: p.finalAuthority,
+      transitionTarget: p.transitionTarget,
+      transition_target: p.transitionTarget,
+      reason: p.reason,
+    })
+  );
+}
+
+export interface SurgeCandidateAuthorityInput {
+  market: string;
+  currentPrice: number;
+  localHigh: number;
+  distanceFromLocalHighPct: number | null;
+  recent1mRet: number | null;
+  recent3mRet: number | null;
+  recent5mRet: number | null;
+  emaDistancePct: number | null;
+  volumeRatio1m5: number | null;
+  volumeRatio: number;
+  score: number;
+  sourceKind: string;
+  secondsSinceSignal: number | null;
+  priceChangeSinceSignalPct: number | null;
+  staleLimit: number;
+  chaseLimit: number;
+  hasPosition: boolean;
+  isCooldown: boolean;
+  isRiskOff: boolean;
+  isDailyRiskKill: boolean;
+  hasValidStopLoss: boolean;
+  volumeFadeTriggered: boolean;
+  upperWickHeavy: boolean;
+  boxBreakoutFailed: boolean;
+  volumeSpikeCloseFail: boolean;
+  bearishReject: boolean;
+  setupOk: boolean;
+  breakout: boolean;
+}
+
+export interface SurgeCandidateAuthorityResult {
+  category: "BAD_SETUP" | "LATE_BUT_GOOD" | "TRUE_EARLY";
+  immediateBuyAllowed: boolean;
+  finalAuthority: "FAST_SURGE_PROBE" | "RECLAIM_WATCH" | "BLOCKED";
+  transitionTarget: "BUY" | "watching" | "hard_reject";
+  reason: string;
+  lateTimingTier: "pass" | "hard_block" | "reduced_size_allowed";
+  lateEntrySizingMultiplier: number;
+}
+
+export function classifySurgeCandidateAuthority(
+  input: SurgeCandidateAuthorityInput
+): SurgeCandidateAuthorityResult {
+  // 1. HARD RISK / FATAL BAD SETUP CHECK (Reclaim 완화 금지 대상: 즉시 hard reject)
+  const isStale = input.secondsSinceSignal !== null && input.secondsSinceSignal > input.staleLimit;
+  const isVolumeCollapse = input.volumeFadeTriggered && (input.volumeRatio1m5 !== null && input.volumeRatio1m5 < 0.35);
+  const isStructuralFail = !input.setupOk || input.boxBreakoutFailed || input.upperWickHeavy || input.volumeSpikeCloseFail || input.bearishReject;
+
+  if (isStale) {
+    return {
+      category: "BAD_SETUP",
+      immediateBuyAllowed: false,
+      finalAuthority: "BLOCKED",
+      transitionTarget: "hard_reject",
+      reason: `signal_stale:${input.secondsSinceSignal}s>${input.staleLimit}s`,
+      lateTimingTier: "hard_block",
+      lateEntrySizingMultiplier: 0,
+    };
+  }
+
+  if (input.isRiskOff) {
+    return {
+      category: "BAD_SETUP",
+      immediateBuyAllowed: false,
+      finalAuthority: "BLOCKED",
+      transitionTarget: "hard_reject",
+      reason: "market_risk_off",
+      lateTimingTier: "hard_block",
+      lateEntrySizingMultiplier: 0,
+    };
+  }
+
+  if (input.hasPosition) {
+    return {
+      category: "BAD_SETUP",
+      immediateBuyAllowed: false,
+      finalAuthority: "BLOCKED",
+      transitionTarget: "hard_reject",
+      reason: "position_exists",
+      lateTimingTier: "hard_block",
+      lateEntrySizingMultiplier: 0,
+    };
+  }
+
+  if (input.isCooldown) {
+    return {
+      category: "BAD_SETUP",
+      immediateBuyAllowed: false,
+      finalAuthority: "BLOCKED",
+      transitionTarget: "hard_reject",
+      reason: "cooldown_active",
+      lateTimingTier: "hard_block",
+      lateEntrySizingMultiplier: 0,
+    };
+  }
+
+  if (input.isDailyRiskKill) {
+    return {
+      category: "BAD_SETUP",
+      immediateBuyAllowed: false,
+      finalAuthority: "BLOCKED",
+      transitionTarget: "hard_reject",
+      reason: "daily_risk_kill_active",
+      lateTimingTier: "hard_block",
+      lateEntrySizingMultiplier: 0,
+    };
+  }
+
+  if (!input.hasValidStopLoss) {
+    return {
+      category: "BAD_SETUP",
+      immediateBuyAllowed: false,
+      finalAuthority: "BLOCKED",
+      transitionTarget: "hard_reject",
+      reason: "invalid_missing_stop",
+      lateTimingTier: "hard_block",
+      lateEntrySizingMultiplier: 0,
+    };
+  }
+
+  if (isVolumeCollapse) {
+    return {
+      category: "BAD_SETUP",
+      immediateBuyAllowed: false,
+      finalAuthority: "BLOCKED",
+      transitionTarget: "hard_reject",
+      reason: `volume_collapse:${(input.volumeRatio1m5 ?? 0).toFixed(3)}<0.35`,
+      lateTimingTier: "hard_block",
+      lateEntrySizingMultiplier: 0,
+    };
+  }
+
+  if (isStructuralFail) {
+    return {
+      category: "BAD_SETUP",
+      immediateBuyAllowed: false,
+      finalAuthority: "BLOCKED",
+      transitionTarget: "hard_reject",
+      reason: "structural_failure_or_rejection",
+      lateTimingTier: "hard_block",
+      lateEntrySizingMultiplier: 0,
+    };
+  }
+
+  // 1-B. CHASE FROM SIGNAL (요구사항 1: chase != bad setup, late-but-good must survive into reclaim)
+  const isChaseFromSignal = input.priceChangeSinceSignalPct !== null && input.priceChangeSinceSignalPct > input.chaseLimit;
+  if (isChaseFromSignal) {
+    const extremePriceDistortionLimit = Math.max(input.chaseLimit * 2.5, 8.0);
+    const isExtremeDistortion = input.priceChangeSinceSignalPct !== null && input.priceChangeSinceSignalPct > extremePriceDistortionLimit;
+    if (isExtremeDistortion) {
+      return {
+        category: "BAD_SETUP",
+        immediateBuyAllowed: false,
+        finalAuthority: "BLOCKED",
+        transitionTarget: "hard_reject",
+        reason: `extreme_chase_distortion:${input.priceChangeSinceSignalPct!.toFixed(3)}pct>${extremePriceDistortionLimit}pct`,
+        lateTimingTier: "hard_block",
+        lateEntrySizingMultiplier: 0,
+      };
+    }
+
+    // setup 정상, structural fail 없음, volume collapse 없음, risk_off 아님, valid stop 존재:
+    // late != bad, chase != bad setup -> LATE_BUT_GOOD -> RECLAIM_WATCH
+    return {
+      category: "LATE_BUT_GOOD",
+      immediateBuyAllowed: false,
+      finalAuthority: "RECLAIM_WATCH",
+      transitionTarget: "watching",
+      reason: `chase_from_signal_reclaim:${input.priceChangeSinceSignalPct!.toFixed(3)}pct>${input.chaseLimit}pct`,
+      lateTimingTier: "hard_block",
+      lateEntrySizingMultiplier: 0,
+    };
+  }
+
+  // 2. EVIDENCE CHECK: 가격 위치 증거가 없으면 fail-open 즉시 매수 금지 -> 안전하게 Reclaim Watch로 대기
+  if (input.distanceFromLocalHighPct === null || !Number.isFinite(input.distanceFromLocalHighPct)) {
+    return {
+      category: "LATE_BUT_GOOD",
+      immediateBuyAllowed: false,
+      finalAuthority: "RECLAIM_WATCH",
+      transitionTarget: "watching",
+      reason: "missing_price_location_evidence:distance_from_local_high_is_null",
+      lateTimingTier: "hard_block",
+      lateEntrySizingMultiplier: 0,
+    };
+  }
+
+  const dist = input.distanceFromLocalHighPct;
+  const isBreakout = dist <= 0; // 고점 동일(0) 또는 고점 돌파(<0)
+  const isNearHighBelow = dist >= 0 && dist < 0.12; // 고점 바로 밑 (0 ~ 0.12%)
+  const isNearHighExtendedChase = dist >= 0 && dist < 0.15 && input.recent3mRet !== null && input.recent3mRet >= 2.0;
+
+  // 과열 지표 (Overheating / Chase metrics)
+  const isOverheated3m = input.recent3mRet !== null && input.recent3mRet >= 2.5;
+  const isOverheatedEma = input.emaDistancePct !== null && input.emaDistancePct > 1.8;
+  const isOverheated1m = input.recent1mRet !== null && input.recent1mRet > 1.5;
+  const isOverheated5m = input.recent5mRet !== null && input.recent5mRet >= 4.5;
+
+  // LATE_BUT_GOOD 판정:
+  // 1) 고점 바로 아래 apex 구간 (dist >= 0 && dist < 0.12%)
+  // 2) 고점 근접 + 3분 급등 추격 (dist < 0.15% && 3m >= 2.0%)
+  // 3) 돌파(dist <= 0)했으나 이미 3m/5m/EMA 과열 상태
+  // 4) 일반 위치에서도 3m/EMA/1m/5m 중 복합 과열이 발생한 상태
+  const isLateChase =
+    isNearHighBelow ||
+    isNearHighExtendedChase ||
+    (isBreakout && (isOverheated3m || isOverheatedEma || isOverheated1m || isOverheated5m)) ||
+    (isOverheated3m && isOverheatedEma);
+
+  if (isLateChase) {
+    const detailReason = isNearHighBelow
+      ? `near_high_below_apex:dist=${dist.toFixed(3)}pct>=0_and<0.12pct`
+      : isNearHighExtendedChase
+      ? `near_high_and_rising:dist=${dist.toFixed(3)}pct<0.15pct,3m=${(input.recent3mRet ?? 0).toFixed(2)}pct>=2.0pct`
+      : isBreakout
+      ? `breakout_overheated:dist=${dist.toFixed(3)}pct<=0,3m=${(input.recent3mRet ?? 0).toFixed(2)}pct,ema=${(input.emaDistancePct ?? 0).toFixed(2)}pct`
+      : `overheated_chase:3m=${(input.recent3mRet ?? 0).toFixed(2)}pct,ema=${(input.emaDistancePct ?? 0).toFixed(2)}pct`;
+
+    return {
+      category: "LATE_BUT_GOOD",
+      immediateBuyAllowed: false,
+      finalAuthority: "RECLAIM_WATCH",
+      transitionTarget: "watching",
+      reason: detailReason,
+      lateTimingTier: "hard_block",
+      lateEntrySizingMultiplier: 0,
+    };
+  }
+
+  // 3. SUFFICIENT EVIDENCE CHECK (요구사항 3: 핵심 evidence null을 무조건 pass시키지 말 것)
+  // discovery는 fail-open 가능하지만 BUY authority는 별도다.
+  // price location, recent momentum, EMA distance, volume evidence 실제 존재 확인
+  const hasMomentumEvidence =
+    (input.recent1mRet !== null && Number.isFinite(input.recent1mRet)) ||
+    (input.recent3mRet !== null && Number.isFinite(input.recent3mRet));
+  const hasEmaEvidence = input.emaDistancePct !== null && Number.isFinite(input.emaDistancePct);
+  const hasVolumeEvidence =
+    (input.volumeRatio1m5 !== null && Number.isFinite(input.volumeRatio1m5)) ||
+    (input.volumeRatio !== null && Number.isFinite(input.volumeRatio));
+  const hasAgeEvidence = input.secondsSinceSignal !== null && Number.isFinite(input.secondsSinceSignal);
+
+  const hasSufficientEvidence = hasMomentumEvidence && hasEmaEvidence && hasVolumeEvidence && hasAgeEvidence;
+  if (!hasSufficientEvidence) {
+    return {
+      category: "LATE_BUT_GOOD",
+      immediateBuyAllowed: false,
+      finalAuthority: "RECLAIM_WATCH",
+      transitionTarget: "watching",
+      reason: `insufficient_evidence_for_true_early:momentum=${hasMomentumEvidence},ema=${hasEmaEvidence},vol=${hasVolumeEvidence},age=${hasAgeEvidence}`,
+      lateTimingTier: "hard_block",
+      lateEntrySizingMultiplier: 0,
+    };
+  }
+
+  // 4. TRUE EARLY EVALUATION (요구사항 2: safePreBreakoutLocation에 LIVE_EARLY_ENTRY_NEAR_HIGH_PCT 상한 적용)
+  const isFreshAge = input.secondsSinceSignal !== null && input.secondsSinceSignal <= 90;
+  const is1mGentle = input.recent1mRet === null || (input.recent1mRet <= 1.2 && input.recent1mRet >= -0.5);
+  const is3mGentle = input.recent3mRet === null || input.recent3mRet <= 2.0;
+  const is5mGentle = input.recent5mRet === null || input.recent5mRet <= 3.5;
+  const isReturnsGentle = is1mGentle && is3mGentle && is5mGentle;
+  const isEmaGentle = input.emaDistancePct !== null && input.emaDistancePct <= 1.5;
+  const isVolumeAlive =
+    !input.volumeFadeTriggered &&
+    ((input.volumeRatio1m5 !== null && input.volumeRatio1m5 >= 1.2) ||
+      (input.volumeRatio !== null && input.volumeRatio >= 1.2));
+
+  // 가격 위치 분리:
+  // freshBreakoutLocation = dist <= 0 (고점 돌파)
+  // safePreBreakoutLocation = dist >= 0.12 && dist <= LIVE_EARLY_ENTRY_NEAR_HIGH_PCT (고점 직전 안전 범위)
+  const freshBreakoutLocation = dist <= 0;
+  const safePreBreakoutLocation = dist >= 0.12 && dist <= LIVE_EARLY_ENTRY_NEAR_HIGH_PCT;
+  const isPriceLocationValid = freshBreakoutLocation || safePreBreakoutLocation;
+
+  if (!isPriceLocationValid) {
+    const priceLocReason = dist > LIVE_EARLY_ENTRY_NEAR_HIGH_PCT
+      ? `safe_pre_breakout_too_far_from_high:dist=${dist.toFixed(3)}pct>${LIVE_EARLY_ENTRY_NEAR_HIGH_PCT}pct`
+      : `price_location_out_of_early_bounds:dist=${dist.toFixed(3)}pct`;
+    return {
+      category: "LATE_BUT_GOOD",
+      immediateBuyAllowed: false,
+      finalAuthority: "RECLAIM_WATCH",
+      transitionTarget: "watching",
+      reason: priceLocReason,
+      lateTimingTier: "hard_block",
+      lateEntrySizingMultiplier: 0,
+    };
+  }
+
+  const isTrueEarly = isFreshAge && isReturnsGentle && isEmaGentle && isVolumeAlive && isPriceLocationValid && input.hasValidStopLoss;
+
+  if (isTrueEarly) {
+    return {
+      category: "TRUE_EARLY",
+      immediateBuyAllowed: true,
+      finalAuthority: "FAST_SURGE_PROBE",
+      transitionTarget: "BUY",
+      reason: freshBreakoutLocation ? "fresh_breakout_true_early_probe_granted" : "safe_pre_breakout_true_early_probe_granted",
+      lateTimingTier: "reduced_size_allowed",
+      lateEntrySizingMultiplier: 0.5,
+    };
+  }
+
+  // Fallback: True Early 조건에 완벽히 부합하지 않는 후보는 안전하게 Reclaim Watch로 대기
+  return {
+    category: "LATE_BUT_GOOD",
+    immediateBuyAllowed: false,
+    finalAuthority: "RECLAIM_WATCH",
+    transitionTarget: "watching",
+    reason: "price_or_timing_location_deferred_to_reclaim",
+    lateTimingTier: "hard_block",
+    lateEntrySizingMultiplier: 0,
+  };
+}
+
+export function transferSurgeCandidateToReclaimWatchlist(params: {
+  market: string;
+  currentPrice: number;
+  localHigh: number;
+  dayChangePct: number;
+  volume24hKrw: number;
+  isMorningWindow: boolean;
+  state: any;
+  reason: string;
+}): boolean {
+  if (!params.state.surge_watchlist) params.state.surge_watchlist = {};
+  if (!params.state.morning_surge_watchlist) params.state.morning_surge_watchlist = {};
+
+  const watchListMap = params.isMorningWindow
+    ? params.state.morning_surge_watchlist
+    : params.state.surge_watchlist;
+
+  const currentCount =
+    Object.keys(params.state.surge_watchlist).length +
+    Object.keys(params.state.morning_surge_watchlist).length;
+
+  if (watchListMap[params.market]) {
+    const item = watchListMap[params.market];
+    item.last_seen_price = params.currentPrice;
+    item.last_seen_at = new Date().toISOString();
+    if (params.localHigh > (item.local_high_price || 0)) {
+      item.local_high_price = params.localHigh;
+      item.local_high_at = new Date().toISOString();
+    }
+    return true;
+  }
+
+  if (currentCount >= 20) {
+    return false;
+  }
+
+  const watchItem: SurgeWatchItem = {
+    market: params.market,
+    first_detected_at: new Date().toISOString(),
+    first_detected_price: params.currentPrice,
+    day_change_pct: params.dayChangePct,
+    volume_24h_krw: params.volume24hKrw,
+    local_high_price: Math.max(params.currentPrice, params.localHigh),
+    local_high_at: new Date().toISOString(),
+    pullback_low_price: null,
+    pullback_low_at: null,
+    max_day_change_pct: params.dayChangePct,
+    last_seen_price: params.currentPrice,
+    last_seen_at: new Date().toISOString(),
+    status: "watching",
+    reason: params.reason,
+    expire_at: new Date(Date.now() + 30 * 60000).toISOString(),
+    morning_reentry_candidate: params.isMorningWindow,
+  };
+
+  watchListMap[params.market] = watchItem;
+  return true;
+}
+
 export const MANAGED_DUST_NOTIONAL_KRW = 1000;
 const LIVE_MIN_SAFE_ENTRY_KRW = 12000;
 const LIVE_MIN_STOP_SELL_VALUE_KRW = 5500;
@@ -3345,7 +3779,7 @@ const LIVE_EARLY_ENTRY_MAX_OPEN = (() => {
   const n = raw === undefined || raw === "" ? 1 : Number(raw);
   return Number.isFinite(n) ? Math.max(0, Math.min(3, Math.floor(n))) : 1;
 })();
-const LIVE_EARLY_ENTRY_NEAR_HIGH_PCT = (() => {
+export const LIVE_EARLY_ENTRY_NEAR_HIGH_PCT = (() => {
   const raw = process.env.LIVE_EARLY_ENTRY_NEAR_HIGH_PCT;
   const n = raw === undefined || raw === "" ? 0.3 : Number(raw);
   return Number.isFinite(n) ? Math.max(0.05, Math.min(3, n)) : 0.3;
@@ -14643,6 +15077,25 @@ export function createLiveDataStrategy(opts: {
               })
             );
 
+            emitSurgeAuthorityProof({
+              tag: "SURGE_RECLAIM_BUY_AUTHORITY_PROOF",
+              market,
+              currentPrice,
+              localHigh,
+              distanceFromLocalHighPct: ((localHigh - currentPrice) / localHigh) * 100,
+              recent1mRet,
+              recent3mRet,
+              recent5mRet,
+              emaDistancePct: evalRes.ema20 ? ((currentPrice - evalRes.ema20) / evalRes.ema20) * 100 : 0,
+              volumeAccel: volumeRatio1m5,
+              score: rScore ?? 80,
+              sourceKind: "surge_reclaim",
+              originalDecision: "PULLBACK_RECLAIM_CONFIRMED",
+              finalAuthority: "RECLAIM_BUY_ALLOWED",
+              transitionTarget: "BUY",
+              reason: "reclaim_conditions_verified_pullback_seen_and_rebounded",
+            });
+
             tickEnteredMarkets.add(market); // 진입 시도 즉시 락 추가 (동일 틱 중복 진입 차단)
             const buyRes = await opts.trade.placeBuy(
               market,
@@ -15669,9 +16122,10 @@ export function createLiveDataStrategy(opts: {
       let priceChangeSinceSignalPct: number | null = null;
       let volumeFadeTriggered = false;
       let volumeRatio1m5: number | null = null;
+      let emaDistancePct: number | null = null;
       try {
-        // Small window; used for timing guard + high proximity.
-        const c1 = await fetchMinuteCandlesCached(market, 1, 12);
+        // Small window; used for timing guard + high proximity + 1m EMA calculation.
+        const c1 = await fetchMinuteCandlesCached(market, 1, 24);
         const closes = c1.map((x) => Number(x.trade_price ?? 0)).filter((n: number) => Number.isFinite(n) && n > 0);
         const highs = c1.map((x) => Number(x.high_price ?? 0)).filter((n: number) => Number.isFinite(n) && n > 0);
         if (highs.length > 0) localHigh = Math.max(...highs);
@@ -15679,6 +16133,12 @@ export function createLiveDataStrategy(opts: {
         if (closes.length >= 2) recent1mRet = ((closes[closes.length - 1] / closes[closes.length - 2]) - 1) * 100;
         if (closes.length >= 4) recent3mRet = ((closes[closes.length - 1] / closes[closes.length - 4]) - 1) * 100;
         if (closes.length >= 6) recent5mRet = ((closes[closes.length - 1] / closes[closes.length - 6]) - 1) * 100;
+        if (closes.length >= 20) {
+          const ema20Val = emaLast(closes, 20);
+          if (typeof ema20Val === "number" && Number.isFinite(ema20Val) && ema20Val > 0 && currentPrice > 0) {
+            emaDistancePct = Math.max(0, ((currentPrice - ema20Val) / ema20Val) * 100);
+          }
+        }
 
         if (Number.isFinite(signalTsMs)) {
           // candle timestamp is `candle_date_time_utc` in upbit response (string ISO-ish). fall back other keys.
@@ -15805,198 +16265,385 @@ export function createLiveDataStrategy(opts: {
         !volumeFadeTriggered &&
         hasValidVolumeEvidence &&
         hasValidSignalAgeEvidence &&
-        hasValidChaseEvidence;
+        hasValidChaseEvidence &&
+        (distanceFromLocalHighPct !== null &&
+          (distanceFromLocalHighPct <= 0 ||
+            (distanceFromLocalHighPct >= 0.12 && distanceFromLocalHighPct <= LIVE_EARLY_ENTRY_NEAR_HIGH_PCT)));
 
-      if (secondsSinceSignal !== null && secondsSinceSignal > staleLimit) {
-        lateEntryGuardTriggered = true;
-        lateTimingTier = "hard_block";
-        lateEntryGuardReason = `signal_stale:${secondsSinceSignal}s>${staleLimit}s`;
-      } else if (priceChangeSinceSignalPct !== null && priceChangeSinceSignalPct > chaseLimit) {
-        lateEntryGuardTriggered = true;
-        lateTimingTier = "hard_block";
-        lateEntryGuardReason = `chase_from_signal:${priceChangeSinceSignalPct.toFixed(3)}pct>${chaseLimit}pct`;
-      } else {
+      if (isSurgeSource) {
         const filtersArr = Array.isArray(sig?.p?.filters) ? (sig.p.filters as Array<{ id?: unknown; passed?: unknown }>) : [];
         const failedFilterIds = new Set(filtersArr.filter(f => f && f.passed === false).map(f => String(f.id ?? "")));
         
         const boxBreakoutFailed = failedFilterIds.has("box_breakout");
         const upperWickHeavy = failedFilterIds.has("upper_wick");
         const volumeSpikeCloseFail = failedFilterIds.has("volume_spike_close_fail");
-        const volumeRatio1m5Weak = volumeRatio1m5 === null || volumeRatio1m5 < 0.35;
+        const hasValidStopLoss = (metaForGuard?.stopPrice ?? candidateMetaFromSetup?.stopPrice ?? 0) > 0;
 
-        const isFreshFilterSource = sourceKindForJudgment === "fresh_filter_pass" || sourceKindForJudgment === "scanner_filter_fresh";
-        const hasValidStopLoss = metaForGuard?.stopPrice !== undefined && metaForGuard.stopPrice !== null && metaForGuard.stopPrice > 0;
-        const marketStateBlock = !isSurgeSource && marketState.market_state === "risk_off";
-        const maxPositionsReached = countEffectiveManagedPositions(state.positions, priceBy) >= state.safety_guard.max_positions;
+        const authorityInput: SurgeCandidateAuthorityInput = {
+          market,
+          currentPrice,
+          localHigh: localHigh ?? currentPrice,
+          distanceFromLocalHighPct,
+          recent1mRet,
+          recent3mRet,
+          recent5mRet,
+          emaDistancePct,
+          volumeRatio1m5,
+          volumeRatio,
+          score,
+          sourceKind: sourceKindForJudgment,
+          secondsSinceSignal,
+          priceChangeSinceSignalPct,
+          staleLimit,
+          chaseLimit,
+          hasPosition: Boolean(state.positions[market]),
+          isCooldown: Boolean(state.cooldown_until?.[market] && new Date().toISOString() < state.cooldown_until[market]),
+          isRiskOff: marketState.market_state === "risk_off" || btcCrashGuard || marketPanicGuard,
+          isDailyRiskKill: Boolean((state as any).daily_risk_kill_active ?? false),
+          hasValidStopLoss,
+          volumeFadeTriggered,
+          upperWickHeavy,
+          boxBreakoutFailed,
+          volumeSpikeCloseFail,
+          bearishReject: failedFilterIds.has("bearish_reject") || failedFilterIds.has("high_rejected") || failedFilterIds.has("retest_fail"),
+          setupOk: Boolean(candidateMetaFromSetup?.setup?.ok ?? metaForGuard?.setup?.ok ?? true),
+          breakout: breakoutConfirmed,
+        };
 
-        const nearHighSoftenEligible =
-          isFreshFilterSource &&
-          score >= 70 &&
-          (secondsSinceSignal !== null && secondsSinceSignal <= 90) &&
-          !marketStateBlock &&
-          !maxPositionsReached &&
-          !volumeFadeTriggered &&
-          !volumeRatio1m5Weak &&
-          !upperWickHeavy &&
-          !boxBreakoutFailed &&
-          !volumeSpikeCloseFail &&
-          hasValidStopLoss &&
-          (recent1mRet === null || recent1mRet <= 1.2) &&
-          (recent3mRet === null || recent3mRet <= 2.0) &&
-          (recent5mRet === null || recent5mRet <= 3.5) &&
-          (volumeRatio1m5 !== null && volumeRatio1m5 >= 1.2) &&
-          (Number(metaForGuard?.riskReward ?? 0) >= 1.2);
+        const authority = classifySurgeCandidateAuthority(authorityInput);
 
-        if (distanceFromLocalHighPct !== null && distanceFromLocalHighPct < 0) {
-          console.info(JSON.stringify({
-            tag: "SURGE_NEGATIVE_NEAR_HIGH_BREAKOUT_PROOF",
-            ts: new Date().toISOString(),
+        if (authority.category === "BAD_SETUP") {
+          emitSurgeAuthorityProof({
+            tag: "SURGE_DISCOVERY_BUY_AUTHORITY_PROOF",
             market,
-            current_price: currentPrice,
-            local_high: localHigh,
-            distance_from_local_high_pct: distanceFromLocalHighPct,
-            near_high_block_applied: false,
-            reason: "above_local_high_not_near_high",
-          }));
+            currentPrice,
+            localHigh: localHigh ?? currentPrice,
+            distanceFromLocalHighPct,
+            recent1mRet,
+            recent3mRet,
+            recent5mRet,
+            emaDistancePct,
+            volumeAccel: volumeRatio1m5,
+            score,
+            sourceKind: sourceKindForJudgment,
+            originalDecision: "discovered",
+            finalAuthority: "BLOCKED",
+            transitionTarget: "hard_reject",
+            reason: authority.reason,
+          });
+          lateEntryGuardTriggered = true;
+          lateTimingTier = "hard_block";
+          lateEntryGuardReason = authority.reason;
+        } else if (authority.category === "LATE_BUT_GOOD") {
+          emitSurgeAuthorityProof({
+            tag: "SURGE_IMMEDIATE_BUY_BLOCKED_FOR_PRICE_LOCATION_PROOF",
+            market,
+            currentPrice,
+            localHigh: localHigh ?? currentPrice,
+            distanceFromLocalHighPct,
+            recent1mRet,
+            recent3mRet,
+            recent5mRet,
+            emaDistancePct,
+            volumeAccel: volumeRatio1m5,
+            score,
+            sourceKind: sourceKindForJudgment,
+            originalDecision: "discovered_late_price_location",
+            finalAuthority: "BLOCKED_IMMEDIATE_BUY",
+            transitionTarget: "watching",
+            reason: authority.reason,
+          });
+
+          const dayChangePct = Number(sig?.p?.change_rate_pct ?? sig?.p?.signed_change_rate ?? 0) * (Number(sig?.p?.change_rate_pct) > 1 ? 1 : 100);
+          const volume24hKrw = Number(sig?.p?.acc_trade_price_24h ?? 0);
+          const nowKst = new Date();
+          const kstHour = (nowKst.getUTCHours() + 9) % 24;
+          const isMorningWindow = kstHour >= 9 && kstHour < 10;
+
+          const transferred = transferSurgeCandidateToReclaimWatchlist({
+            market,
+            currentPrice,
+            localHigh: localHigh ?? currentPrice,
+            dayChangePct: Number.isFinite(dayChangePct) ? dayChangePct : 0,
+            volume24hKrw: Number.isFinite(volume24hKrw) ? volume24hKrw : 0,
+            isMorningWindow,
+            state,
+            reason: authority.reason,
+          });
+
+          emitSurgeAuthorityProof({
+            tag: "SURGE_LATE_GOOD_TO_RECLAIM_PROOF",
+            market,
+            currentPrice,
+            localHigh: localHigh ?? currentPrice,
+            distanceFromLocalHighPct,
+            recent1mRet,
+            recent3mRet,
+            recent5mRet,
+            emaDistancePct,
+            volumeAccel: volumeRatio1m5,
+            score,
+            sourceKind: sourceKindForJudgment,
+            originalDecision: "discovered_good_candidate_late_price",
+            finalAuthority: "RECLAIM_WATCH",
+            transitionTarget: "watching",
+            reason: `transferred_to_watchlist:${transferred ? "success" : "queue_full"}:${authority.reason}`,
+          });
+
+          emitSurgeAuthorityProof({
+            tag: "SURGE_DISCOVERY_BUY_AUTHORITY_PROOF",
+            market,
+            currentPrice,
+            localHigh: localHigh ?? currentPrice,
+            distanceFromLocalHighPct,
+            recent1mRet,
+            recent3mRet,
+            recent5mRet,
+            emaDistancePct,
+            volumeAccel: volumeRatio1m5,
+            score,
+            sourceKind: sourceKindForJudgment,
+            originalDecision: "discovered",
+            finalAuthority: "RECLAIM_WATCH",
+            transitionTarget: "watching",
+            reason: authority.reason,
+          });
+
+          lateEntryGuardTriggered = true;
+          lateTimingTier = "hard_block";
+          lateEntryGuardReason = authority.reason;
+          bumpSkip("surge_late_good_transferred_to_reclaim");
+          continue;
+        } else if (authority.category === "TRUE_EARLY") {
+          emitSurgeAuthorityProof({
+            tag: "SURGE_TRUE_EARLY_PROBE_ALLOWED_PROOF",
+            market,
+            currentPrice,
+            localHigh: localHigh ?? currentPrice,
+            distanceFromLocalHighPct,
+            recent1mRet,
+            recent3mRet,
+            recent5mRet,
+            emaDistancePct,
+            volumeAccel: volumeRatio1m5,
+            score,
+            sourceKind: sourceKindForJudgment,
+            originalDecision: "discovered_true_early",
+            finalAuthority: "FAST_SURGE_PROBE",
+            transitionTarget: "BUY",
+            reason: authority.reason,
+          });
+
+          emitSurgeAuthorityProof({
+            tag: "SURGE_DISCOVERY_BUY_AUTHORITY_PROOF",
+            market,
+            currentPrice,
+            localHigh: localHigh ?? currentPrice,
+            distanceFromLocalHighPct,
+            recent1mRet,
+            recent3mRet,
+            recent5mRet,
+            emaDistancePct,
+            volumeAccel: volumeRatio1m5,
+            score,
+            sourceKind: sourceKindForJudgment,
+            originalDecision: "discovered",
+            finalAuthority: "FAST_SURGE_PROBE",
+            transitionTarget: "BUY",
+            reason: authority.reason,
+          });
+
+          lateTimingTier = "reduced_size_allowed";
+          lateEntrySizingMultiplier = 0.5;
+          lateEntryGuardTriggered = false;
+          lateEntryGuardReason = null;
         }
+      } else {
+        if (secondsSinceSignal !== null && secondsSinceSignal > staleLimit) {
+          lateEntryGuardTriggered = true;
+          lateTimingTier = "hard_block";
+          lateEntryGuardReason = `signal_stale:${secondsSinceSignal}s>${staleLimit}s`;
+        } else if (priceChangeSinceSignalPct !== null && priceChangeSinceSignalPct > chaseLimit) {
+          lateEntryGuardTriggered = true;
+          lateTimingTier = "hard_block";
+          lateEntryGuardReason = `chase_from_signal:${priceChangeSinceSignalPct.toFixed(3)}pct>${chaseLimit}pct`;
+        } else {
+          const filtersArr = Array.isArray(sig?.p?.filters) ? (sig.p.filters as Array<{ id?: unknown; passed?: unknown }>) : [];
+          const failedFilterIds = new Set(filtersArr.filter(f => f && f.passed === false).map(f => String(f.id ?? "")));
 
-        const nearHighProblem =
-          distanceFromLocalHighPct !== null &&
-          distanceFromLocalHighPct >= 0 &&
-          distanceFromLocalHighPct < LIVE_MAX_ENTRY_NEAR_HIGH_PCT;
-        const volFadeProblem =
-          volumeFadeTriggered || (volumeRatio1m5 !== null && volumeRatio1m5 < 0.65);
-        if (nearHighProblem) {
-          const severeNearHigh =
-            distanceFromLocalHighPct !== null &&
-            distanceFromLocalHighPct >= 0 &&
-            distanceFromLocalHighPct < 0.12; // 김 사장 지시: 0.12% 미만은 하드 블락
-          
-          const coreRelaxedAllowNearHigh = (metaForGuard?.is_core_relaxed_candidate === true) && 
-                                           (distanceFromLocalHighPct !== null && distanceFromLocalHighPct >= 0.12 && distanceFromLocalHighPct < 0.35);
+          const boxBreakoutFailed = failedFilterIds.has("box_breakout");
+          const upperWickHeavy = failedFilterIds.has("upper_wick");
+          const volumeSpikeCloseFail = failedFilterIds.has("volume_spike_close_fail");
+          const volumeRatio1m5Weak = volumeRatio1m5 === null || volumeRatio1m5 < 0.35;
 
-          const coreTrendNearHighSoftAllowed =
-            metaForGuard?.setupReason === "CORE_TREND_ENTRY" &&
-            (metaForGuard?.candle_source === "live_fetch" ||
-              (metaForGuard?.candle_source === "last_good_cache" && metaForGuard?.candle_freshness_ok === true)) &&
-            Number(metaForGuard?.riskReward ?? 0) >= 1.15 &&
-            Number(metaForGuard?.volumeRatio ?? 0) >= LIVE_CORE_TREND_MIN_VOLUME_RATIO &&
-            Number(metaForGuard?.stopPrice ?? 0) > 0;
+          const isFreshFilterSource = sourceKindForJudgment === "fresh_filter_pass" || sourceKindForJudgment === "scanner_filter_fresh";
+          const hasValidStopLoss = metaForGuard?.stopPrice !== undefined && metaForGuard.stopPrice !== null && metaForGuard.stopPrice > 0;
+          const marketStateBlock = !isSurgeSource && marketState.market_state === "risk_off";
+          const maxPositionsReached = countEffectiveManagedPositions(state.positions, priceBy) >= state.safety_guard.max_positions;
 
-          if (isAuthoritativeSurgeBreakoutFirstEntry) {
-            // [권위 분리] 스캐너 Tradable + Breakout 확정 + Setup 통과 첫 진입:
-            // 돌파 직후 고점 일치(dist=0%) 및 근접(dist<0.12%)은 정상 돌파 상태이므로 hard block 면제.
-            lateTimingTier = "pass";
-            lateEntryGuardReason = null;
-            if (metaForGuard) {
-              if (!metaForGuard.softened_reasons) metaForGuard.softened_reasons = [];
-              metaForGuard.softened_reasons.push("SURGE_BREAKOUT_NEAR_HIGH_AUTHORITY_PASSED");
-            }
+          const nearHighSoftenEligible =
+            isFreshFilterSource &&
+            score >= 70 &&
+            (secondsSinceSignal !== null && secondsSinceSignal <= 90) &&
+            !marketStateBlock &&
+            !maxPositionsReached &&
+            !volumeFadeTriggered &&
+            !volumeRatio1m5Weak &&
+            !upperWickHeavy &&
+            !boxBreakoutFailed &&
+            !volumeSpikeCloseFail &&
+            hasValidStopLoss &&
+            (recent1mRet === null || recent1mRet <= 1.2) &&
+            (recent3mRet === null || recent3mRet <= 2.0) &&
+            (recent5mRet === null || recent5mRet <= 3.5) &&
+            (volumeRatio1m5 !== null && volumeRatio1m5 >= 1.2) &&
+            (Number(metaForGuard?.riskReward ?? 0) >= 1.2);
+
+          if (distanceFromLocalHighPct !== null && distanceFromLocalHighPct < 0) {
             console.info(JSON.stringify({
-              tag: "SURGE_BREAKOUT_NEAR_HIGH_AUTHORITY_PROOF",
+              tag: "SURGE_NEGATIVE_NEAR_HIGH_BREAKOUT_PROOF",
               ts: new Date().toISOString(),
               market,
-              source_kind: sourceKindForJudgment,
-              score,
-              age_seconds: secondsSinceSignal,
+              current_price: currentPrice,
+              local_high: localHigh,
               distance_from_local_high_pct: distanceFromLocalHighPct,
-              breakout: true,
-              setup_ok: true,
-              near_high_hard_block: false,
-              decision: "pass",
-              reason: "authoritative_surge_breakout_first_entry_exempt_from_near_high_block"
+              near_high_block_applied: false,
+              reason: "above_local_high_not_near_high",
             }));
-          } else if (nearHighSoftenEligible) {
-            lateTimingTier = "reduced_size_allowed";
-            lateEntrySizingMultiplier *= 0.45;
-            lateEntryGuardReason = "near_high_probe_allowed";
-            if (metaForGuard) {
-              if (!metaForGuard.softened_reasons) metaForGuard.softened_reasons = [];
-              metaForGuard.softened_reasons.push("NEAR_HIGH_ENTRY_SOFTENED_PROBE");
-            }
-            console.info(JSON.stringify({
-              tag: "NEAR_HIGH_ENTRY_SOFTENED_PROBE_PROOF",
-              market,
-              source_kind: sourceKindForJudgment,
-              score,
-              age_seconds: secondsSinceSignal,
-              distance_from_local_high_pct: distanceFromLocalHighPct,
-              volume_ratio_1m5: volumeRatio1m5,
-              volume_fade_triggered: volumeFadeTriggered,
-              near_high_hard_block: false,
-              near_high_probe_allowed: true,
-              late_entry_sizing_multiplier: lateEntrySizingMultiplier,
-              stop_loss_price: metaForGuard?.stopPrice ?? 0,
-              reason: "near_high_softened_to_probe_allowed"
-            }));
-          } else if (severeNearHigh && coreTrendNearHighSoftAllowed) {
-            // CORE_TREND_ENTRY 후보는 near-high를 “소액 probe”로 낮추되, 다른 위험 신호는 기존 hard block 유지.
-            lateTimingTier = "reduced_size_allowed";
-            lateEntrySizingMultiplier *= 0.45;
-            lateEntryGuardReason = `CORE_TREND_NEAR_HIGH_SOFT_GUARD:${distanceFromLocalHighPct!.toFixed(3)}pct<0.12pct`;
-          } else if (severeNearHigh || (!softContextForMicroGuard && !coreRelaxedAllowNearHigh)) {
-            lateEntryGuardTriggered = true;
-            lateTimingTier = "hard_block";
-            const threshold = severeNearHigh ? 0.12 : LIVE_MAX_ENTRY_NEAR_HIGH_PCT;
-            lateEntryGuardReason = severeNearHigh
-              ? `too_near_local_high:${distanceFromLocalHighPct!.toFixed(3)}pct<${threshold.toFixed(2)}pct`
-              : `too_near_local_high:${distanceFromLocalHighPct!.toFixed(3)}pct<${threshold.toFixed(2)}pct(soft_context=false)`;
-          } else {
-            lateTimingTier = "reduced_size_allowed";
-            lateEntrySizingMultiplier *= 0.45; // 김 사장 지시: 0.45 적용
-            lateEntryGuardReason = `too_near_local_high_soft:${distanceFromLocalHighPct!.toFixed(3)}pct<0.35pct`;
-            if (coreRelaxedAllowNearHigh) {
-              metaForGuard?.softened_reasons?.push("CORE_NEAR_HIGH_SOFTENED");
+          }
+
+          const nearHighProblem =
+            distanceFromLocalHighPct !== null &&
+            distanceFromLocalHighPct >= 0 &&
+            distanceFromLocalHighPct < LIVE_MAX_ENTRY_NEAR_HIGH_PCT;
+          const volFadeProblem =
+            volumeFadeTriggered || (volumeRatio1m5 !== null && volumeRatio1m5 < 0.65);
+          if (nearHighProblem) {
+            const severeNearHigh =
+              distanceFromLocalHighPct !== null &&
+              distanceFromLocalHighPct >= 0 &&
+              distanceFromLocalHighPct < 0.12; // 김 사장 지시: 0.12% 미만은 하드 블락
+
+            const coreRelaxedAllowNearHigh = (metaForGuard?.is_core_relaxed_candidate === true) &&
+                                             (distanceFromLocalHighPct !== null && distanceFromLocalHighPct >= 0.12 && distanceFromLocalHighPct < 0.35);
+
+            const coreTrendNearHighSoftAllowed =
+              metaForGuard?.setupReason === "CORE_TREND_ENTRY" &&
+              (metaForGuard?.candle_source === "live_fetch" ||
+                (metaForGuard?.candle_source === "last_good_cache" && metaForGuard?.candle_freshness_ok === true)) &&
+              Number(metaForGuard?.riskReward ?? 0) >= 1.15 &&
+              Number(metaForGuard?.volumeRatio ?? 0) >= LIVE_CORE_TREND_MIN_VOLUME_RATIO &&
+              Number(metaForGuard?.stopPrice ?? 0) > 0;
+
+            if (isAuthoritativeSurgeBreakoutFirstEntry) {
+              lateTimingTier = "pass";
+              lateEntryGuardReason = null;
+              if (metaForGuard) {
+                if (!metaForGuard.softened_reasons) metaForGuard.softened_reasons = [];
+                metaForGuard.softened_reasons.push("SURGE_BREAKOUT_NEAR_HIGH_AUTHORITY_PASSED");
+              }
               console.info(JSON.stringify({
-                tag: "CORE_NEAR_HIGH_SOFTENED_PROOF",
+                tag: "SURGE_BREAKOUT_NEAR_HIGH_AUTHORITY_PROOF",
+                ts: new Date().toISOString(),
                 market,
+                source_kind: sourceKindForJudgment,
+                score,
+                age_seconds: secondsSinceSignal,
                 distance_from_local_high_pct: distanceFromLocalHighPct,
-                original_block_reason: "too_near_local_high",
-                size_multiplier: 0.45,
-                reason: "near_high_softened_to_probe"
+                breakout: true,
+                setup_ok: true,
+                near_high_hard_block: false,
+                decision: "pass",
+                reason: "authoritative_surge_breakout_first_entry_exempt_from_near_high_block"
               }));
+            } else if (nearHighSoftenEligible) {
+              lateTimingTier = "reduced_size_allowed";
+              lateEntrySizingMultiplier *= 0.45;
+              lateEntryGuardReason = "near_high_probe_allowed";
+              if (metaForGuard) {
+                if (!metaForGuard.softened_reasons) metaForGuard.softened_reasons = [];
+                metaForGuard.softened_reasons.push("NEAR_HIGH_ENTRY_SOFTENED_PROBE");
+              }
+              console.info(JSON.stringify({
+                tag: "NEAR_HIGH_ENTRY_SOFTENED_PROBE_PROOF",
+                market,
+                source_kind: sourceKindForJudgment,
+                score,
+                age_seconds: secondsSinceSignal,
+                distance_from_local_high_pct: distanceFromLocalHighPct,
+                volume_ratio_1m5: volumeRatio1m5,
+                volume_fade_triggered: volumeFadeTriggered,
+                near_high_hard_block: false,
+                near_high_probe_allowed: true,
+                late_entry_sizing_multiplier: lateEntrySizingMultiplier,
+                stop_loss_price: metaForGuard?.stopPrice ?? 0,
+                reason: "near_high_softened_to_probe_allowed"
+              }));
+            } else if (severeNearHigh && coreTrendNearHighSoftAllowed) {
+              lateTimingTier = "reduced_size_allowed";
+              lateEntrySizingMultiplier *= 0.45;
+              lateEntryGuardReason = `CORE_TREND_NEAR_HIGH_SOFT_GUARD:${distanceFromLocalHighPct!.toFixed(3)}pct<0.12pct`;
+            } else if (severeNearHigh || (!softContextForMicroGuard && !coreRelaxedAllowNearHigh)) {
+              lateEntryGuardTriggered = true;
+              lateTimingTier = "hard_block";
+              const threshold = severeNearHigh ? 0.12 : LIVE_MAX_ENTRY_NEAR_HIGH_PCT;
+              lateEntryGuardReason = severeNearHigh
+                ? `too_near_local_high:${distanceFromLocalHighPct!.toFixed(3)}pct<${threshold.toFixed(2)}pct`
+                : `too_near_local_high:${distanceFromLocalHighPct!.toFixed(3)}pct<${threshold.toFixed(2)}pct(soft_context=false)`;
+            } else {
+              lateTimingTier = "reduced_size_allowed";
+              lateEntrySizingMultiplier *= 0.45;
+              lateEntryGuardReason = `too_near_local_high_soft:${distanceFromLocalHighPct!.toFixed(3)}pct<0.35pct`;
+              if (coreRelaxedAllowNearHigh) {
+                metaForGuard?.softened_reasons?.push("CORE_NEAR_HIGH_SOFTENED");
+                console.info(JSON.stringify({
+                  tag: "CORE_NEAR_HIGH_SOFTENED_PROOF",
+                  market,
+                  distance_from_local_high_pct: distanceFromLocalHighPct,
+                  original_block_reason: "too_near_local_high",
+                  size_multiplier: 0.45,
+                  reason: "near_high_softened_to_probe"
+                }));
+              }
             }
           }
-        }
-        if (!lateEntryGuardTriggered && volFadeProblem) {
-          const severeVol = volumeRatio1m5 !== null && volumeRatio1m5 < 0.35; // 김 사장 지시: 0.35 미만은 하드 블락
-          
-          // 수익률 조건: 1분/3분 동시에 음수면 완화 금지
-          const negativeMomentum = (recent1mRet !== null && recent1mRet < 0) && (recent3mRet !== null && recent3mRet < 0);
+          if (!lateEntryGuardTriggered && volFadeProblem) {
+            const severeVol = volumeRatio1m5 !== null && volumeRatio1m5 < 0.35;
+            const negativeMomentum = (recent1mRet !== null && recent1mRet < 0) && (recent3mRet !== null && recent3mRet < 0);
+            const coreRelaxedAllowVolFade = (metaForGuard?.is_core_relaxed_candidate === true) &&
+                                            (volumeRatio1m5 !== null && volumeRatio1m5 >= 0.35) &&
+                                            !negativeMomentum;
 
-          const coreRelaxedAllowVolFade = (metaForGuard?.is_core_relaxed_candidate === true) && 
-                                          (volumeRatio1m5 !== null && volumeRatio1m5 >= 0.35) &&
-                                          !negativeMomentum;
-
-          if (severeVol || (!softContextForMicroGuard && !coreRelaxedAllowVolFade)) {
-            lateEntryGuardTriggered = true;
-            lateTimingTier = "hard_block";
-            lateEntryGuardReason =
-              volumeRatio1m5 !== null
-                ? severeVol
-                  ? `volume_fade_after_spike:${volumeRatio1m5.toFixed(3)}<0.35`
-                  : `volume_fade_after_spike:${volumeRatio1m5.toFixed(3)}<0.65(soft_context=false)`
-                : "volume_fade_after_spike";
-          } else {
-            lateTimingTier = "reduced_size_allowed";
-            lateEntrySizingMultiplier *= 0.45; // 김 사장 지시: 0.45 적용
-            const vr = volumeRatio1m5 !== null ? volumeRatio1m5.toFixed(3) : "na";
-            lateEntryGuardReason =
-              lateEntryGuardReason !== null
-                ? `${lateEntryGuardReason}|volume_fade_after_spike_soft:${vr}`
-                : `volume_fade_after_spike_soft:${vr}`;
-            if (coreRelaxedAllowVolFade) {
-              metaForGuard?.softened_reasons?.push("CORE_VOLUME_FADE_SOFTENED");
-              console.info(JSON.stringify({
-                tag: "CORE_VOLUME_FADE_SOFTENED_PROOF",
-                market,
-                volume_ratio_1m5: volumeRatio1m5,
-                recent_1m_return_pct: recent1mRet,
-                recent_3m_return_pct: recent3mRet,
-                original_block_reason: "volume_fade_after_spike",
-                size_multiplier: 0.45,
-                reason: "volume_fade_softened_to_probe"
-              }));
+            if (severeVol || (!softContextForMicroGuard && !coreRelaxedAllowVolFade)) {
+              lateEntryGuardTriggered = true;
+              lateTimingTier = "hard_block";
+              lateEntryGuardReason =
+                volumeRatio1m5 !== null
+                  ? severeVol
+                    ? `volume_fade_after_spike:${volumeRatio1m5.toFixed(3)}<0.35`
+                    : `volume_fade_after_spike:${volumeRatio1m5.toFixed(3)}<0.65(soft_context=false)`
+                  : "volume_fade_after_spike";
+            } else {
+              lateTimingTier = "reduced_size_allowed";
+              lateEntrySizingMultiplier *= 0.45;
+              const vr = volumeRatio1m5 !== null ? volumeRatio1m5.toFixed(3) : "na";
+              lateEntryGuardReason =
+                lateEntryGuardReason !== null
+                  ? `${lateEntryGuardReason}|volume_fade_after_spike_soft:${vr}`
+                  : `volume_fade_after_spike_soft:${vr}`;
+              if (coreRelaxedAllowVolFade) {
+                metaForGuard?.softened_reasons?.push("CORE_VOLUME_FADE_SOFTENED");
+                console.info(JSON.stringify({
+                  tag: "CORE_VOLUME_FADE_SOFTENED_PROOF",
+                  market,
+                  volume_ratio_1m5: volumeRatio1m5,
+                  recent_1m_return_pct: recent1mRet,
+                  recent_3m_return_pct: recent3mRet,
+                  original_block_reason: "volume_fade_after_spike",
+                  size_multiplier: 0.45,
+                  reason: "volume_fade_softened_to_probe"
+                }));
+              }
             }
           }
         }
@@ -16124,7 +16771,10 @@ export function createLiveDataStrategy(opts: {
       if (LIVE_EARLY_ENTRY_ENABLED) {
         const earlySlotsUsed = Object.keys(state.early_positions).length;
         const secondsFreshOk = secondsSinceSignal !== null && secondsSinceSignal <= LIVE_EARLY_ENTRY_MAX_SIGNAL_SECONDS;
-        const nearHighOk = distanceFromLocalHighPct !== null && distanceFromLocalHighPct <= LIVE_EARLY_ENTRY_NEAR_HIGH_PCT;
+        const nearHighOk =
+          distanceFromLocalHighPct !== null &&
+          (distanceFromLocalHighPct <= 0 ||
+            (distanceFromLocalHighPct >= 0.12 && distanceFromLocalHighPct <= LIVE_EARLY_ENTRY_NEAR_HIGH_PCT));
         const volOk = volumeRatio1m5 !== null && volumeRatio1m5 >= LIVE_EARLY_ENTRY_MIN_VOLUME_RATIO;
         const earlyMinScoreDefault = Math.max(0, marketState.min_entry_score - 7);
         const earlyMinScore = (() => {
@@ -17238,6 +17888,108 @@ export function createLiveDataStrategy(opts: {
             bumpSkip(decision.reason);
             continue;
           }
+
+          const isConfirmedNearHighOrChase =
+            isSurgeSource &&
+            decision.action === "enter" &&
+            ((distanceFromLocalHighPct !== null && distanceFromLocalHighPct >= 0 && distanceFromLocalHighPct < 0.12) ||
+              (distanceFromLocalHighPct !== null && distanceFromLocalHighPct >= 0 && distanceFromLocalHighPct < 0.15 && recent3mRet !== null && recent3mRet >= 2.0) ||
+              (recent3mRet !== null && recent3mRet >= 2.5) ||
+              (emaDistancePct !== null && emaDistancePct > 1.8));
+
+          if (isConfirmedNearHighOrChase) {
+            const confirmedBlockReason =
+              distanceFromLocalHighPct !== null && distanceFromLocalHighPct >= 0 && distanceFromLocalHighPct < 0.12
+                ? `confirmed_surge_too_near_local_high:${distanceFromLocalHighPct.toFixed(3)}pct<0.12pct`
+                : distanceFromLocalHighPct !== null && distanceFromLocalHighPct >= 0 && distanceFromLocalHighPct < 0.15 && recent3mRet !== null && recent3mRet >= 2.0
+                ? `confirmed_surge_near_high_and_rising:dist=${distanceFromLocalHighPct.toFixed(3)}pct<0.15pct,3m=${(recent3mRet ?? 0).toFixed(2)}pct>=2.0pct`
+                : recent3mRet !== null && recent3mRet >= 2.5
+                ? `confirmed_surge_recent_3m_extended:${recent3mRet.toFixed(2)}pct>=2.5pct`
+                : `confirmed_surge_ema_extended:${(emaDistancePct ?? 0).toFixed(2)}pct>1.8pct`;
+
+            emitSurgeAuthorityProof({
+              tag: "SURGE_IMMEDIATE_BUY_BLOCKED_FOR_PRICE_LOCATION_PROOF",
+              market,
+              currentPrice,
+              localHigh: localHigh ?? currentPrice,
+              distanceFromLocalHighPct,
+              recent1mRet,
+              recent3mRet,
+              recent5mRet,
+              emaDistancePct,
+              volumeAccel: volumeRatio1m5,
+              score: signalScore,
+              sourceKind: surgeSourceKindLog,
+              originalDecision: decision.entryMode ?? "CONFIRMED_SURGE_ENTRY",
+              finalAuthority: "BLOCKED_IMMEDIATE_BUY",
+              transitionTarget: "watching",
+              reason: confirmedBlockReason,
+            });
+
+            const dayChangePct = Number(sig?.p?.change_rate_pct ?? sig?.p?.signed_change_rate ?? 0) * (Number(sig?.p?.change_rate_pct) > 1 ? 1 : 100);
+            const volume24hKrw = Number(sig?.p?.acc_trade_price_24h ?? 0);
+            const nowKst = new Date();
+            const kstHour = (nowKst.getUTCHours() + 9) % 24;
+            const isMorningWindow = kstHour >= 9 && kstHour < 10;
+
+            const transferred = transferSurgeCandidateToReclaimWatchlist({
+              market,
+              currentPrice,
+              localHigh: localHigh ?? currentPrice,
+              dayChangePct: Number.isFinite(dayChangePct) ? dayChangePct : 0,
+              volume24hKrw: Number.isFinite(volume24hKrw) ? volume24hKrw : 0,
+              isMorningWindow,
+              state,
+              reason: confirmedBlockReason,
+            });
+
+            emitSurgeAuthorityProof({
+              tag: "SURGE_LATE_GOOD_TO_RECLAIM_PROOF",
+              market,
+              currentPrice,
+              localHigh: localHigh ?? currentPrice,
+              distanceFromLocalHighPct,
+              recent1mRet,
+              recent3mRet,
+              recent5mRet,
+              emaDistancePct,
+              volumeAccel: volumeRatio1m5,
+              score: signalScore,
+              sourceKind: surgeSourceKindLog,
+              originalDecision: decision.entryMode ?? "CONFIRMED_SURGE_ENTRY",
+              finalAuthority: "RECLAIM_WATCH",
+              transitionTarget: "watching",
+              reason: `transferred_to_watchlist:${transferred ? "success" : "queue_full"}:${confirmedBlockReason}`,
+            });
+
+            emitSurgeAuthorityProof({
+              tag: "SURGE_DISCOVERY_BUY_AUTHORITY_PROOF",
+              market,
+              currentPrice,
+              localHigh: localHigh ?? currentPrice,
+              distanceFromLocalHighPct,
+              recent1mRet,
+              recent3mRet,
+              recent5mRet,
+              emaDistancePct,
+              volumeAccel: volumeRatio1m5,
+              score: signalScore,
+              sourceKind: surgeSourceKindLog,
+              originalDecision: decision.entryMode ?? "CONFIRMED_SURGE_ENTRY",
+              finalAuthority: "RECLAIM_WATCH",
+              transitionTarget: "watching",
+              reason: confirmedBlockReason,
+            });
+
+            logPlacebuyFinalGateBlocked("confirmed_surge_deferred_to_reclaim", {
+              market,
+              entry_mode: decision.entryMode,
+              reason: confirmedBlockReason,
+            });
+            bumpSkip("confirmed_surge_deferred_to_reclaim");
+            continue;
+          }
+
           entryPipelineDetail = { ...decision.detail, entry_pipeline: "surge" };
           surgeDecisionMetrics = decision;
           surgeMarketSizeMultiplier *= decision.sizeMultiplier;
