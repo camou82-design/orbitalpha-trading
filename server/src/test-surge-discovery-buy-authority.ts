@@ -139,48 +139,38 @@ console.log("\n[TEST 1] 강한 후보 + 진짜 초입 → FAST_SURGE_PROBE 허�
 }
 
 // -----------------------------------------------------------------------------
-// 시나리오 2: 강한 후보 + local high 바로 밑 → 즉시 매수 금지, reclaim queue 이동
+// 시나리오 2: 강한 후보 + local high 바로 밑(dist ≈ 0.099%) → P1 정책: TRUE_EARLY 복원 검증
 // -----------------------------------------------------------------------------
-console.log("\n[TEST 2] 강한 후보 + local high 바로 밑(dist < 0.12%) → 즉시 매수 금지, reclaim queue 이동");
+console.log("\n[TEST 2] 강한 후보 + local high 바로 밑(dist ≈ 0.099%) → P1 정책: FAST_SURGE_PROBE 허용 및 경계 검증");
 {
-  const mockState: any = { surge_watchlist: {}, morning_surge_watchlist: {} };
   const input = createBaseSurgeCandidate({
     market: "KRW-KERNEL",
     currentPrice: 1000,
     localHigh: 1001,
-    distanceFromLocalHighPct: 0.099, // 0.099% >= 0 && < 0.12% (고점 꼭대기)
-    recent1mRet: 0.5,
-    recent3mRet: 1.2,
+    distanceFromLocalHighPct: 0.099, // 0.099% (고점 바로 밑 초입)
+    recent1mRet: 0.5,                // +0.5% (과열 없음)
+    recent3mRet: 1.2,                // +1.2% (과열 없음)
+    recent5mRet: 1.8,                // +1.8% (과열 없음)
+    emaDistancePct: 0.8,             // +0.8% (과열 없음)
     breakout: true,
     setupOk: true,
+    hasValidStopLoss: true,
+    isRiskOff: false,
+    isCooldown: false,
+    isDailyRiskKill: false,
   });
 
   const res = classifySurgeCandidateAuthority(input);
-  assert.strictEqual(res.category, "LATE_BUT_GOOD", "Must be classified as LATE_BUT_GOOD");
-  assert.strictEqual(res.immediateBuyAllowed, false, "Immediate buy must be BLOCKED");
-  assert.strictEqual(res.finalAuthority, "RECLAIM_WATCH", "Authority must be RECLAIM_WATCH");
-  assert.strictEqual(res.transitionTarget, "watching", "Transition target must be watching");
-  assert.ok(res.reason.includes("near_high_below_apex"), `Reason should mention near high apex: ${res.reason}`);
 
-  const transferred = transferSurgeCandidateToReclaimWatchlist({
-    market: input.market,
-    currentPrice: input.currentPrice,
-    localHigh: input.localHigh,
-    dayChangePct: 5.5,
-    volume24hKrw: 10_000_000_000,
-    isMorningWindow: false,
-    state: mockState,
-    reason: res.reason,
-  });
-
-  assert.strictEqual(transferred, true, "Candidate must be successfully transferred to watchlist");
-  const watchItem = mockState.surge_watchlist["KRW-KERNEL"];
-  assert.ok(watchItem, "Item must exist in surge_watchlist");
-  assert.strictEqual(watchItem.status, "watching", "Initial status in watchlist must be 'watching'");
-  assert.strictEqual(watchItem.local_high_price, 1001, "Local high price must match");
+  // 1. P1 복원 검증: blanket defer 해제 -> TRUE_EARLY / FAST_SURGE_PROBE 정상 부여
+  assert.strictEqual(res.category, "TRUE_EARLY", "Must be classified as TRUE_EARLY under restored P1 policy");
+  assert.strictEqual(res.immediateBuyAllowed, true, "Immediate buy must be ALLOWED for fresh early candidate");
+  assert.strictEqual(res.finalAuthority, "FAST_SURGE_PROBE", "Authority must be FAST_SURGE_PROBE");
+  assert.strictEqual(res.transitionTarget, "BUY", "Transition target must be BUY");
+  assert.notStrictEqual(res.finalAuthority, "RECLAIM_WATCH", "Must NOT be blanket-deferred to RECLAIM_WATCH");
 
   emitSurgeAuthorityProof({
-    tag: "SURGE_IMMEDIATE_BUY_BLOCKED_FOR_PRICE_LOCATION_PROOF",
+    tag: "SURGE_TRUE_EARLY_PROBE_ALLOWED_PROOF",
     market: input.market,
     currentPrice: input.currentPrice,
     localHigh: input.localHigh,
@@ -192,12 +182,45 @@ console.log("\n[TEST 2] 강한 후보 + local high 바로 밑(dist < 0.12%) → 
     volumeAccel: input.volumeRatio1m5,
     score: input.score,
     sourceKind: input.sourceKind,
-    originalDecision: "discovered_near_high_apex",
+    originalDecision: "discovered_near_high_safe_pre_breakout",
     finalAuthority: res.finalAuthority,
     transitionTarget: res.transitionTarget,
     reason: res.reason,
   });
-  console.log("  -> PASS: Immediate buy blocked for dist < 0.12%, transferred to surge_watchlist as 'watching'.");
+  console.log("  -> PASS: dist 0.099% 초입 후보 FAST_SURGE_PROBE 정상 허용 확인 (Reclaim 강등 차단 해제)");
+
+  // 2. 반대 경계 1: 동일 dist 0.099%라도 late-chase 과열 조건(3m >= 2.0% & dist < 0.15%) 시 -> RECLAIM_WATCH 강등
+  const overheatedInput = createBaseSurgeCandidate({
+    ...input,
+    recent3mRet: 2.2, // >= 2.0% (과열 추격)
+  });
+  const overRes = classifySurgeCandidateAuthority(overheatedInput);
+  assert.strictEqual(overRes.category, "LATE_BUT_GOOD", "Overheated candidate must be LATE_BUT_GOOD");
+  assert.strictEqual(overRes.finalAuthority, "RECLAIM_WATCH", "Overheated candidate must be RECLAIM_WATCH");
+  assert.strictEqual(overRes.immediateBuyAllowed, false, "Overheated candidate immediate buy must be BLOCKED");
+  console.log("  -> PASS: 동일 dist 0.099% 과열 시 RECLAIM_WATCH 정상 강등 확인");
+
+  // 3. 반대 경계 2: 동일 dist 0.099%라도 structural fail(setupOk = false 또는 stoploss 결여) 시 -> BLOCK
+  const structFailInput = createBaseSurgeCandidate({
+    ...input,
+    setupOk: false,
+  });
+  const structRes = classifySurgeCandidateAuthority(structFailInput);
+  assert.strictEqual(structRes.category, "BAD_SETUP", "Structural failure must be BAD_SETUP");
+  assert.strictEqual(structRes.finalAuthority, "BLOCKED", "Structural failure must be BLOCKED");
+  assert.strictEqual(structRes.immediateBuyAllowed, false);
+  console.log("  -> PASS: 동일 dist 0.099% structural fail 시 즉시 BLOCK 확인");
+
+  // 4. 반대 경계 3: 동일 dist 0.099%라도 risk_off / HARD_RISK 시 -> 절대 BLOCK
+  const riskOffInput = createBaseSurgeCandidate({
+    ...input,
+    isRiskOff: true,
+  });
+  const riskOffRes = classifySurgeCandidateAuthority(riskOffInput);
+  assert.strictEqual(riskOffRes.category, "BAD_SETUP", "Market risk-off must be BAD_SETUP");
+  assert.strictEqual(riskOffRes.finalAuthority, "BLOCKED", "Market risk-off must be BLOCKED");
+  assert.strictEqual(riskOffRes.immediateBuyAllowed, false);
+  console.log("  -> PASS: 동일 dist 0.099% risk_off/HARD_RISK 시 절대 BLOCK 확인");
 }
 
 // -----------------------------------------------------------------------------
@@ -928,7 +951,8 @@ async function runPerformanceKillRegressionSuite() {
     const mockState: any = { surge_watchlist: {}, morning_surge_watchlist: {}, trades: performanceKillTrades };
     const input = createBaseSurgeCandidate({
       market: "KRW-LATE-PERF",
-      distanceFromLocalHighPct: 0.08, // near apex -> LATE_BUT_GOOD
+      distanceFromLocalHighPct: 0.12,
+      recent3mRet: 2.2, // 3m 과열 추격 -> LATE_BUT_GOOD
       score: 95,
       breakout: true,
       setupOk: true,

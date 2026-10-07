@@ -802,7 +802,7 @@ type DailyStats = {
   actual_daily_pnl_pct?: number;
 };
 
-type SurgeWatchItem = {
+export type SurgeWatchItem = {
   market: string;
   first_detected_at: string;
   first_detected_price: number;
@@ -816,6 +816,9 @@ type SurgeWatchItem = {
   last_seen_price: number;
   last_seen_at: string;
   status: "watching" | "pullback_seen" | "reclaim_ready" | "entered" | "expired" | "retry_wait";
+  local_high_candle_ts?: number;
+  pullback_candle_ts?: number;
+  pullback_candle_time?: string | null;
   reason: string;
   expire_at: string;
   attempt_count?: number;
@@ -834,6 +837,8 @@ type SurgeWatchItem = {
   distanceFromLocalHighPct?: number;
   riskReward?: number;
 };
+
+export type SurgeWatchlistItem = SurgeWatchItem;
 
 type PersistedState = {
   positions: Record<string, StrategyPosition>;
@@ -1486,6 +1491,11 @@ export const SURGE_PULLBACK_MIN_PCT = 0.5;
 export const SURGE_PULLBACK_MAX_PCT = 3.0;
 export const SURGE_PULLBACK_DEEP_EXPIRY_PCT = 4.2;
 
+// Reclaim Authority Constants (명시적 Reclaim 권한 기준: 0.62% 호가 노이즈 차단)
+export const SURGE_RECLAIM_AUTHORITY_MIN_PULLBACK_PCT = 1.5;
+export const SURGE_RECLAIM_AUTHORITY_MAX_PULLBACK_PCT = 3.0;
+export const SURGE_RECLAIM_AUTHORITY_DEEP_EXPIRY_PCT = 4.2;
+
 export function detectSurgePullback(params: {
   localHigh: number;
   currentPrice: number;
@@ -1924,30 +1934,24 @@ export function classifySurgeCandidateAuthority(
 
   const dist = input.distanceFromLocalHighPct;
   const isBreakout = dist <= 0; // 고점 동일(0) 또는 고점 돌파(<0)
-  const isNearHighBelow = dist >= 0 && dist < 0.12; // 고점 바로 밑 (0 ~ 0.12%)
   const isNearHighExtendedChase = dist >= 0 && dist < 0.15 && input.recent3mRet !== null && input.recent3mRet >= 2.0;
 
-  // 과열 지표 (Overheating / Chase metrics)
+  // 과열 지표 (Overheating / Chase metrics) - 기존 기준 100% 보존
   const isOverheated3m = input.recent3mRet !== null && input.recent3mRet >= 2.5;
   const isOverheatedEma = input.emaDistancePct !== null && input.emaDistancePct > 1.8;
   const isOverheated1m = input.recent1mRet !== null && input.recent1mRet > 1.5;
   const isOverheated5m = input.recent5mRet !== null && input.recent5mRet >= 4.5;
 
   // LATE_BUT_GOOD 판정:
-  // 1) 고점 바로 아래 apex 구간 (dist >= 0 && dist < 0.12%)
-  // 2) 고점 근접 + 3분 급등 추격 (dist < 0.15% && 3m >= 2.0%)
-  // 3) 돌파(dist <= 0)했으나 이미 3m/5m/EMA 과열 상태
-  // 4) 일반 위치에서도 3m/EMA/1m/5m 중 복합 과열이 발생한 상태
+  // - near_high_below_apex blanket defer 제거됨.
+  // - 실제 과열/급등 추격이 있는 경우에만 LATE_BUT_GOOD(Reclaim 대기)로 분류.
   const isLateChase =
-    isNearHighBelow ||
     isNearHighExtendedChase ||
     (isBreakout && (isOverheated3m || isOverheatedEma || isOverheated1m || isOverheated5m)) ||
     (isOverheated3m && isOverheatedEma);
 
   if (isLateChase) {
-    const detailReason = isNearHighBelow
-      ? `near_high_below_apex:dist=${dist.toFixed(3)}pct>=0_and<0.12pct`
-      : isNearHighExtendedChase
+    const detailReason = isNearHighExtendedChase
       ? `near_high_and_rising:dist=${dist.toFixed(3)}pct<0.15pct,3m=${(input.recent3mRet ?? 0).toFixed(2)}pct>=2.0pct`
       : isBreakout
       ? `breakout_overheated:dist=${dist.toFixed(3)}pct<=0,3m=${(input.recent3mRet ?? 0).toFixed(2)}pct,ema=${(input.emaDistancePct ?? 0).toFixed(2)}pct`
@@ -2003,9 +2007,9 @@ export function classifySurgeCandidateAuthority(
 
   // 가격 위치 분리:
   // freshBreakoutLocation = dist <= 0 (고점 돌파)
-  // safePreBreakoutLocation = dist >= 0.12 && dist <= LIVE_EARLY_ENTRY_NEAR_HIGH_PCT (고점 직전 안전 범위)
+  // safePreBreakoutLocation = dist >= 0 && dist <= LIVE_EARLY_ENTRY_NEAR_HIGH_PCT (고점 직전 0~0.30% 복원)
   const freshBreakoutLocation = dist <= 0;
-  const safePreBreakoutLocation = dist >= 0.12 && dist <= LIVE_EARLY_ENTRY_NEAR_HIGH_PCT;
+  const safePreBreakoutLocation = dist >= 0 && dist <= LIVE_EARLY_ENTRY_NEAR_HIGH_PCT;
   const isPriceLocationValid = freshBreakoutLocation || safePreBreakoutLocation;
 
   if (!isPriceLocationValid) {
@@ -14748,6 +14752,7 @@ export function createLiveDataStrategy(opts: {
       const closes1 = c1.map(c => Number(c.trade_price));
       const closes5 = c5.map(c => Number(c.trade_price));
       const lastC1 = c1[c1.length - 1];
+      const currentCandleTs = parseCandleTimeMs(lastC1);
 
       const recent1mRet = ((currentPrice - closes1[closes1.length - 2]) / closes1[closes1.length - 2]) * 100;
       const recent3mRet = c1.length >= 4 ? ((currentPrice - closes1[closes1.length - 4]) / closes1[closes1.length - 4]) * 100 : 0;
@@ -14760,8 +14765,34 @@ export function createLiveDataStrategy(opts: {
 
       const localHigh = Math.max(item.local_high_price, currentPrice);
       if (localHigh > item.local_high_price) {
+        const prevStatus = item.status;
         item.local_high_price = localHigh;
         item.local_high_at = new Date().toISOString();
+        item.local_high_candle_ts = currentCandleTs;
+
+        // P0 Reset Rule: pullback_seen 또는 reclaim_ready 상태에서 기존 pullback 이후 새로운 localHigh가 형성되면 과거 pullback authority는 즉시 폐기!
+        if (prevStatus === "pullback_seen" || prevStatus === "reclaim_ready") {
+          item.status = "watching";
+          item.pullback_low_price = null;
+          item.pullback_low_at = null;
+          item.pullback_candle_ts = undefined;
+          item.pullback_candle_time = null;
+
+          console.info(
+            JSON.stringify({
+              tag: "SURGE_WATCH_NEW_HIGH_RESET",
+              ts: new Date().toISOString(),
+              market,
+              previous_high: item.local_high_price,
+              new_high: localHigh,
+              previous_status: prevStatus,
+              new_status: "watching",
+              reason: "new_local_high_invalidates_past_pullback_authority",
+            })
+          );
+        }
+      } else if (!item.local_high_candle_ts) {
+        item.local_high_candle_ts = currentCandleTs;
       }
       const distanceFromLocalHighPct = ((localHigh - currentPrice) / localHigh) * 100;
 
@@ -14781,22 +14812,44 @@ export function createLiveDataStrategy(opts: {
 
       // 1. 상태 기계: watching -> pullback_seen (pullback 판정을 만료 판정 전에 먼저 수행)
       if (item.status === "watching") {
-        const recentCandleLows = c1.slice(-3).map((c) => Number(c.low_price ?? 0)).filter((n) => n > 0);
-        const pb = detectSurgePullback({
-          localHigh,
-          currentPrice,
-          lastSeenPrice: previousSeenPrice,
-          recentCandleLows,
-          minPct: SURGE_PULLBACK_MIN_PCT,
-          maxPct: SURGE_PULLBACK_MAX_PCT,
-          deepExpiryPct: SURGE_PULLBACK_DEEP_EXPIRY_PCT,
+        // P0 Temporal Invariant Step 1: localHighTs < pullbackClosedCandleTs 증명
+        // 1) live 미완성봉(lastC1) 완전 배제: closedCandles1 = c1.slice(0, -1)
+        // 2) localHighTs 이전 마감봉 완전 배제 (pullbackTs > localHighTs 엄격 강제)
+        const closedCandles1 = c1.slice(0, -1);
+        const localHighTs = item.local_high_candle_ts ?? 0;
+
+        const validClosedAfterHigh = closedCandles1.filter((c) => {
+          const cTs = parseCandleTimeMs(c);
+          return Number.isFinite(cTs) && cTs > localHighTs;
         });
 
-        if (pb.isPullback && volumeRatio1m5 >= 0.1 && marketState.market_state !== "risk_off") {
+        let bestClosedCandle: UpbitCandle | null = null;
+        let minClosedLow = Infinity;
+        for (const cand of validClosedAfterHigh.slice(-3)) {
+          const low = Number(cand.low_price ?? 0);
+          if (low > 0 && low < minClosedLow) {
+            minClosedLow = low;
+            bestClosedCandle = cand;
+          }
+        }
+
+        const closedPullbackPct = bestClosedCandle !== null
+          ? ((localHigh - minClosedLow) / localHigh) * 100
+          : 0;
+
+        const isAuthoritativePullback =
+          bestClosedCandle !== null &&
+          closedPullbackPct >= SURGE_RECLAIM_AUTHORITY_MIN_PULLBACK_PCT &&
+          closedPullbackPct <= SURGE_RECLAIM_AUTHORITY_MAX_PULLBACK_PCT;
+
+        if (isAuthoritativePullback && volumeRatio1m5 >= 0.1 && marketState.market_state !== "risk_off") {
           const fromState = item.status;
           item.status = "pullback_seen";
-          item.pullback_low_price = pb.pullbackLow ?? currentPrice;
+          item.pullback_low_price = minClosedLow;
           item.pullback_low_at = new Date().toISOString();
+          // numeric epoch timestamp를 canonical authority로 저장 (lastC1 대입 금지!)
+          item.pullback_candle_ts = parseCandleTimeMs(bestClosedCandle!);
+          item.pullback_candle_time = bestClosedCandle!.candle_date_time_kst ?? null;
           pullback_seen_count++;
 
           const ema20 = emaLast(closes1, 20) || currentPrice;
@@ -14812,14 +14865,16 @@ export function createLiveDataStrategy(opts: {
               to_state: "pullback_seen",
               local_high: localHigh,
               current_price: currentPrice,
-              pullback_pct: pb.pullbackPct,
-              pullback_evidence_source: pb.evidenceSource,
+              pullback_pct: closedPullbackPct,
+              pullback_evidence_source: "closed_candle",
               pullback_low_price: item.pullback_low_price,
+              pullback_candle_ts: item.pullback_candle_ts,
+              pullback_candle_time: item.pullback_candle_time,
               recent_1m_ret: recent1mRet,
               price_above_ema20: isAboveEma,
               high_reclaim: highReclaim,
               volume_accel: volumeRatio1m5,
-              reason: "pullback_confirmed",
+              reason: "pullback_confirmed_closed_candle",
             })
           );
 
@@ -14830,11 +14885,16 @@ export function createLiveDataStrategy(opts: {
               market,
               local_high_price: localHigh,
               pullback_low_price: item.pullback_low_price,
-              pullback_pct: pb.pullbackPct,
-              pullback_evidence_source: pb.evidenceSource,
+              pullback_pct: closedPullbackPct,
+              pullback_evidence_source: "closed_candle",
+              pullback_candle_ts: item.pullback_candle_ts,
+              pullback_candle_time: item.pullback_candle_time,
               elapsed_seconds: Math.floor((nowMs - registerTime) / 1000),
             })
           );
+
+          // P0: 동일 평가 주기에서 즉시 reclaim_ready로 직행하지 못하도록 이번 루프 차단
+          continue;
         }
       }
 
@@ -14869,6 +14929,22 @@ export function createLiveDataStrategy(opts: {
 
       // 3. 상태 기계: pullback_seen -> reclaim_ready 전이
       if (item.status === "pullback_seen") {
+        // P0 Temporal Invariant Step 2: localHighTs < pullbackClosedCandleTs < reclaimEvaluationCandleTs 증명
+        const localHighTs = item.local_high_candle_ts ?? 0;
+        const pullbackTs = item.pullback_candle_ts ?? 0;
+        const reclaimEvaluationCandleTs = currentCandleTs;
+
+        const isTemporalInvariantValid =
+          localHighTs > 0 &&
+          pullbackTs > localHighTs &&
+          Number.isFinite(reclaimEvaluationCandleTs) &&
+          reclaimEvaluationCandleTs > pullbackTs;
+
+        if (!isTemporalInvariantValid) {
+          // 시간 무결성 위반 (동일 캔들, 소급 캔들, 미완성봉 꼬리) 시 전이 차단
+          continue;
+        }
+
         const evalRes = evaluateReclaimConditions({
           currentPrice,
           pullbackLowPrice: item.pullback_low_price,
@@ -16625,8 +16701,7 @@ export function createLiveDataStrategy(opts: {
         hasValidSignalAgeEvidence &&
         hasValidChaseEvidence &&
         (distanceFromLocalHighPct !== null &&
-          (distanceFromLocalHighPct <= 0 ||
-            (distanceFromLocalHighPct >= 0.12 && distanceFromLocalHighPct <= LIVE_EARLY_ENTRY_NEAR_HIGH_PCT)));
+          distanceFromLocalHighPct <= LIVE_EARLY_ENTRY_NEAR_HIGH_PCT);
 
       if (isSurgeSource) {
         const filtersArr = Array.isArray(sig?.p?.filters) ? (sig.p.filters as Array<{ id?: unknown; passed?: unknown }>) : [];
@@ -17211,8 +17286,7 @@ export function createLiveDataStrategy(opts: {
         const secondsFreshOk = secondsSinceSignal !== null && secondsSinceSignal <= LIVE_EARLY_ENTRY_MAX_SIGNAL_SECONDS;
         const nearHighOk =
           distanceFromLocalHighPct !== null &&
-          (distanceFromLocalHighPct <= 0 ||
-            (distanceFromLocalHighPct >= 0.12 && distanceFromLocalHighPct <= LIVE_EARLY_ENTRY_NEAR_HIGH_PCT));
+          distanceFromLocalHighPct <= LIVE_EARLY_ENTRY_NEAR_HIGH_PCT;
         const volOk = volumeRatio1m5 !== null && volumeRatio1m5 >= LIVE_EARLY_ENTRY_MIN_VOLUME_RATIO;
         const earlyMinScoreDefault = Math.max(0, marketState.min_entry_score - 7);
         const earlyMinScore = (() => {
